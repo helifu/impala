@@ -32,15 +32,22 @@ source_impala_config() {
   set -u
 }
 
+source_impala_config
+
 onexit() {
+  # Get the logs from all docker containers
+  DOCKER_LOGS_DIR="${IMPALA_HOME}/logs/docker_logs"
+  mkdir -p "${DOCKER_LOGS_DIR}"
+  for container in $(docker ps -a -q); do
+    docker logs ${container} > "${DOCKER_LOGS_DIR}/${container}.log" 2>&1 || true
+  done
+
   # Clean up docker containers and networks that may have been created by
   # these tests.
   docker rm -f $(docker ps -a -q) || true
   docker network rm $DOCKER_NETWORK || true
 }
 trap onexit EXIT
-
-source_impala_config
 
 # Check that docker is running and that our user can interact with it.
 docker run hello-world
@@ -71,8 +78,13 @@ time -p ./buildall.sh -format -testdata -notests < /dev/null
 start-impala-cluster.py --kill
 
 # Build the docker images required to start the cluster.
-# parquet-reader is needed for e2e tests but not built for non-test build.
-make -j ${IMPALA_BUILD_THREADS} docker_debug_images parquet-reader
+# parquet-reader and impala-profile-tool are needed for e2e tests but not built for
+# non-test build.
+IMAGE_TYPE=docker_debug
+if ${IMPALA_DOCKER_USE_JAVA11-false}; then
+  IMAGE_TYPE=${IMAGE_TYPE}_java11
+fi
+make -j ${IMPALA_BUILD_THREADS} ${IMAGE_TYPE}_images parquet-reader impala-profile-tool
 
 source_impala_config
 
@@ -80,6 +92,8 @@ FAIR_SCHED_CONF=/opt/impala/conf/minicluster-fair-scheduler.xml
 LLAMA_CONF=/opt/impala/conf/minicluster-llama-site.xml
 export TEST_START_CLUSTER_ARGS="--docker_network=${DOCKER_NETWORK}"
 TEST_START_CLUSTER_ARGS+=" --data_cache_dir=/tmp --data_cache_size=500m"
+TEST_START_CLUSTER_ARGS+=" --impalad_args=--disk_spill_compression_codec=lz4"
+TEST_START_CLUSTER_ARGS+=" --impalad_args=--disk_spill_punch_holes=true"
 TEST_START_CLUSTER_ARGS+=" --impalad_args=-fair_scheduler_allocation_path=${FAIR_SCHED_CONF}"
 TEST_START_CLUSTER_ARGS+=" --impalad_args=-llama_site_path=${LLAMA_CONF}"
 export MAX_PYTEST_FAILURES=0

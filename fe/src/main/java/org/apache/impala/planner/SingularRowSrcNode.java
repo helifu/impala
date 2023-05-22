@@ -23,6 +23,7 @@ import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.ExprUtil;
 
 import com.google.common.base.Preconditions;
 
@@ -63,6 +64,14 @@ public class SingularRowSrcNode extends PlanNode {
     // The containing SubplanNode has not yet been initialized, so get the number
     // of nodes from the SubplanNode's input.
     numNodes_ = containingSubplanNode_.getChild(0).getNumNodes();
+    numInstances_ = containingSubplanNode_.getChild(0).getNumInstances();
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = ProcessingCost.basicCost(getDisplayLabel(),
+        containingSubplanNode_.getChild(0).getCardinality(),
+        ExprUtil.computeExprsTotalCost(getConjuncts()));
   }
 
   @Override

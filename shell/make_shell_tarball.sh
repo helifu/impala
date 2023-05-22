@@ -31,6 +31,18 @@ if [ "x${IMPALA_HOME}" == "x" ]; then
   exit 1
 fi
 
+# Detect whether IMPALA_HOME is a git repository. This is used below to allow extra
+# checks when building ext-py.
+pushd ${IMPALA_HOME}
+IS_GIT_CHECKOUT=false
+if git ls-files --error-unmatch > /dev/null 2>&1 ; then
+  IS_GIT_CHECKOUT=true
+  echo "IMPALA_HOME is a git repository"
+else
+  echo "IMPALA_HOME is not a git repository"
+fi;
+popd
+
 IMPALA_VERSION_INFO_FILE=${IMPALA_HOME}/bin/version.info
 
 if [ ! -f ${IMPALA_VERSION_INFO_FILE} ]; then
@@ -49,15 +61,21 @@ SHELL_HOME=${IMPALA_HOME}/shell
 BUILD_DIR=${SHELL_HOME}/build
 TARBALL_ROOT=${BUILD_DIR}/impala-shell-${VERSION}
 
-echo "Deleting all files in ${TARBALL_ROOT}/{gen-py,lib,ext-py}"
+THRIFT_GEN_PY_DIR="${SHELL_HOME}/gen-py"
+
+echo "Deleting all files in ${TARBALL_ROOT}/{gen-py,lib,ext-py*,legacy}"
 rm -rf ${TARBALL_ROOT}/lib/* 2>&1 > /dev/null
 rm -rf ${TARBALL_ROOT}/gen-py/* 2>&1 > /dev/null
-rm -rf ${TARBALL_ROOT}/ext-py/* 2>&1 > /dev/null
+rm -rf ${TARBALL_ROOT}/ext-py*/* 2>&1 > /dev/null
+rm -rf ${TARBALL_ROOT}/legacy/* 2>&1 > /dev/null
 mkdir -p ${TARBALL_ROOT}/lib
-mkdir -p ${TARBALL_ROOT}/ext-py
+mkdir -p ${TARBALL_ROOT}/ext-py2
+mkdir -p ${TARBALL_ROOT}/ext-py3
+mkdir -p ${TARBALL_ROOT}/legacy
 
-rm -f ${SHELL_HOME}/gen-py/impala_build_version.py
-cat > ${SHELL_HOME}/gen-py/impala_build_version.py <<EOF
+rm -f ${THRIFT_GEN_PY_DIR}/impala_build_version.py
+cat > ${THRIFT_GEN_PY_DIR}/impala_build_version.py <<EOF
+# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -89,42 +107,68 @@ EOF
 # Building all eggs.
 echo "Building all external modules into eggs"
 for MODULE in ${SHELL_HOME}/ext-py/*; do
-  pushd ${MODULE} > /dev/null 2>&1
-  echo "Cleaning up old build artifacts."
-  rm -rf dist 2>&1 > /dev/null
-  rm -rf build 2>&1 > /dev/null
-  echo "Creating an egg for ${MODULE}"
-  if [[ "$MODULE" == *"/bitarray"* ]]; then
-    # Need to use setuptools to build egg for bitarray module
-    python -c "import setuptools; execfile('setup.py')" -q bdist_egg clean
-  else
-    python setup.py -q bdist_egg clean
+  # Sometimes there are leftover module directories from version changes. If IMPALA_HOME
+  # is a git repository, then we can check if the module directory is tracked by git.
+  # If it is not tracked, skip building it. The downside of this check is that when
+  # adding a new directory, it won't build until added in git. This check does not apply
+  # when IMPALA_HOME is not a git repository (e.g. if building from a release tarball).
+  if ${IS_GIT_CHECKOUT} &&
+     ! git ls-files --error-unmatch ${MODULE} > /dev/null 2>&1 ; then
+    echo "WARNING: ${MODULE} is not tracked by the git repository, skipping..."
+    continue;
   fi
-  cp dist/*.egg ${TARBALL_ROOT}/ext-py
+  pushd ${MODULE} > /dev/null 2>&1
+  if [ ! -z "${IMPALA_SYSTEM_PYTHON2:-}" ]; then
+    echo "Cleaning up old build artifacts."
+    rm -rf dist 2>&1 > /dev/null
+    rm -rf build 2>&1 > /dev/null
+    echo "Creating a Python 2 egg for ${MODULE}"
+    if [[ "$MODULE" == *"/bitarray"* ]]; then
+      # Need to use setuptools to build egg for bitarray module
+      ${IMPALA_SYSTEM_PYTHON2} -c "import setuptools; exec(open('setup.py').read())" \
+          -q bdist_egg
+    else
+      ${IMPALA_SYSTEM_PYTHON2} setup.py -q bdist_egg clean
+    fi
+    cp dist/*.egg ${TARBALL_ROOT}/ext-py2
+  fi
+  if [ ! -z "${IMPALA_SYSTEM_PYTHON3:-}" ]; then
+    echo "Cleaning up old build artifacts."
+    rm -rf dist 2>&1 > /dev/null
+    rm -rf build 2>&1 > /dev/null
+    echo "Creating a Python 3 egg for ${MODULE}"
+    if [[ "$MODULE" == *"/bitarray"* ]]; then
+      # Need to use setuptools to build egg for bitarray module
+      ${IMPALA_SYSTEM_PYTHON3} -c "import setuptools; exec(open('setup.py').read())" \
+          -q bdist_egg
+    else
+      ${IMPALA_SYSTEM_PYTHON3} setup.py -q bdist_egg clean
+    fi
+    cp dist/*.egg ${TARBALL_ROOT}/ext-py3
+  fi
   popd 2>&1 > /dev/null
 done
 
 # Copy all the shell files into the build dir
-# The location of python libs for thrift is different in rhel/centos/sles
-if [ -d ${THRIFT_HOME}/python/lib/python*/site-packages/thrift ]; then
-  cp -r ${THRIFT_HOME}/python/lib/python*/site-packages/thrift\
-        ${TARBALL_ROOT}/lib
-else
-  cp -r ${THRIFT_HOME}/python/lib64/python*/site-packages/thrift\
-        ${TARBALL_ROOT}/lib
-fi
-cp -r ${SHELL_HOME}/gen-py ${TARBALL_ROOT}
-cp ${SHELL_HOME}/thrift_sasl.py ${TARBALL_ROOT}/lib
+
+cp -r ${THRIFT_GEN_PY_DIR} ${TARBALL_ROOT}
 cp ${SHELL_HOME}/option_parser.py ${TARBALL_ROOT}/lib
 cp ${SHELL_HOME}/impala_shell_config_defaults.py ${TARBALL_ROOT}/lib
 cp ${SHELL_HOME}/impala_client.py ${TARBALL_ROOT}/lib
 cp ${SHELL_HOME}/TSSLSocketWithWildcardSAN.py ${TARBALL_ROOT}/lib
+cp ${SHELL_HOME}/ImpalaHttpClient.py ${TARBALL_ROOT}/lib
+cp ${SHELL_HOME}/shell_exceptions.py ${TARBALL_ROOT}/lib
 cp ${SHELL_HOME}/shell_output.py ${TARBALL_ROOT}/lib
-cp ${SHELL_HOME}/pkg_resources.py ${TARBALL_ROOT}/lib
+cp ${SHELL_HOME}/cookie_util.py ${TARBALL_ROOT}/lib
+cp ${SHELL_HOME}/value_converter.py ${TARBALL_ROOT}/lib
 cp ${SHELL_HOME}/impala-shell ${TARBALL_ROOT}
 cp ${SHELL_HOME}/impala_shell.py ${TARBALL_ROOT}
+cp ${SHELL_HOME}/compatibility.py ${TARBALL_ROOT}
+cp ${SHELL_HOME}/thrift_printer.py ${TARBALL_ROOT}
+
+cp ${SHELL_HOME}/pkg_resources.py ${TARBALL_ROOT}/legacy
 
 pushd ${BUILD_DIR} > /dev/null
 echo "Making tarball in ${BUILD_DIR}"
-tar czf ${BUILD_DIR}/impala-shell-${VERSION}.tar.gz ./impala-shell-${VERSION}/\
-    --exclude="*.pyc" || popd 2>&1 > /dev/null
+tar czf ${BUILD_DIR}/impala-shell-${VERSION}.tar.gz --exclude="*.pyc" \
+    ./impala-shell-${VERSION}/ || popd 2>&1 > /dev/null

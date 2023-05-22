@@ -55,22 +55,23 @@
 #  8) Verify the result set hash of successful queries if there are no DML queries in the
 #     current run.
 
-from __future__ import print_function
+from __future__ import absolute_import, division, print_function
 
+from builtins import range
 import logging
 import os
 import re
 import signal
 import sys
 import threading
-from Queue import Empty   # Must be before Queue below
+from queue import Empty   # Must be before Queue below
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, Namespace, SUPPRESS
 from collections import defaultdict
 from copy import copy
 from datetime import datetime
 from multiprocessing import Lock, Process, Queue, Value
 from random import choice, random, randrange, shuffle
-from sys import exit, maxint
+from sys import exit, maxsize
 from tempfile import gettempdir
 from textwrap import dedent
 from threading import current_thread
@@ -187,7 +188,7 @@ def print_crash_info_if_exists(impala, start_time):
   that evaluates to True if any impalads are stopped.
   """
   max_attempts = 5
-  for remaining_attempts in xrange(max_attempts - 1, -1, -1):
+  for remaining_attempts in range(max_attempts - 1, -1, -1):
     try:
       crashed_impalads = impala.find_crashed_impalads(start_time)
       break
@@ -195,11 +196,12 @@ def print_crash_info_if_exists(impala, start_time):
       LOG.info(
           "Timeout checking if impalads crashed: %s."
           % e + (" Will retry." if remaining_attempts else ""))
-  else:
-    LOG.error(
-        "Aborting after %s failed attempts to check if impalads crashed", max_attempts)
-    raise e
-  for message in crashed_impalads.itervalues():
+      if not remaining_attempts:
+        LOG.error(
+            "Aborting after %s failed attempts to check if impalads crashed",
+            max_attempts)
+        raise e
+  for message in crashed_impalads.values():
     print(message, file=sys.stderr)
   return crashed_impalads
 
@@ -388,12 +390,13 @@ class StressRunner(object):
           queries_by_type[query.query_type] = []
         queries_by_type[query.query_type].append(query)
       try:
-        for _ in xrange(self._num_queries_to_run):
+        for _ in range(self._num_queries_to_run):
           # First randomly determine a query type, then choose a random query of that
           # type.
           if (
-              QueryType.SELECT in queries_by_type and
-              (len(queries_by_type.keys()) == 1 or random() < self._select_probability)
+              QueryType.SELECT in queries_by_type
+              and (len(list(queries_by_type.keys())) == 1
+                   or random() < self._select_probability)
           ):
             result = choice(queries_by_type[QueryType.SELECT])
           else:
@@ -594,7 +597,7 @@ class StressRunner(object):
         else:
           # Let the query run as long as necessary - it is nearly impossible to pick a
           # good value that won't have false positives under load - see IMPALA-8222.
-          timeout = maxint
+          timeout = maxsize
         report = query_runner.run_query(query, mem_limit, timeout_secs=timeout,
             cancel_mech=cancel_mech)
         LOG.debug("Got execution report for query")
@@ -607,7 +610,7 @@ class StressRunner(object):
           # example due to hitting a mem limit), just before the cancellation request, the
           # server may have already unregistered the query as part of the fetch failure.
           # In that case the server gives an error response saying the handle is invalid.
-          if "Invalid query handle" in error_msg and report.timed_out:
+          if "Invalid or unknown query handle" in error_msg and report.timed_out:
             self._num_successive_errors.value = 0
             continue
           # Occasionally the network connection will fail, and depending on when the
@@ -856,7 +859,7 @@ def populate_runtime_info_for_random_queries(impala, candidate_queries, converte
   return queries
 
 
-def populate_runtime_info(query, impala, converted_args, timeout_secs=maxint):
+def populate_runtime_info(query, impala, converted_args, timeout_secs=maxsize):
   """Runs the given query by itself repeatedly until the minimum memory is determined
   with and without spilling. Potentially all fields in the Query class (except
   'sql') will be populated by this method. 'required_mem_mb_without_spilling' and
@@ -918,7 +921,7 @@ def populate_runtime_info(query, impala, converted_args, timeout_secs=maxint):
   def get_report(desired_outcome=None):
     reports_by_outcome = defaultdict(list)
     leading_outcome = None
-    for remaining_samples in xrange(samples - 1, -1, -1):
+    for remaining_samples in range(samples - 1, -1, -1):
       report = runner.run_query(query, mem_limit, run_set_up=True,
           timeout_secs=timeout_secs, retain_profile=True)
       if report.timed_out:
@@ -968,7 +971,7 @@ def populate_runtime_info(query, impala, converted_args, timeout_secs=maxint):
         return
     reports = reports_by_outcome[leading_outcome]
     reports.sort(key=lambda r: r.runtime_secs)
-    return reports[len(reports) / 2]
+    return reports[len(reports) // 2]
 
   if not any((old_required_mem_mb_with_spilling, old_required_mem_mb_without_spilling)):
     mem_estimate = estimate_query_mem_mb_usage(query, runner.impalad_conn)
@@ -995,13 +998,13 @@ def populate_runtime_info(query, impala, converted_args, timeout_secs=maxint):
 
   LOG.info("Finding minimum memory required to avoid spilling")
   lower_bound = max(limit_exceeded_mem, spill_mem)
-  upper_bound = min(non_spill_mem or maxint, impala.min_impalad_mem_mb)
+  upper_bound = min(non_spill_mem or maxsize, impala.min_impalad_mem_mb)
   while True:
     if old_required_mem_mb_without_spilling:
       mem_limit = old_required_mem_mb_without_spilling
       old_required_mem_mb_without_spilling = None
     else:
-      mem_limit = (lower_bound + upper_bound) / 2
+      mem_limit = (lower_bound + upper_bound) // 2
     LOG.info("Next mem_limit: {0}".format(mem_limit))
     should_break = mem_limit / float(upper_bound) > 1 - mem_limit_eq_threshold_percent \
         or upper_bound - mem_limit < mem_limit_eq_threshold_mb
@@ -1032,13 +1035,13 @@ def populate_runtime_info(query, impala, converted_args, timeout_secs=maxint):
   LOG.info("Finding absolute minimum memory required")
   lower_bound = limit_exceeded_mem
   upper_bound = min(
-      spill_mem or maxint, non_spill_mem or maxint, impala.min_impalad_mem_mb)
+      spill_mem or maxsize, non_spill_mem or maxsize, impala.min_impalad_mem_mb)
   while True:
     if old_required_mem_mb_with_spilling:
       mem_limit = old_required_mem_mb_with_spilling
       old_required_mem_mb_with_spilling = None
     else:
-      mem_limit = (lower_bound + upper_bound) / 2
+      mem_limit = (lower_bound + upper_bound) // 2
     LOG.info("Next mem_limit: {0}".format(mem_limit))
     should_break = mem_limit / float(upper_bound) > 1 - mem_limit_eq_threshold_percent \
         or upper_bound - mem_limit < mem_limit_eq_threshold_mb
@@ -1438,7 +1441,7 @@ def main():
         impala, file_queries, converted_args))
 
   # Apply tweaks to the query's runtime info as requested by CLI options.
-  for idx in xrange(len(queries) - 1, -1, -1):
+  for idx in range(len(queries) - 1, -1, -1):
     query = queries[idx]
     if query.required_mem_mb_with_spilling:
       query.required_mem_mb_with_spilling += int(

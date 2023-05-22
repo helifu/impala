@@ -41,6 +41,7 @@ using impala_udf::TimestampVal;
 using impala_udf::StringVal;
 using impala_udf::DecimalVal;
 using impala_udf::CollectionVal;
+using impala_udf::StructVal;
 using impala_udf::DateVal;
 
 class MemPool;
@@ -161,9 +162,26 @@ class ScalarExprEvaluator {
   DoubleVal GetDoubleVal(const TupleRow* row);
   StringVal GetStringVal(const TupleRow* row);
   CollectionVal GetCollectionVal(const TupleRow* row);
+  StructVal GetStructVal(const TupleRow* row);
   TimestampVal GetTimestampVal(const TupleRow* row);
   DecimalVal GetDecimalVal(const TupleRow* row);
   DateVal GetDateVal(const TupleRow* row);
+
+  /// Helper to evaluate a boolean expression with predicate semantics, where NULL is
+  /// equivalent to false.
+  bool EvalPredicate(TupleRow* row) {
+    BooleanVal v = GetBooleanVal(row);
+    if (v.is_null || !v.val) return false;
+    return true;
+  }
+
+  /// Helper to evaluate a boolean expression with predicate semantics, where NULL is
+  /// equivalent to true.
+  bool EvalPredicateAcceptNull(TupleRow* row) {
+    BooleanVal v = GetBooleanVal(row);
+    if (v.is_null || v.val) return true;
+    return false;
+  }
 
   /// Returns an error status if there was any error in evaluating the expression
   /// or its sub-expressions. 'start_idx' and 'end_idx' correspond to the range
@@ -195,6 +213,8 @@ class ScalarExprEvaluator {
   /// not strip these symbols.
   static void InitBuiltinsDummy();
 
+  std::vector<ScalarExprEvaluator*>& GetChildEvaluators() { return childEvaluators_; }
+
   static const char* LLVM_CLASS_NAME;
 
  protected:
@@ -202,6 +222,7 @@ class ScalarExprEvaluator {
   friend class CaseExpr;
   friend class CastFormatExpr;
   friend class HiveUdfCall;
+  friend class KuduPartitionExpr;
   friend class ScalarFnCall;
 
   /// Retrieves a registered FunctionContext. 'i' is the 'fn_context_index_' of the
@@ -214,6 +235,7 @@ class ScalarExprEvaluator {
 
  private:
   friend class ScalarExpr;
+  friend class SlotRef;
 
   /// FunctionContexts for nodes in this Expr tree. Created by this ScalarExprEvaluator
   /// and live in the same object pool as this evaluator (i.e. same life span as the
@@ -233,8 +255,13 @@ class ScalarExprEvaluator {
   const ScalarExpr& root_;
 
   /// Stores the result of evaluation for this expr tree (or any sub-expression).
-  /// This is used in interpreted path when we need to return a void*.
+  /// This is used in interpreted path when we need to return a void* and to store the
+  /// children of a struct expression in both interpreted and codegen mode.
   ExprValue result_;
+
+  /// For a struct scalar expression there is one evaluator created for each child of
+  /// the struct. This is empty for non-struct expressions.
+  std::vector<ScalarExprEvaluator*> childEvaluators_;
 
   /// True if this evaluator came from a Clone() call. Used to manage FunctionStateScope.
   bool is_clone_ = false;
@@ -258,6 +285,14 @@ class ScalarExprEvaluator {
   /// which need FunctionContext.
   void CreateFnCtxs(RuntimeState* state, const ScalarExpr& expr, MemPool* expr_perm_pool,
       MemPool* expr_results_pool);
+
+  // Helper functions for codegen.
+
+  // Converts and stores 'val' to 'result_' according to its type. Intended to be called
+  // from codegen code.
+  void* StoreResult(const AnyVal& val, const ColumnType& type);
+  static FunctionContext* GetFunctionContext(ScalarExprEvaluator* eval, int fn_ctx_idx);
+  static ScalarExprEvaluator* GetChildEvaluator(ScalarExprEvaluator* eval, int idx);
 };
 }
 

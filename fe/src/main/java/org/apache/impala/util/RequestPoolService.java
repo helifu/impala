@@ -28,9 +28,6 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.yarn.api.records.QueueACL;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
-import org.apache.thrift.TException;
-import org.apache.thrift.TSerializer;
-import org.apache.thrift.protocol.TBinaryProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -80,8 +77,6 @@ import com.google.common.collect.Lists;
 public class RequestPoolService {
   final static Logger LOG = LoggerFactory.getLogger(RequestPoolService.class);
 
-  private final static TBinaryProtocol.Factory protocolFactory_ =
-      new TBinaryProtocol.Factory();
   // Used to ensure start() has been called before any other methods can be used.
   private final AtomicBoolean running_;
 
@@ -125,20 +120,14 @@ public class RequestPoolService {
   private final static String CLAMP_MEM_LIMIT_QUERY_OPTION =
       "impala.admission-control.clamp-mem-limit-query-option";
 
-  // Key for specifying the "Max Running Queries Multiple" configuration
-  // of the pool.
-  private final static String MAX_RUNNING_QUERIES_MULTIPLE =
-      "impala.admission-control.max-running-queries-multiple";
+  // Key for specifying the "Max mt_dop" configuration of the pool
+  private final static String MAX_MT_DOP = "impala.admission-control.max-mt-dop";
 
-  // Key for specifying the "Max Queued Queries Multiple" configuration
-  // of the pool.
-  private final static String MAX_QUEUED_QUERIES_MULTIPLE =
-      "impala.admission-control.max-queued-queries-multiple";
-
-  // Key for specifying the "Max Memory Multiple" configuration
-  // of the pool.
-  private final static String MAX_MEMORY_MULTIPLE =
-      "impala.admission-control.max-memory-multiple";
+  // Keys for the pool max query cpu core per node and coordinator respectively.
+  private final static String MAX_QUERY_CPU_CORE_PER_NODE_LIMIT =
+      "impala.admission-control.max-query-cpu-core-per-node-limit";
+  private final static String MAX_QUERY_CPU_CORE_COORDINATOR_LIMIT =
+      "impala.admission-control.max-query-cpu-core-coordinator-limit";
 
   // String format for a per-pool configuration key. First parameter is the key for the
   // default, e.g. MAX_PLACED_RESERVATIONS_KEY, and the second parameter is the
@@ -164,6 +153,9 @@ public class RequestPoolService {
   // URL of the configuration file.
   private final URL confUrl_;
 
+  // Reference of single instance of RequestPoolService.
+  private static RequestPoolService single_instance_ = null;
+
   /**
    * Updates the configuration when the file changes. The file is confUrl_
    * and it will exist when this is created (or RequestPoolService will not start). If
@@ -182,13 +174,42 @@ public class RequestPoolService {
   }
 
   /**
+   * Static method to create singleton instance of RequestPoolService class.
+   * This API is called by backend code through JNI, or called by unit-test code.
+   */
+  public static RequestPoolService getInstance(
+      final String fsAllocationPath, final String sitePath, boolean isTest) {
+    // For frontend and backend tests, different request pools could be created with
+    // different configurations in one process so we have to allow multiple instances
+    // to be created for frontend and backend tests.
+    if (isTest) return (new RequestPoolService(fsAllocationPath, sitePath));
+
+    if (single_instance_ == null) {
+      single_instance_ = new RequestPoolService(fsAllocationPath, sitePath);
+    }
+    return single_instance_;
+  }
+
+  /**
+   * Static method to return singleton instance of RequestPoolService class.
+   * This API is called by frontend Java code. An instance should be already created
+   * by backend before this API is called except only default pool is used.
+   */
+  public static RequestPoolService getInstance() {
+    if (single_instance_ == null) {
+      LOG.info("Default pool only, scheduler allocation is not specified.");
+    }
+    return single_instance_;
+  }
+
+  /**
    * Creates a RequestPoolService instance with a configuration containing the specified
    * fair-scheduler.xml and llama-site.xml.
    *
    * @param fsAllocationPath path to the fair scheduler allocation file.
    * @param sitePath path to the configuration file.
    */
-  RequestPoolService(final String fsAllocationPath, final String sitePath) {
+  private RequestPoolService(final String fsAllocationPath, final String sitePath) {
     Preconditions.checkNotNull(fsAllocationPath);
     running_ = new AtomicBoolean(false);
     allocationConf_ = new AtomicReference<>();
@@ -286,31 +307,12 @@ public class RequestPoolService {
    * Resolves a user and pool to the pool specified by the allocation placement policy
    * and checks if the user is authorized to submit requests.
    *
-   * @param thriftResolvePoolParams Serialized {@link TResolveRequestPoolParams}
-   * @return serialized {@link TResolveRequestPoolResult}
+   * @param resolvePoolParams {@link TResolveRequestPoolParams}
+   * @return {@link TResolveRequestPoolResult}
    */
-  @SuppressWarnings("unused") // called from C++
-  public byte[] resolveRequestPool(byte[] thriftResolvePoolParams)
-      throws ImpalaException {
-    TResolveRequestPoolParams resolvePoolParams = new TResolveRequestPoolParams();
-    JniUtil.deserializeThrift(protocolFactory_, resolvePoolParams,
-        thriftResolvePoolParams);
-    TResolveRequestPoolResult result = resolveRequestPool(resolvePoolParams);
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("resolveRequestPool(pool={}, user={}): resolved_pool={}, has_access={}",
-          resolvePoolParams.getRequested_pool(), resolvePoolParams.getUser(),
-          result.resolved_pool, result.has_access);
-    }
-    try {
-      return new TSerializer(protocolFactory_).serialize(result);
-    } catch (TException e) {
-      throw new InternalException(e.getMessage());
-    }
-  }
-
-  @VisibleForTesting
-  TResolveRequestPoolResult resolveRequestPool(
+  public TResolveRequestPoolResult resolveRequestPool(
       TResolveRequestPoolParams resolvePoolParams) throws InternalException {
+    Preconditions.checkState(running_.get());
     String requestedPool = resolvePoolParams.getRequested_pool();
     String user = resolvePoolParams.getUser();
     TResolveRequestPoolResult result = new TResolveRequestPoolResult();
@@ -347,31 +349,22 @@ public class RequestPoolService {
       result.setHas_access(hasAccess(pool, user));
       result.setStatus(new TStatus(TErrorCode.OK, Lists.newArrayList()));
     }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("resolveRequestPool(pool={}, user={}): resolved_pool={}, has_access={}",
+          resolvePoolParams.getRequested_pool(), resolvePoolParams.getUser(),
+          result.resolved_pool, result.has_access);
+    }
     return result;
   }
 
   /**
    * Gets the pool configuration values for the specified pool.
    *
-   * @param thriftPoolConfigParams Serialized {@link TPoolConfigParams}
-   * @return serialized {@link TPoolConfig}
+   * @param pool name.
+   * @return {@link TPoolConfig}
    */
-  @SuppressWarnings("unused") // called from C++
-  public byte[] getPoolConfig(byte[] thriftPoolConfigParams) throws ImpalaException {
+  public TPoolConfig getPoolConfig(String pool) {
     Preconditions.checkState(running_.get());
-    TPoolConfigParams poolConfigParams = new TPoolConfigParams();
-    JniUtil.deserializeThrift(protocolFactory_, poolConfigParams,
-        thriftPoolConfigParams);
-    TPoolConfig result = getPoolConfig(poolConfigParams.getPool());
-    try {
-      return new TSerializer(protocolFactory_).serialize(result);
-    } catch (TException e) {
-      throw new InternalException(e.getMessage());
-    }
-  }
-
-  @VisibleForTesting
-  TPoolConfig getPoolConfig(String pool) {
     TPoolConfig result = new TPoolConfig();
     long maxMemoryMb = allocationConf_.get().getMaxResources(pool).getMemory();
     result.setMax_mem_resources(
@@ -399,24 +392,24 @@ public class RequestPoolService {
           getPoolConfigValue(currentConf, pool, MIN_QUERY_MEM_LIMIT_BYTES, 0L));
       result.setClamp_mem_limit_query_option(
           getPoolConfigValue(currentConf, pool, CLAMP_MEM_LIMIT_QUERY_OPTION, true));
-      result.setMax_running_queries_multiple(
-          getPoolConfigDoubleValue(currentConf, pool, MAX_RUNNING_QUERIES_MULTIPLE, 0.0));
-      result.setMax_queued_queries_multiple(
-          getPoolConfigDoubleValue(currentConf, pool, MAX_QUEUED_QUERIES_MULTIPLE, 0.0));
-      result.setMax_memory_multiple(
-          getPoolConfigValue(currentConf, pool, MAX_MEMORY_MULTIPLE, 0));
+      result.setMax_mt_dop(
+          getPoolConfigValue(currentConf, pool, MAX_MT_DOP, -1));
+      result.setMax_query_cpu_core_per_node_limit(
+          getPoolConfigValue(currentConf, pool, MAX_QUERY_CPU_CORE_PER_NODE_LIMIT, 0L));
+      result.setMax_query_cpu_core_coordinator_limit(getPoolConfigValue(
+          currentConf, pool, MAX_QUERY_CPU_CORE_COORDINATOR_LIMIT, 0L));
     }
     if (LOG.isTraceEnabled()) {
       LOG.debug("getPoolConfig(pool={}): max_mem_resources={}, max_requests={},"
               + " max_queued={},  queue_timeout_ms={}, default_query_options={},"
               + " max_query_mem_limit={}, min_query_mem_limit={},"
-              + " clamp_mem_limit_query_option={}, max_running_queries_multiple={},"
-              + " max_queued_queries_multiple={}, max_memory_multiple={}",
+              + " clamp_mem_limit_query_option={}, max_query_cpu_core_per_node_limit={},"
+              + " max_query_cpu_core_coordinator_limit={}",
           pool, result.max_mem_resources, result.max_requests, result.max_queued,
           result.queue_timeout_ms, result.default_query_options,
           result.max_query_mem_limit, result.min_query_mem_limit,
-          result.clamp_mem_limit_query_option, result.max_running_queries_multiple,
-          result.max_queued_queries_multiple, result.max_memory_multiple);
+          result.clamp_mem_limit_query_option, result.max_query_cpu_core_per_node_limit,
+          result.max_query_cpu_core_coordinator_limit);
     }
     return result;
   }
@@ -451,15 +444,6 @@ public class RequestPoolService {
       Configuration conf, String pool, String key, boolean defaultValue) {
     return conf.getBoolean(String.format(PER_POOL_CONFIG_KEY_FORMAT, key, pool),
         conf.getBoolean(key, defaultValue));
-  }
-
-  /**
-   * Looks up the per-pool Double config from the Configuration. See above.
-   */
-  private double getPoolConfigDoubleValue(
-      Configuration conf, String pool, String key, double defaultValue) {
-    return conf.getDouble(String.format(PER_POOL_CONFIG_KEY_FORMAT, key, pool),
-        conf.getDouble(key, defaultValue));
   }
 
   /**

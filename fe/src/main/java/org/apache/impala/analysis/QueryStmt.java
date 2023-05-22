@@ -20,6 +20,7 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 import com.google.common.collect.Sets;
@@ -38,7 +39,7 @@ import com.google.common.collect.Lists;
 /**
  * Abstract base class for any statement that returns results
  * via a list of result expressions, for example a
- * SelectStmt or UnionStmt. Also maintains a map of expression substitutions
+ * SelectStmt or SetOperationStmt. Also maintains a map of expression substitutions
  * for replacing expressions from ORDER BY or GROUP BY clauses with
  * their corresponding result expressions.
  * Used for sharing members/methods and some of the analysis code, in particular the
@@ -165,6 +166,16 @@ public abstract class QueryStmt extends StatementBase {
     super.analyze(analyzer);
     analyzeLimit(analyzer);
     if (hasWithClause()) withClause_.analyze(analyzer);
+  }
+
+  @Override
+  public boolean resolveTableMask(Analyzer analyzer) throws AnalysisException {
+    boolean hasChanges = false;
+    if (hasWithClause()) {
+      // Local views may be used in rewriting. Make sure they are masked as well.
+      hasChanges = withClause_.resolveTableMask(analyzer);
+    }
+    return hasChanges;
   }
 
   /**
@@ -309,6 +320,9 @@ public abstract class QueryStmt extends StatementBase {
             orderingExpr.getType().toSql()));
       }
     }
+
+    checkForVarLenCollectionSorting(analyzer);
+
     sortInfo_.createSortTupleInfo(resultExprs_, analyzer);
 
     ExprSubstitutionMap smap = sortInfo_.getOutputSmap();
@@ -328,6 +342,17 @@ public abstract class QueryStmt extends StatementBase {
     }
 
     substituteResultExprs(smap, analyzer);
+  }
+
+  private void checkForVarLenCollectionSorting(Analyzer analyzer)
+      throws AnalysisException {
+    for (Expr expr: getResultExprs()) {
+      Type exprType = expr.getType();
+      Optional<String> err = SortInfo.checkTypeForVarLenCollection(exprType);
+      if (err.isPresent()) {
+        throw new AnalysisException(err.get());
+      }
+    }
   }
 
   /**

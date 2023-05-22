@@ -37,6 +37,7 @@
 #include "runtime/client-cache.h"
 #include "runtime/decimal-value.inline.h"
 #include "runtime/exec-env.h"
+#include "runtime/fragment-state.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
 #include "runtime/mem-pool.h"
@@ -62,23 +63,24 @@ using namespace apache::thrift::server;
 
 static bool fe_support_disable_codegen = true;
 
-// Called from the FE when it explicitly loads libfesupport.so for tests.
+// Called from tests or external FE after it explicitly loads libfesupport.so.
 // This creates the minimal state necessary to service the other JNI calls.
 // This is not called when we first start up the BE.
 extern "C"
 JNIEXPORT void JNICALL
-Java_org_apache_impala_service_FeSupport_NativeFeTestInit(
-    JNIEnv* env, jclass fe_support_class) {
+Java_org_apache_impala_service_FeSupport_NativeFeInit(
+    JNIEnv* env, jclass fe_support_class, bool external_fe) {
   DCHECK(ExecEnv::GetInstance() == NULL) << "This should only be called once from the FE";
   char* env_logs_dir_str = std::getenv("IMPALA_FE_TEST_LOGS_DIR");
   if (env_logs_dir_str != nullptr) FLAGS_log_dir = env_logs_dir_str;
   char* name = const_cast<char*>("FeSupport");
   // Init the JVM to load the classes in JniUtil that are needed for returning
   // exceptions to the FE.
-  InitCommonRuntime(1, &name, true, TestInfo::FE_TEST);
+  InitCommonRuntime(1, &name, true,
+      external_fe ? TestInfo::NON_TEST : TestInfo::FE_TEST, external_fe);
   THROW_IF_ERROR(LlvmCodeGen::InitializeLlvm(true), env, JniUtil::internal_exc_class());
-  ExecEnv* exec_env = new ExecEnv(); // This also caches it from the process.
-  THROW_IF_ERROR(exec_env->InitForFeTests(), env, JniUtil::internal_exc_class());
+  ExecEnv* exec_env = new ExecEnv(external_fe); // This also caches it from the process.
+  THROW_IF_ERROR(exec_env->InitForFeSupport(), env, JniUtil::internal_exc_class());
 }
 
 // Serializes expression value 'value' to thrift structure TColumnValue 'col_val'.
@@ -200,9 +202,14 @@ Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
   query_ctx.request_pool = "fe-eval-exprs";
 
   RuntimeState state(query_ctx, ExecEnv::GetInstance());
+  TPlanFragment fragment;
+  PlanFragmentCtxPB fragment_ctx;
+  FragmentState fragment_state(state.query_state(), fragment, fragment_ctx);
   // Make sure to close the runtime state no matter how this scope is exited.
-  const auto close_runtime_state =
-      MakeScopeExitTrigger([&state]() { state.ReleaseResources(); });
+  const auto close_runtime_state = MakeScopeExitTrigger([&state, &fragment_state]() {
+    fragment_state.ReleaseResources();
+    state.ReleaseResources();
+  });
 
   THROW_IF_ERROR_RET(
       jni_frame.push(env), env, JniUtil::internal_exc_class(), result_bytes);
@@ -214,7 +221,7 @@ Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
   vector<ScalarExprEvaluator*> evals;
   for (const TExpr& texpr : texprs) {
     ScalarExpr* expr;
-    status = ScalarExpr::Create(texpr, RowDescriptor(), &state, &expr);
+    status = ScalarExpr::Create(texpr, RowDescriptor(), &fragment_state, &expr);
     if (!status.ok()) goto error;
     exprs.push_back(expr);
     ScalarExprEvaluator* eval;
@@ -225,12 +232,12 @@ Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
   }
 
   // UDFs which cannot be interpreted need to be handled by codegen.
-  if (state.ScalarExprNeedsCodegen()) {
-    status = state.CreateCodegen();
+  if (fragment_state.ScalarExprNeedsCodegen()) {
+    status = fragment_state.CreateCodegen();
     if (!status.ok()) goto error;
-    LlvmCodeGen* codegen = state.codegen();
+    LlvmCodeGen* codegen = fragment_state.codegen();
     DCHECK(codegen != NULL);
-    status = state.CodegenScalarExprs();
+    status = fragment_state.CodegenScalarExprs();
     if (!status.ok()) goto error;
     codegen->EnableOptimizations(false);
     status = codegen->FinalizeModule();
@@ -458,7 +465,7 @@ Java_org_apache_impala_service_FeSupport_NativeLookupSymbol(
 
 // Add a catalog update to pending_topic_updates_.
 extern "C"
-JNIEXPORT jboolean JNICALL
+JNIEXPORT jint JNICALL
 Java_org_apache_impala_service_FeSupport_NativeAddPendingTopicItem(JNIEnv* env,
     jclass fe_support_class, jlong native_catalog_server_ptr, jstring key, jlong version,
     jbyteArray serialized_object, jboolean deleted) {
@@ -466,18 +473,18 @@ Java_org_apache_impala_service_FeSupport_NativeAddPendingTopicItem(JNIEnv* env,
   {
     JniUtfCharGuard key_str;
     if (!JniUtfCharGuard::create(env, key, &key_str).ok()) {
-      return static_cast<jboolean>(false);
+      return static_cast<jint>(-1);
     }
     key_string.assign(key_str.get());
   }
   JniScopedArrayCritical obj_buf;
   if (!JniScopedArrayCritical::Create(env, serialized_object, &obj_buf)) {
-    return static_cast<jboolean>(false);
+    return static_cast<jint>(-1);
   }
-  reinterpret_cast<CatalogServer*>(native_catalog_server_ptr)->
+  int res = reinterpret_cast<CatalogServer*>(native_catalog_server_ptr)->
       AddPendingTopicItem(std::move(key_string), version, obj_buf.get(),
       static_cast<uint32_t>(obj_buf.size()), deleted);
-  return static_cast<jboolean>(true);
+  return static_cast<jint>(res);
 }
 
 // Get the next catalog update pointed by 'callback_ctx'.
@@ -568,30 +575,6 @@ Java_org_apache_impala_service_FeSupport_NativeUpdateTableUsage(
   jbyteArray result_bytes = nullptr;
   THROW_IF_ERROR_RET(SerializeThriftMsg(env, &result, &result_bytes), env,
                      JniUtil::internal_exc_class(), result_bytes);
-  return result_bytes;
-}
-
-// Calls the catalog server to to check if the given user is a Sentry admin.
-extern "C"
-JNIEXPORT jbyteArray JNICALL
-Java_org_apache_impala_service_FeSupport_NativeSentryAdminCheck(
-    JNIEnv* env, jclass caller_class, jbyteArray thrift_struct) {
-  TSentryAdminCheckRequest request;
-  THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &request), env,
-      JniUtil::internal_exc_class(), nullptr);
-
-  CatalogOpExecutor catalog_op_executor(ExecEnv::GetInstance(), nullptr, nullptr);
-  TSentryAdminCheckResponse result;
-  Status status = catalog_op_executor.SentryAdminCheck(request, &result);
-  if (!status.ok()) {
-    LOG(ERROR) << status.GetDetail();
-    status.AddDetail("Error making an RPC call to Catalog server.");
-    status.SetTStatus(&result);
-  }
-
-  jbyteArray result_bytes = nullptr;
-  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &result, &result_bytes), env,
-      JniUtil::internal_exc_class(), result_bytes);
   return result_bytes;
 }
 
@@ -710,8 +693,8 @@ namespace impala {
 
 static JNINativeMethod native_methods[] = {
   {
-      const_cast<char*>("NativeFeTestInit"), const_cast<char*>("()V"),
-      (void*)::Java_org_apache_impala_service_FeSupport_NativeFeTestInit
+      const_cast<char*>("NativeFeInit"), const_cast<char*>("(Z)V"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeFeInit
   },
   {
       const_cast<char*>("NativeEvalExprsWithoutRow"), const_cast<char*>("([B[BJ)[B"),
@@ -744,18 +727,13 @@ static JNINativeMethod native_methods[] = {
       (void*)::Java_org_apache_impala_service_FeSupport_NativeUpdateTableUsage
   },
   {
-      const_cast<char*>("NativeSentryAdminCheck"),
-      const_cast<char*>("([B)[B"),
-      (void*)::Java_org_apache_impala_service_FeSupport_NativeSentryAdminCheck
-  },
-  {
       const_cast<char*>("NativeParseQueryOptions"),
       const_cast<char*>("(Ljava/lang/String;[B)[B"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeParseQueryOptions
   },
   {
       const_cast<char*>("NativeAddPendingTopicItem"),
-      const_cast<char*>("(JLjava/lang/String;J[BZ)Z"),
+      const_cast<char*>("(JLjava/lang/String;J[BZ)I"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeAddPendingTopicItem
   },
   {

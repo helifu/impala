@@ -742,7 +742,8 @@ PLAN-ROOT SINK
 00:SCAN HDFS [functional.alltypesagg t1]
    HDFS partitions=11/11 files=11 size=814.73KB
    runtime filters: RF000 -> t1.year, RF002 -> t1.month
-   row-size=8B cardinality=11.00K
+   partition key scan
+   row-size=8B cardinality=11
 ====
 # Four-way join query between an inline view with an aggregation and three base tables
 select straight_join 1 from
@@ -1057,7 +1058,7 @@ PLAN-ROOT SINK
 |  row-size=20B cardinality=11.00K
 |
 03:SORT
-|  order by: year ASC NULLS FIRST, month DESC
+|  order by: year ASC NULLS LAST, month DESC
 |  row-size=12B cardinality=11.00K
 |
 02:HASH JOIN [INNER JOIN]
@@ -1101,7 +1102,7 @@ PLAN-ROOT SINK
 |  row-size=20B cardinality=3.65K
 |
 01:SORT
-|  order by: year ASC NULLS FIRST, id ASC
+|  order by: year ASC NULLS LAST, id ASC
 |  row-size=12B cardinality=3.65K
 |
 00:SCAN HDFS [functional.alltypes]
@@ -1265,7 +1266,7 @@ PLAN-ROOT SINK
 |     row-size=32B cardinality=1
 |
 00:SCAN HDFS [tpch_nested_parquet.customer c]
-   HDFS partitions=1/1 files=4 size=288.99MB
+   HDFS partitions=1/1 files=4 size=289.08MB
    row-size=32B cardinality=150.00K
 ====
 # Two-way join query where the build side is optimized into an empty set
@@ -1602,7 +1603,7 @@ PLAN-ROOT SINK
 |
 |--11:HASH JOIN [INNER JOIN]
 |  |  hash predicates: a.bigint_col = b.bigint_col, a.bool_col = b.bool_col, a.double_col = b.double_col, a.float_col = b.float_col, a.id = b.id, a.int_col = b.int_col, a.smallint_col = b.smallint_col, a.tinyint_col = b.tinyint_col
-|  |  runtime filters: RF032 <- b.bigint_col, RF033 <- b.bool_col, RF034 <- b.double_col, RF035 <- b.float_col, RF036 <- b.id, RF037 <- b.int_col, RF038 <- b.smallint_col, RF039 <- b.tinyint_col
+|  |  runtime filters: RF033 <- b.bigint_col, RF034 <- b.bool_col, RF035 <- b.double_col, RF036 <- b.float_col, RF037 <- b.id, RF038 <- b.int_col, RF039 <- b.smallint_col, RF040 <- b.tinyint_col
 |  |  row-size=64B cardinality=8
 |  |
 |  |--10:SCAN HDFS [functional.alltypestiny b]
@@ -1611,7 +1612,7 @@ PLAN-ROOT SINK
 |  |
 |  09:SCAN HDFS [functional.alltypes a]
 |     HDFS partitions=24/24 files=24 size=478.45KB
-|     runtime filters: RF032 -> a.bigint_col, RF033 -> a.bool_col, RF034 -> a.double_col, RF035 -> a.float_col, RF036 -> a.id, RF037 -> a.int_col, RF038 -> a.smallint_col, RF039 -> a.tinyint_col
+|     runtime filters: RF033 -> a.bigint_col, RF034 -> a.bool_col, RF035 -> a.double_col, RF036 -> a.float_col, RF037 -> a.id, RF038 -> a.int_col, RF039 -> a.smallint_col, RF040 -> a.tinyint_col
 |     row-size=32B cardinality=7.30K
 |
 30:NESTED LOOP JOIN [CROSS JOIN]
@@ -1708,7 +1709,7 @@ PLAN-ROOT SINK
 |  row-size=419B cardinality=4
 |
 |--00:SCAN HDFS [tpch_parquet.lineitem]
-|     HDFS partitions=1/1 files=3 size=193.99MB
+|     HDFS partitions=1/1 files=3 size=193.98MB
 |     predicates: l_orderkey = 965
 |     row-size=231B cardinality=4
 |
@@ -1815,4 +1816,61 @@ PLAN-ROOT SINK
 00:SCAN HDFS [functional.alltypestiny t1]
    HDFS partitions=4/4 files=4 size=460B
    row-size=4B cardinality=8
+====
+# IMPALA-10252: runtime filters should not be generated from left and full outer joins
+# when expressions are not null-preserving, e.g. zeroifnull() which returns a non-NULL
+# value even when the input is NULL.
+# This tests Parquet + LEFT OUTER JOIN
+SELECT s.id, s.int_col % 2, v.id, zeroifnull(v.id + 1)
+FROM functional_parquet.alltypessmall s LEFT OUTER JOIN (
+    SELECT id, int_col
+    FROM functional_parquet.alltypestiny t) v ON s.id = v.id
+WHERE s.int_col % 2 = zeroifnull(v.id + 1)
+ORDER BY s.id ASC
+LIMIT 10
+---- PLAN
+PLAN-ROOT SINK
+|
+03:TOP-N [LIMIT=10]
+|  order by: id ASC
+|  row-size=12B cardinality=10
+|
+02:HASH JOIN [LEFT OUTER JOIN]
+|  hash predicates: s.id = id
+|  other predicates: s.int_col % 2 = zeroifnull(id + 1)
+|  row-size=12B cardinality=940
+|
+|--01:SCAN HDFS [functional_parquet.alltypestiny t]
+|     HDFS partitions=4/4 files=4 size=11.92KB
+|     row-size=4B cardinality=758
+|
+00:SCAN HDFS [functional_parquet.alltypessmall s]
+   HDFS partitions=4/4 files=4 size=14.78KB
+   row-size=8B cardinality=940
+====
+# IMPALA-10252: same as above but Kudu + FULL OUTER JOIN
+SELECT s.id, s.int_col % 2, v.id, zeroifnull(v.id + 1)
+FROM functional_kudu.alltypessmall s FULL OUTER JOIN (
+    SELECT id, int_col
+    FROM functional_kudu.alltypestiny t) v ON s.id = v.id
+WHERE s.int_col % 2 = zeroifnull(v.id + 1)
+ORDER BY s.id ASC
+LIMIT 10
+---- PLAN
+PLAN-ROOT SINK
+|
+03:TOP-N [LIMIT=10]
+|  order by: id ASC
+|  row-size=12B cardinality=10
+|
+02:HASH JOIN [FULL OUTER JOIN]
+|  hash predicates: s.id = id
+|  other predicates: s.int_col % 2 = zeroifnull(id + 1)
+|  row-size=12B cardinality=108
+|
+|--01:SCAN KUDU [functional_kudu.alltypestiny t]
+|     row-size=4B cardinality=8
+|
+00:SCAN KUDU [functional_kudu.alltypessmall s]
+   row-size=8B cardinality=100
 ====

@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_SERVICE_IMPALA_HTTP_HANDLER_H
-#define IMPALA_SERVICE_IMPALA_HTTP_HANDLER_H
+#pragma once
 
-#include <sstream>
+#include <iosfwd>
 #include <rapidjson/document.h>
 #include "kudu/util/web_callback_registry.h"
 #include "util/webserver.h"
@@ -29,18 +28,43 @@ using kudu::HttpStatusCode;
 
 namespace impala {
 
+class AdmissionController;
+class ClusterMembershipMgr;
+
 /// Handles all webserver callbacks for an ImpalaServer. This class is a friend of
 /// ImpalaServer in order to access the internal state needed to generate the debug
 /// webpages.
 class ImpalaHttpHandler {
  public:
-  ImpalaHttpHandler(ImpalaServer* server) : server_(server) { }
+  static ImpalaHttpHandler* CreateImpaladHandler(ImpalaServer* server,
+      AdmissionController* admission_controller,
+      ClusterMembershipMgr* cluster_membership_mgr) {
+    return new ImpalaHttpHandler(
+        server, admission_controller, cluster_membership_mgr, false);
+  }
 
-  /// Registers all the per-Impalad webserver callbacks
-  void RegisterHandlers(Webserver* webserver);
+  static ImpalaHttpHandler* CreateAdmissiondHandler(
+      AdmissionController* admission_controller,
+      ClusterMembershipMgr* cluster_membership_mgr) {
+    return new ImpalaHttpHandler(
+        nullptr, admission_controller, cluster_membership_mgr, true);
+  }
+
+  /// Registers per-Impalad webserver callbacks. If 'metrics_only' is true, only registers
+  /// the callbacks needed by the metrics server, i.e. /healthz.
+  void RegisterHandlers(Webserver* webserver, bool metrics_only = false);
 
  private:
+  ImpalaHttpHandler(ImpalaServer* server, AdmissionController* admission_controller,
+      ClusterMembershipMgr* cluster_membership_mgr, bool is_admissiond);
+
   ImpalaServer* server_;
+  AdmissionController* admission_controller_;
+  ClusterMembershipMgr* cluster_membership_mgr_;
+
+  /// If true, this is an admissiond and we'll only expose admission related endpoints,
+  /// otherwise its an impalad.
+  bool is_admissiond_;
 
   /// Raw callback to indicate whether the server is ready to accept queries.
   void HealthzHandler(const Webserver::WebRequest& req, std::stringstream* data,
@@ -80,8 +104,10 @@ class ImpalaHttpHandler {
   void QueryStateHandler(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 
-  /// Json callback for /query_profile. Expects query_id as an argument, produces Json
-  /// with 'profile' set to the profile string, and 'query_id' set to the query ID.
+  /// Json callback for /query_profile. Expects query_id as an argument. If a json
+  /// profile is requested, the JSON profile is returned in 'document' under
+  /// "contents". Otherwise 'document' has 'profile' set to the profile string,
+  /// and 'query_id' set to the query ID.
   void QueryProfileHandler(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 
@@ -119,7 +145,8 @@ class ImpalaHttpHandler {
 
   /// Helper method to put query profile in 'document' with required format.
   void QueryProfileHelper(const Webserver::WebRequest& req,
-      rapidjson::Document* document, TRuntimeProfileFormat::type format);
+      rapidjson::Document* document, TRuntimeProfileFormat::type format,
+      bool internal_profile = false);
 
   /// Upon return, 'document' will contain the query profile as a base64 encoded object in
   /// 'contents'.
@@ -249,7 +276,4 @@ class ImpalaHttpHandler {
   void ResetResourcePoolStatsHandler(
       const Webserver::WebRequest& req, rapidjson::Document* document);
 };
-
 }
-
-#endif

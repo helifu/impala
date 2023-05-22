@@ -47,7 +47,6 @@ struct TExecStats {
 
   // Total CPU time spent across all threads. For operators that have an async
   // component (e.g. multi-threaded) this will be >= latency_ns.
-  // TODO-MT: remove this or latency_ns
   2: optional i64 cpu_time_ns
 
   // Number of rows returned.
@@ -98,8 +97,9 @@ struct TExecSummary {
   // Flattened execution summary of the plan tree.
   3: optional list<TPlanNodeExecSummary> nodes
 
-  // For each exch node in 'nodes', contains the index to the root node of the sending
-  // fragment for this exch. Both the key and value are indices into 'nodes'.
+  // For each node in 'nodes' that consumes input from the root of a different fragment,
+  // i.e. an exchange or join node with a separate build, contains the index to the root
+  // node of the source fragment. Both the key and value are indices into 'nodes'.
   4: optional map<i32, i32> exch_to_sender_map
 
   // List of errors that were encountered during execution. This can be non-empty

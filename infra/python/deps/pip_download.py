@@ -19,9 +19,9 @@
 
 # Implement the basic 'pip download' functionality in a way that gives us more control
 # over which archive type is downloaded and what post-download steps are executed.
-# This script requires Python 2.6+.
+# This script requires Python 2.7+.
 
-from __future__ import print_function
+from __future__ import absolute_import, division, print_function
 import hashlib
 import multiprocessing.pool
 import os
@@ -30,22 +30,16 @@ import re
 import sys
 from random import randint
 from time import sleep
-# The path to import is different for libraries in Python 2 & 3 - this try/catch ensures
-# that this code runs in both
-try:
-  # This should be removed when support for Python2 is dropped
-  from urllib import urlopen, FancyURLopener
-except ImportError:
-  from urllib.request import urlopen, FancyURLopener
+import subprocess
 
 NUM_DOWNLOAD_ATTEMPTS = 8
 
 PYPI_MIRROR = os.environ.get('PYPI_MIRROR', 'https://pypi.python.org')
 
 # The requirement files that list all of the required packages and versions.
-REQUIREMENTS_FILES = ['requirements.txt', 'stage2-requirements.txt',
-                      'compiled-requirements.txt', 'kudu-requirements.txt',
-                      'adls-requirements.txt']
+REQUIREMENTS_FILES = ['requirements.txt', 'setuptools-requirements.txt',
+                      'kudu-requirements.txt', 'adls-requirements.txt',
+                      'py2-requirements.txt', 'py3-requirements.txt']
 
 
 def check_digest(filename, algorithm, expected_digest):
@@ -58,7 +52,7 @@ def check_digest(filename, algorithm, expected_digest):
     print('Hash algorithm {0} is not supported by hashlib'.format(algorithm))
     return False
   h = hashlib.new(algorithm)
-  h.update(open(filename).read())
+  h.update(open(filename, mode='rb').read())
   actual_digest = h.hexdigest()
   return actual_digest == expected_digest
 
@@ -89,13 +83,15 @@ def get_package_info(pkg_name, pkg_version):
   # to sort them and return the first value in alphabetical order. This ensures that the
   # same result is always returned even if the ordering changed on the server.
   candidates = []
-  url = '{0}/simple/{1}/'.format(PYPI_MIRROR, pkg_name)
+  normalized_name = re.sub(r"[-_.]+", "-", pkg_name).lower()
+  url = '{0}/simple/{1}/'.format(PYPI_MIRROR, normalized_name)
   print('Getting package info from {0}'.format(url))
   # The web page should be in PEP 503 format (https://www.python.org/dev/peps/pep-0503/).
   # We parse the page with regex instead of an html parser because that requires
   # downloading an extra package before running this script. Since the HTML is guaranteed
   # to be formatted according to PEP 503, this is acceptable.
-  pkg_info = urlopen(url).read()
+  pkg_info = subprocess.check_output(
+      ["wget", "-q", "-O", "-", url], universal_newlines=True)
   regex = r'<a .*?href=\".*?packages/(.*?)#(.*?)=(.*?)\".*?>(.*?)<\/a>'
   for match in re.finditer(regex, pkg_info):
     path = match.group(1)
@@ -122,10 +118,10 @@ def download_package(pkg_name, pkg_version):
       expected_digest):
     print('File with matching digest already exists, skipping {0}'.format(file_name))
     return True
-  downloader = FancyURLopener()
   pkg_url = '{0}/packages/{1}'.format(PYPI_MIRROR, path)
   print('Downloading {0} from {1}'.format(file_name, pkg_url))
-  downloader.retrieve(pkg_url, file_name)
+  if 0 != subprocess.check_call(["wget", pkg_url, "-q", "-O", file_name]):
+    return False
   if check_digest(file_name, hash_algorithm, expected_digest):
     return True
   else:

@@ -25,15 +25,12 @@
 #include <gtest/gtest_prod.h>
 
 #include "common/status.h"
+#include "util/cache/cache.h"
+#include "util/metrics-fwd.h"
 #include "util/spinlock.h"
 #include "util/thread-pool.h"
-#include "kudu/util/cache.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/slice.h"
-
-namespace kudu {
-class Cache;
-} // kudu
 
 /// This class is an implementation of an IO data cache which is backed by local storage.
 /// It implicitly relies on the OS page cache management to shuffle data between memory
@@ -110,6 +107,11 @@ class Cache;
 namespace impala {
 namespace io {
 
+namespace trace {
+  class Tracer;
+  enum class EventType;
+}
+
 class DataCache {
  public:
 
@@ -117,10 +119,14 @@ class DataCache {
   /// in which <dir1>, <dirN> are part of a list of directories for storing cached data
   /// and each directory corresponds to a cache partition. <quota> is the storage quota
   /// for each directory. Impala daemons running on the same host will not share any
-  /// caching directories.
-  explicit DataCache(const std::string config) : config_(std::move(config)) { }
+  /// caching directories. If 'trace_replay' is set to true, the cache operates in a
+  /// an optimized mode that skips all file operations and only does the metadata
+  /// operations. This is used to replay the access trace and compare different cache
+  /// configurations. See data-cache-trace.h
+  explicit DataCache(const std::string config, int32_t num_async_write_threads = 0,
+      bool trace_replay = false);
 
-  ~DataCache() { ReleaseResources(); }
+  ~DataCache();
 
   /// Parses the configuration string, initializes all partitions in the cache by
   /// checking for storage space available and creates a backing file for caching.
@@ -138,7 +144,8 @@ class DataCache {
   /// 'mtime'         : the modification time of the requested file
   /// 'offset'        : starting offset of the requested region in the file
   /// 'bytes_to_read' : number of bytes to be read from the cache
-  /// 'buffer'        : output buffer to be written into on cache hit
+  /// 'buffer'        : output buffer to be written into on cache hit or nullptr for
+  ///                   trace replay
   ///
   /// Returns the number of bytes read from the cache on cache hit; Returns 0 otherwise.
   ///
@@ -153,7 +160,8 @@ class DataCache {
   /// 'filename'      : name of the file being inserted
   /// 'mtime'         : the modification time of the file being inserted.
   /// 'offset'        : the starting offset of the region in the file being inserted
-  /// 'buffer'        : buffer holding the data to be inserted
+  /// 'buffer'        : buffer holding the data to be inserted or nullptr for trace
+  ///                   replay
   /// 'buffer_len'    : size of 'buffer'
   ///
   /// The cache key is hashed and the resulting hash determines the partition to use.
@@ -183,20 +191,27 @@ class DataCache {
   Status CloseFilesAndVerifySizes();
 
  private:
+  friend class DataCacheBaseTest;
   friend class DataCacheTest;
-  FRIEND_TEST(DataCacheTest, TestAccessTrace);
+  FRIEND_TEST(DataCacheTest, RotationalDisk);
+  FRIEND_TEST(DataCacheTest, NonRotationalDisk);
+  FRIEND_TEST(DataCacheTest, InvalidDisk);
 
   class CacheFile;
   struct CacheKey;
   class CacheEntry;
+  class StoreTask;
 
   /// An implementation of a cache partition. Each partition maintains its own set of
   /// cache keys in a LRU cache.
-  class Partition : public kudu::Cache::EvictionCallback {
+  class Partition : public Cache::EvictionCallback {
    public:
     /// Creates a partition at the given directory 'path' with quota 'capacity' in bytes.
     /// 'max_opened_files' is the maximum number of opened files allowed per partition.
-    Partition(const std::string& path, int64_t capacity, int max_opened_files);
+    /// If 'trace_replay' is true, this only performs metadata operations for the
+    /// access trace functionality.
+    Partition(int32_t index, const std::string& path, int64_t capacity,
+        int max_opened_files, bool trace_replay);
 
     ~Partition();
 
@@ -215,14 +230,15 @@ class DataCache {
     void ReleaseResources();
 
     /// Looks up in the meta-data cache with key 'cache_key'. If found, try copying
-    /// 'bytes_to_read' bytes from the backing file into 'buffer'. Returns number
+    /// 'bytes_to_read' bytes from the backing file into 'buffer'. If trace_replay
+    /// is enabled, the buffer is null and no bytes are copied. Returns number
     /// of bytes read from the cache. Returns 0 if there is a cache miss.
     int64_t Lookup(const CacheKey& cache_key, int64_t bytes_to_read, uint8_t* buffer);
 
     /// Inserts a entry with key 'cache_key' and data in 'buffer' into the cache.
-    /// 'buffer_len' is the length of buffer. 'start_reclaim' is set to true if
-    /// the number of backing files exceeds the per partition limit. Returns true if
-    /// the entry is inserted. Returns false otherwise.
+    /// 'buffer' is nullptr for trace replay. 'buffer_len' is the length of buffer.
+    /// 'start_reclaim' is set to true if the number of backing files exceeds the per
+    /// partition limit. Returns true if the entry is inserted. Returns false otherwise.
     bool Store(const CacheKey& cache_key, const uint8_t* buffer, int64_t buffer_len,
         bool* start_reclaim);
 
@@ -249,9 +265,15 @@ class DataCache {
     void DeleteOldFiles();
 
    private:
+    friend class DataCacheBaseTest;
     friend class DataCacheTest;
-    FRIEND_TEST(DataCacheTest, TestAccessTrace);
-    class Tracer;
+    FRIEND_TEST(DataCacheTest, RotationalDisk);
+    FRIEND_TEST(DataCacheTest, NonRotationalDisk);
+    FRIEND_TEST(DataCacheTest, InvalidDisk);
+
+    /// Index of this partition. This is used for naming metrics or other items that
+    /// need separate values for each partition. It does not impact cache behavior.
+    int32_t index_;
 
     /// The directory path which this partition stores cached data in.
     const std::string path_;
@@ -262,15 +284,20 @@ class DataCache {
     /// Maximum number of opened files allowed in a partition.
     const int max_opened_files_;
 
+    /// Device-specific write concurrency
+    int32_t data_cache_write_concurrency_ = 1;
+
+    /// Whether this is only a trace replay. For trace replay, this is only
+    /// performing the metadata operations to determine the hit/miss rate.
+    /// There is no need to perform any filesystem operations.
+    bool trace_replay_;
+
     /// True if this partition has been closed. Expected to be set after all IO
     /// threads have been joined.
     bool closed_ = false;
 
     /// The prefix of the names of the cache backing files.
     static const char* CACHE_FILE_PREFIX;
-
-    /// The file name used for the access trace.
-    static const char* TRACE_FILE_NAME;
 
     /// Protects the following fields.
     SpinLock lock_;
@@ -298,9 +325,19 @@ class DataCache {
     ///
     /// A cache entry has type CacheEntry and it contains the metadata of the cached
     /// content. Please see comments at CachedEntry for details.
-    std::unique_ptr<kudu::Cache> meta_cache_;
+    std::unique_ptr<Cache> meta_cache_;
 
-    std::unique_ptr<Tracer> tracer_;
+    std::unique_ptr<trace::Tracer> tracer_;
+
+    /// Metrics to track performance of the underlying filesystem for the data cache
+    /// These are all latency histograms for the operations on the data cache files for
+    /// this partition.
+    HistogramMetric* read_latency_ = nullptr;
+    HistogramMetric* write_latency_ = nullptr;
+    HistogramMetric* eviction_latency_ = nullptr;
+
+    /// Initialize the metrics
+    void InitMetrics();
 
     /// Utility function for creating a new backing file in 'path_'. The cache
     /// partition's lock needs to be held when calling this function. Returns
@@ -324,8 +361,9 @@ class DataCache {
     /// Returns true iff the existing entry already covers the range of 'buffer' so no
     /// work needs to be done. Returns false otherwise. In which case, the existing entry
     /// will be overwritten.
-    bool HandleExistingEntry(const kudu::Slice& key, kudu::Cache::Handle* handle,
-        const uint8_t* buffer, int64_t buffer_len);
+    bool HandleExistingEntry(const kudu::Slice& key,
+        const Cache::UniqueHandle& handle, const uint8_t* buffer,
+        int64_t buffer_len);
 
     /// Helper function to insert a new entry with key 'key' into the LRU cache.
     /// The content in 'buffer' of length 'buffer_len' in bytes will be written to
@@ -345,10 +383,20 @@ class DataCache {
     /// Returns false if the checksum of 'buffer' doesn't match 'entry->checksum'.
     static bool VerifyChecksum(const std::string& ops_name, const CacheEntry& entry,
         const uint8_t* buffer, int64_t buffer_len);
+
+    void Trace(const trace::EventType& status, const DataCache::CacheKey& key,
+        int64_t lookup_len, int64_t entry_len);
   };
 
   /// The configuration string for the data cache.
   const std::string config_;
+
+  /// The capacity in bytes of one partition.
+  int64_t per_partition_capacity_;
+
+  /// Set to true if this is only doing trace replay. Trace replay does only metadata
+  /// operations, and no filesystem operations are required.
+  bool trace_replay_;
 
   /// The set of all cache partitions.
   std::vector<std::unique_ptr<Partition>> partitions_;
@@ -361,6 +409,35 @@ class DataCache {
   /// Thread function called by threads in 'file_deleter_pool_' for deleting old files
   /// in partitions_[partition_idx].
   void DeleteOldFiles(uint32_t thread_id, int partition_idx);
+
+  /// Create a new store task and copy the data to a temporary buffer, then submit it to
+  /// the asynchronous write thread pool for handling. May abort due to buffer size limit.
+  /// Return true if success.
+  bool SubmitStoreTask(const std::string& filename, int64_t mtime, int64_t offset,
+      const uint8_t* buffer, int64_t buffer_len);
+
+  /// Called by StoreTask's d'tor, decrease the current_buffer_size_ by task's buffer_len.
+  void CompleteStoreTask(const StoreTask& task);
+
+  /// Thread pool for storing cache asynchronously, it is initialized only if
+  /// 'data_cache_num_async_write_threads' has been set above 0, and creates a
+  /// corresponding number of worker threads.
+  int32_t num_async_write_threads_;
+  using StoreTaskHandle = std::unique_ptr<const StoreTask>;
+  std::unique_ptr<ThreadPool<StoreTaskHandle>> storer_pool_;
+
+  /// Thread function called by threads in 'storer_pool_' for handling store task.
+  void HandleStoreTask(uint32_t thread_id, const StoreTaskHandle& task);
+
+  /// Limit of the total buffer size used by asynchronous store tasks, when the current
+  /// buffer size reaches the limit, the subsequent store task will be abandoned.
+  int64_t store_buffer_capacity_;
+
+  /// Total buffer size currently used by all asynchronous store tasks.
+  AtomicInt64 current_buffer_size_{0};
+
+  /// Call the corresponding cache partition for storing.
+  bool StoreInternal(const CacheKey& key, const uint8_t* buffer, int64_t buffer_len);
 
 };
 

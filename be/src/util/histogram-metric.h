@@ -42,9 +42,14 @@ class HistogramMetric : public Metric {
       std::stringstream* metric_kind) override;
 
   void Update(int64_t val) {
-    boost::lock_guard<SpinLock> l(lock_);
+    std::lock_guard<SpinLock> l(lock_);
     histogram_->Increment(val);
   }
+
+  uint64_t MinValue() const { return histogram_->MinValue(); }
+  uint64_t MaxValue() const { return histogram_->MaxValue(); }
+  uint64_t TotalCount() const { return histogram_->TotalCount(); }
+  uint64_t TotalSum() const { return histogram_->TotalSum(); }
 
   /// Reset the histogram by removing all previous entries.
   void Reset();

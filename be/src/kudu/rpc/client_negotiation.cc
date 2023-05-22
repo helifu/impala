@@ -17,9 +17,13 @@
 
 #include "kudu/rpc/client_negotiation.h"
 
+#include <gssapi/gssapi.h>
+#include <gssapi/gssapi_krb5.h>
+#include <sasl/sasl.h>
+
 #include <cstdint>
 #include <cstring>
-#include <map>
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <set>
@@ -27,9 +31,6 @@
 
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
-#include <gssapi/gssapi.h>
-#include <gssapi/gssapi_krb5.h>
-#include <sasl/sasl.h>
 
 #include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/map-util.h"
@@ -38,28 +39,36 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/blocking_ops.h"
 #include "kudu/rpc/constants.h"
-#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/sasl_helper.h"
 #include "kudu/rpc/serialization.h"
 #include "kudu/security/cert.h"
+#include "kudu/security/gssapi.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/tls_handshake.h"
+#include "kudu/security/token.pb.h"
+#include "kudu/util/debug/leakcheck_disabler.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/trace.h"
 
-using std::map;
+#if defined(__APPLE__)
+// Almost all functions in the SASL API are marked as deprecated
+// since macOS 10.11.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif // #if defined(__APPLE__)
+
+DECLARE_bool(rpc_encrypt_loopback_connections);
+
+using kudu::security::RpcEncryption;
 using std::set;
 using std::string;
 using std::unique_ptr;
-
 using strings::Substitute;
-
-DECLARE_bool(rpc_encrypt_loopback_connections);
 
 namespace kudu {
 namespace rpc {
@@ -110,12 +119,15 @@ ClientNegotiation::ClientNegotiation(unique_ptr<Socket> socket,
                                      const security::TlsContext* tls_context,
                                      boost::optional<security::SignedTokenPB> authn_token,
                                      RpcEncryption encryption,
+                                     bool encrypt_loopback,
                                      std::string sasl_proto_name)
     : socket_(std::move(socket)),
       helper_(SaslHelper::CLIENT),
       tls_context_(tls_context),
+      tls_handshake_(security::TlsHandshakeType::CLIENT),
       encryption_(encryption),
       tls_negotiated_(false),
+      encrypt_loopback_(encrypt_loopback),
       authn_token_(std::move(authn_token)),
       psecret_(nullptr, std::free),
       negotiated_authn_(AuthenticationType::INVALID),
@@ -179,8 +191,7 @@ Status ClientNegotiation::Negotiate(unique_ptr<ErrorStatusPB>* rpc_error) {
   // TODO(KUDU-1921): allow the client to require TLS.
   if (encryption_ != RpcEncryption::DISABLED &&
       ContainsKey(server_features_, TLS)) {
-    RETURN_NOT_OK(tls_context_->InitiateHandshake(security::TlsHandshakeType::CLIENT,
-                                                  &tls_handshake_));
+    RETURN_NOT_OK(tls_context_->InitiateHandshake(&tls_handshake_));
 
     if (negotiated_authn_ == AuthenticationType::SASL) {
       // When using SASL authentication, verifying the server's certificate is
@@ -235,7 +246,7 @@ Status ClientNegotiation::SendNegotiatePB(const NegotiatePB& msg) {
   DCHECK(msg.has_step()) << "message must have a step";
 
   TRACE("Sending $0 NegotiatePB request", NegotiatePB::NegotiateStep_Name(msg.step()));
-  return SendFramedMessageBlocking(socket(), header, msg, deadline_);
+  return SendFramedMessageBlocking(socket_.get(), header, msg, deadline_);
 }
 
 Status ClientNegotiation::RecvNegotiatePB(NegotiatePB* msg,
@@ -243,7 +254,8 @@ Status ClientNegotiation::RecvNegotiatePB(NegotiatePB* msg,
                                           unique_ptr<ErrorStatusPB>* rpc_error) {
   ResponseHeader header;
   Slice param_buf;
-  RETURN_NOT_OK(ReceiveFramedMessageBlocking(socket(), buffer, &header, &param_buf, deadline_));
+  RETURN_NOT_OK(ReceiveFramedMessageBlocking(
+      socket_.get(), buffer, &header, &param_buf, deadline_));
   RETURN_NOT_OK(helper_.CheckNegotiateCallId(header.call_id()));
 
   if (header.is_error()) {
@@ -251,7 +263,8 @@ Status ClientNegotiation::RecvNegotiatePB(NegotiatePB* msg,
   }
 
   RETURN_NOT_OK(helper_.ParseNegotiatePB(param_buf, msg));
-  TRACE("Received $0 NegotiatePB response", NegotiatePB::NegotiateStep_Name(msg->step()));
+  TRACE("Received $0 NegotiatePB response",
+        NegotiatePB::NegotiateStep_Name(msg->step()));
   return Status::OK();
 }
 
@@ -276,24 +289,28 @@ Status ClientNegotiation::SendConnectionHeader() {
   uint8_t buf[buflen];
   serialization::SerializeConnHeader(buf);
   size_t nsent;
-  return socket()->BlockingWrite(buf, buflen, &nsent, deadline_);
+  return socket_->BlockingWrite(buf, buflen, &nsent, deadline_);
 }
 
 Status ClientNegotiation::InitSaslClient() {
   // TODO(KUDU-1922): consider setting SASL_SUCCESS_DATA
   unsigned flags = 0;
 
+  const auto desc = Substitute("creating new SASL $0 client", sasl_proto_name_);
   sasl_conn_t* sasl_conn = nullptr;
-  RETURN_NOT_OK_PREPEND(WrapSaslCall(nullptr /* no conn */, [&]() {
-      return sasl_client_new(
-          sasl_proto_name_.c_str(),     // Registered name of the service using SASL. Required.
-          helper_.server_fqdn(),        // The fully qualified domain name of the remote server.
-          nullptr,                      // Local and remote IP address strings. (we don't use
-          nullptr,                      // any mechanisms which require this info.)
-          &callbacks_[0],               // Connection-specific callbacks.
-          flags,
-          &sasl_conn);
-    }), Substitute("unable to create new SASL $0 client", sasl_proto_name_));
+  RETURN_NOT_OK_PREPEND(WrapSaslCall(
+      nullptr /* no conn */,
+      [&]() {
+        return sasl_client_new(
+            sasl_proto_name_.c_str(),     // Registered name of the service using SASL. Required.
+            helper_.server_fqdn(),        // The fully qualified domain name of the remote server.
+            nullptr,                      // Local and remote IP address strings. (we don't use
+            nullptr,                      // any mechanisms which require this info.)
+            &callbacks_[0],               // Connection-specific callbacks.
+            flags,
+            &sasl_conn);
+      },
+      desc.c_str()), desc + " failed");
   sasl_conn_.reset(sasl_conn);
   return Status::OK();
 }
@@ -309,7 +326,7 @@ Status ClientNegotiation::SendNegotiate() {
     client_features_.insert(TLS);
     // If the remote peer is local, then we allow using TLS for authentication
     // without encryption or integrity.
-    if (socket_->IsLoopbackConnection() && !FLAGS_rpc_encrypt_loopback_connections) {
+    if (socket_->IsLoopbackConnection() && !encrypt_loopback_) {
       client_features_.insert(TLS_AUTHENTICATION_ONLY);
     }
   }
@@ -336,8 +353,7 @@ Status ClientNegotiation::SendNegotiate() {
     return Status::NotAuthorized("client is not configured with an authentication type");
   }
 
-  RETURN_NOT_OK(SendNegotiatePB(msg));
-  return Status::OK();
+  return SendNegotiatePB(msg);
 }
 
 Status ClientNegotiation::HandleNegotiate(const NegotiatePB& response) {
@@ -418,7 +434,6 @@ Status ClientNegotiation::HandleNegotiate(const NegotiatePB& response) {
   // TODO(KUDU-1921): allow the client to require authentication.
   if (ContainsKey(client_mechs, SaslMechanism::GSSAPI) &&
       ContainsKey(server_mechs, SaslMechanism::GSSAPI)) {
-
     // Check that the client has local Kerberos credentials, and if not fall
     // back to an alternate mechanism.
     Status s = CheckGSSAPI();
@@ -483,8 +498,7 @@ Status ClientNegotiation::HandleTlsHandshake(const NegotiatePB& response) {
 
   string token;
   Status s = tls_handshake_.Continue(response.tls_handshake(), &token);
-  if (s.IsIncomplete()) {
-    // Another roundtrip is required to complete the handshake.
+  if (tls_handshake_.NeedsExtraStep(s, token)) {
     RETURN_NOT_OK(SendTlsHandshake(std::move(token)));
   }
 
@@ -562,6 +576,13 @@ Status ClientNegotiation::SendSaslInitiate() {
   unsigned init_msg_len = 0;
   const char* negotiated_mech = nullptr;
 
+  // If the negotiated mechanism is GSSAPI (Kerberos), configure SASL to use
+  // integrity protection so that the channel bindings and nonce can be
+  // verified.
+  if (negotiated_mech_ == SaslMechanism::GSSAPI) {
+    RETURN_NOT_OK(EnableProtection(sasl_conn_.get(), SaslProtection::kIntegrity));
+  }
+
   /* select a mechanism for a connection
    *  mechlist      -- mechanisms server has available (punctuation ignored)
    * output:
@@ -576,7 +597,8 @@ Status ClientNegotiation::SendSaslInitiate() {
    *  SASL_NOMECH   -- no mechanism meets requested properties
    *  SASL_INTERACT -- user interaction needed to fill in prompt_need list
    */
-  TRACE("Calling sasl_client_start()");
+  static constexpr const char* const kDesc = "calling sasl_client_start()";
+  TRACE(kDesc);
   const Status s = WrapSaslCall(sasl_conn_.get(), [&]() {
       return sasl_client_start(
           sasl_conn_.get(),                         // The SASL connection context created by init()
@@ -585,21 +607,14 @@ Status ClientNegotiation::SendSaslInitiate() {
           &init_msg,                                // Filled in on success.
           &init_msg_len,                            // Filled in on success.
           &negotiated_mech);                        // Filled in on success.
-  });
+  }, kDesc);
 
-  if (PREDICT_FALSE(!s.IsIncomplete() && !s.ok())) {
+  if (PREDICT_FALSE(!s.ok() && !s.IsIncomplete())) {
     return s;
   }
 
   // Check that the SASL library is using the mechanism that we picked.
   DCHECK_EQ(SaslMechanism::value_of(negotiated_mech), negotiated_mech_);
-
-  // If the negotiated mechanism is GSSAPI (Kerberos), configure SASL to use
-  // integrity protection so that the channel bindings and nonce can be
-  // verified.
-  if (negotiated_mech_ == SaslMechanism::GSSAPI) {
-    RETURN_NOT_OK(EnableProtection(sasl_conn_.get(), SaslProtection::kIntegrity));
-  }
 
   NegotiatePB msg;
   msg.set_step(NegotiatePB::SASL_INITIATE);
@@ -686,11 +701,13 @@ Status ClientNegotiation::HandleSaslSuccess(const NegotiatePB& response) {
 }
 
 Status ClientNegotiation::DoSaslStep(const string& in, const char** out, unsigned* out_len) {
-  TRACE("Calling sasl_client_step()");
+  static constexpr const char* const kDesc = "calling sasl_client_step()";
+  TRACE(kDesc);
 
   return WrapSaslCall(sasl_conn_.get(), [&]() {
-      return sasl_client_step(sasl_conn_.get(), in.c_str(), in.length(), nullptr, out, out_len);
-  });
+      return sasl_client_step(
+          sasl_conn_.get(), in.c_str(), in.length(), nullptr, out, out_len);
+  }, kDesc);
 }
 
 Status ClientNegotiation::SendConnectionContext() {
@@ -711,7 +728,7 @@ Status ClientNegotiation::SendConnectionContext() {
     *conn_context.mutable_encoded_nonce() = ciphertext.ToString();
   }
 
-  return SendFramedMessageBlocking(socket(), header, conn_context, deadline_);
+  return SendFramedMessageBlocking(socket_.get(), header, conn_context, deadline_);
 }
 
 int ClientNegotiation::GetOptionCb(const char* plugin_name, const char* option,
@@ -784,37 +801,13 @@ int ClientNegotiation::SecretCb(sasl_conn_t* conn, int id, sasl_secret_t** psecr
   return SASL_OK;
 }
 
-namespace {
-// Retrieve the GSSAPI error description for an error code and type.
-string gss_error_description(OM_uint32 code, int type) {
-  string description;
-  OM_uint32 message_context = 0;
-
-  do {
-    if (!description.empty()) {
-      description.append(": ");
-    }
-    OM_uint32 minor = 0;
-    gss_buffer_desc buf;
-    gss_display_status(&minor, code, type, GSS_C_NULL_OID, &message_context, &buf);
-    description.append(static_cast<const char*>(buf.value), buf.length);
-    gss_release_buffer(&minor, &buf);
-  } while (message_context != 0);
-
-  return description;
-}
-
-// Transforms a GSSAPI major and minor error code into a Kudu Status.
-Status check_gss_error(OM_uint32 major, OM_uint32 minor) {
-    if (GSS_ERROR(major)) {
-      return Status::NotAuthorized(gss_error_description(major, GSS_C_GSS_CODE),
-                                   gss_error_description(minor, GSS_C_MECH_CODE));
-    }
-    return Status::OK();
-}
-} // anonymous namespace
-
 Status ClientNegotiation::CheckGSSAPI() {
+  // Disable leak checking in this function to work around memory leak in libgssapi_krb5
+  // when opening a corrupt credential cache fails:
+  // https://krbdev.mit.edu/rt/Ticket/Display.html?id=8437.
+  // Fixed in MIT Kerberos 1.13.7, 1.14.4 and 1.15.
+  debug::ScopedLeakCheckDisabler disable_leak_checks;
+
   OM_uint32 major, minor;
   gss_cred_id_t cred = GSS_C_NO_CREDENTIAL;
 
@@ -829,7 +822,7 @@ Status ClientNegotiation::CheckGSSAPI() {
                            &cred,
                            nullptr,
                            nullptr);
-  Status s = check_gss_error(major, minor);
+  Status s = gssapi::MajorMinorToStatus(major, minor);
 
   // Inspect the Kerberos credential to determine if it is expired. The lifetime
   // returned from gss_acquire_cred in the RHEL 6 version of krb5 is always 0,
@@ -838,7 +831,7 @@ Status ClientNegotiation::CheckGSSAPI() {
   OM_uint32 lifetime;
   if (s.ok()) {
     major = gss_inquire_cred(&minor, cred, nullptr, &lifetime, nullptr, nullptr);
-    s = check_gss_error(major, minor);
+    s = gssapi::MajorMinorToStatus(major, minor);
   }
 
   // Release the credential even if gss_inquire_cred fails.
@@ -853,3 +846,7 @@ Status ClientNegotiation::CheckGSSAPI() {
 
 } // namespace rpc
 } // namespace kudu
+
+#if defined(__APPLE__)
+#pragma GCC diagnostic pop
+#endif // #if defined(__APPLE__)

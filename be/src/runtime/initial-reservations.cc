@@ -18,8 +18,8 @@
 #include "runtime/initial-reservations.h"
 
 #include <limits>
+#include <mutex>
 
-#include <boost/thread/mutex.hpp>
 #include <gflags/gflags.h>
 
 #include "common/logging.h"
@@ -33,7 +33,7 @@
 
 using std::numeric_limits;
 
-DECLARE_int32(be_port);
+DECLARE_int32(krpc_port);
 DECLARE_string(hostname);
 
 namespace impala {
@@ -59,7 +59,7 @@ Status InitialReservations::Init(
           query_min_reservation, &reservation_status)) {
     return Status(TErrorCode::MINIMUM_RESERVATION_UNAVAILABLE,
         PrettyPrinter::Print(query_min_reservation, TUnit::BYTES), FLAGS_hostname,
-        FLAGS_be_port, PrintId(query_id), reservation_status.GetDetail());
+        FLAGS_krpc_port, PrintId(query_id), reservation_status.GetDetail());
   }
   VLOG(2) << "Successfully claimed initial reservations ("
           << PrettyPrinter::Print(query_min_reservation, TUnit::BYTES) << ") for"
@@ -78,9 +78,12 @@ void InitialReservations::Claim(BufferPool::ClientHandle* dst, int64_t bytes) {
 
 void InitialReservations::Return(BufferPool::ClientHandle* src, int64_t bytes) {
   lock_guard<SpinLock> l(lock_);
-  bool success = src->TransferReservationTo(&initial_reservations_, bytes);
+  bool success;
+  Status status = src->TransferReservationTo(&initial_reservations_, bytes, &success);
+  DCHECK(status.ok()) << status.GetDetail() << " no dirty pages to flush, can't fail "
+                      << src->DebugString();
   // No limits on our tracker - no way this should fail.
-  DCHECK(success);
+  DCHECK(success) << initial_reservations_.DebugString();
   // Check to see if we can release any reservation.
   int64_t excess_reservation =
     initial_reservations_.GetReservation() - remaining_initial_reservation_claims_;

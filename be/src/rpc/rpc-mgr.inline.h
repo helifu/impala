@@ -22,7 +22,7 @@
 
 #include <gflags/gflags.h>
 
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/service_pool.h"
@@ -35,19 +35,20 @@ namespace impala {
 
 /// Always inline to avoid having to provide a definition for each use type P.
 template <typename P>
-Status RpcMgr::GetProxy(const TNetworkAddress& address, const std::string& hostname,
+Status RpcMgr::GetProxy(const NetworkAddressPB& address, const std::string& hostname,
     std::unique_ptr<P>* proxy) {
   DCHECK(proxy != nullptr);
   DCHECK(is_inited()) << "Must call Init() before GetProxy()";
   DCHECK(IsResolvedAddress(address));
-  TNetworkAddress address_to_use = address;
+  NetworkAddressPB address_to_use = address;
   // Talk to self via loopback.
-  if (FLAGS_rpc_use_loopback &&
-      address_to_use.hostname == ExecEnv::GetInstance()->krpc_address().hostname) {
-    address_to_use.__set_hostname(LOCALHOST_IP_STR);
+  if (FLAGS_rpc_use_loopback
+      && address_to_use.hostname() == ExecEnv::GetInstance()->krpc_address().hostname()) {
+    address_to_use.set_hostname(LOCALHOST_IP_STR);
   }
-  kudu::Sockaddr sockaddr;
-  RETURN_IF_ERROR(TNetworkAddressToSockaddr(address_to_use, &sockaddr));
+  kudu::Sockaddr sockaddr = kudu::Sockaddr::Wildcard();
+  // Connect to KRPC server via Unix domain socket if krpc_use_uds_ is true.
+  RETURN_IF_ERROR(NetworkAddressPBToSockaddr(address_to_use, krpc_use_uds_, &sockaddr));
   proxy->reset(new P(messenger_, sockaddr, hostname));
 
   // Always set the user credentials as Proxy ctor may fail in GetLoggedInUser().

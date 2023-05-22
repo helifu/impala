@@ -21,12 +21,6 @@
 
 namespace impala {
 
-void CollectionColumnReader::Close(RowBatch* row_batch) {
-  for (ParquetColumnReader* child_reader : children_) {
-    child_reader->Close(row_batch);
-  }
-}
-
 bool CollectionColumnReader::NextLevels() {
   DCHECK(!children_.empty());
   DCHECK_LE(rep_level_, new_collection_rep_level());
@@ -51,8 +45,15 @@ bool CollectionColumnReader::ReadValue(MemPool* pool, Tuple* tuple) {
   } else if (def_level_ >= max_def_level()) {
     return ReadSlot(tuple->GetCollectionSlot(tuple_offset_), pool);
   } else {
-    // Null value
-    tuple->SetNull(null_indicator_offset_);
+    // Collections add an extra def level, so it is possible to distinguish between
+    // NULL and empty collections. See hdfs-parquet-scanner.h for more detailed
+    // explanation.
+    if (def_level_ == max_def_level() - 1) {
+      CollectionValue* slot = tuple->GetCollectionSlot(tuple_offset_);
+      *slot = CollectionValue();
+    } else {
+      SetNullSlot(tuple);
+    }
     return CollectionColumnReader::NextLevels();
   }
 }
@@ -77,9 +78,12 @@ bool CollectionColumnReader::ReadValueBatch(MemPool* pool, int max_values,
       continue_execution = NextLevels();
       continue;
     }
-    // Fill in position slot if applicable
-    if (pos_slot_desc_ != nullptr) {
-      ReadPositionNonBatched(tuple->GetBigIntSlot(pos_slot_desc()->tuple_offset()));
+    // Fill in position slots if applicable
+    if (pos_slot_desc() != nullptr) {
+      ReadItemPositionNonBatched(tuple->GetBigIntSlot(pos_slot_desc()->tuple_offset()));
+    } else if (file_pos_slot_desc() != nullptr) {
+      ReadFilePositionNonBatched(
+          tuple->GetBigIntSlot(file_pos_slot_desc()->tuple_offset()));
     }
     continue_execution = ReadValue(pool, tuple);
     ++val_count;
@@ -119,7 +123,7 @@ bool CollectionColumnReader::ReadSlot(CollectionValue* slot, MemPool* pool) {
   // Recursively read the collection into a new CollectionValue.
   *slot = CollectionValue();
   CollectionValueBuilder builder(
-      slot, *slot_desc_->collection_item_descriptor(), pool, parent_->state_);
+      slot, *slot_desc_->children_tuple_descriptor(), pool, parent_->state_);
   bool continue_execution =
       parent_->AssembleCollection(children_, new_collection_rep_level(), &builder);
   if (!continue_execution) return false;
@@ -156,5 +160,14 @@ void CollectionColumnReader::UpdateDerivedState() {
     // the current collection is the first item in a new parent collection).
     pos_current_value_ = 0;
   }
+}
+
+bool CollectionColumnReader::SkipRows(int64_t num_rows, int64_t skip_row_id) {
+  DCHECK(!children_.empty());
+  for (int c = 0; c < children_.size(); ++c) {
+    if (!children_[c]->SkipRows(num_rows, skip_row_id)) return false;
+  }
+  UpdateDerivedState();
+  return true;
 }
 } // namespace impala

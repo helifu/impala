@@ -122,8 +122,15 @@ public class ResetMetadataStmt extends StatementBase {
 
   public TableName getTableName() { return tableName_; }
 
+  public PartitionSpec getPartitionSpec() { return partitionSpec_; }
+
   @VisibleForTesting
   protected Action getAction() { return action_; }
+
+  @VisibleForTesting
+  public void setRequestingUser(User user) {
+    requestingUser_ = user;
+  }
 
   @Override
   public void collectTableRefs(List<TableRef> tblRefs) {
@@ -156,7 +163,8 @@ public class ResetMetadataStmt extends StatementBase {
           if (partitionSpec_ != null) {
             try {
               // Get local table info without reaching out to HMS
-              FeTable table = analyzer.getTable(dbName, tableName_.getTbl());
+              FeTable table = analyzer.getTable(dbName, tableName_.getTbl(),
+                  /* must_exist */ true);
               if (AcidUtils.isTransactionalTable(
                       table.getMetaStoreTable().getParameters())) {
                 throw new AnalysisException("Refreshing a partition is not allowed on " +
@@ -178,7 +186,7 @@ public class ResetMetadataStmt extends StatementBase {
           } else {
             analyzer.registerPrivReq(
                 builder -> builder.onTable(dbName, tableName_.getTbl(),
-                  tbl.getOwnerUser()).allOf(Privilege.REFRESH).build());
+                    tbl.getOwnerUser()).allOf(Privilege.REFRESH).build());
           }
         }
         break;

@@ -57,7 +57,8 @@ Status CaseExpr::OpenEvaluator(FunctionContext::FunctionStateScope scope,
   }
   fn_ctx->SetFunctionState(FunctionContext::THREAD_LOCAL, case_state);
 
-  const ColumnType& case_val_type = has_case_expr_ ? GetChild(0)->type() : TYPE_BOOLEAN;
+  const ColumnType& case_val_type = has_case_expr_ ? GetChild(0)->type()
+                                                   : ColumnType(TYPE_BOOLEAN);
   RETURN_IF_ERROR(AllocateAnyVal(state, eval->expr_perm_pool(), case_val_type,
       "Could not allocate expression value", &case_state->case_val));
   const ColumnType& when_val_type =
@@ -178,7 +179,7 @@ string CaseExpr::DebugString() const {
 // }
 Status CaseExpr::GetCodegendComputeFnImpl(LlvmCodeGen* codegen, llvm::Function** fn) {
   const int num_children = GetNumChildren();
-  llvm::Function* child_fns[num_children];
+  vector<llvm::Function*> child_fns(num_children, nullptr);
   for (int i = 0; i < num_children; ++i) {
     RETURN_IF_ERROR(GetChild(i)->GetCodegendComputeFn(codegen, false, &child_fns[i]));
   }

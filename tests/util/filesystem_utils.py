@@ -16,6 +16,7 @@
 # under the License.
 #
 # Utilities for supporting different filesystems.
+from __future__ import absolute_import, division, print_function
 import os
 
 # FILESYSTEM_PREFIX is the path prefix that should be used in queries.  When running
@@ -31,7 +32,13 @@ IS_LOCAL = FILESYSTEM == "local"
 IS_HDFS = FILESYSTEM == "hdfs"
 IS_ADLS = FILESYSTEM == "adls"
 IS_ABFS = FILESYSTEM == "abfs"
+IS_GCS = FILESYSTEM == "gs"
+IS_COS = FILESYSTEM == "cosn"
+IS_OSS = FILESYSTEM == "oss"
+IS_OBS = FILESYSTEM == "obs"
+IS_OZONE = FILESYSTEM == "ozone"
 IS_EC = os.getenv("ERASURE_CODING") == "true"
+IS_ENCRYPTED = os.getenv("USE_OZONE_ENCRYPTION") == "true"
 # This condition satisfies both the states where one can assume a default fs
 #   - The environment variable is set to an empty string.
 #   - Tne environment variables is unset ( None )
@@ -56,7 +63,8 @@ ADLS_CLIENT_SECRET = os.getenv("azure_client_secret")
 
 # A map of FILESYSTEM values to their corresponding Scan Node types
 fs_to_name = {'s3': 'S3', 'hdfs': 'HDFS', 'local': 'LOCAL', 'adls': 'ADLS',
-              'abfs': 'ADLS'}
+              'abfs': 'ADLS', 'gs': 'GCS', 'cosn': 'COS', 'ozone': 'OZONE',
+              'oss': 'OSS', 'obs': 'OBS'}
 
 
 def get_fs_name(fs):
@@ -79,3 +87,4 @@ def get_secondary_fs_path(path):
 
 WAREHOUSE = get_fs_path('/test-warehouse')
 FILESYSTEM_NAME = get_fs_name(FILESYSTEM)
+WAREHOUSE_PREFIX = os.getenv("WAREHOUSE_LOCATION_PREFIX")

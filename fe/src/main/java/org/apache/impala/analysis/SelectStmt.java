@@ -19,22 +19,40 @@ package org.apache.impala.analysis;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.stream.Stream;
+import java.util.stream.Collectors;
 
+import org.apache.iceberg.Table;
 import org.apache.impala.analysis.Path.PathType;
 import org.apache.impala.authorization.Privilege;
+import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.DatabaseNotFoundException;
+import org.apache.impala.catalog.FeIcebergTable;
+import org.apache.impala.catalog.FeIcebergTable.Utils;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.KuduColumn;
+import org.apache.impala.catalog.MapType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ColumnAliasGenerator;
+import org.apache.impala.common.Pair;
 import org.apache.impala.common.TableAliasGenerator;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.rewrite.ExprRewriter;
+import org.apache.impala.service.BackendConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,39 +68,6 @@ import com.google.common.collect.Lists;
 public class SelectStmt extends QueryStmt {
   private final static Logger LOG = LoggerFactory.getLogger(SelectStmt.class);
 
-  /**
-   * Impala 3.x and earlier provide non-standard support for a single ordinal
-   * in the HAVING clause:
-   *
-   * SELECT region, count(*), count(*) > 10 FROM sales
-   * HAVING 3
-   *
-   * Most other SQL dialects do not allow ordinals in expressions (such as
-   * HAVING), only in lists (GROUP BY, ORDER BY). The standard way to express
-   * the above is:
-   *
-   * SELECT region, count(*) FROM sales
-   * HAVING count(*) > 10
-   *
-   * Or, better (not currently supported by IMPALA):
-   *
-   * SELECT region, count(*) c FROM SALES
-   * HAVING c > 10
-   *
-   * We intend to disable this non-standard feature in the next major
-   * release. For now, we leave the feature/bug enabled, controlled by
-   * the following constant.
-   *
-   * In that same release, we will enable the third example above.
-   * At present, all that is supported is the odd:
-   *
-   * SELECT region, count(*), count(*) > 10 p FROM sales
-   * HAVING p
-   *
-   * See IMPALA-7844.
-   */
-  public static final boolean ALLOW_ORDINALS_IN_HAVING = true;
-
   /////////////////////////////////////////
   // BEGIN: Members that need to be reset()
 
@@ -90,7 +75,17 @@ public class SelectStmt extends QueryStmt {
   protected final List<String> colLabels_; // lower case column labels
   protected final FromClause fromClause_;
   protected Expr whereClause_;
+
+  // Grouping expressions for this select block, including expressions from the original
+  // query statement and additional expressions that may be added during rewriting.
   protected List<Expr> groupingExprs_;
+
+  // The original GROUP BY clause with information about grouping sets, etc.
+  // If there was no original GROUP BY clause, but grouping exprs are added during
+  // rewriting, this is initialized as a placeholder empty group by list.
+  // Non-null iff groupingExprs_ is non-null.
+  private GroupByClause groupByClause_;
+
   protected Expr havingClause_;  // original having clause
 
   // havingClause with aliases and agg output resolved
@@ -115,7 +110,7 @@ public class SelectStmt extends QueryStmt {
 
   SelectStmt(SelectList selectList,
              FromClause fromClause,
-             Expr wherePredicate, List<Expr> groupingExprs,
+             Expr wherePredicate, GroupByClause groupByClause,
              Expr havingPredicate, List<OrderByElement> orderByElements,
              LimitElement limitElement) {
     super(orderByElements, limitElement);
@@ -126,7 +121,12 @@ public class SelectStmt extends QueryStmt {
       fromClause_ = fromClause;
     }
     whereClause_ = wherePredicate;
-    groupingExprs_ = groupingExprs;
+    groupByClause_ = groupByClause;
+    if (groupByClause != null) {
+      groupingExprs_ = Expr.cloneList(groupByClause.getOrigGroupingExprs());
+    } else {
+      groupingExprs_ = null;
+    }
     havingClause_ = havingPredicate;
     colLabels_ = new ArrayList<>();
     havingPred_ = null;
@@ -159,6 +159,76 @@ public class SelectStmt extends QueryStmt {
   public boolean hasHavingClause() { return havingClause_ != null; }
   public ExprSubstitutionMap getBaseTblSmap() { return baseTblSmap_; }
 
+  public void addToFromClause(TableRef ref) { fromClause_.add(ref); }
+
+  /**
+   * A simple limit statement has a limit but no order-by,
+   * group-by, aggregates or analytic functions. Joins are
+   * allowed if one of the table refs has a limit_to_sample
+   * hint. The statement can have a WHERE clause if it has an
+   * always_true hint.
+   * This method does not explicitly check for subqueries. If the
+   * subquery occurs in the WHERE, the initial check for simple
+   * limit may succeed. Subsequently, in the planning process
+   * the statement rewriter may transform it to a join or an
+   * equivalent plan and analyze will be called again and this time
+   * it may or may not satisfy the simple limit criteria.
+   * Note that FROM clause subquery is generally ok since it is
+   * a table ref.
+   */
+  public Pair<Boolean, Long> checkSimpleLimitStmt() {
+    if (hasSimpleLimitEligibleTableRefs()
+        && !hasGroupByClause() && !hasOrderByClause()
+        && !hasMultiAggInfo() && !hasAnalyticInfo()) {
+      if (hasWhereClause() && !Expr.IS_ALWAYS_TRUE_PREDICATE.apply(getWhereClause())) {
+        return null;
+      }
+      if (hasLimit()) {
+        return new Pair<>(Boolean.valueOf(true), getLimit());
+      } else {
+        // even if this SELECT statement does not have a LIMIT, it is a
+        // simple select which may be an inline view and eligible for a
+        // limit pushdown from an outer block, so we return a non-null value
+        return new Pair<>(Boolean.valueOf(false), null);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Append additional grouping expressions to the select list. Used by StmtRewriter.
+   */
+  protected void addGroupingExprs(List<Expr> addtlGroupingExprs) {
+    if (groupingExprs_ == null) {
+      groupByClause_ = new GroupByClause(
+          Collections.emptyList(), GroupByClause.GroupingSetsType.NONE);
+      groupingExprs_ = new ArrayList<>();
+    }
+    groupingExprs_.addAll(addtlGroupingExprs);
+  }
+
+  private boolean hasSimpleLimitEligibleTableRefs() {
+    // for single table query blocks, limit pushdown can be considered
+    // even if no table hint is present
+    if (getTableRefs().size() == 1) return true;
+    // if there are multiple table refs, at least 1 should have the hint
+    // for limit to sample
+    for (TableRef ref : getTableRefs()) {
+      if (ref.hasConvertLimitToSampleHint()) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Remove the group by clause. Used by StmtRewriter. This changes the semantics
+   * of this statement and should only be called when the query is being rewritten
+   * in a way such that the GROUP BY is *not* required for correctness.
+   */
+  protected void removeGroupBy() {
+    groupByClause_ = null;
+    groupingExprs_ = null;
+  }
+
   // Column alias generator used during query rewriting.
   private ColumnAliasGenerator columnAliasGenerator_ = null;
   public ColumnAliasGenerator getColumnAliasGenerator() {
@@ -177,6 +247,23 @@ public class SelectStmt extends QueryStmt {
     return tableAliasGenerator_;
   }
 
+  @Override
+  public boolean resolveTableMask(Analyzer analyzer) throws AnalysisException {
+    boolean hasChanges = super.resolveTableMask(analyzer);
+    // Recurse in all places that could have subqueries. After resolveTableMask() is done
+    // on the whole AST, SlotRefs referencing the original table refs will be reset and
+    // re-analyzed to reference the table masking views. So we don't need to deal with
+    // SlotRefs here.
+    hasChanges |= fromClause_.resolveTableMask(analyzer);
+    for (SelectListItem item : selectList_.getItems()) {
+      if (item.isStar()) continue;
+      hasChanges |= item.getExpr().resolveTableMask(analyzer);
+    }
+    if (whereClause_ != null) hasChanges |= whereClause_.resolveTableMask(analyzer);
+    if (havingClause_ != null) hasChanges |= havingClause_.resolveTableMask(analyzer);
+    return hasChanges;
+  }
+
   /**
    * Creates resultExprs and baseTblResultExprs.
    */
@@ -185,6 +272,7 @@ public class SelectStmt extends QueryStmt {
     if (isAnalyzed()) return;
     super.analyze(analyzer);
     new SelectAnalyzer(analyzer).analyze();
+    this.optimizePlainCountStarQueryForIcebergTable();
   }
 
   /**
@@ -196,8 +284,42 @@ public class SelectStmt extends QueryStmt {
     private final Analyzer analyzer_;
     private List<Expr> groupingExprsCopy_;
     private List<FunctionCallExpr> aggExprs_;
-    private ExprSubstitutionMap ndvSmap_;
     private ExprSubstitutionMap countAllMap_;
+
+    private class StarExpandedPathInfo {
+      public StarExpandedPathInfo(Path expandedPath, Path originalRootPath) {
+        expandedPath_ = expandedPath;
+        originalRootPath_ = originalRootPath;
+      }
+
+      public Path getExpandedPath() { return expandedPath_; }
+      public boolean shouldRegisterForColumnMasking() {
+        // Empty matched types means this is expanded from star of a catalog table. For
+        // star of complex types, e.g. my_struct.*, my_array.*, my_map.*, the matched
+        // types will have the complex type so it's not empty.
+        // TODO: IMPALA-11712: We should sort out column masking and complex types. The
+        // above comment may not always be true: in the query
+        //   select a.* from mix_struct_array t, t.struct_in_arr a;
+        // getMatchedTypes() returns an empty list for the star path even though it is not
+        // from a catalog table.
+        // We should also find out whether we can determine from the expanded path alone
+        // (and not from the path of the star item) whether we need to register it for
+        // column masking, for example by checking if it is within a complex type.
+        return originalRootPath_.getMatchedTypes().isEmpty();
+      }
+
+      // The path expanded from a star select list item.
+      private final Path expandedPath_;
+
+      // The original path of the star select list item from which 'expandedPath_' was
+      // expanded.
+      // Can be the path of a table, a struct or a collection.
+      private final Path originalRootPath_;
+    }
+
+    // A map from star 'SelectListItem's to the paths to which they are expanded.
+    private final Map<SelectListItem, List<StarExpandedPathInfo>> starExpandedPaths_
+        = new HashMap<>();
 
     private SelectAnalyzer(Analyzer analyzer) {
       this.analyzer_ = analyzer;
@@ -207,11 +329,19 @@ public class SelectStmt extends QueryStmt {
       // Start out with table refs to establish aliases.
       fromClause_.analyze(analyzer_);
 
+      // Register struct paths (including those expanded from star expressions) before
+      // analyzeSelectClause() to guarantee tuple memory sharing between structs and
+      // struct members. See registerStructSlotRefPathsWithAnalyzer().
+      collectStarExpandedPaths();
+      registerStructSlotRefPathsWithAnalyzer();
+
       analyzeSelectClause();
       verifyResultExprs();
       registerViewColumnPrivileges();
       analyzeWhereClause();
       createSortInfo(analyzer_);
+
+      setZippingUnnestSlotRefsFromViews();
 
       // Analyze aggregation-relevant components of the select block (Group By
       // clause, select list, Order By clause), substitute AVG with SUM/COUNT,
@@ -222,7 +352,6 @@ public class SelectStmt extends QueryStmt {
         verifyAggSemantics();
         analyzeGroupingExprs();
         collectAggExprs();
-        rewriteCountDistinct();
         buildAggregateExprs();
         buildResultExprs();
         verifyAggregation();
@@ -243,6 +372,98 @@ public class SelectStmt extends QueryStmt {
       }
 
       buildColumnLineageGraph();
+      analyzer_.setSimpleLimitStatus(checkSimpleLimitStmt());
+    }
+
+    /** Ensure that embedded (struct member) expressions share the tuple memory of their
+     * enclosing struct expressions by registering struct paths before analysis of select
+     * list items. Struct paths are registered in order of increasing number of path
+     * elements - this guarantees that when a struct member path is registered, its
+     * enclosing struct has already been registered, so Analyzer.registerSlotRef() can
+     * return the SlotDescriptor already created for the struct member within the struct,
+     * instead of creating a new SlotDescriptor for the struct member outside of the
+     * struct.
+     *
+     * Note that struct members can themselves be structs: this is the reason that
+     * ordering by increasing path element number (increasing embedding depth) is
+     * necessary and simply registering struct paths before other paths is not enough.
+     */
+    private void registerStructSlotRefPathsWithAnalyzer() throws AnalysisException {
+      Stream<Path> nonStarPaths = collectNonStarPaths();
+      Stream<Path> starExpandedPaths = starExpandedPaths_.values().stream()
+          // Get a flat list of paths (and booleans) belonging to all star items.
+          .flatMap(pathList -> pathList.stream())
+          // Discard the booleans and keep only the actual paths.
+          .map((StarExpandedPathInfo pathInfo)  -> pathInfo.getExpandedPath());
+
+      Stream<Path> allPaths = Stream.concat(nonStarPaths, starExpandedPaths);
+      List<Path> structPaths = allPaths
+          .filter(path -> path.destType().isStructType())
+          .collect(Collectors.toList());
+
+      // Sort paths by length in ascending order so that structs that contain other
+      // structs come before their children.
+      Collections.sort(structPaths,
+          Comparator.<Path>comparingInt(path -> path.getMatchedTypes().size()));
+      for (Path p : structPaths) {
+        analyzer_.registerSlotRef(p);
+      }
+    }
+
+    private Stream<Path> collectNonStarPaths() {
+      Preconditions.checkNotNull(selectList_);
+      Stream<Expr> selectListExprs = selectList_.getItems().stream()
+        .filter(elem -> !elem.isStar())
+        .map(elem -> elem.getExpr());
+      Stream<Expr> nonSelectListExprs = collectExprsOutsideSelectList();
+
+      Stream<Expr> exprs = Stream.concat(selectListExprs, nonSelectListExprs);
+
+      // Use a LinkedHashSet for deterministic iteration order.
+      LinkedHashSet<SlotRef> slotRefs = new LinkedHashSet<>();
+      exprs.forEach(expr -> expr.collect(SlotRef.class, slotRefs));
+
+      return slotRefs.stream()
+          .map(this::slotRefToResolvedPath)
+          .filter(path -> path != null);
+    }
+
+    private Stream<Expr> collectExprsOutsideSelectList() {
+      Stream<Expr> res = Stream.empty();
+      if (whereClause_ != null) {
+        res = Stream.concat(res, Stream.of(whereClause_));
+      }
+      if (havingClause_ != null) {
+        res = Stream.concat(res, Stream.of(havingClause_));
+      }
+      if (groupingExprs_ != null) {
+        res = Stream.concat(res, groupingExprs_.stream());
+      }
+      if (sortInfo_ != null) {
+        res = Stream.concat(res, sortInfo_.getSortExprs().stream());
+      }
+      if (analyticInfo_ != null) {
+        res = Stream.concat(res,
+            analyticInfo_.getAnalyticExprs().stream()
+            .map(analyticExpr -> (Expr) analyticExpr));
+      }
+      return res;
+    }
+
+    private Path slotRefToResolvedPath(SlotRef slotRef) {
+      try {
+        Path resolvedPath = analyzer_.resolvePathWithMasking(slotRef.getRawPath(),
+            PathType.SLOT_REF);
+        return resolvedPath;
+      } catch (TableLoadingException e) {
+        // Should never happen because we only check registered table aliases.
+        Preconditions.checkState(false);
+        return null;
+      } catch (AnalysisException e) {
+        // Return null if analysis did not succeed. This means this path will not be
+        // registered here.
+        return null;
+      }
     }
 
     private void analyzeSelectClause() throws AnalysisException {
@@ -256,36 +477,76 @@ public class SelectStmt extends QueryStmt {
       selectList_.analyzePlanHints(analyzer_);
 
       // populate resultExprs_, aliasSmap_, and colLabels_
+      // This additional map is used for performance reasons and not for finding
+      // ambiguous alias.
+      Map<String, Expr> existingAliasExprs = new LinkedHashMap<>();
       for (int i = 0; i < selectList_.getItems().size(); ++i) {
         SelectListItem item = selectList_.getItems().get(i);
         if (item.isStar()) {
-          if (item.getRawPath() != null) {
-            Path resolvedPath = analyzeStarPath(item.getRawPath(), analyzer_);
-            expandStar(resolvedPath);
-          } else {
-            expandStar();
-          }
+          analyzeStarItem(item);
         } else {
-          // Analyze the resultExpr before generating a label to ensure enforcement
-          // of expr child and depth limits (toColumn() label may call toSql()).
-          item.getExpr().analyze(analyzer_);
-          if (item.getExpr().contains(Predicates.instanceOf(Subquery.class))) {
-            throw new AnalysisException(
-                "Subqueries are not supported in the select list.");
-          }
-          resultExprs_.add(item.getExpr());
-          String label = item.toColumnLabel(i, analyzer_.useHiveColLabels());
-          SlotRef aliasRef = new SlotRef(label);
-          Expr existingAliasExpr = aliasSmap_.get(aliasRef);
-          if (existingAliasExpr != null && !existingAliasExpr.equals(item.getExpr())) {
-            // If we have already seen this alias, it refers to more than one column and
-            // therefore is ambiguous.
-            ambiguousAliasList_.add(aliasRef);
-          }
-          aliasSmap_.put(aliasRef, item.getExpr().clone());
-          colLabels_.add(label);
+          analyzeNonStarItem(item, existingAliasExprs, i);
         }
       }
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Analyzed select clause aliasSmap={}", aliasSmap_.debugString());
+      }
+    }
+
+    private void analyzeStarItem(SelectListItem item) throws AnalysisException {
+      Preconditions.checkState(item.isStar());
+      List<StarExpandedPathInfo> starExpandedPathInfos = starExpandedPaths_.get(item);
+      // If complex types are not expanded, a star item may expand to zero items, in which
+      // case starExpandedPaths_ does not have a value for it.
+      if (starExpandedPathInfos == null) {
+        Preconditions.checkState(
+            !analyzer_.getQueryCtx().client_request.query_options.expand_complex_types);
+        return;
+      }
+
+      for (StarExpandedPathInfo pathInfo : starExpandedPathInfos) {
+        addStarExpandedPathResultExpr(pathInfo);
+      }
+    }
+
+    private void analyzeNonStarItem(SelectListItem item,
+        Map<String, Expr> existingAliasExprs, int selectListPos)
+        throws AnalysisException {
+      // Analyze the resultExpr before generating a label to ensure enforcement
+      // of expr child and depth limits (toColumn() label may call toSql()).
+      item.getExpr().analyze(analyzer_);
+      // Check for scalar subquery types which are not supported
+      List<Subquery> subqueryExprs = new ArrayList<>();
+      item.getExpr().collect(Subquery.class, subqueryExprs);
+      for (Subquery s : subqueryExprs) {
+        Preconditions.checkState(s.getStatement() instanceof SelectStmt);
+        if (!s.returnsScalarColumn()) {
+          throw new AnalysisException("A non-scalar subquery is not supported in "
+              + "the expression: " + item.getExpr().toSql());
+        }
+        if (s.getStatement().isRuntimeScalar()) {
+          throw new AnalysisException(
+              "A subquery which may return more than one row is not supported in "
+              + "the expression: " + item.getExpr().toSql());
+        }
+        if (!((SelectStmt)s.getStatement()).returnsAtMostOneRow()) {
+          throw new AnalysisException("Only subqueries that are guaranteed to return "
+              + "a single row are supported: " + item.getExpr().toSql());
+        }
+      }
+      resultExprs_.add(item.getExpr());
+      String label = item.toColumnLabel(selectListPos, analyzer_.useHiveColLabels());
+      SlotRef aliasRef = new SlotRef(label);
+      Expr existingAliasExpr = existingAliasExprs.get(label);
+      if (existingAliasExpr != null && !existingAliasExpr.equals(item.getExpr())) {
+        // If we have already seen this alias, it refers to more than one column and
+        // therefore is ambiguous.
+        ambiguousAliasList_.add(aliasRef);
+      } else {
+        existingAliasExprs.put(label, item.getExpr());
+      }
+      aliasSmap_.put(aliasRef, item.getExpr().clone());
+      colLabels_.add(label);
     }
 
     private void verifyResultExprs() throws AnalysisException {
@@ -295,19 +556,25 @@ public class SelectStmt extends QueryStmt {
         throw new AnalysisException("The star exprs expanded to an empty select list " +
             "because the referenced tables only have complex-typed columns.\n" +
             "Star exprs only expand to scalar-typed columns because " +
-            "complex-typed exprs " +
-            "are currently not supported in the select list.\n" +
+            "currently not all complex-typed exprs " +
+            "are supported in the select list.\n" +
             "Affected select statement:\n" + toSql());
       }
 
       for (Expr expr: resultExprs_) {
-        // Complex types are currently not supported in the select list because
-        // we'd need to serialize them in a meaningful way.
-        if (expr.getType().isComplexType()) {
-          throw new AnalysisException(String.format(
-              "Expr '%s' in select list returns a complex type '%s'.\n" +
-              "Only scalar types are allowed in the select list.",
-              expr.toSql(), expr.getType().toSql()));
+        if (expr.getType().isArrayType()) {
+          ArrayType arrayType = (ArrayType) expr.getType();
+          if (!arrayType.getItemType().isSupported()) {
+            throw new AnalysisException("Unsupported type '" +
+                expr.getType().toSql() + "' in '" + expr.toSql() + "'.");
+          }
+        } else if (expr.getType().isMapType()) {
+          MapType mapType = (MapType) expr.getType();
+          if (!mapType.getKeyType().isSupported()
+              || !mapType.getValueType().isSupported()) {
+            throw new AnalysisException("Unsupported type '" +
+                expr.getType().toSql() + "' in '" + expr.toSql() + "'.");
+          }
         }
         if (!expr.getType().isSupported()) {
           throw new AnalysisException("Unsupported type '"
@@ -342,7 +609,78 @@ public class SelectStmt extends QueryStmt {
         throw new AnalysisException(
             "WHERE clause must not contain analytic expressions: " + e.toSql());
       }
+
+      verifyZippingUnnestSlots();
+
       analyzer_.registerConjuncts(whereClause_, false);
+    }
+
+    /**
+     * Don't allow a WHERE conjunct on an array item that is part of a zipping unnest.
+     * In case there is only one zipping unnested array this restriction is not needed
+     * as the UNNEST node has to handle a single array and it's safe to do the filtering
+     * in the scanner.
+     */
+    private void verifyZippingUnnestSlots() throws AnalysisException {
+      if (analyzer_.getNumZippingUnnests() <= 1) return;
+      List<TupleId> zippingUnnestTupleIds = Lists.newArrayList(
+          analyzer_.getZippingUnnestTupleIds());
+
+      List<SlotRef> slotRefsInWhereClause = new ArrayList<>();
+      whereClause_.collect(SlotRef.class, slotRefsInWhereClause);
+      for (SlotRef slotRef : slotRefsInWhereClause) {
+        if (slotRef.isBoundByTupleIds(zippingUnnestTupleIds)) {
+          throw new AnalysisException("Not allowed to add a filter on an unnested " +
+              "array under the same select statement: " + slotRef.toSql());
+        }
+      }
+    }
+
+    /**
+     * When zipping unnest is performed using the SQL standard compliant syntax (where
+     * the unnest is in the FROM clause) the SlotRefs used for the zipping unnest are not
+     * UnnestExprs as with the other approach (where zipping unnest is in the select list)
+     * but regular SlotRefs. As a result they have to be marked so that later on anything
+     * specific for zipping unnest could be executed for them.
+     * This function identifies the SlotRefs that are for zipping unnesting and sets a
+     * flag for them. Note, only marks the SlotRefs that are originated form a view.
+     */
+    private void setZippingUnnestSlotRefsFromViews() {
+      for (TableRef tblRef : fromClause_.getTableRefs()) {
+        if (!tblRef.isFromClauseZippingUnnest()) continue;
+        Preconditions.checkState(tblRef instanceof CollectionTableRef);
+        ExprSubstitutionMap exprSubMap = getBaseTableSMapFromTableRef(tblRef);
+        if (exprSubMap == null) continue;
+
+        for (SelectListItem item : selectList_.getItems()) {
+          if (item.isStar()) continue;
+          Expr itemExpr = item.getExpr();
+          List<SlotRef> slotRefs = new ArrayList<>();
+          itemExpr.collect(SlotRef.class, slotRefs);
+          for (SlotRef slotRef : slotRefs) {
+            Expr subbedExpr = exprSubMap.get(slotRef);
+            if (subbedExpr == null || !(subbedExpr instanceof SlotRef)) continue;
+            SlotRef subbedSlotRef = (SlotRef)subbedExpr;
+            CollectionTableRef collTblRef = (CollectionTableRef)tblRef;
+            SlotRef collectionSlotRef = (SlotRef)collTblRef.getCollectionExpr();
+            // Check if 'slotRef' is originated from 'collectionSlotRef'.
+            if (subbedSlotRef.getDesc().getParent().getId() ==
+                collectionSlotRef.getDesc().getItemTupleDesc().getId()) {
+              slotRef.setIsZippingUnnest(true);
+            }
+          }
+        }
+      }
+    }
+
+    /**
+     * If 'tblRef' is originated from a view then returns the baseTblSmap from the view.
+     * Returns false otherwise.
+     */
+    private ExprSubstitutionMap getBaseTableSMapFromTableRef(TableRef tblRef) {
+      if (tblRef.getResolvedPath().getRootDesc() == null) return null;
+      if (tblRef.getResolvedPath().getRootDesc().getSourceView() == null) return null;
+      return tblRef.getResolvedPath().getRootDesc().getSourceView().getBaseTblSmap();
     }
 
     /**
@@ -394,6 +732,11 @@ public class SelectStmt extends QueryStmt {
         // Do not generate a predicate if the parent tuple is outer joined.
         if (analyzer_.isOuterJoined(ref.getResolvedPath().getRootDesc().getId()))
           continue;
+        // Don't push down the "is not empty" predicate for zipping unnests if there are
+        // multiple zipping unnests in the FROM clause.
+        if (tblRef.isZippingUnnest() && analyzer_.getNumZippingUnnests() > 1) {
+          continue;
+        }
         IsNotEmptyPredicate isNotEmptyPred =
             new IsNotEmptyPredicate(ref.getCollectionExpr().clone());
         isNotEmptyPred.analyze(analyzer_);
@@ -436,7 +779,7 @@ public class SelectStmt extends QueryStmt {
         throws AnalysisException {
       Path resolvedPath = null;
       try {
-        resolvedPath = analyzer.resolvePath(rawPath, PathType.STAR);
+        resolvedPath = analyzer.resolvePathWithMasking(rawPath, PathType.STAR);
       } catch (TableLoadingException e) {
         // Should never happen because we only check registered table aliases.
         Preconditions.checkState(false);
@@ -446,31 +789,32 @@ public class SelectStmt extends QueryStmt {
     }
 
     /**
-     * Expand "*" select list item, ignoring semi-joined tables as well as
-     * complex-typed fields because those are currently illegal in any select
-     * list (even for inline views, etc.)
+     * Expand "*" select list item, ignoring semi-joined tables because those are
+     * currently illegal in any select list (even for inline views, etc.). Also ignores
+     * complex-typed fields for backwards compatibility unless EXPAND_COMPLEX_TYPES is set
+     * to true.
      */
-    private void expandStar() throws AnalysisException {
+    private void expandStar(SelectListItem selectListItem) throws AnalysisException {
       if (fromClause_.isEmpty()) {
         throw new AnalysisException(
             "'*' expression in select list requires FROM clause.");
       }
       // expand in From clause order
       for (TableRef tableRef: fromClause_) {
+        if (tableRef.isHidden()) continue;
         if (analyzer_.isSemiJoined(tableRef.getId())) continue;
         Path resolvedPath = new Path(tableRef.getDesc(),
             Collections.<String>emptyList());
         Preconditions.checkState(resolvedPath.resolve());
-        expandStar(resolvedPath);
+        expandStar(selectListItem, resolvedPath);
       }
     }
 
     /**
-     * Expand "path.*" from a resolved path, ignoring complex-typed fields
-     * because those are currently illegal in any select list (even for
-     * inline views, etc.)
+     * Expand "path.*" from a resolved path, ignoring complex-typed fields for backwards
+     * compatibility unless EXPAND_COMPLEX_TYPES is set to true.
      */
-    private void expandStar(Path resolvedPath)
+    private void expandStar(SelectListItem selectListItem, Path resolvedPath)
         throws AnalysisException {
       Preconditions.checkState(resolvedPath.isResolved());
       if (resolvedPath.destTupleDesc() != null &&
@@ -481,7 +825,9 @@ public class SelectStmt extends QueryStmt {
         TupleDescriptor tupleDesc = resolvedPath.destTupleDesc();
         FeTable table = tupleDesc.getTable();
         for (Column c: table.getColumnsInHiveOrder()) {
-          addStarResultExpr(resolvedPath, c.getName());
+          // Omit auto-incrementing column for Kudu table since it's a hidden column.
+          if (c instanceof KuduColumn && ((KuduColumn)c).isAutoIncrementing()) continue;
+          addStarExpandedPath(selectListItem, resolvedPath, c.getName());
         }
       } else {
         // The resolved path does not target the descriptor of a catalog table.
@@ -499,44 +845,85 @@ public class SelectStmt extends QueryStmt {
         if (structType instanceof CollectionStructType) {
           CollectionStructType cst = (CollectionStructType) structType;
           if (cst.isMapStruct()) {
-            addStarResultExpr(resolvedPath, Path.MAP_KEY_FIELD_NAME);
+            addStarExpandedPath(selectListItem, resolvedPath, Path.MAP_KEY_FIELD_NAME);
           }
           if (cst.getOptionalField().getType().isStructType()) {
             structType = (StructType) cst.getOptionalField().getType();
             for (StructField f: structType.getFields()) {
-              addStarResultExpr(
-                  resolvedPath, cst.getOptionalField().getName(), f.getName());
+              addStarExpandedPath(selectListItem, resolvedPath,
+                  cst.getOptionalField().getName(), f.getName());
             }
           } else if (cst.isMapStruct()) {
-            addStarResultExpr(resolvedPath, Path.MAP_VALUE_FIELD_NAME);
+            addStarExpandedPath(selectListItem, resolvedPath, Path.MAP_VALUE_FIELD_NAME);
           } else {
-            addStarResultExpr(resolvedPath, Path.ARRAY_ITEM_FIELD_NAME);
+            addStarExpandedPath(selectListItem, resolvedPath, Path.ARRAY_ITEM_FIELD_NAME);
           }
         } else {
           // Default star expansion.
           for (StructField f: structType.getFields()) {
-            addStarResultExpr(resolvedPath, f.getName());
+            if (f.isHidden()) continue;
+            addStarExpandedPath(selectListItem, resolvedPath, f.getName());
           }
         }
       }
     }
 
     /**
-     * Helper function used during star expansion to add a single result expr
-     * based on a given raw path to be resolved relative to an existing path.
-     * Ignores paths with a complex-typed destination because they are currently
-     * illegal in any select list (even for inline views, etc.)
+     * Expand star items to paths and store them in 'starExpandedPaths_'.
      */
-    private void addStarResultExpr(Path resolvedPath,
+    private void collectStarExpandedPaths() throws AnalysisException {
+      for (SelectListItem item : selectList_.getItems()) {
+        if (item.isStar()) {
+          if (item.getRawPath() != null) {
+            Path resolvedPath = analyzeStarPath(item.getRawPath(), analyzer_);
+            expandStar(item, resolvedPath);
+          } else {
+            expandStar(item);
+          }
+        }
+      }
+    }
+
+    /**
+     * Helper function used during star expansion to add a single expanded path based on a
+     * given raw path to be resolved relative to an existing path.
+     */
+    private void addStarExpandedPath(SelectListItem selectListItem, Path resolvedRootPath,
         String... relRawPath) throws AnalysisException {
-      Path p = Path.createRelPath(resolvedPath, relRawPath);
-      Preconditions.checkState(p.resolve());
-      if (p.destType().isComplexType()) return;
-      SlotDescriptor slotDesc = analyzer_.registerSlotRef(p);
+      Path starExpandedPath = Path.createRelPath(resolvedRootPath, relRawPath);
+      Preconditions.checkState(starExpandedPath.resolve());
+      if (starExpandedPath.destType().isComplexType() &&
+          !analyzer_.getQueryCtx().client_request.query_options.expand_complex_types) {
+        return;
+      }
+
+      if (!starExpandedPaths_.containsKey(selectListItem)) {
+        starExpandedPaths_.put(selectListItem, new ArrayList<>());
+      }
+      List<StarExpandedPathInfo> pathsOfStarItem = starExpandedPaths_.get(selectListItem);
+      pathsOfStarItem.add(new StarExpandedPathInfo(starExpandedPath, resolvedRootPath));
+    }
+
+    private void addStarExpandedPathResultExpr(StarExpandedPathInfo starExpandedPathInfo)
+        throws AnalysisException {
+      Preconditions.checkState(starExpandedPathInfo.getExpandedPath().isResolved());
+
+      SlotDescriptor slotDesc = analyzer_.registerSlotRef(
+          starExpandedPathInfo.getExpandedPath(), false);
       SlotRef slotRef = new SlotRef(slotDesc);
-      slotRef.analyze(analyzer_);
+      if (slotRef.getType().isStructType()) {
+        slotRef.checkForUnsupportedStructFeatures();
+      }
+      Preconditions.checkState(slotRef.isAnalyzed(),
+          "Analysis should be done in constructor");
+
+      if (starExpandedPathInfo.shouldRegisterForColumnMasking()) {
+        analyzer_.registerColumnForMasking(slotDesc);
+      }
       resultExprs_.add(slotRef);
-      colLabels_.add(relRawPath[relRawPath.length - 1]);
+      final List<String> starExpandedRawPath = starExpandedPathInfo
+        .getExpandedPath().getRawPath();
+      colLabels_.add(starExpandedRawPath.get(starExpandedRawPath.size() - 1));
     }
 
     /**
@@ -602,14 +989,16 @@ public class SelectStmt extends QueryStmt {
       // Analyze the HAVING clause first so we can check if it contains aggregates.
       // We need to analyze/register it even if we are not computing aggregates.
       if (havingClause_ == null) return;
-      // can't contain subqueries
-      if (havingClause_.contains(Predicates.instanceOf(Subquery.class))) {
+      List<Expr> subqueries = new ArrayList<>();
+      havingClause_.collectAll(Predicates.instanceOf(Subquery.class), subqueries);
+      if (subqueries.size() > 1) {
         throw new AnalysisException(
-            "Subqueries are not supported in the HAVING clause.");
+            "Multiple subqueries are not supported in expression: "
+            + havingClause_.toSql());
       }
       // Resolve (top-level) aliases and analyzes
       havingPred_ = resolveReferenceExpr(havingClause_, "HAVING", analyzer_,
-          ALLOW_ORDINALS_IN_HAVING);
+          BackendConfig.INSTANCE.getAllowOrdinalsInHaving());
       // can't contain analytic exprs
       Expr analyticExpr = havingPred_.findFirstOf(AnalyticExpr.class);
       if (analyticExpr != null) {
@@ -621,13 +1010,7 @@ public class SelectStmt extends QueryStmt {
     }
 
     private boolean checkForAggregates() throws AnalysisException {
-      if (groupingExprs_ == null && !selectList_.isDistinct()
-          && !TreeNode.contains(resultExprs_, Expr.IS_AGGREGATE)
-          && (havingPred_ == null
-              || !havingPred_.contains(Expr.IS_AGGREGATE))
-          && (sortInfo_ == null
-              || !TreeNode.contains(sortInfo_.getSortExprs(),
-                                    Expr.IS_AGGREGATE))) {
+      if (!hasAggregate(/*includeDistinct=*/ true)) {
         // We're not computing aggregates but we still need to register the HAVING
         // clause which could, e.g., contain a constant expression evaluating to false.
         if (havingPred_ != null) analyzer_.registerConjuncts(havingPred_, true);
@@ -701,6 +1084,10 @@ public class SelectStmt extends QueryStmt {
                   + groupingExprsCopy_.get(i).toSql());
         }
       }
+
+      if (groupByClause_ != null && groupByClause_.hasGroupingSets()) {
+        groupByClause_.analyzeGroupingSets(groupingExprsCopy_);
+      }
     }
 
     private void collectAggExprs() {
@@ -718,34 +1105,6 @@ public class SelectStmt extends QueryStmt {
       }
     }
 
-    private void rewriteCountDistinct() {
-      // Optionally rewrite all count(distinct <expr>) into equivalent NDV() calls.
-      if (!analyzer_.getQueryCtx().client_request.query_options.appx_count_distinct) {
-        return;
-      }
-      ndvSmap_ = new ExprSubstitutionMap();
-      for (FunctionCallExpr aggExpr: aggExprs_) {
-        if (!aggExpr.isDistinct()
-            || !aggExpr.getFnName().getFunction().equals("count")
-            || aggExpr.getParams().size() != 1) {
-          continue;
-        }
-        FunctionCallExpr ndvFnCall =
-            new FunctionCallExpr("ndv", aggExpr.getParams().exprs());
-        ndvFnCall.analyzeNoThrow(analyzer_);
-        Preconditions.checkState(ndvFnCall.getType().equals(aggExpr.getType()));
-        ndvSmap_.put(aggExpr, ndvFnCall);
-      }
-      // Replace all count(distinct <expr>) with NDV(<expr>).
-      List<Expr> substAggExprs = Expr.substituteList(aggExprs_,
-          ndvSmap_, analyzer_, false);
-      aggExprs_.clear();
-      for (Expr aggExpr: substAggExprs) {
-        Preconditions.checkState(aggExpr instanceof FunctionCallExpr);
-        aggExprs_.add((FunctionCallExpr) aggExpr);
-      }
-    }
-
     private void buildAggregateExprs() throws AnalysisException {
       // When DISTINCT aggregates are present, non-distinct (i.e. ALL) aggregates are
       // evaluated in two phases (see AggregateInfo for more details). In particular,
@@ -759,7 +1118,6 @@ public class SelectStmt extends QueryStmt {
       // i) There is no GROUP-BY clause, and
       // ii) Other DISTINCT aggregates are present.
       countAllMap_ = createCountAllMap();
-      countAllMap_ = ExprSubstitutionMap.compose(ndvSmap_, countAllMap_, analyzer_);
       List<Expr> substitutedAggs =
           Expr.substituteList(aggExprs_, countAllMap_, analyzer_, false);
       aggExprs_.clear();
@@ -774,9 +1132,14 @@ public class SelectStmt extends QueryStmt {
         Preconditions.checkState(aggExprs_.isEmpty());
         groupingExprs = Expr.cloneList(resultExprs_);
       }
+      // All expressions passed into the MultiAggregateInfo must be deduplicated.
+      // The analyzed grouping sets were already deduplicated.
       Expr.removeDuplicates(aggExprs_);
       Expr.removeDuplicates(groupingExprs);
-      multiAggInfo_ = new MultiAggregateInfo(groupingExprs, aggExprs_);
+      List<List<Expr>> groupingSets =
+          (groupByClause_ != null && groupByClause_.hasGroupingSets()) ?
+          groupByClause_.getAnalyzedGroupingSets() : null;
+      multiAggInfo_ = new MultiAggregateInfo(groupingExprs, aggExprs_, groupingSets);
       multiAggInfo_.analyze(analyzer_);
     }
 
@@ -797,10 +1160,6 @@ public class SelectStmt extends QueryStmt {
         LOG.trace("post-agg selectListExprs: " + Expr.debugString(resultExprs_));
       }
       if (havingPred_ != null) {
-        // Make sure the predicate in the HAVING clause does not contain a
-        // subquery.
-        Preconditions.checkState(!havingPred_.contains(
-            Predicates.instanceOf(Subquery.class)));
         havingPred_ = havingPred_.substitute(combinedSmap, analyzer_, false);
         analyzer_.registerConjuncts(havingPred_, true);
         if (LOG.isTraceEnabled()) {
@@ -977,7 +1336,8 @@ public class SelectStmt extends QueryStmt {
   @Override
   public void materializeRequiredSlots(Analyzer analyzer) {
     // Mark unassigned join predicates. Some predicates that must be evaluated by a join
-    // can also be safely evaluated below the join (picked up by getBoundPredicates()).
+    // can also be safely evaluated below the join (picked up by getBoundPredicates() and
+    // migrateConjunctsToInlineView()).
     // Such predicates will be marked twice and that is ok.
     List<Expr> unassigned =
         analyzer.getUnassignedConjuncts(getTableRefIds(), true);
@@ -1005,6 +1365,22 @@ public class SelectStmt extends QueryStmt {
       List<TupleId> tids = new ArrayList<>();
       getMaterializedTupleIds(tids); // includes the analytic tuple
       List<Expr> conjuncts = analyzer.getUnassignedConjuncts(tids, false);
+      // The predicates that can be bounded to KuduScanNode don't need to materialize
+      // here. Because we don't need to materialize the predicates that can be evaluated
+      // by Kudu.
+      for (TupleId tid : tids) {
+        if (analyzer.getTupleDesc(tid).getTable() instanceof FeKuduTable) {
+          Iterator<Expr> iterator = conjuncts.iterator();
+          while (iterator.hasNext()) {
+            Expr e = iterator.next();
+            List<TupleId> etids = new ArrayList<>();
+            e.getIds(etids, null);
+            if (1 == etids.size() && etids.get(0) == tid) {
+              iterator.remove();
+            }
+          }
+        }
+      }
       materializeSlots(analyzer, conjuncts);
       analyticInfo_.materializeRequiredSlots(analyzer, baseTblSmap_);
     }
@@ -1042,21 +1418,108 @@ public class SelectStmt extends QueryStmt {
     }
   }
 
+
+  /**
+   * Set totalRecordsNumVx_ in analyzer_ for the plain count(*) queries of Iceberg tables.
+   * Queries that can be rewritten need to meet the following requirements:
+   *  - stmt does not have WHERE clause
+   *  - stmt does not have GROUP BY clause
+   *  - stmt does not have HAVING clause
+   *  - tableRefs contains only one BaseTableRef
+   *  - tableRef doesn't have sampling param
+   *  - table is the Iceberg table
+   *  - SelectList must contains 'count(*)' or 'count(constant)'
+   *  - SelectList can contain constant
+   *  - stmt does not have WITH clause
+   *  - only for V1: SelectList can contain other agg functions, e.g. min, sum, etc
+   * e.g. 'SELECT count(*) FROM iceberg_tbl' would be rewritten as 'SELECT constant'.
+   */
+  public void optimizePlainCountStarQueryForIcebergTable() throws AnalysisException {
+    // When optimizing the simple count star query for the Iceberg table, the WITH CLAUSE
+    // should be skipped, but that doesn't mean the SQL can't be optimized, because when
+    // the WITH CLAUSE is inlined, the final Stmt is optimized by CountStarToConstRule.
+    if (this.analyzer_.hasWithClause()) return;
+
+    if (this.hasWhereClause()) return;
+    if (this.hasGroupByClause()) return;
+    if (this.hasHavingClause()) return;
+
+    List<TableRef> tables = this.getTableRefs();
+    if (tables.size() != 1) return;
+    TableRef tableRef = tables.get(0);
+    if (!(tableRef instanceof BaseTableRef)) return;
+    if (tableRef.getSampleParams() != null) return;
+
+    TableName tableName = tableRef.getDesc().getTableName();
+    FeTable table;
+    try {
+      table = analyzer_.getCatalog().getTable(tableName.getDb(), tableName.getTbl());
+    } catch (DatabaseNotFoundException e) {
+      throw new AnalysisException(
+          Analyzer.DB_DOES_NOT_EXIST_ERROR_MSG + tableName.getDb(), e);
+    }
+    if (!(table instanceof FeIcebergTable)) return;
+
+    analyzer_.checkStmtExprLimit();
+    Table iceTable = ((FeIcebergTable) table).getIcebergApiTable();
+    if (Utils.hasDeleteFiles(iceTable, tableRef.getTimeTravelSpec())) {
+      optimizePlainCountStarQueryV2(tableRef, (FeIcebergTable)table);
+    } else {
+      optimizePlainCountStarQueryV1(tableRef, iceTable);
+    }
+  }
+
+  private void optimizePlainCountStarQueryV2(TableRef tableRef, FeIcebergTable table)
+      throws AnalysisException {
+    for (SelectListItem selectItem : getSelectList().getItems()) {
+      Expr expr = selectItem.getExpr();
+      if (expr == null) return;
+      if (expr.isConstant()) continue;
+      if (!FunctionCallExpr.isCountStarFunctionCallExpr(expr)) return;
+    }
+    long num = Utils.getRecordCountV2(table, tableRef.getTimeTravelSpec());
+    if (num > 0) {
+      analyzer_.getQueryCtx().setOptimize_count_star_for_iceberg_v2(true);
+      analyzer_.setTotalRecordsNumV2(num);
+    }
+  }
+
+  private void optimizePlainCountStarQueryV1(TableRef tableRef, Table iceTable) {
+    boolean hasCountStarFunc = false;
+    boolean hasAggFunc = false;
+    for (SelectListItem selectItem : getSelectList().getItems()) {
+      Expr expr = selectItem.getExpr();
+      if (expr == null) return;
+      if (expr.isConstant()) continue;
+      if (FunctionCallExpr.isCountStarFunctionCallExpr(expr)) { hasCountStarFunc = true; }
+      else if (expr.isAggregate()) { hasAggFunc = true; }
+      else return;
+    }
+    if (!hasCountStarFunc) return;
+    long num = Utils.getRecordCountV1(iceTable, tableRef.getTimeTravelSpec());
+    if (num <= 0) return;
+    analyzer_.setTotalRecordsNumV1(num);
+    if (hasAggFunc) return;
+    // When all select items are 'count(*)' or constant, 'select count(*) from ice_tbl;'
+    // would need to be rewritten as 'select const;'
+    fromClause_.getTableRefs().clear();
+  }
+
   @Override
   public void rewriteExprs(ExprRewriter rewriter) throws AnalysisException {
     Preconditions.checkState(isAnalyzed());
     selectList_.rewriteExprs(rewriter, analyzer_);
     for (TableRef ref: fromClause_.getTableRefs()) ref.rewriteExprs(rewriter, analyzer_);
+    List<Subquery> subqueryExprs = new ArrayList<>();
     if (whereClause_ != null) {
       whereClause_ = rewriter.rewrite(whereClause_, analyzer_);
-      // Also rewrite exprs in the statements of subqueries.
-      List<Subquery> subqueryExprs = new ArrayList<>();
       whereClause_.collect(Subquery.class, subqueryExprs);
-      for (Subquery s: subqueryExprs) s.getStatement().rewriteExprs(rewriter);
     }
     if (havingClause_ != null) {
       havingClause_ = rewriteCheckOrdinalResult(rewriter, havingClause_);
+      havingClause_.collect(Subquery.class, subqueryExprs);
     }
+    for (Subquery s : subqueryExprs) s.getStatement().rewriteExprs(rewriter);
     if (groupingExprs_ != null) {
       for (int i = 0; i < groupingExprs_.size(); ++i) {
         groupingExprs_.set(i, rewriteCheckOrdinalResult(
@@ -1101,20 +1564,21 @@ public class SelectStmt extends QueryStmt {
     // Where clause
     if (whereClause_ != null) {
       strBuilder.append(" WHERE ");
+      List<PlanHint> predHints = whereClause_.getPredicateHints();
+      if (predHints != null && predHints.size() > 0) {
+        strBuilder.append(ToSqlUtils.getPlanHintsSql(options,
+            predHints)).append(" ");
+      }
       strBuilder.append(whereClause_.toSql(options));
     }
     // Group By clause
-    if (groupingExprs_ != null) {
-      strBuilder.append(" GROUP BY ");
+    if (groupByClause_ != null) {
       // Handle both analyzed (multiAggInfo_ != null) and unanalyzed cases.
       // Unanalyzed case us used to generate SQL such as for views.
       // See ToSqlUtils.getCreateViewSql().
       List<Expr> groupingExprs = multiAggInfo_ == null
           ? groupingExprs_ : multiAggInfo_.getGroupingExprs();
-      for (int i = 0; i < groupingExprs.size(); ++i) {
-        strBuilder.append(groupingExprs.get(i).toSql(options));
-        strBuilder.append((i+1 != groupingExprs.size()) ? ", " : "");
-      }
+      strBuilder.append(groupByClause_.toSql(groupingExprs, options));
     }
     // Having clause
     if (havingClause_ != null) {
@@ -1175,6 +1639,8 @@ public class SelectStmt extends QueryStmt {
     whereClause_ = (other.whereClause_ != null) ? other.whereClause_.clone() : null;
     groupingExprs_ =
         (other.groupingExprs_ != null) ? Expr.cloneList(other.groupingExprs_) : null;
+    groupByClause_ =
+        (other.groupByClause_ != null) ? other.groupByClause_.clone() : null;
     havingClause_ = (other.havingClause_ != null) ? other.havingClause_.clone() : null;
     colLabels_ = Lists.newArrayList(other.colLabels_);
     multiAggInfo_ = (other.multiAggInfo_ != null) ? other.multiAggInfo_.clone() : null;
@@ -1189,12 +1655,20 @@ public class SelectStmt extends QueryStmt {
     if (fromClauseOnly) {
       fromClause_.collectFromClauseTableRefs(tblRefs);
     } else {
+      // Collect TableRefs in all subqueries.
       fromClause_.collectTableRefs(tblRefs);
-    }
-    if (!fromClauseOnly && whereClause_ != null) {
-      // Collect TableRefs in WHERE-clause subqueries.
       List<Subquery> subqueries = new ArrayList<>();
-      whereClause_.collect(Subquery.class, subqueries);
+      if (whereClause_ != null) {
+        whereClause_.collect(Subquery.class, subqueries);
+      }
+      if (havingClause_ != null) {
+        havingClause_.collect(Subquery.class, subqueries);
+      }
+      for (SelectListItem item : selectList_.getItems()) {
+        if (item.isStar()) continue;
+        item.getExpr().collect(Subquery.class, subqueries);
+      }
+
       for (Subquery sq: subqueries) {
         sq.getStatement().collectTableRefs(tblRefs, fromClauseOnly);
       }
@@ -1203,8 +1677,6 @@ public class SelectStmt extends QueryStmt {
 
   @Override
   public void collectInlineViews(Set<FeView> inlineViews) {
-    // Impala currently supports sub queries only in FROM, WHERE & WITH clauses. Hence,
-    // this function does not carry out any checks on HAVING clause.
     super.collectInlineViews(inlineViews);
     List<TableRef> fromTblRefs = getTableRefs();
     Preconditions.checkNotNull(inlineViews);
@@ -1228,6 +1700,17 @@ public class SelectStmt extends QueryStmt {
         whereSubQueries.get(0).getStatement().collectInlineViews(inlineViews);
       }
     }
+    List<Subquery> subqueries = Lists.newArrayList();
+    for (SelectListItem item : selectList_.getItems()) {
+      if (item.isStar()) continue;
+      item.getExpr().collect(Subquery.class, subqueries);
+    }
+    if (havingClause_ != null) {
+      havingClause_.collect(Subquery.class, subqueries);
+    }
+    for (Subquery sq : subqueries) {
+      sq.getStatement().collectInlineViews(inlineViews);
+    }
   }
 
   @Override
@@ -1237,6 +1720,7 @@ public class SelectStmt extends QueryStmt {
     colLabels_.clear();
     fromClause_.reset();
     if (whereClause_ != null) whereClause_.reset();
+    if (groupByClause_ != null) groupByClause_.reset();
     if (groupingExprs_ != null) Expr.resetList(groupingExprs_);
     if (havingClause_ != null) havingClause_.reset();
     havingPred_ = null;
@@ -1258,27 +1742,96 @@ public class SelectStmt extends QueryStmt {
    *
    * This function may produce false negatives because the cardinality of the
    * result set also depends on the data a stmt is processing.
+   *
+   * TODO: IMPALA-1285 to cover more cases that can be determinded at plan time such has a
+   * group by clause where all grouping expressions are bound to constant expressions.
    */
-  public boolean returnsSingleRow() {
-    Preconditions.checkState(isAnalyzed());
-    // limit 1 clause
-    if (limitElement_ != null && hasLimit() && limitElement_.getLimit() == 1) return true;
-    // No from clause (base tables or inline views)
-    if (fromClause_.isEmpty()) return true;
-    // Aggregation with no group by and no DISTINCT
+  public boolean returnsAtMostOneRow() {
+    return returnsSingleRow(false);
+  }
+
+  /**
+   * Check if the stmt returns exactly one row. This can happen
+   * in the following cases:
+   * 1. select stmt with an aggregate function and no group by and no having clause.
+   * 2. select stmt with no from clause and no where or having clause.
+   * 3. select from an inline view that returns exactly one row and no where or
+   *    having clause.
+   *
+   * This function may produce false negatives because the cardinality of the
+   * result set also depends on the data a stmt is processing.
+   *
+   * TODO: IMPALA-1285 to cover more cases that can be determinded at plan time such has a
+   * group by clause where all grouping expressions are bound to constant expressions.
+   */
+  public boolean returnsExactlyOneRow() {
+    return returnsSingleRow(true);
+  }
+
+  /**
+   * Helper for returnsAtMostOneRow() and returnsExactlyOneRow(). If exactlyOne
+   * is true, returns true iff this SELECT always returns exactly one row. If
+   * exactlyOne is false, returns true iff this SELECT returns zero or one rows.
+   */
+  private boolean returnsSingleRow(boolean exactlyOne) {
+    // This function checks the clauses in reverse order in which they are applied.
+    // We must return false as soon as we determine there is no upper bound on the rows
+    // returned.
+    // If exactlyOne is true, we also must return false when we determine there is no
+    // lower bound on the rows returned.
+    // If exactlyOne is false, we can also return true as soon as we determine an upper
+    // bound on the rows returned.
+
+    if (limitElement_ != null && hasLimit()) {
+      // Limit 0 or 1 clause. This is an upper bound on rows returned.
+      if (!exactlyOne && limitElement_.getLimit() <= 1) return true;
+      // Limit 0 clause - the query will return 0 rows.
+      if (exactlyOne && limitElement_.getLimit() == 0) return false;
+    }
+
+    // HAVING cause can eliminate any rows produced by the statement, therefore we have
+    // no lower bound on rows returned.
+    if (exactlyOne && havingClause_ != null && !havingClause_.isTriviallyTrue()) {
+      return false;
+    }
+
+    // Aggregation with no GROUP BY and no DISTINCT. The aggregation produces exactly one
+    // row and the WHERE clause cannot eliminate that row.
     if (hasMultiAggInfo() && !hasGroupByClause() && !selectList_.isDistinct()) {
       return true;
     }
-    // Select from an inline view that returns at most one row.
+
+    // The WHERE clause can eliminate the singular row produced by the FROM clause
+    // (or lack of FROM clause).
+    if (exactlyOne && whereClause_ != null && !whereClause_.isTriviallyTrue()) {
+      return false;
+    }
+
+    // No FROM clause (base tables or inline views). Exactly one row is produced.
+    if (fromClause_.isEmpty()) return true;
+
     List<TableRef> tableRefs = fromClause_.getTableRefs();
     if (tableRefs.size() == 1 && tableRefs.get(0) instanceof InlineViewRef) {
       InlineViewRef inlineView = (InlineViewRef)tableRefs.get(0);
       if (inlineView.queryStmt_ instanceof SelectStmt) {
         SelectStmt selectStmt = (SelectStmt)inlineView.queryStmt_;
-        return selectStmt.returnsSingleRow();
+        return selectStmt.returnsSingleRow(exactlyOne);
       }
     }
     // In all other cases, return false.
     return false;
+  }
+
+  /**
+   * @param includeDistinct if true, a distinct in the select list is counted
+   *    as requiring an aggregation
+   * @returns true if query block has an aggregate function or grouping.
+   */
+  public boolean hasAggregate(boolean includeDistinct) throws AnalysisException {
+    return groupingExprs_ != null || (includeDistinct && selectList_.isDistinct()) ||
+          TreeNode.contains(resultExprs_, Expr.IS_AGGREGATE) ||
+          (havingPred_ != null && havingPred_.contains(Expr.IS_AGGREGATE)) ||
+          (sortInfo_ != null &&
+           TreeNode.contains(sortInfo_.getSortExprs(), Expr.IS_AGGREGATE));
   }
 }

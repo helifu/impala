@@ -69,10 +69,11 @@ import com.google.common.base.Preconditions;
 public class FeSupport {
   private final static Logger LOG = LoggerFactory.getLogger(FeSupport.class);
   private static boolean loaded_ = false;
+  private static boolean externalFE_ = false;
 
-  // Only called if this library is explicitly loaded. This only happens
-  // when running FE tests.
-  public native static void NativeFeTestInit();
+  // Only called if this library is explicitly loaded. This happens
+  // when running FE tests or external FE
+  public native static void NativeFeInit(boolean externalFE);
 
   // Returns a serialized TResultRow
   public native static byte[] NativeEvalExprsWithoutRow(
@@ -86,8 +87,8 @@ public class FeSupport {
 
   // Adds a topic item to the backend's pending metadata-topic update.
   // 'serializationBuffer' is a serialized TCatalogObject.
-  // The return value is true if the operation succeeds and false otherwise.
-  public native static boolean NativeAddPendingTopicItem(long nativeCatalogServerPtr,
+  // Returns the actual value size and -1 if the operation fails.
+  public native static int NativeAddPendingTopicItem(long nativeCatalogServerPtr,
       String key, long version, byte[] serializationBuffer, boolean deleted);
 
   // Get a catalog object update from the backend. A pair of isDeletion flag and
@@ -114,9 +115,6 @@ public class FeSupport {
   public native static byte[] NativeGetPartitionStats(byte[] thriftReq);
 
   public native static byte[] NativeUpdateTableUsage(byte[] thriftReq);
-
-  // Does an RPC to the Catalog Server to check if the given user is a Sentry admin.
-  public native static byte[] NativeSentryAdminCheck(byte[] thriftReq);
 
   // Parses a string of comma-separated key=value query options ('csvQueryOptions'),
   // updates the existing query options ('queryOptions') with them and returns the
@@ -147,9 +145,9 @@ public class FeSupport {
   public static TCacheJarResult CacheJar(String hdfsLocation) throws InternalException {
     Preconditions.checkNotNull(hdfsLocation);
     TCacheJarParams params = new TCacheJarParams(hdfsLocation);
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     byte[] result;
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       result = CacheJar(serializer.serialize(params));
       Preconditions.checkNotNull(result);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
@@ -188,9 +186,9 @@ public class FeSupport {
     Preconditions.checkState(!expr.contains(SlotRef.class));
     TExprBatch exprBatch = new TExprBatch();
     exprBatch.addToExprs(expr.treeToThrift());
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     byte[] result;
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       result = EvalExprsWithoutRowBounded(
           serializer.serialize(exprBatch), serializer.serialize(queryCtx), maxResultSize);
       Preconditions.checkNotNull(result);
@@ -219,8 +217,8 @@ public class FeSupport {
 
   public static TSymbolLookupResult LookupSymbol(TSymbolLookupParams params)
       throws InternalException {
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       byte[] resultBytes = LookupSymbol(serializer.serialize(params));
       Preconditions.checkNotNull(resultBytes);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
@@ -278,7 +276,6 @@ public class FeSupport {
    */
   public static TResultRow EvalPredicateBatch(List<Expr> exprs,
       TQueryCtx queryCtx) throws InternalException {
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     TExprBatch exprBatch = new TExprBatch();
     for (Expr expr: exprs) {
       // Make sure we only process boolean exprs.
@@ -288,6 +285,7 @@ public class FeSupport {
     }
     byte[] result;
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       result = EvalExprsWithoutRow(
           serializer.serialize(exprBatch), serializer.serialize(queryCtx));
       Preconditions.checkNotNull(result);
@@ -329,8 +327,8 @@ public class FeSupport {
     request.setHeader(new TCatalogServiceRequestHeader());
     request.setObject_descs(objectDescs);
 
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       byte[] result = PrioritizeLoad(serializer.serialize(request));
       Preconditions.checkNotNull(result);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
@@ -364,8 +362,8 @@ public class FeSupport {
     TGetPartitionStatsRequest request = new TGetPartitionStatsRequest();
     request.setTable_name(table.toThrift());
     TGetPartitionStatsResponse response = new TGetPartitionStatsResponse();
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       byte[] result = GetPartitionStats(serializer.serialize(request));
       Preconditions.checkNotNull(result);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
@@ -406,8 +404,8 @@ public class FeSupport {
     Preconditions.checkNotNull(csvQueryOptions);
     Preconditions.checkNotNull(queryOptions);
 
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       byte[] result = ParseQueryOptions(csvQueryOptions,
           serializer.serialize(queryOptions));
       Preconditions.checkNotNull(result);
@@ -444,15 +442,6 @@ public class FeSupport {
     return NativeGetPartialCatalogObject(thriftReq);
   }
 
-  public static byte[] CheckSentryAdmin(byte[] thriftReq) {
-    try {
-      return NativeSentryAdminCheck(thriftReq);
-    } catch (UnsatisfiedLinkError e) {
-      loadLibrary();
-    }
-    return NativeSentryAdminCheck(thriftReq);
-  }
-
   private static byte[] parseDateStringUtil(String date) {
     try {
       return nativeParseDateString(date);
@@ -483,6 +472,15 @@ public class FeSupport {
   }
 
   /**
+   * Calling this function before loadLibrary() causes external frontend
+   * initialization to be used during NativeFeInit()
+   */
+  public static synchronized void setExternalFE() {
+    Preconditions.checkState(!loaded_);
+    externalFE_ = true;
+  }
+
+  /**
    * This function should be called explicitly by the FeSupport to ensure that
    * native functions are loaded. Tests that depend on JniCatalog or JniFrontend
    * being instantiated should also call this function.
@@ -493,6 +491,6 @@ public class FeSupport {
     NativeLibUtil.loadLibrary("libfesupport.so");
     LOG.info("Loaded libfesupport.so");
     loaded_ = true;
-    NativeFeTestInit();
+    NativeFeInit(externalFE_);
   }
 }

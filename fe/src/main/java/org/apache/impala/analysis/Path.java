@@ -20,6 +20,7 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.google.common.base.MoreObjects;
 import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeTable;
@@ -27,10 +28,17 @@ import org.apache.impala.catalog.MapType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.VirtualColumn;
+import org.apache.impala.catalog.iceberg.IcebergMetadataTable;
+import org.apache.impala.thrift.TVirtualColumnType;
+import org.apache.impala.util.AcidUtils;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Represents a resolved or unresolved dot-separated path that is rooted at a registered
@@ -105,6 +113,8 @@ import com.google.common.collect.Lists;
  * of the query block that it is used in.
  */
 public class Path {
+  private final static Logger LOG = LoggerFactory.getLogger(Path.class);
+
   // Implicit field names of collections.
   public static final String ARRAY_ITEM_FIELD_NAME = "item";
   public static final String ARRAY_POS_FIELD_NAME = "pos";
@@ -124,6 +134,7 @@ public class Path {
 
   // Registered table alias that this path is rooted at, if any.
   // Null if the path is rooted at a catalog table/view.
+  // Note that this is also set for STAR path of "v.*" when "v" is a catalog table/view.
   private final TupleDescriptor rootDesc_;
 
   // Catalog table that this resolved path is rooted at, if any.
@@ -135,7 +146,9 @@ public class Path {
   private final Path rootPath_;
 
   // List of matched types and field positions set during resolution. The matched
-  // types/positions describe the physical path through the schema tree.
+  // types/positions describe the physical path through the schema tree of a catalog
+  // table/view. Empty if the path corresponds to a catalog table/view, e.g. when it's a
+  // TABLE_REF or when it's a STAR on a table/view.
   private final List<Type> matchedTypes_ = new ArrayList<>();
   private final List<Integer> matchedPositions_ = new ArrayList<>();
 
@@ -149,6 +162,11 @@ public class Path {
 
   // Caches the result of getAbsolutePath() to avoid re-computing it.
   private List<Integer> absolutePath_ = null;
+
+  private TVirtualColumnType virtualColType_ = TVirtualColumnType.NONE;
+
+  // Resolved path before we resolved it again inside the table masking view.
+  private Path pathBeforeMasking_ = null;
 
   /**
    * Constructs a Path rooted at the given rootDesc.
@@ -196,11 +214,20 @@ public class Path {
 
   /**
    * Resolves this path in the context of the root tuple descriptor / root table
-   * or continues resolving this relative path from an existing root path.
+   * or continues resolving this relative path from an existing root path. If normal
+   * path resolution fails it tries to resolve the path as a virtual column.
    * Returns true if the path could be fully resolved, false otherwise.
    * A failed resolution leaves this Path in a partially resolved state.
    */
   public boolean resolve() {
+    if (!resolveNonVirtualPath()) {
+      return resolveVirtualColumn();
+    } else {
+      return true;
+    }
+  }
+
+  private boolean resolveNonVirtualPath() {
     if (isResolved_) return true;
     Preconditions.checkState(rootDesc_ != null || rootTable_ != null);
     Type currentType = null;
@@ -220,8 +247,12 @@ public class Path {
     while (rawPathIdx < rawPath_.size()) {
       if (!currentType.isComplexType()) return false;
       StructType structType = getTypeAsStruct(currentType);
+      if (LOG.isTraceEnabled()) LOG.trace("structType: {}", structType.toSql());
       // Resolve explicit path.
       StructField field = structType.getField(rawPath_.get(rawPathIdx));
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("field: {}", field == null ? null : field.toSql(0));
+      }
       if (field == null) {
         // Resolve implicit path.
         if (structType instanceof CollectionStructType) {
@@ -255,6 +286,32 @@ public class Path {
     return true;
   }
 
+  private boolean resolveVirtualColumn() {
+    if (isResolved_) return true;
+    if (rootTable_ == null) return false;
+    if (rootDesc_ != null) {
+      if (rootDesc_.getType() != rootTable_.getType().getItemType()) {
+        // 'rootDesc_' describes a collection tuple. Currently we only allow virtual
+        // columns at the table-level.
+        return false;
+      }
+    }
+    if (rawPath_.size() != 1) return false;
+
+    String colName = rawPath_.get(0);
+    List<VirtualColumn> virtualColumns = rootTable_.getVirtualColumns();
+    for (VirtualColumn vCol : virtualColumns) {
+      if (vCol.getName().equalsIgnoreCase(colName)) {
+        virtualColType_ = vCol.getVirtualColumnType();
+        matchedTypes_.add(vCol.getType());
+        matchedPositions_.add(vCol.getPosition());
+        isResolved_ = true;
+        return true;
+      }
+    }
+    return false;
+  }
+
   /**
    * If the given type is a collection, returns a collection struct type representing
    * named fields of its explicit path. Returns the given type itself if it is already
@@ -280,6 +337,9 @@ public class Path {
    * a.b -> [<sessionDb>.a, a.b]
    * a.b.c -> [<sessionDb>.a, a.b]
    * a.b.c... -> [<sessionDb>.a, a.b]
+   *
+   * Notes on Iceberg tables:
+   * a.b.c -> translates to metadata table querying
    */
   public static List<TableName> getCandidateTables(List<String> path, String sessionDb) {
     Preconditions.checkArgument(path != null && !path.isEmpty());
@@ -288,7 +348,11 @@ public class Path {
     for (int tblNameIdx = 0; tblNameIdx < end; ++tblNameIdx) {
       String dbName = (tblNameIdx == 0) ? sessionDb : path.get(0);
       String tblName = path.get(tblNameIdx);
-      result.add(new TableName(dbName, tblName));
+      String vTblName = null;
+      if (IcebergMetadataTable.isIcebergMetadataTable(path)) {
+        vTblName = path.get(2);
+      }
+      result.add(new TableName(dbName, tblName, vTblName));
     }
     return result;
   }
@@ -299,6 +363,16 @@ public class Path {
   public boolean isRootedAtTuple() { return rootDesc_ != null; }
   public List<String> getRawPath() { return rawPath_; }
   public boolean isResolved() { return isResolved_; }
+  public TVirtualColumnType getVirtualColumnType() { return virtualColType_; }
+  public boolean isVirtualColumn() {
+    return virtualColType_ != TVirtualColumnType.NONE;
+  }
+  public boolean isMaskedPath() { return pathBeforeMasking_ != null; }
+  public Path getPathBeforeMasking() { return pathBeforeMasking_; }
+  public void setPathBeforeMasking(Path p) {
+    Preconditions.checkState(p.isResolved());
+    pathBeforeMasking_ = p;
+  }
 
   public List<Type> getMatchedTypes() {
     Preconditions.checkState(isResolved_);
@@ -433,7 +507,43 @@ public class Path {
     absolutePath_ = new ArrayList<>();
     if (rootDesc_ != null) absolutePath_.addAll(rootDesc_.getPath().getAbsolutePath());
     absolutePath_.addAll(matchedPositions_);
+    // ACID table schema path differs from file schema path. Let's convert it here.
+    if (!absolutePath_.isEmpty() &&
+        // Only convert if path was already absolute. Otherwise 'matchedPositions_' is
+        // relative to a path that we have already converted.
+        matchedPositions_.size() == absolutePath_.size() &&
+        rootTable_ != null &&
+        AcidUtils.isFullAcidTable(rootTable_.getMetaStoreTable().getParameters())) {
+      convertToFullAcidFilePath();
+    }
     return absolutePath_;
+  }
+
+  /**
+   * Converts table schema path to file schema path. Well, it's actually somewhere between
+   * the two because the first column is offsetted with the number of partitions.
+   */
+  private void convertToFullAcidFilePath() {
+    // For Full ACID tables we need to create a schema path that corresponds to the
+    // ACID file schema.
+    if (virtualColType_ != TVirtualColumnType.NONE) return;
+    int numPartitions = rootTable_.getNumClusteringCols();
+    if (absolutePath_.get(0) == numPartitions) {
+      // The path refers to the synthetic "row__id" column.
+      Preconditions.checkState(absolutePath_.size() == 2);
+      // "row__id" is not present in the file so remove it.
+      absolutePath_.remove(0);
+      // The member of the synthetic "row__id" field is actually a top-level table col,
+      // so we need to add 'numPartitions' to its index.
+      absolutePath_.set(0, absolutePath_.get(0) + numPartitions);
+    } else if (absolutePath_.get(0) > numPartitions) {
+      // In the file user columns are embedded inside the "row" column which is
+      // the fifth column in a full ACID file.
+      absolutePath_.add(0, numPartitions + 5);
+      // Since the user column is not top-level anymore we need to subtract
+      // 'numPartitions' and 1 (the synthetic "row__id").
+      absolutePath_.set(1, absolutePath_.get(1) - numPartitions - 1);
+    }
   }
 
   @Override
@@ -447,6 +557,14 @@ public class Path {
     }
     if (rawPath_.isEmpty()) return pathRoot;
     return pathRoot + "." + Joiner.on(".").join(rawPath_);
+  }
+
+  public String debugString() {
+    return MoreObjects.toStringHelper(this)
+        .add("rootTable", rootTable_)
+        .add("rootDesc", rootDesc_)
+        .add("rawPath", rawPath_)
+        .toString();
   }
 
   /**

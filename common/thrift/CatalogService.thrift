@@ -24,6 +24,7 @@ include "Types.thrift"
 include "Status.thrift"
 include "Results.thrift"
 include "hive_metastore.thrift"
+include "SqlConstraints.thrift"
 
 // CatalogServer service API and related structs.
 
@@ -54,6 +55,10 @@ struct TCatalogServiceRequestHeader {
 
   // The client IP address.
   3: optional string client_ip
+
+  // Set by LocalCatalog coordinators. The response will contain minimal catalog objects
+  // (for invalidations) instead of full catalog objects.
+  4: optional bool want_minimal_response
 }
 
 // Returns details on the result of an operation that updates the catalog. Information
@@ -79,6 +84,18 @@ struct TCatalogUpdateResult {
 
   // The resulting TCatalogObjects that were removed, if applicable.
   6: optional list<CatalogObjects.TCatalogObject> removed_catalog_objects
+}
+
+// Subset of query options passed to DDL operations
+struct TDdlQueryOptions {
+  // True if SYNC_DDL is set in query options
+  1: required bool sync_ddl
+
+  // Passes the debug actions to catalogd if the query option is set.
+  2: optional string debug_action
+
+  // Maximum wait time on an HMS ACID lock in seconds.
+  3: optional i32 lock_max_wait_time_s
 }
 
 // Request for executing a DDL operation (CREATE, ALTER, DROP).
@@ -144,17 +161,17 @@ struct TDdlExecRequest {
   // Parameters for GRANT/REVOKE privilege
   21: optional JniCatalog.TGrantRevokePrivParams grant_revoke_priv_params
 
-  // True if SYNC_DDL is set in query options
-  22: required bool sync_ddl
-
   // Parameters for COMMENT ON
-  23: optional JniCatalog.TCommentOnParams comment_on_params
+  22: optional JniCatalog.TCommentOnParams comment_on_params
 
   // Parameters for ALTER DATABASE
-  24: optional JniCatalog.TAlterDbParams alter_db_params
+  23: optional JniCatalog.TAlterDbParams alter_db_params
 
   // Parameters for replaying an exported testcase.
-  25: optional JniCatalog.TCopyTestCaseReq copy_test_case_params
+  24: optional JniCatalog.TCopyTestCaseReq copy_test_case_params
+
+  // Query options passed to DDL operations.
+  25: required TDdlQueryOptions query_options
 }
 
 // Response from executing a TDdlExecRequest
@@ -186,6 +203,26 @@ struct TDdlExecResponse {
   6: optional string table_location
 }
 
+// Parameters for the Iceberg operation.
+struct TIcebergOperationParam {
+  // Iceberg partition spec used by this operation
+  1: optional i32 spec_id;
+
+  // Iceberg data files to append to the table, encoded in FlatBuffers.
+  2: required list<binary> iceberg_data_files_fb;
+
+  // Is overwrite operation
+  3: required bool is_overwrite = false;
+
+  // The snapshot id when the operation was started
+  4: optional i64 initial_snapshot_id;
+}
+
+// Per-partion info needed by Catalog to handle an INSERT.
+struct TUpdatedPartition {
+  1: required list<string> files;
+}
+
 // Updates the metastore with new partition information and returns a response
 // with details on the result of the operation. Used to add partitions after executing
 // DML operations, and could potentially be used in the future to update column stats
@@ -208,13 +245,22 @@ struct TUpdateCatalogRequest {
 
   // List of partitions that are new and need to be created. May
   // include the root partition (represented by the empty string).
-  6: required set<string> created_partitions;
+  6: required map<string, TUpdatedPartition> updated_partitions;
 
   // True if the update corresponds to an "insert overwrite" operation
   7: required bool is_overwrite;
 
   // ACID transaction ID for transactional inserts.
-  8: optional i64 transaction_id;
+  8: optional i64 transaction_id
+
+  // ACID write ID for transactional inserts.
+  9: optional i64 write_id
+
+  // Descriptor object about the Iceberg operation.
+  10: optional TIcebergOperationParam iceberg_operation
+
+  // Passes the debug actions to catalogd if the query option is set.
+  11: optional string debug_action
 }
 
 // Response from a TUpdateCatalogRequest
@@ -248,6 +294,13 @@ struct TResetMetadataRequest {
 
   // If set, refreshes authorization metadata.
   8: optional bool authorization
+
+  // If set, refreshes partition objects which are modified externally.
+  // Applicable only when refreshing the table.
+  9: optional bool refresh_updated_hms_partitions
+
+  // debug_action is set from the query_option when available.
+  10: optional string debug_action
 }
 
 // Response from TResetMetadataRequest
@@ -312,7 +365,9 @@ struct TTableInfoSelector {
   // ... each such partition should include its name.
   3: bool want_partition_names
 
-  // ... each such partition should include metadata (location, etc).
+  // ... each such partition should include metadata (location, etc). Note that the
+  // response won't contain hms partition structs (use want_hms_partition instead for
+  // this purpose).
   4: bool want_partition_metadata
 
   // ... each such partition should include its file info
@@ -324,6 +379,34 @@ struct TTableInfoSelector {
   // ... each partition should include the partition stats serialized as a byte[]
   // and that is deflate-compressed.
   7: bool want_partition_stats
+
+  // The response should contain table constraints like primary keys
+  // and foreign keys
+  8: bool want_table_constraints
+
+  // If this is for a ACID table and this is set, this table info returned
+  // will be consistent the provided valid_write_ids
+  9: optional CatalogObjects.TValidWriteIdList valid_write_ids
+
+  // If the table id is provided the catalog service compares this table id
+  // with the HMS table which it has and triggers a reload in case it doesn't match.
+  // this field is only used when valid_write_ids is set, otherwise it is ignored
+  10: optional i64 table_id = -1
+
+  // The response should contain the column statistics for all columns. If this is set
+  // to true, the list provided in want_stats_for_column_names will be ignored and
+  // stats for all columns will be returned.
+  11: optional bool want_stats_for_all_columns
+
+  // The response should contain the HMS partition struct. This indicates all fields
+  // requested by want_partition_metadata will be contained in the HMS partitions.
+  // So setting both want_partition_metadata and want_hms_partition to true is a waste.
+  // Note that want_hms_partition=true will consume more space (IMPALA-7501), so only use
+  // it in cases the clients do need HMS partition structs.
+  12: bool want_hms_partition
+
+  // The response should contain information about the Iceberg table.
+  13: bool want_iceberg_table
 }
 
 // Returned information about a particular partition.
@@ -333,11 +416,20 @@ struct TPartialPartitionInfo {
   // Set if 'want_partition_names' was set in TTableInfoSelector.
   2: optional string name
 
-  // Set if 'want_partition_metadata' was set in TTableInfoSelector.
+  // Set if 'want_hms_partition' was set in TTableInfoSelector.
   3: optional hive_metastore.Partition hms_partition
 
   // Set if 'want_partition_files' was set in TTableInfoSelector.
   4: optional list<CatalogObjects.THdfsFileDesc> file_descriptors
+
+  // Set if 'want_partition_files' was set in TTableInfoSelector.
+  8: optional list<CatalogObjects.THdfsFileDesc> insert_file_descriptors
+
+  // Set if 'want_partition_files' was set in TTableInfoSelector.
+  9: optional list<CatalogObjects.THdfsFileDesc> delete_file_descriptors
+
+  // Set if 'want_partition_files' was set in TTableInfoSelector.
+  14: optional i64 last_compaction_id
 
   // Deflate-compressed byte[] representation of TPartitionStats for this partition.
   // Set if 'want_partition_stats' was set in TTableInfoSelector. Not set if the
@@ -349,6 +441,19 @@ struct TPartialPartitionInfo {
   // TTableInfoSelector. Incremental stats data can be fetched by setting
   // 'want_partition_stats' in TTableInfoSelector.
   6: optional bool has_incremental_stats
+
+  // Set to true if the partition is marked as cached by hdfs caching. Does not
+  // necessarily mean the data is cached. Set when 'want_partition_metadata' is true in
+  // TTableInfoSelector.
+  7: optional bool is_marked_cached
+
+  // Fields 10-13 are set if 'want_partition_metadata' was set in TTableInfoSelector.
+  // These fields are actual info of hms_partition that Impala needs, and are better
+  // compressed.
+  10: optional map<string, string> hms_parameters
+  11: optional i64 write_id
+  12: optional CatalogObjects.THdfsStorageDescriptor hdfs_storage_descriptor
+  13: optional CatalogObjects.THdfsPartitionLocation location
 }
 
 // Returned information about a Table, as selected by TTableInfoSelector.
@@ -366,15 +471,59 @@ struct TPartialTableInfo {
 
   3: optional list<hive_metastore.ColumnStatisticsObj> column_stats
 
+  4: optional list<CatalogObjects.TColumn> virtual_columns
+
   // Set if this table needs storage access during metadata load.
   // Time used for storage loading in nanoseconds.
-  4: optional i64 storage_metadata_load_time_ns
+  5: optional i64 storage_metadata_load_time_ns
 
   // Each TNetworkAddress is a datanode which contains blocks of a file in the table.
   // Used so that each THdfsFileBlock can just reference an index in this list rather
   // than duplicate the list of network address, which helps reduce memory usage.
   // Only used when partition files are fetched.
-  7: optional list<Types.TNetworkAddress> network_addresses
+  8: optional list<Types.TNetworkAddress> network_addresses
+
+  // SqlConstraints for the table, small enough that we can
+  // return them wholesale.
+  9: optional SqlConstraints.TSqlConstraints sql_constraints
+
+  // Valid write id list of ACID table.
+  10: optional CatalogObjects.TValidWriteIdList valid_write_ids;
+
+  // Set if this table is marked as cached by hdfs caching. Does not necessarily mean the
+  // data is cached or that all/any partitions are cached. Only used in analyzing DDLs.
+  11: optional bool is_marked_cached
+
+  // The prefixes of locations of partitions in this table. See THdfsPartitionLocation for
+  // the description of how a prefix is computed.
+  12: optional list<string> partition_prefixes
+
+  // Iceberg table information
+  13: optional CatalogObjects.TIcebergTable iceberg_table
+}
+
+// Table types in the user's perspective. Though we treat materialized view as table
+// internally, materialized views are shown in view type to the users.
+enum TImpalaTableType {
+  TABLE,
+  VIEW,
+  UNKNOWN
+}
+
+struct TBriefTableMeta {
+  // Name of the table
+  1: required string name
+
+  // HMS table type of the table: EXTERNAL_TABLE, MANAGED_TABLE, VIRTUAL_VIEW, etc.
+  // Unset if the table is unloaded.
+  // Deprecated since 4.2 (IMPALA-9670).
+  2: optional string msType
+
+  // Comment(remark) of the table. Unset if the table is unloaded.
+  3: optional string comment
+
+  // Impala table type of the table: TABLE, VIEW, UNKNOWN
+  4: optional TImpalaTableType tblType
 }
 
 // Selector for partial information about a Database.
@@ -382,8 +531,8 @@ struct TDbInfoSelector {
   // The response should include the HMS Database object.
   1: bool want_hms_database
 
-  // The response should include the list of table names in the DB.
-  2: bool want_table_names
+  // The response should include TBriefTableMeta of tables in the DB.
+  2: bool want_brief_meta_of_tables
 
   // The response should include the list of function names in the DB.
   3: bool want_function_names
@@ -392,7 +541,7 @@ struct TDbInfoSelector {
 // Returned information about a Database, as selected by TDbInfoSelector.
 struct TPartialDbInfo {
   1: optional hive_metastore.Database hms_database
-  2: optional list<string> table_names
+  2: optional list<TBriefTableMeta> brief_meta_of_tables
   3: optional list<string> function_names
 }
 
@@ -464,6 +613,13 @@ struct TGetCatalogObjectResponse {
 struct TGetPartitionStatsRequest {
   1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
   2: required CatalogObjects.TTableName table_name
+  // if the table is transactional then this field represents the client's view
+  // of the table snapshot view in terms of ValidWriteIdList.
+  3: optional CatalogObjects.TValidWriteIdList valid_write_ids
+  // If the table id is provided the catalog service compares this table id
+  // with the HMS table which it has and triggers a reload in case it doesn't match.
+  // this field is only used when valid_write_ids is set, otherwise it is ignored
+  4: optional i64 table_id = -1
 }
 
 // Response for requesting partition statistics. All partition statistics
@@ -496,23 +652,6 @@ struct TPrioritizeLoadRequest {
 struct TPrioritizeLoadResponse {
   // The status of the operation, OK if the operation was successful.
   1: required Status.TStatus status
-}
-
-// Request to perform a privilege check with the Sentry Service to determine
-// if the requesting user is a Sentry Service admin.
-struct TSentryAdminCheckRequest {
-  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
-
-  // Common header included in all CatalogService requests.
-  2: optional TCatalogServiceRequestHeader header
-}
-
-struct TSentryAdminCheckResponse {
-  // Returns OK if the operation was successful.
-  1: optional Status.TStatus status
-
-  // Returns true if the user is a Sentry admin user.
-  2: required bool is_admin
 }
 
 struct TTableUsage {
@@ -556,13 +695,6 @@ service CatalogService {
   // Prioritize the loading of metadata for the CatalogObjects specified in the
   // TPrioritizeLoadRequest.
   TPrioritizeLoadResponse PrioritizeLoad(1: TPrioritizeLoadRequest req);
-
-  // Performs a check with the Sentry Service to determine if the requesting user
-  // is configured as an admin on the Sentry Service. This API may be removed in
-  // the future and external clients should not rely on using it.
-  // TODO: When Sentry Service has a better mechanism to perform these changes this API
-  // should be deprecated.
-  TSentryAdminCheckResponse SentryAdminCheck(1: TSentryAdminCheckRequest req);
 
   // Fetch partial information about some object in the catalog.
   TGetPartialCatalogObjectResponse GetPartialCatalogObject(

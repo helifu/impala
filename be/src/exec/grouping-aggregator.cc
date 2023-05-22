@@ -21,6 +21,7 @@
 
 #include "codegen/llvm-codegen.h"
 #include "exec/exec-node.h"
+#include "exec/exec-node.inline.h"
 #include "exec/hash-table.inline.h"
 #include "exprs/agg-fn-evaluator.h"
 #include "exprs/scalar-expr.h"
@@ -29,13 +30,16 @@
 #include "runtime/buffered-tuple-stream.inline.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec-env.h"
+#include "runtime/fragment-state.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
+#include "runtime/string-value.h"
 #include "runtime/tuple-row.h"
 #include "runtime/tuple.h"
 #include "util/runtime-profile-counters.h"
+#include "util/runtime-profile.h"
 #include "util/string-parser.h"
 
 #include "gen-cpp/PlanNodes_types.h"
@@ -43,6 +47,8 @@
 #include "common/names.h"
 
 namespace impala {
+
+typedef HashTable::BucketType BucketType;
 
 /// The minimum reduction factor (input rows divided by output rows) to grow hash tables
 /// in a streaming preaggregation, given that the hash tables are currently the given
@@ -83,14 +89,14 @@ static const StreamingHtMinReductionEntry STREAMING_HT_MIN_REDUCTION[] = {
 };
 
 GroupingAggregatorConfig::GroupingAggregatorConfig(
-    const TAggregator& taggregator, RuntimeState* state, PlanNode* pnode)
-  : AggregatorConfig(taggregator, state, pnode),
+    const TAggregator& taggregator, FragmentState* state, PlanNode* pnode, int agg_idx)
+  : AggregatorConfig(taggregator, state, pnode, agg_idx),
     intermediate_row_desc_(intermediate_tuple_desc_, false),
     is_streaming_preagg_(taggregator.use_streaming_preaggregation),
     resource_profile_(taggregator.resource_profile){};
 
 Status GroupingAggregatorConfig::Init(
-    const TAggregator& taggregator, RuntimeState* state, PlanNode* pnode) {
+    const TAggregator& taggregator, FragmentState* state, PlanNode* pnode) {
   RETURN_IF_ERROR(ScalarExpr::Create(
       taggregator.grouping_exprs, input_row_desc_, state, &grouping_exprs_));
 
@@ -98,10 +104,8 @@ Status GroupingAggregatorConfig::Init(
   for (int i = 0; i < grouping_exprs_.size(); ++i) {
     SlotDescriptor* desc = intermediate_tuple_desc_->slots()[i];
     DCHECK(desc->type().type == TYPE_NULL || desc->type() == grouping_exprs_[i]->type());
-    // Hack to avoid TYPE_NULL SlotRefs.
-    SlotRef* build_expr = state->obj_pool()->Add(desc->type().type != TYPE_NULL ?
-            new SlotRef(desc) :
-            new SlotRef(desc, TYPE_BOOLEAN));
+    // Use SlotRef::TypeSafeCreate() to avoid TYPE_NULL SlotRefs.
+    SlotRef* build_expr = state->obj_pool()->Add(SlotRef::TypeSafeCreate(desc));
     build_exprs_.push_back(build_expr);
     // Not an entry point because all hash table callers support codegen.
     RETURN_IF_ERROR(
@@ -113,7 +117,16 @@ Status GroupingAggregatorConfig::Init(
   for (int i = 0; i < aggregate_functions_.size(); ++i) {
     needs_serialize_ |= aggregate_functions_[i]->SupportsSerialize();
   }
+
+  hash_table_config_ = state->obj_pool()->Add(new HashTableConfig(
+      build_exprs_, grouping_exprs_, true, vector<bool>(build_exprs_.size(), true)));
   return Status::OK();
+}
+
+void GroupingAggregatorConfig::Close() {
+  ScalarExpr::Close(build_exprs_);
+  ScalarExpr::Close(grouping_exprs_);
+  AggregatorConfig::Close();
 }
 
 static const int STREAMING_HT_MIN_REDUCTION_SIZE =
@@ -121,9 +134,10 @@ static const int STREAMING_HT_MIN_REDUCTION_SIZE =
 
 GroupingAggregator::GroupingAggregator(ExecNode* exec_node, ObjectPool* pool,
     const GroupingAggregatorConfig& config, int64_t estimated_input_cardinality,
-    int agg_idx)
-  : Aggregator(
-        exec_node, pool, config, Substitute("GroupingAggregator $0", agg_idx), agg_idx),
+    bool needUnsetLimit)
+  : Aggregator(exec_node, pool, config,
+      Substitute("$0$1", RuntimeProfile::PREFIX_GROUPING_AGGREGATOR, config.agg_idx_)),
+    hash_table_config_(*config.hash_table_config_),
     intermediate_row_desc_(config.intermediate_row_desc_),
     is_streaming_preagg_(config.is_streaming_preagg_),
     needs_serialize_(config.needs_serialize_),
@@ -133,9 +147,14 @@ GroupingAggregator::GroupingAggregator(ExecNode* exec_node, ObjectPool* pool,
     resource_profile_(config.resource_profile_),
     is_in_subplan_(exec_node->IsInSubplan()),
     limit_(exec_node->limit()),
+    add_batch_impl_fn_(config.add_batch_impl_fn_),
+    add_batch_streaming_impl_fn_(config.add_batch_streaming_impl_fn_),
     estimated_input_cardinality_(estimated_input_cardinality),
     partition_pool_(new ObjectPool()) {
   DCHECK_EQ(PARTITION_FANOUT, 1 << NUM_PARTITIONING_BITS);
+  if (needUnsetLimit) {
+    UnsetLimit();
+  }
 }
 
 Status GroupingAggregator::Prepare(RuntimeState* state) {
@@ -168,10 +187,9 @@ Status GroupingAggregator::Prepare(RuntimeState* state) {
         runtime_profile()->AddHighWaterMarkCounter("MaxPartitionLevel", TUnit::UNIT);
   }
 
-  RETURN_IF_ERROR(HashTableCtx::Create(pool_, state, build_exprs_, grouping_exprs_, true,
-      vector<bool>(build_exprs_.size(), true), state->fragment_hash_seed(),
-      MAX_PARTITION_DEPTH, 1, expr_perm_pool_.get(), expr_results_pool_.get(),
-      expr_results_pool_.get(), &ht_ctx_));
+  RETURN_IF_ERROR(HashTableCtx::Create(pool_, state, hash_table_config_,
+      state->fragment_hash_seed(), MAX_PARTITION_DEPTH, 1, expr_perm_pool_.get(),
+      expr_results_pool_.get(), expr_results_pool_.get(), &ht_ctx_));
 
   reservation_tracker_.reset(new ReservationTracker);
   reservation_tracker_->InitChildTracker(runtime_profile_,
@@ -183,14 +201,14 @@ Status GroupingAggregator::Prepare(RuntimeState* state) {
   return Status::OK();
 }
 
-void GroupingAggregator::Codegen(RuntimeState* state) {
+void GroupingAggregatorConfig::Codegen(FragmentState* state) {
   LlvmCodeGen* codegen = state->codegen();
   DCHECK(codegen != nullptr);
   TPrefetchMode::type prefetch_mode = state->query_options().prefetch_mode;
-  Status codegen_status = is_streaming_preagg_ ?
+  Status status = is_streaming_preagg_ ?
       CodegenAddBatchStreamingImpl(codegen, prefetch_mode) :
       CodegenAddBatchImpl(codegen, prefetch_mode);
-  runtime_profile()->AddCodegenMsg(codegen_status.ok(), codegen_status);
+  codegen_status_msg_ = FragmentState::GenerateCodegenMsg(status.ok(), status);
 }
 
 Status GroupingAggregator::Open(RuntimeState* state) {
@@ -201,6 +219,25 @@ Status GroupingAggregator::Open(RuntimeState* state) {
   if (!buffer_pool_client()->is_registered()) {
     DCHECK_GE(resource_profile_.min_reservation, MinReservation());
     RETURN_IF_ERROR(reservation_manager_.ClaimBufferReservation(state));
+  }
+
+  // Init the SubReservations for non-streaming instances. Open() may be called many times
+  // if this is in a subplan. Only init them once.
+  if (!is_streaming_preagg_ && large_write_page_reservation_.is_closed()) {
+    DCHECK(large_read_page_reservation_.is_closed());
+    large_write_page_reservation_.Init(buffer_pool_client());
+    large_read_page_reservation_.Init(buffer_pool_client());
+    // The min reservation only guarantees reading one large page and writing one large
+    // page at the same time. Save the extra reservation so we can restore them when we
+    // actually need them, to avoid accidentally occupy them for other purposes.
+    int64_t extra_reservation = resource_profile_.max_row_buffer_size
+        - resource_profile_.spillable_buffer_size;
+    if (extra_reservation > 0) {
+      DCHECK_GT(buffer_pool_client()->GetUnusedReservation(), extra_reservation * 2)
+        << buffer_pool_client()->DebugString() << "\n" << resource_profile_;
+      SaveLargeReadPageReservation();
+      SaveLargeWritePageReservation();
+    }
   }
 
   DCHECK(ht_ctx_.get() != nullptr);
@@ -246,6 +283,12 @@ Status GroupingAggregator::GetRowsFromPartition(
     if (output_partition_ != nullptr) {
       output_partition_->Close(false);
       output_partition_ = nullptr;
+      // Try to save the large write page reservation (if it's used) after closing
+      // a partition.
+      if (!large_write_page_reservation_.is_closed()
+          && large_write_page_reservation_.GetReservation() == 0) {
+        TrySaveLargeWritePageReservation();
+      }
     }
     if (aggregated_partitions_.empty() && spilled_partitions_.empty()) {
       // No more partitions, all done.
@@ -277,7 +320,7 @@ Status GroupingAggregator::GetRowsFromPartition(
 
     int row_idx = row_batch->AddRow();
     TupleRow* row = row_batch->GetRow(row_idx);
-    Tuple* intermediate_tuple = output_iterator_.GetTuple();
+    Tuple* intermediate_tuple = output_iterator_.GetTuple<BucketType::MATCH_UNSET>();
     Tuple* output_tuple = GetOutputTuple(output_partition_->agg_fn_evals,
         intermediate_tuple, row_batch->tuple_data_pool());
     output_iterator_.Next();
@@ -363,7 +406,7 @@ void GroupingAggregator::CleanupHashTbl(
     Tuple* dummy_dst = nullptr;
     dummy_dst = Tuple::Create(output_tuple_desc_->byte_size(), tuple_pool_.get());
     while (!it.AtEnd()) {
-      Tuple* tuple = it.GetTuple();
+      Tuple* tuple = it.GetTuple<BucketType::MATCH_UNSET>();
       AggFnEvaluator::Finalize(agg_fn_evals, tuple, dummy_dst);
       it.Next();
       // Free any expr result allocations to prevent them accumulating excessively.
@@ -371,7 +414,7 @@ void GroupingAggregator::CleanupHashTbl(
     }
   } else {
     while (!it.AtEnd()) {
-      Tuple* tuple = it.GetTuple();
+      Tuple* tuple = it.GetTuple<BucketType::MATCH_UNSET>();
       AggFnEvaluator::Serialize(agg_fn_evals, tuple);
       it.Next();
       // Free any expr result allocations to prevent them accumulating excessively.
@@ -399,13 +442,16 @@ void GroupingAggregator::Close(RuntimeState* state) {
   ClosePartitions();
 
   if (tuple_pool_.get() != nullptr) tuple_pool_->FreeAll();
-  if (ht_ctx_.get() != nullptr) ht_ctx_->Close(state);
+  if (ht_ctx_.get() != nullptr) {
+    ht_ctx_->StatsCountersAdd(ht_stats_profile_.get());
+    ht_ctx_->Close(state);
+  }
   ht_ctx_.reset();
   if (serialize_stream_.get() != nullptr) {
     serialize_stream_->Close(nullptr, RowBatch::FlushMode::NO_FLUSH_RESOURCES);
   }
-  ScalarExpr::Close(grouping_exprs_);
-  ScalarExpr::Close(build_exprs_);
+  large_write_page_reservation_.Close();
+  large_read_page_reservation_.Close();
   reservation_manager_.Close(state);
   if (reservation_tracker_ != nullptr) reservation_tracker_->Close();
   // Must be called after tuple_pool_ is freed, so that mem_tracker_ can be closed.
@@ -418,10 +464,11 @@ Status GroupingAggregator::AddBatch(RuntimeState* state, RowBatch* batch) {
   num_input_rows_ += batch->num_rows();
 
   TPrefetchMode::type prefetch_mode = state->query_options().prefetch_mode;
-  if (add_batch_impl_fn_ != nullptr) {
-    RETURN_IF_ERROR(add_batch_impl_fn_(this, batch, prefetch_mode, ht_ctx_.get()));
+  GroupingAggregatorConfig::AddBatchImplFn add_batch_impl_fn = add_batch_impl_fn_.load();
+  if (add_batch_impl_fn != nullptr) {
+    RETURN_IF_ERROR(add_batch_impl_fn(this, batch, prefetch_mode, ht_ctx_.get(), true));
   } else {
-    RETURN_IF_ERROR(AddBatchImpl<false>(batch, prefetch_mode, ht_ctx_.get()));
+    RETURN_IF_ERROR(AddBatchImpl<false>(batch, prefetch_mode, ht_ctx_.get(), true));
   }
 
   return Status::OK();
@@ -429,7 +476,6 @@ Status GroupingAggregator::AddBatch(RuntimeState* state, RowBatch* batch) {
 
 Status GroupingAggregator::AddBatchStreaming(
     RuntimeState* state, RowBatch* out_batch, RowBatch* child_batch, bool* eos) {
-  RETURN_IF_ERROR(QueryMaintenance(state));
   SCOPED_TIMER(streaming_timer_);
   RETURN_IF_ERROR(QueryMaintenance(state));
   num_input_rows_ += child_batch->num_rows();
@@ -463,8 +509,10 @@ Status GroupingAggregator::AddBatchStreaming(
   }
 
   TPrefetchMode::type prefetch_mode = state->query_options().prefetch_mode;
-  if (add_batch_streaming_impl_fn_ != nullptr) {
-    RETURN_IF_ERROR(add_batch_streaming_impl_fn_(this, agg_idx_, needs_serialize_,
+  GroupingAggregatorConfig::AddBatchStreamingImplFn fn
+      = add_batch_streaming_impl_fn_.load();
+  if (fn != nullptr) {
+    RETURN_IF_ERROR(fn(this, agg_idx_, needs_serialize_,
         prefetch_mode, child_batch, out_batch, ht_ctx_.get(), remaining_capacity));
   } else {
     RETURN_IF_ERROR(AddBatchStreamingImpl(agg_idx_, needs_serialize_, prefetch_mode,
@@ -565,6 +613,43 @@ void GroupingAggregator::CopyGroupingValues(
   }
 }
 
+int GroupingAggregator::GetNumPinnedPartitions() {
+  // If we are building a spilled partition, all items of hash_partitions_ are the same.
+  // Just need to check the first one.
+  if (hash_partitions_[0] == hash_partitions_[1]) {
+    return hash_partitions_[0]->is_spilled() ? 0 : 1;
+  }
+  int res = 0;
+  for (Partition* hash_partition : hash_partitions_) {
+    if (!hash_partition->is_spilled()) ++res;
+  }
+  return res;
+}
+
+bool GroupingAggregator::AddRowToSpilledStream(BufferedTupleStream* stream,
+    TupleRow* __restrict__ row, Status* status) {
+  DCHECK(!stream->is_pinned());
+  if (LIKELY(stream->AddRow(row, status))) return true;
+  if (!status->ok()) return false;
+  // We fail to add a large row due to run out of unused reservation and fail to increase
+  // the reservation. If we don't have the serialize stream, spilling partitions don't
+  // need extra reservation so we can restore the large write page reservation and try
+  // again. The same if we have the serialize stream but all partitions are spilled.
+  if ((!needs_serialize_ || GetNumPinnedPartitions() == 0)
+      && large_write_page_reservation_.GetReservation() > 0) {
+    RestoreLargeWritePageReservation();
+    if (LIKELY(stream->AddRow(row, status))) {
+      // 'stream' is spilled so the large write page should already be spilled after it's
+      // written.
+      SaveLargeWritePageReservation();
+      return true;
+    }
+    DCHECK(!status->ok()) << "Extra reservation not used by AddRow in "
+        << DebugString() << ":\n" << buffer_pool_client()->DebugString();
+  }
+  return false;
+}
+
 template <bool AGGREGATED_ROWS>
 Status GroupingAggregator::AppendSpilledRow(
     Partition* __restrict__ partition, TupleRow* __restrict__ row) {
@@ -575,16 +660,21 @@ Status GroupingAggregator::AppendSpilledRow(
       partition->unaggregated_row_stream.get();
   DCHECK(!stream->is_pinned());
   Status status;
-  if (LIKELY(stream->AddRow(row, &status))) return Status::OK();
+  if (LIKELY(AddRowToSpilledStream(stream, row, &status))) return Status::OK();
   RETURN_IF_ERROR(status);
 
-  // Keep trying to free memory by spilling until we succeed or hit an error.
-  // Running out of partitions to spill is treated as an error by SpillPartition().
-  while (true) {
+  // Keep trying to free memory by spilling and retry AddRow() until we run out of
+  // partitions or hit an error.
+  for (int n = GetNumPinnedPartitions(); n > 0; --n) {
     RETURN_IF_ERROR(SpillPartition(AGGREGATED_ROWS));
-    if (stream->AddRow(row, &status)) return Status::OK();
+    if (LIKELY(AddRowToSpilledStream(stream, row, &status))) return Status::OK();
     RETURN_IF_ERROR(status);
   }
+  // If we have spilled all partitions, we should be able to add the row use the large
+  // write page reservation. This indicates a bug that we can't work in min reservation.
+  return Status(TErrorCode::INTERNAL_ERROR, Substitute("Internal error: No reservation "
+      "for writing a large page even after all partitions are spilled in $0:\n$1",
+      DebugString(), buffer_pool_client()->DebugString()));
 }
 
 void GroupingAggregator::SetDebugOptions(const TDebugOptions& debug_options) {
@@ -603,7 +693,19 @@ void GroupingAggregator::DebugString(int indentation_level, stringstream* out) c
        << "intermediate_tuple_id=" << intermediate_tuple_id_
        << " output_tuple_id=" << output_tuple_id_ << " needs_finalize=" << needs_finalize_
        << " grouping_exprs=" << ScalarExpr::DebugString(grouping_exprs_)
-       << " agg_exprs=" << AggFn::DebugString(agg_fns_);
+       << " agg_exprs=" << AggFn::DebugString(agg_fns_)
+       << " large_read_page_reservation=";
+  if (large_read_page_reservation_.is_closed()) {
+    *out << "<closed>";
+  } else {
+    *out << large_read_page_reservation_.GetReservation();
+  }
+  *out << " large_write_page_reservation=";
+  if (large_write_page_reservation_.is_closed()) {
+    *out << "<closed>";
+  } else {
+    *out << large_write_page_reservation_.GetReservation();
+  }
   *out << ")";
 }
 
@@ -669,7 +771,7 @@ Status GroupingAggregator::CreateHashPartitions(int level, int single_partition_
 }
 
 Status GroupingAggregator::CheckAndResizeHashPartitions(
-    bool partitioning_aggregated_rows, int num_rows, const HashTableCtx* ht_ctx) {
+    bool partitioning_aggregated_rows, int num_rows, HashTableCtx* ht_ctx) {
   DCHECK(!is_streaming_preagg_);
   for (int i = 0; i < PARTITION_FANOUT; ++i) {
     Partition* partition = hash_partitions_[i];
@@ -760,8 +862,10 @@ Status GroupingAggregator::BuildSpilledPartition(Partition** built_partition) {
   // significantly, we could do better here by keeping the incomplete hash table in
   // memory and only spilling unaggregated rows that didn't fit in the hash table
   // (somewhat similar to the passthrough pre-aggregation).
-  RETURN_IF_ERROR(ProcessStream<true>(src_partition->aggregated_row_stream.get()));
-  RETURN_IF_ERROR(ProcessStream<false>(src_partition->unaggregated_row_stream.get()));
+  RETURN_IF_ERROR(ProcessStream<true>(src_partition->aggregated_row_stream.get(),
+      /* has_more_streams */ src_partition->unaggregated_row_stream->num_rows() > 0));
+  RETURN_IF_ERROR(ProcessStream<false>(src_partition->unaggregated_row_stream.get(),
+      /* has_more_streams */ false));
   src_partition->Close(false);
   spilled_partitions_.pop_front();
   hash_partitions_.clear();
@@ -786,6 +890,9 @@ Status GroupingAggregator::RepartitionSpilledPartition() {
   // Leave the partition in 'spilled_partitions_' to be closed if we hit an error.
   Partition* partition = spilled_partitions_.front();
   DCHECK(partition->is_spilled());
+  DCHECK(partition->aggregated_row_stream->num_rows()
+      + partition->unaggregated_row_stream->num_rows() > 1)
+      << "Should not repartition a single-row partition: " << partition->DebugString();
 
   // Create the new hash partitions to repartition into. This will allocate a
   // write buffer for each partition's aggregated row stream.
@@ -795,22 +902,26 @@ Status GroupingAggregator::RepartitionSpilledPartition() {
   // Rows in this partition could have been spilled into two streams, depending
   // on if it is an aggregated intermediate, or an unaggregated row. Aggregated
   // rows are processed first to save a hash table lookup in AddBatchImpl().
-  RETURN_IF_ERROR(ProcessStream<true>(partition->aggregated_row_stream.get()));
+  RETURN_IF_ERROR(ProcessStream<true>(partition->aggregated_row_stream.get(),
+      /* has_more_streams */ partition->unaggregated_row_stream->num_rows() > 0));
 
-  // Prepare write buffers so we can append spilled rows to unaggregated partitions.
-  for (Partition* hash_partition : hash_partitions_) {
-    if (!hash_partition->is_spilled()) continue;
-    // The aggregated rows have been repartitioned. Free up at least a buffer's worth of
-    // reservation and use it to pin the unaggregated write buffer.
-    RETURN_IF_ERROR(hash_partition->aggregated_row_stream->UnpinStream(
-        BufferedTupleStream::UNPIN_ALL));
-    bool got_buffer;
-    RETURN_IF_ERROR(
-        hash_partition->unaggregated_row_stream->PrepareForWrite(&got_buffer));
-    DCHECK(got_buffer) << "Accounted in min reservation"
-                       << buffer_pool_client()->DebugString();
+  if (partition->unaggregated_row_stream->num_rows() > 0) {
+    // Prepare write buffers so we can append spilled rows to unaggregated partitions.
+    for (Partition* hash_partition : hash_partitions_) {
+      if (!hash_partition->is_spilled()) continue;
+      // The aggregated rows have been repartitioned. Free up at least a buffer's worth of
+      // reservation and use it to pin the unaggregated write buffer.
+      RETURN_IF_ERROR(hash_partition->aggregated_row_stream->UnpinStream(
+          BufferedTupleStream::UNPIN_ALL));
+      bool got_buffer;
+      RETURN_IF_ERROR(
+          hash_partition->unaggregated_row_stream->PrepareForWrite(&got_buffer));
+      DCHECK(got_buffer) << "Accounted in min reservation"
+                         << buffer_pool_client()->DebugString();
+    }
+    RETURN_IF_ERROR(ProcessStream<false>(partition->unaggregated_row_stream.get(),
+        /* has_more_streams */ false));
   }
-  RETURN_IF_ERROR(ProcessStream<false>(partition->unaggregated_row_stream.get()));
 
   COUNTER_ADD(num_row_repartitioned_, partition->aggregated_row_stream->num_rows());
   COUNTER_ADD(num_row_repartitioned_, partition->unaggregated_row_stream->num_rows());
@@ -827,12 +938,26 @@ Status GroupingAggregator::RepartitionSpilledPartition() {
 }
 
 template <bool AGGREGATED_ROWS>
-Status GroupingAggregator::ProcessStream(BufferedTupleStream* input_stream) {
+Status GroupingAggregator::ProcessStream(BufferedTupleStream* input_stream,
+    bool has_more_streams) {
   DCHECK(!is_streaming_preagg_);
   if (input_stream->num_rows() > 0) {
+    if (!input_stream->is_pinned()) {
+      // This is the only stream that we are currently reading and it's unpinned. Transfer
+      // the large read page reservation to the stream by restoring the reservation and
+      // saving it immediately to the stream.
+      if (large_read_page_reservation_.GetReservation() > 0) {
+        RestoreLargeReadPageReservation();
+        input_stream->SaveLargeReadPageReservation();
+      } else {
+        DCHECK_EQ(resource_profile_.max_row_buffer_size,
+            resource_profile_.spillable_buffer_size)
+            << "Large read page reservation not reclaimed in previous ProcessStream";
+      }
+    }
     while (true) {
       bool got_buffer = false;
-      RETURN_IF_ERROR(input_stream->PrepareForRead(true, &got_buffer));
+      RETURN_IF_ERROR(input_stream->PrepareForRead(/*attach_on_read*/ true, &got_buffer));
       if (got_buffer) break;
       // Did not have a buffer to read the input stream. Spill and try again.
       RETURN_IF_ERROR(SpillPartition(AGGREGATED_ROWS));
@@ -843,13 +968,27 @@ Status GroupingAggregator::ProcessStream(BufferedTupleStream* input_stream) {
     const RowDescriptor* desc =
         AGGREGATED_ROWS ? &intermediate_row_desc_ : &input_row_desc_;
     RowBatch batch(desc, state_->batch_size(), mem_tracker_.get());
+    int64_t rows_read = 0;
     do {
       RETURN_IF_ERROR(input_stream->GetNext(&batch, &eos));
-      RETURN_IF_ERROR(
-          AddBatchImpl<AGGREGATED_ROWS>(&batch, prefetch_mode, ht_ctx_.get()));
+      rows_read += batch.num_rows();
+      if (rows_read == input_stream->num_rows()) DCHECK(eos);
+      bool has_more_rows = AGGREGATED_ROWS ? (has_more_streams || !eos) : !eos;
+      RETURN_IF_ERROR(AddBatchImpl<AGGREGATED_ROWS>(&batch, prefetch_mode, ht_ctx_.get(),
+          has_more_rows));
       RETURN_IF_ERROR(QueryMaintenance(state_));
       batch.Reset();
+      // We are reading in attach_on_read mode, the large read page reservation could be
+      // used by an attached buffer of the large page. It's only freed after resetting the
+      // batch. Save back the large read page reservation if we have used it.
+      input_stream->SaveLargeReadPageReservation();
     } while (!eos);
+    if (!input_stream->is_pinned() && input_stream->HasLargeReadPageReservation()) {
+      // Save back the large read page reservation by restoring it from the stream and
+      // save it immediately.
+      input_stream->RestoreLargeReadPageReservation();
+      SaveLargeReadPageReservation();
+    }
   }
   input_stream->Close(nullptr, RowBatch::FlushMode::NO_FLUSH_RESOURCES);
   return Status::OK();
@@ -884,7 +1023,12 @@ Status GroupingAggregator::SpillPartition(bool more_aggregate_rows) {
   for (int i = 0; i < PARTITION_FANOUT; ++i) {
     if (hash_partitions_[i] == hash_partitions_[partition_idx]) hash_tbls_[i] = nullptr;
   }
-  return hash_partitions_[partition_idx]->Spill(more_aggregate_rows);
+  Status status = hash_partitions_[partition_idx]->Spill(more_aggregate_rows);
+  // Try to save back the large write page reservation if it's used by a pinned partition.
+  if (status.ok() && large_write_page_reservation_.GetReservation() == 0) {
+    TrySaveLargeWritePageReservation();
+  }
+  return status;
 }
 
 Status GroupingAggregator::MoveHashPartitions(int64_t num_input_rows) {
@@ -977,11 +1121,60 @@ int64_t GroupingAggregator::MinReservation() const {
       + resource_profile_.max_row_buffer_size * 2;
 }
 
+void GroupingAggregator::SaveLargeWritePageReservation() {
+  bool success = TrySaveLargeWritePageReservation();
+  DCHECK(success);
+}
+
+void GroupingAggregator::SaveLargeReadPageReservation() {
+  bool success = TrySaveLargeReadPageReservation();
+  DCHECK(success);
+}
+
+bool GroupingAggregator::TrySaveLargeWritePageReservation() {
+  DCHECK_EQ(large_write_page_reservation_.GetReservation(), 0);
+  int64_t extra_reservation = resource_profile_.max_row_buffer_size
+      - resource_profile_.spillable_buffer_size;
+  if (extra_reservation > 0
+      && buffer_pool_client()->GetUnusedReservation() >= extra_reservation) {
+    buffer_pool_client()->SaveReservation(&large_write_page_reservation_,
+        extra_reservation);
+    return true;
+  }
+  return false;
+}
+
+bool GroupingAggregator::TrySaveLargeReadPageReservation() {
+  DCHECK_EQ(large_read_page_reservation_.GetReservation(), 0);
+  int64_t extra_reservation = resource_profile_.max_row_buffer_size
+      - resource_profile_.spillable_buffer_size;
+  if (buffer_pool_client()->GetUnusedReservation() >= extra_reservation) {
+    buffer_pool_client()->SaveReservation(&large_read_page_reservation_,
+        extra_reservation);
+    return true;
+  }
+  return false;
+}
+
+void GroupingAggregator::RestoreLargeWritePageReservation() {
+  DCHECK_GT(large_write_page_reservation_.GetReservation(), 0);
+  DCHECK_EQ(large_write_page_reservation_.GetReservation(),
+      resource_profile_.max_row_buffer_size - resource_profile_.spillable_buffer_size);
+  buffer_pool_client()->RestoreAllReservation(&large_write_page_reservation_);
+}
+
+void GroupingAggregator::RestoreLargeReadPageReservation() {
+  int64_t extra_read_reservation = large_read_page_reservation_.GetReservation();
+  DCHECK_EQ(extra_read_reservation, resource_profile_.max_row_buffer_size
+          - resource_profile_.spillable_buffer_size);
+  buffer_pool_client()->RestoreAllReservation(&large_read_page_reservation_);
+}
+
 BufferPool::ClientHandle* GroupingAggregator::buffer_pool_client() {
   return reservation_manager_.buffer_pool_client();
 }
 
-Status GroupingAggregator::CodegenAddBatchImpl(
+Status GroupingAggregatorConfig::CodegenAddBatchImpl(
     LlvmCodeGen* codegen, TPrefetchMode::type prefetch_mode) {
   llvm::Function* update_tuple_fn;
   RETURN_IF_ERROR(CodegenUpdateTuple(codegen, &update_tuple_fn));
@@ -1001,15 +1194,18 @@ Status GroupingAggregator::CodegenAddBatchImpl(
   // The codegen'd AddBatchImpl function is only used in Open() with level_ = 0,
   // so don't use murmur hash
   llvm::Function* hash_fn;
-  RETURN_IF_ERROR(ht_ctx_->CodegenHashRow(codegen, /* use murmur */ false, &hash_fn));
+  RETURN_IF_ERROR(
+      HashTableCtx::CodegenHashRow(codegen, false, *hash_table_config_, &hash_fn));
 
   // Codegen HashTable::Equals<true>
   llvm::Function* build_equals_fn;
-  RETURN_IF_ERROR(ht_ctx_->CodegenEquals(codegen, true, &build_equals_fn));
+  RETURN_IF_ERROR(HashTableCtx::CodegenEquals(
+      codegen, true, *hash_table_config_, &build_equals_fn));
 
   // Codegen for evaluating input rows
   llvm::Function* eval_grouping_expr_fn;
-  RETURN_IF_ERROR(ht_ctx_->CodegenEvalRow(codegen, false, &eval_grouping_expr_fn));
+  RETURN_IF_ERROR(HashTableCtx::CodegenEvalRow(
+      codegen, false, *hash_table_config_, &eval_grouping_expr_fn));
 
   // Replace call sites
   replaced =
@@ -1024,8 +1220,9 @@ Status GroupingAggregator::CodegenAddBatchImpl(
 
   HashTableCtx::HashTableReplacedConstants replaced_constants;
   const bool stores_duplicates = false;
-  RETURN_IF_ERROR(ht_ctx_->ReplaceHashTableConstants(
-      codegen, stores_duplicates, 1, add_batch_impl_fn, &replaced_constants));
+  RETURN_IF_ERROR(
+      HashTableCtx::ReplaceHashTableConstants(codegen, *hash_table_config_,
+          stores_duplicates, 1, add_batch_impl_fn, &replaced_constants));
   DCHECK_GE(replaced_constants.stores_nulls, 1);
   DCHECK_GE(replaced_constants.finds_some_nulls, 1);
   DCHECK_GE(replaced_constants.stores_duplicates, 1);
@@ -1040,12 +1237,11 @@ Status GroupingAggregator::CodegenAddBatchImpl(
                   "AddBatchImpl() function failed verification, see log");
   }
 
-  void** codegened_fn_ptr = reinterpret_cast<void**>(&add_batch_impl_fn_);
-  codegen->AddFunctionToJit(add_batch_impl_fn, codegened_fn_ptr);
+  codegen->AddFunctionToJit(add_batch_impl_fn, &add_batch_impl_fn_);
   return Status::OK();
 }
 
-Status GroupingAggregator::CodegenAddBatchStreamingImpl(
+Status GroupingAggregatorConfig::CodegenAddBatchStreamingImpl(
     LlvmCodeGen* codegen, TPrefetchMode::type prefetch_mode) {
   DCHECK(is_streaming_preagg_);
 
@@ -1070,15 +1266,18 @@ Status GroupingAggregator::CodegenAddBatchStreamingImpl(
 
   // We only use the top-level hash function for streaming aggregations.
   llvm::Function* hash_fn;
-  RETURN_IF_ERROR(ht_ctx_->CodegenHashRow(codegen, false, &hash_fn));
+  RETURN_IF_ERROR(
+      HashTableCtx::CodegenHashRow(codegen, false, *hash_table_config_, &hash_fn));
 
   // Codegen HashTable::Equals
   llvm::Function* equals_fn;
-  RETURN_IF_ERROR(ht_ctx_->CodegenEquals(codegen, true, &equals_fn));
+  RETURN_IF_ERROR(
+      HashTableCtx::CodegenEquals(codegen, true, *hash_table_config_, &equals_fn));
 
   // Codegen for evaluating input rows
   llvm::Function* eval_grouping_expr_fn;
-  RETURN_IF_ERROR(ht_ctx_->CodegenEvalRow(codegen, false, &eval_grouping_expr_fn));
+  RETURN_IF_ERROR(HashTableCtx::CodegenEvalRow(
+      codegen, false, *hash_table_config_, &eval_grouping_expr_fn));
 
   // Replace call sites
   int replaced = codegen->ReplaceCallSites(
@@ -1097,8 +1296,9 @@ Status GroupingAggregator::CodegenAddBatchStreamingImpl(
 
   HashTableCtx::HashTableReplacedConstants replaced_constants;
   const bool stores_duplicates = false;
-  RETURN_IF_ERROR(ht_ctx_->ReplaceHashTableConstants(
-      codegen, stores_duplicates, 1, add_batch_streaming_impl_fn, &replaced_constants));
+  RETURN_IF_ERROR(
+      HashTableCtx::ReplaceHashTableConstants(codegen, *hash_table_config_,
+          stores_duplicates, 1, add_batch_streaming_impl_fn, &replaced_constants));
   DCHECK_GE(replaced_constants.stores_nulls, 1);
   DCHECK_GE(replaced_constants.finds_some_nulls, 1);
   DCHECK_GE(replaced_constants.stores_duplicates, 1);
@@ -1112,12 +1312,30 @@ Status GroupingAggregator::CodegenAddBatchStreamingImpl(
                   "AddBatchStreamingImpl() function failed verification, see log");
   }
 
-  codegen->AddFunctionToJit(add_batch_streaming_impl_fn,
-      reinterpret_cast<void**>(&add_batch_streaming_impl_fn_));
+  codegen->AddFunctionToJit(add_batch_streaming_impl_fn, &add_batch_streaming_impl_fn_);
   return Status::OK();
 }
 
 // Instantiate required templates.
 template Status GroupingAggregator::AppendSpilledRow<false>(Partition*, TupleRow*);
 template Status GroupingAggregator::AppendSpilledRow<true>(Partition*, TupleRow*);
+
+int64_t GroupingAggregator::GetNumKeys() const {
+  int64_t num_keys = 0;
+  for (int i = 0; i < hash_partitions_.size(); ++i) {
+    Partition* partition = hash_partitions_[i];
+    if (partition == nullptr) continue;
+    // We might be dealing with a rebuilt spilled partition, where all partitions are
+    // pointing to a single in-memory partition, so make sure we only proceed for the
+    // right partition.
+    if (i != partition->idx) continue;
+    if (!partition->is_spilled()) {
+      if (partition->hash_tbl == nullptr) {
+        continue;
+      }
+      num_keys += partition->hash_tbl->size();
+    }
+  }
+  return num_keys;
+}
 } // namespace impala

@@ -17,15 +17,17 @@
 
 # Functional tests for ACID integration with Hive.
 
+from __future__ import absolute_import, division, print_function
+import os
 import pytest
 import time
 
-from hive_metastore.ttypes import CommitTxnRequest, OpenTxnRequest
+from hive_metastore.ttypes import CommitTxnRequest, LockType, OpenTxnRequest
 from subprocess import check_call
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIfHive2, SkipIfCatalogV2, SkipIfS3, SkipIfABFS,
-                               SkipIfADLS, SkipIfIsilon, SkipIfLocal)
+from tests.common.skip import SkipIf, SkipIfHive2, SkipIfCatalogV2, SkipIfFS
 from tests.common.test_dimensions import create_single_exec_option_dimension
+from tests.util.acid_txn import AcidTxn
 
 
 class TestAcid(ImpalaTestSuite):
@@ -43,46 +45,49 @@ class TestAcid(ImpalaTestSuite):
         v.get_value('table_format').file_format in ['text'])
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_basic(self, vector, unique_database):
     self.run_test_case('QueryTest/acid', vector, use_db=unique_database)
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  def test_acid_no_hive(self, vector, unique_database):
+    """ Run tests that do not need a running Hive server. This means that (unlike other
+    tests) these can be run in enviroments without Hive, e.g. S3.
+    TODO: find a long term solution to run much more ACID tests in S3
+    """
+    self.run_test_case('QueryTest/acid-no-hive', vector, use_db=unique_database)
+
+  @SkipIfHive2.acid
+  @SkipIfFS.hive
   def test_acid_compaction(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-compaction', vector, use_db=unique_database)
 
   @SkipIfHive2.acid
+  @SkipIfFS.hive
   def test_acid_negative(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-negative', vector, use_db=unique_database)
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_truncate(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-truncate', vector, use_db=unique_database)
     assert "0" == self.run_stmt_in_hive("select count(*) from {0}.{1}".format(
         unique_database, "pt")).split("\n")[1]
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_partitioned(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-partitioned', vector, use_db=unique_database)
+
+  @SkipIfHive2.acid
+  @SkipIfFS.hive
+  def test_full_acid_scans(self, vector, unique_database):
+    self.run_test_case('QueryTest/full-acid-scans', vector, use_db=unique_database)
+
+  @SkipIfHive2.acid
+  def test_full_acid_complex_type_scans(self, vector, unique_database):
+    self.run_test_case('QueryTest/full-acid-complex-type-scans', vector,
+        use_db='functional_orc_def')
 
   # When local CatalogV2 combines with hms_enent_polling enabled, it seems
   # that Catalog loads tables by itself, the query statement cannot trigger
@@ -90,20 +95,34 @@ class TestAcid(ImpalaTestSuite):
   # it can not be shown in the query profile.  Skip CatalogV2 to avoid flaky tests.
   @SkipIfHive2.acid
   @SkipIfCatalogV2.hms_event_polling_enabled()
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_profile(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-profile', vector, use_db=unique_database)
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  def test_full_acid_rowid(self, vector, unique_database):
+    self.run_test_case('QueryTest/full-acid-rowid', vector, use_db=unique_database)
+
+  @SkipIfHive2.acid
+  @SkipIfFS.hive
+  def test_full_acid_original_files(self, vector, unique_database):
+    table_name = "alltypes_promoted_nopart"
+    fq_table_name = "{0}.{1}".format(unique_database, table_name)
+    self.client.execute("""CREATE TABLE {0} (
+          id INT, bool_col BOOLEAN, tinyint_col TINYINT, smallint_col SMALLINT,
+          int_col INT, bigint_col BIGINT, float_col FLOAT, double_col DOUBLE,
+          date_string_col STRING, string_col STRING, timestamp_col TIMESTAMP,
+          year INT, month INT) STORED AS ORC""".format(fq_table_name))
+    table_uri = self._get_table_location(fq_table_name, vector)
+    original_file = os.environ['IMPALA_HOME'] + "/testdata/data/alltypes_non_acid.orc"
+    self.hdfs_client.copy_from_local(original_file, table_uri + "/000000_0")
+    self.run_stmt_in_hive("""alter table {0}.{1}
+        set tblproperties('EXTERNAL'='FALSE','transactional'='true')""".format(
+        unique_database, table_name))
+    self.run_test_case('QueryTest/full-acid-original-file', vector, unique_database)
+
+  @SkipIfHive2.acid
+  @SkipIfFS.hive
   def test_acid_insert_statschg(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-clear-statsaccurate',
         vector, use_db=unique_database)
@@ -115,11 +134,7 @@ class TestAcid(ImpalaTestSuite):
         .format(unique_database, "insertonly_part_colstats"))
     assert "2" in result
 
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_ext_statschg(self, vector, unique_database):
     self.run_test_case('QueryTest/clear-statsaccurate',
         vector, use_db=unique_database)
@@ -133,11 +148,7 @@ class TestAcid(ImpalaTestSuite):
     assert "2" in result
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_compute_stats(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-compute-stats', vector, use_db=unique_database)
 
@@ -147,18 +158,16 @@ class TestAcid(ImpalaTestSuite):
 #  Negative test for LOAD DATA INPATH and all other SQL that we don't support.
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
-  @pytest.mark.execute_serially
+  @SkipIfFS.hive
   def test_acid_heartbeats(self, vector, unique_database):
     """Tests heartbeating of transactions. Creates a long-running query via
     some jitting and in the meanwhile it periodically checks whether there is
     a transaction that has sent a heartbeat since its start.
     """
     if self.exploration_strategy() != 'exhaustive': pytest.skip()
+    table_format = vector.get_value('table_format')
+    if table_format.compression_codec != 'none': pytest.skip()
+
     last_open_txn_start_time = self._latest_open_transaction()
     dummy_tbl = "{}.{}".format(unique_database, "dummy")
     self.execute_query("create table {} (i int) tblproperties"
@@ -166,8 +175,8 @@ class TestAcid(ImpalaTestSuite):
                        "'transactional_properties'='insert_only')".format(dummy_tbl))
     try:
       handle = self.execute_query_async(
-          "insert into {} values (sleep(200000))".format(dummy_tbl))
-      MAX_ATTEMPTS = 10
+          "insert into {} values (sleep(320000))".format(dummy_tbl))
+      MAX_ATTEMPTS = 16
       attempt = 0
       success = False
       while attempt < MAX_ATTEMPTS:
@@ -222,12 +231,48 @@ class TestAcid(ImpalaTestSuite):
     commit_req.txnid = txn_id
     return self.hive_client.commit_txn(commit_req)
 
+  @SkipIfFS.hive
+  def test_lock_timings(self, vector, unique_database):
+    def elapsed_time_for_query(query):
+      t_start = time.time()
+      self.execute_query_expect_failure(self.client, query)
+      return time.time() - t_start
+
+    tbl_name = "test_lock"
+    tbl = "{0}.{1}".format(unique_database, tbl_name)
+    self.execute_query("create table {} (i int) tblproperties"
+        "('transactional'='true',"
+        "'transactional_properties'='insert_only')".format(tbl))
+    acid_util = AcidTxn(self.hive_client)
+    lock_resp = acid_util.lock(0, unique_database, tbl_name, LockType.EXCLUSIVE)
+    try:
+      if self.exploration_strategy() == 'exhaustive':
+        elapsed = elapsed_time_for_query("insert into {} values (1)".format(tbl))
+        assert elapsed > 300 and elapsed < 310
+      self.execute_query("set lock_max_wait_time_s=20")
+      elapsed = elapsed_time_for_query("insert into {} values (1)".format(tbl))
+      assert elapsed > 20 and elapsed < 28
+
+      self.execute_query("set lock_max_wait_time_s=0")
+      elapsed = elapsed_time_for_query("insert into {} values (1)".format(tbl))
+      assert elapsed < 8
+
+      self.execute_query("set lock_max_wait_time_s=10")
+      elapsed = elapsed_time_for_query("insert into {} values (1)".format(tbl))
+      assert elapsed > 10 and elapsed < 18
+
+      self.execute_query("set lock_max_wait_time_s=2")
+      elapsed = elapsed_time_for_query("truncate table {}".format(tbl))
+      assert elapsed > 2 and elapsed < 10
+
+      self.execute_query("set lock_max_wait_time_s=5")
+      elapsed = elapsed_time_for_query("drop table {}".format(tbl))
+      assert elapsed > 5 and elapsed < 13
+    finally:
+      acid_util.unlock(lock_resp.lockid)
+
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_in_progress_compactions(self, vector, unique_database):
     """Checks that in-progress compactions are not visible. The test mimics
     in-progress compactions by opening a transaction and creating a new base
@@ -258,3 +303,46 @@ class TestAcid(ImpalaTestSuite):
     self._commit_txn(txn_id)
     self.execute_query("refresh {}".format(tbl_name))
     assert len(self.execute_query("select * from {}".format(tbl_name)).data) == 0
+
+  @SkipIfHive2.acid
+  @SkipIf.not_dfs
+  def test_full_acid_schema_without_file_metadata_tag(self, vector, unique_database):
+    """IMPALA-10115: Some files have full ACID schema without having
+    'hive.acid.version' set. We still need to identify such files as full ACID"""
+    table_name = "full_acid_schema_no_metadata"
+    fq_table_name = "{0}.{1}".format(unique_database, table_name)
+    self.client.execute("""CREATE TABLE {0} (i int) STORED AS ORC
+        TBLPROPERTIES('transactional'='true')""".format(fq_table_name))
+    table_uri = self._get_table_location(fq_table_name, vector)
+    acid_file = (os.environ['IMPALA_HOME'] +
+        "/testdata/data/full_acid_schema_but_no_acid_version.orc")
+    self.filesystem_client.copy_from_local(acid_file, table_uri + "/bucket_00000")
+    self.execute_query("refresh {}".format(fq_table_name))
+    result = self.execute_query("select count(*) from {0}".format(fq_table_name))
+    assert "3" in result.data
+
+  def test_add_partition_write_id(self, vector, unique_database):
+    """Test that ALTER TABLE ADD PARTITION increases the write id of the table."""
+    # Test INSERT-only table
+    io_tbl_name = "insert_only_table"
+    self.client.execute("""CREATE TABLE {0}.{1} (i int) PARTITIONED BY (p int)
+        TBLPROPERTIES('transactional'='true', 'transactional_properties'='insert_only')
+        """.format(unique_database, io_tbl_name))
+    self._check_add_partition_write_id_change(unique_database, io_tbl_name)
+
+    # Test Full ACID table
+    full_acid_name = "full_acid_table"
+    self.client.execute("""CREATE TABLE {0}.{1} (i int) PARTITIONED BY (p int)
+        STORED AS ORC TBLPROPERTIES('transactional'='true')
+        """.format(unique_database, full_acid_name))
+    self._check_add_partition_write_id_change(unique_database, full_acid_name)
+
+  def _check_add_partition_write_id_change(self, db_name, tbl_name):
+    acid_util = AcidTxn(self.hive_client)
+    valid_write_ids = acid_util.get_valid_write_ids(db_name, tbl_name)
+    orig_write_id = valid_write_ids.tblValidWriteIds[0].writeIdHighWaterMark
+    self.client.execute("""alter table {0}.{1} add partition (p=1)
+        """.format(db_name, tbl_name))
+    valid_write_ids = acid_util.get_valid_write_ids(db_name, tbl_name)
+    new_write_id = valid_write_ids.tblValidWriteIds[0].writeIdHighWaterMark
+    assert new_write_id > orig_write_id

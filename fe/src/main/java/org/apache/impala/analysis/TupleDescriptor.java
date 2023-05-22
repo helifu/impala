@@ -30,10 +30,12 @@ import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.StructType;
+import org.apache.impala.catalog.Type;
+import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TTupleDescriptor;
 
 import com.google.common.base.Joiner;
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
 /**
@@ -94,6 +96,9 @@ public class TupleDescriptor {
   // single implicit alias.
   private boolean hasExplicitAlias_;
 
+  // True for collection tuples backing collections in select list.
+  private boolean isHidden_;
+
   // If false, this tuple doesn't need to be materialized.
   private boolean isMaterialized_ = true;
 
@@ -103,6 +108,19 @@ public class TupleDescriptor {
   private int byteSize_;  // of all slots plus null indicators
   private int numNullBytes_;
   private float avgSerializedSize_;  // in bytes; includes serialization overhead
+
+  // Underlying masked table if this is the tuple of a table masking view.
+  private BaseTableRef maskedTable_ = null;
+  // Tuple of the table masking view that masks this tuple's table.
+  private TupleDescriptor maskedByTuple_ = null;
+
+  // If this is a tuple representing the children of a struct slot then 'parentSlot_'
+  // is the struct slot where this tuple belongs. Otherwise it's null.
+  private SlotDescriptor parentStructSlot_ = null;
+
+  // The view that registered this tuple. Null if this is not the result tuple of a view.
+  // This affects handling of collections.
+  private InlineViewRef sourceView_ = null;
 
   public TupleDescriptor(TupleId id, String debugName) {
     id_ = id;
@@ -118,6 +136,28 @@ public class TupleDescriptor {
   public TupleId getId() { return id_; }
   public List<SlotDescriptor> getSlots() { return slots_; }
 
+  /**
+   * Returns the slots in this 'TupleDescriptor' and if any slot is a struct slot, returns
+   * their slots as well, recursively. Does not descend into collections, only structs.
+   */
+  public List<SlotDescriptor> getSlotsRecursively() {
+    List<SlotDescriptor> res = new ArrayList();
+    for (SlotDescriptor slotDesc : slots_) {
+      res.add(slotDesc);
+      TupleDescriptor itemTupleDesc = slotDesc.getItemTupleDesc();
+      if (slotDesc.getType().isStructType() && itemTupleDesc != null) {
+        res.addAll(itemTupleDesc.getSlotsRecursively());
+      }
+    }
+    return res;
+  }
+
+  public boolean hasMaterializedSlots() {
+    for (SlotDescriptor slot: slots_) {
+      if (slot.isMaterialized()) return true;
+    }
+    return false;
+  }
   public List<SlotDescriptor> getMaterializedSlots() {
     List<SlotDescriptor> result = new ArrayList<>();
     for (SlotDescriptor slot: slots_) {
@@ -155,7 +195,7 @@ public class TupleDescriptor {
   public void setPath(Path p) {
     Preconditions.checkNotNull(p);
     Preconditions.checkState(p.isResolved());
-    Preconditions.checkState(p.destType().isCollectionType());
+    Preconditions.checkState(p.destType().isComplexType());
     path_ = p;
     if (p.destTable() != null) {
       // Do not use Path.getTypeAsStruct() to only allow implicit path resolutions,
@@ -172,8 +212,12 @@ public class TupleDescriptor {
   public StructType getType() { return type_; }
   public int getByteSize() { return byteSize_; }
   public float getAvgSerializedSize() { return avgSerializedSize_; }
-  public boolean isMaterialized() { return isMaterialized_; }
-  public void setIsMaterialized(boolean value) { isMaterialized_ = value; }
+  public boolean isMaterialized() {
+    return isMaterialized_;
+  }
+  public void setIsMaterialized(boolean value) {
+    isMaterialized_ = value;
+  }
   public boolean hasMemLayout() { return hasMemLayout_; }
   public void setAliases(String[] aliases, boolean hasExplicitAlias) {
     aliases_ = aliases;
@@ -184,11 +228,33 @@ public class TupleDescriptor {
   public TableName getAliasAsName() {
     return (aliases_ != null) ? new TableName(null, aliases_[0]) : null;
   }
+  public void setSourceView(InlineViewRef value) { sourceView_ = value; }
+  public InlineViewRef getSourceView() { return sourceView_; }
+
+  public void setHidden(boolean isHidden) { isHidden_ = isHidden; }
+  public boolean isHidden() { return isHidden_; }
 
   public TupleDescriptor getRootDesc() {
     if (path_ == null) return null;
     return path_.getRootDesc();
   }
+
+  public TupleDescriptor getMaskedByTuple() { return maskedByTuple_; }
+  public BaseTableRef getMaskedTable() { return maskedTable_; }
+  public void setMaskedTable(BaseTableRef table) {
+    Preconditions.checkState(maskedTable_ == null);
+    maskedTable_ = table;
+    table.getDesc().maskedByTuple_ = this;
+  }
+
+  public void setParentSlotDesc(SlotDescriptor parent) {
+    Type parentType = parent.getType();
+    Preconditions.checkState(parentType.isStructType() || parentType.isCollectionType(),
+        "Parent for a TupleDescriptor should be a STRUCT or a COLLECTION. " +
+        "Actual type is " + parentType + " Tuple ID: " + getId());
+    parentStructSlot_ = parent;
+  }
+  public SlotDescriptor getParentSlotDesc() { return parentStructSlot_; }
 
   public String debugString() {
     String tblStr = (getTable() == null ? "null" : getTable().getFullName());
@@ -196,14 +262,18 @@ public class TupleDescriptor {
     for (SlotDescriptor slot : slots_) {
       slotStrings.add(slot.debugString());
     }
-    return Objects.toStringHelper(this)
+    MoreObjects.ToStringHelper toStrHelper = MoreObjects.toStringHelper(this)
         .add("id", id_.asInt())
         .add("name", debugName_)
         .add("tbl", tblStr)
         .add("byte_size", byteSize_)
         .add("is_materialized", isMaterialized_)
-        .add("slots", "[" + Joiner.on(", ").join(slotStrings) + "]")
-        .toString();
+        .add("slots", "[" + Joiner.on(", ").join(slotStrings) + "]");
+    if (maskedTable_ != null) toStrHelper.add("masks", maskedTable_.getId());
+    if (parentStructSlot_ != null) {
+      toStrHelper.add("parentSlot", parentStructSlot_.getId());
+    }
+    return toStrHelper.toString();
   }
 
   @Override
@@ -226,7 +296,7 @@ public class TupleDescriptor {
    * Materialize all slots.
    */
   public void materializeSlots() {
-    for (SlotDescriptor slot: slots_) slot.setIsMaterialized(true);
+    for (SlotDescriptor slot: getSlotsRecursively()) slot.setIsMaterialized(true);
   }
 
   public TTupleDescriptor toThrift(Integer tableId) {
@@ -237,6 +307,10 @@ public class TupleDescriptor {
     Preconditions.checkNotNull(path_);
     ttupleDesc.setTuplePath(path_.getAbsolutePath());
     return ttupleDesc;
+  }
+
+  public void resetHasMemoryLayout() {
+    hasMemLayout_ = false;
   }
 
   /**
@@ -250,8 +324,25 @@ public class TupleDescriptor {
     computeMemLayout();
   }
 
-  public void computeMemLayout() {
-    if (hasMemLayout_) return;
+  /**
+   * Computes the memory layout within this tuple including the total size of the tuple,
+   * size of each underlying slot, slot offsets, offset for the tuple level null
+   * indicator bytes and the null indicator bits for the slots.
+   * For struct tuples the offsets are calculated from the topmost parent's beginning and
+   * not neccessarily starting from zero within this tuple.
+   * Returns the nullIndicatorByte and nullIndicator bit in a Pair<>. This is needed to
+   * handle the case when there is a struct or nested structs in the tuple and top level
+   * nullIndicatorByte and nullIndicatorBit has to be adjusted based on the actual
+   * structure of the structs.
+   */
+  public Pair<Integer, Integer> computeMemLayout() {
+    if (parentStructSlot_ != null) {
+      // If this TupleDescriptor represents the children of a STRUCT then the slot
+      // offsets are adjusted with the parent struct's offset.
+      Preconditions.checkState(parentStructSlot_.getType().isStructType());
+      Preconditions.checkState(parentStructSlot_.getByteOffset() != -1);
+    }
+    if (hasMemLayout_) return null;
     hasMemLayout_ = true;
 
     boolean alwaysAddNullBit = hasNullableKuduScanSlots();
@@ -265,50 +356,59 @@ public class TupleDescriptor {
     int totalSlotSize = 0;
     for (SlotDescriptor d: slots_) {
       if (!d.isMaterialized()) continue;
-      ColumnStats stats = d.getStats();
-      int slotSize = d.getType().getSlotSize();
+      int slotSize = getSlotSize(d);
+      addToAvgSerializedSize(d);
 
-      if (stats.hasAvgSize()) {
-        avgSerializedSize_ += d.getStats().getAvgSerializedSize();
-      } else {
-        // TODO: for computed slots, try to come up with stats estimates
-        avgSerializedSize_ += slotSize;
-      }
-      // Add padding for a KUDU string slot.
-      if (d.isKuduStringSlot()) {
-        slotSize += KUDU_STRING_PADDING;
-        avgSerializedSize_ += KUDU_STRING_PADDING;
-      }
       if (!slotsBySize.containsKey(slotSize)) {
         slotsBySize.put(slotSize, new ArrayList<>());
       }
-      totalSlotSize += slotSize;
       slotsBySize.get(slotSize).add(d);
-      if (d.getIsNullable() || alwaysAddNullBit) ++numNullBits;
+
+      totalSlotSize += slotSize;
+      numNullBits += getNumNullBits(d, alwaysAddNullBit);
     }
     // we shouldn't have anything of size <= 0
     Preconditions.checkState(!slotsBySize.containsKey(0));
     Preconditions.checkState(!slotsBySize.containsKey(-1));
 
-    // assign offsets to slots in order of descending size
-    numNullBytes_ = (numNullBits + 7) / 8;
+    // The total number of bytes for nullable scalar or nested struct fields will be
+    // computed for the struct at the top level (i.e., parentStructSlot_ == null).
+
+    // If this descriptor is inside a struct then don't need to count for an additional
+    // null byte here as the null indicator will be on the top level tuple. In other
+    // words the total number of bytes for nullable scalar or nested struct fields will
+    // be computed for the struct at the top level (i.e., parentStructSlot_ == null).
+    numNullBytes_ = (parentStructSlot_ == null) ? (numNullBits + 7) / 8 : 0;
     int slotOffset = 0;
     int nullIndicatorByte = totalSlotSize;
+    if (parentStructSlot_ != null) {
+      nullIndicatorByte = parentStructSlot_.getNullIndicatorByte();
+    }
     int nullIndicatorBit = 0;
+    if (parentStructSlot_ != null) {
+      // If this is a child tuple from a struct then get the next available bit from the
+      // parent struct.
+      nullIndicatorBit = (parentStructSlot_.getNullIndicatorBit() + 1) % 8;
+      // If the parent struct ran out of null bits in the current null byte just before
+      // this tuple then start using a new byte.
+      if (nullIndicatorBit == 0) ++nullIndicatorByte;
+    }
     // slotIdx is the index into the resulting tuple struct.  The first (largest) field
     // is 0, next is 1, etc.
     int slotIdx = 0;
     // sort slots in descending order of size
     List<Integer> sortedSizes = new ArrayList<>(slotsBySize.keySet());
     Collections.sort(sortedSizes, Collections.reverseOrder());
+    // assign offsets to slots in order of descending size
     for (int slotSize: sortedSizes) {
       if (slotsBySize.get(slotSize).isEmpty()) continue;
       for (SlotDescriptor d: slotsBySize.get(slotSize)) {
         Preconditions.checkState(d.isMaterialized());
         d.setByteSize(slotSize);
-        d.setByteOffset(slotOffset);
-        d.setSlotIdx(slotIdx++);
+        d.setByteOffset((parentStructSlot_ == null) ? slotOffset :
+            parentStructSlot_.getByteOffset() + slotOffset);
         slotOffset += slotSize;
+        d.setSlotIdx(slotIdx++);
 
         // assign null indicator
         if (d.getIsNullable() || alwaysAddNullBit) {
@@ -324,11 +424,82 @@ public class TupleDescriptor {
           d.setNullIndicatorBit(-1);
           d.setNullIndicatorByte(0);
         }
+        // For struct slots calculate the mem layout for the tuple representing it's
+        // children.
+        if (d.getType().isStructType()) {
+          Pair<Integer, Integer> nullIndicators =
+              d.getItemTupleDesc().computeMemLayout();
+          // Adjust the null indicator byte and bit according to what is set in the
+          // struct's children
+          nullIndicatorByte = nullIndicators.first;
+          nullIndicatorBit = nullIndicators.second;
+        }
+        if (d.getType().isCollectionType() && d.isMaterializedRecursively()) {
+          d.getItemTupleDesc().computeMemLayout();
+        }
       }
     }
     Preconditions.checkState(slotOffset == totalSlotSize);
 
     byteSize_ = totalSlotSize + numNullBytes_;
+    return new Pair<Integer, Integer>(nullIndicatorByte, nullIndicatorBit);
+  }
+
+  /**
+   * In some cases (such as with an external frontend) there may be a need
+   * to reset the mem layout such that it can be recomputed at a later time.
+   */
+  public void resetMemLayout() {
+    hasMemLayout_ = false;
+  }
+
+  /**
+   * Receives a SlotDescriptor as a parameter and returns its size.
+   */
+  private int getSlotSize(SlotDescriptor slotDesc) {
+    int slotSize = slotDesc.getMaterializedSlotSize();
+    // Add padding for a KUDU string slot.
+    if (slotDesc.isKuduStringSlot()) {
+      slotSize += KUDU_STRING_PADDING;
+    }
+    return slotSize;
+  }
+
+  /**
+   * Gets a SlotDescriptor as parameter and calculates its average serialized size and
+   * adds the result to 'avgSerializedSize_'.
+   */
+  private void addToAvgSerializedSize(SlotDescriptor slotDesc) {
+    ColumnStats stats = slotDesc.getStats();
+    if (stats.hasAvgSize()) {
+      avgSerializedSize_ += stats.getAvgSerializedSize();
+    } else {
+      // Note, there are no stats for complex types slots so can't use average serialized
+      // size from stats for them.
+      // TODO: for computed slots, try to come up with stats estimates
+      avgSerializedSize_ += slotDesc.getMaterializedSlotSize();
+    }
+    // Add padding for a KUDU string slot.
+    if (slotDesc.isKuduStringSlot()) {
+      avgSerializedSize_ += KUDU_STRING_PADDING;
+    }
+  }
+
+  // Function to calculate the number of null bits required for a slot descriptor. In
+  // case of a struct slot it calls itself recursively to get the required null bits for
+  // the struct's children.
+  private int getNumNullBits(SlotDescriptor slotDesc, boolean alwaysAddNullBit) {
+    Preconditions.checkState(!slotDesc.getType().isStructType() ||
+        slotDesc.getIsNullable());
+    if (!slotDesc.getIsNullable() && !alwaysAddNullBit) return 0;
+    if (!slotDesc.getType().isStructType()) return 1;
+    TupleDescriptor childrenTuple = slotDesc.getItemTupleDesc();
+    Preconditions.checkState(childrenTuple != null);
+    int numNullBits = 1;
+    for (SlotDescriptor child : childrenTuple.getSlots()) {
+      numNullBits += getNumNullBits(child, alwaysAddNullBit);
+    }
+    return numNullBits;
   }
 
   /**
@@ -347,7 +518,11 @@ public class TupleDescriptor {
    */
   public boolean hasClusteringColsOnly() {
     FeTable table = getTable();
-    if (!(table instanceof FeFsTable) || table.getNumClusteringCols() == 0) return false;
+    if (!(table instanceof FeFsTable)) return false;
+    // If we have no materialized slots, we are referencing no columns, so it's
+    // trivially true that that we're referencing only partition columns.
+    if (!hasMaterializedSlots()) return true;
+    if (table.getNumClusteringCols() == 0) return false;
 
     FeFsTable hdfsTable = (FeFsTable)table;
     for (SlotDescriptor slotDesc: getSlots()) {

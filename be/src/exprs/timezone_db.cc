@@ -17,12 +17,14 @@
 
 #include "exprs/timezone_db.h"
 
-#include <libgen.h>
-
-#include <iostream>
-#include <string>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <regex>
-#include <boost/algorithm/string.hpp>
+#include <string>
+#include <vector>
+
+#include <boost/algorithm/string/trim.hpp>
 
 #include "common/compiler-util.h"
 #include "common/logging.h"
@@ -178,6 +180,7 @@ string TimezoneDatabase::LocalZoneName() {
     string result;
     while (timezone_file) {
       getline(timezone_file, result);
+      if (result.rfind("#", 0) == 0) continue;
       auto p = result.find("ZONE=\"");
       if (p != string::npos) {
         result.erase(p, p + 6);

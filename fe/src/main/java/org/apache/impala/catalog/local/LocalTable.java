@@ -23,10 +23,10 @@ import java.util.List;
 
 import javax.annotation.Nullable;
 
+import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
-import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
-import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.catalog.ArrayType;
@@ -37,21 +37,29 @@ import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.HdfsFileFormat;
+import org.apache.impala.catalog.IcebergColumn;
+import org.apache.impala.catalog.IcebergStructField;
+import org.apache.impala.catalog.IcebergTable;
 import org.apache.impala.catalog.KuduTable;
+import org.apache.impala.catalog.SqlConstraints;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.TableLoadingException;
+import org.apache.impala.catalog.VirtualColumn;
 import org.apache.impala.catalog.local.MetaProvider.TableMetaRef;
 import org.apache.impala.common.Pair;
+import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.service.MetadataOp;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TTableStats;
+import org.apache.impala.util.AcidUtils;
 import org.apache.log4j.Logger;
 import org.apache.thrift.TException;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 
 /**
@@ -66,12 +74,17 @@ abstract class LocalTable implements FeTable {
   protected final LocalDb db_;
   /** The lower-case name of the table. */
   protected final String name_;
+  protected final TImpalaTableType tableType_;
+  protected final String tableComment_;
 
   private final ColumnMap cols_;
 
   protected final Table msTable_;
 
   private final TTableStats tableStats_;
+
+  // Virtual columns of this table.
+  protected final ArrayList<VirtualColumn> virtualCols_ = new ArrayList<>();
 
   /**
    * Table reference as provided by the initial call to the metadata provider.
@@ -83,6 +96,7 @@ abstract class LocalTable implements FeTable {
    * about them.
    */
   @Nullable
+  @VisibleForTesting
   protected final TableMetaRef ref_;
 
   public static LocalTable load(LocalDb db, String tblName) throws TableLoadingException {
@@ -98,6 +112,8 @@ abstract class LocalTable implements FeTable {
       t = LocalHbaseTable.loadFromHbase(db, msTbl, ref);
     } else if (KuduTable.isKuduTable(msTbl)) {
       t = LocalKuduTable.loadFromKudu(db, msTbl, ref);
+    } else if (IcebergTable.isIcebergTable(msTbl)) {
+      t = LocalIcebergTable.loadIcebergTableViaMetaProvider(db, msTbl, ref);
     } else if (DataSourceTable.isDataSourceTable(msTbl)) {
       // TODO(todd) support datasource table
     } else if (HdfsFileFormat.isHdfsInputFormatClass(
@@ -138,6 +154,8 @@ abstract class LocalTable implements FeTable {
   public LocalTable(LocalDb db, Table msTbl, TableMetaRef ref, ColumnMap cols) {
     this.db_ = Preconditions.checkNotNull(db);
     this.name_ = msTbl.getTableName();
+    this.tableType_ = MetastoreShim.mapToInternalTableType(msTbl.getTableType());
+    this.tableComment_ = MetadataOp.getTableComment(msTbl);
     this.cols_ = cols;
     this.ref_ = ref;
     this.msTable_ = msTbl;
@@ -155,12 +173,21 @@ abstract class LocalTable implements FeTable {
   protected LocalTable(LocalDb db, String tblName) {
     this.db_ = Preconditions.checkNotNull(db);
     this.name_ = tblName;
+    this.tableType_ = TImpalaTableType.TABLE;
+    this.tableComment_ = null;
     this.ref_ = null;
     this.msTable_ = null;
     this.cols_ = null;
     this.tableStats_ = null;
   }
 
+  protected void addVirtualColumns(List<VirtualColumn> virtualColumns) {
+    for (VirtualColumn virtCol : virtualColumns) addVirtualColumn(virtCol);
+  }
+
+  protected void addVirtualColumn(VirtualColumn col) {
+    virtualCols_.add(col);
+  }
 
   @Override
   public boolean isLoaded() {
@@ -205,21 +232,23 @@ abstract class LocalTable implements FeTable {
   }
 
   @Override
+  public TImpalaTableType getTableType() {
+    return tableType_;
+  }
+
+  @Override
+  public String getTableComment() {
+    return tableComment_;
+  }
+
+  @Override
   public List<Column> getColumns() {
-    // TODO(todd) why does this return ArrayList instead of List?
-    return new ArrayList<>(cols_.colsByPos_);
+    return cols_ == null ? Collections.emptyList() : cols_.colsByPos_;
   }
 
   @Override
-  public List<SQLPrimaryKey> getPrimaryKeys() {
-    // TODO: return primary keys after IMPALA-9158
-    return Collections.emptyList();
-  }
-
-  @Override
-  public List<SQLForeignKey> getForeignKeys() {
-    // TODO: return foreign keys after IMPALA-9158
-    return Collections.emptyList();
+  public SqlConstraints getSqlConstraints() {
+    return new SqlConstraints(new ArrayList<>(), new ArrayList<>());
   }
 
   @Override
@@ -231,37 +260,40 @@ abstract class LocalTable implements FeTable {
 
   @Override
   public List<String> getColumnNames() {
-    return cols_.getColumnNames();
+    return cols_ == null ? Collections.emptyList() : cols_.getColumnNames();
   }
 
   @Override
   public List<Column> getClusteringColumns() {
-    return cols_.getClusteringColumns();
+    return cols_ == null ? Collections.emptyList() : cols_.getClusteringColumns();
   }
 
   @Override
   public List<Column> getNonClusteringColumns() {
-    return cols_.getNonClusteringColumns();
+    return cols_ == null ? Collections.emptyList() : cols_.getNonClusteringColumns();
   }
 
   @Override
+  public List<VirtualColumn> getVirtualColumns() { return virtualCols_; }
+
+  @Override
   public int getNumClusteringCols() {
-    return cols_.getNumClusteringCols();
+    return cols_ == null ? 0 : cols_.getNumClusteringCols();
   }
 
   @Override
   public boolean isClusteringColumn(Column c) {
-    return cols_.isClusteringColumn(c);
+    return cols_ != null && cols_.isClusteringColumn(c);
   }
 
   @Override
   public Column getColumn(String name) {
-    return cols_.getByName(name);
+    return cols_ == null ? null : cols_.getByName(name);
   }
 
   @Override
   public ArrayType getType() {
-    return cols_.getType();
+    return cols_ == null ? null : cols_.getType();
   }
 
   @Override
@@ -285,7 +317,7 @@ abstract class LocalTable implements FeTable {
   }
 
   @Override
-  public String getValidWriteIds() {
+  public ValidWriteIdList getValidWriteIds() {
     return null;
   }
 
@@ -305,6 +337,7 @@ abstract class LocalTable implements FeTable {
     private final ImmutableMap<String, Column> colsByName_;
 
     private final int numClusteringCols_;
+    private final boolean hasRowIdCol_;
 
     public static ColumnMap fromMsTable(Table msTbl) {
       final String fullName = msTbl.getDbName() + "." + msTbl.getTableName();
@@ -315,18 +348,17 @@ abstract class LocalTable implements FeTable {
       // then all other columns.
       List<Column> cols;
       try {
-        cols = FeCatalogUtils.fieldSchemasToColumns(
-            Iterables.concat(msTbl.getPartitionKeys(),
-                             msTbl.getSd().getCols()),
-            msTbl.getTableName());
-        return new ColumnMap(cols, numClusteringCols, fullName);
+        cols = FeCatalogUtils.fieldSchemasToColumns(msTbl);
+        boolean isFullAcidTable = AcidUtils.isFullAcidTable(msTbl.getParameters());
+        return new ColumnMap(cols, numClusteringCols, fullName, isFullAcidTable);
       } catch (TableLoadingException e) {
         throw new LocalCatalogException(e);
       }
     }
 
     public ColumnMap(List<Column> cols, int numClusteringCols,
-        String fullTableName) {
+        String fullTableName, boolean isFullAcidSchema) {
+      hasRowIdCol_ = isFullAcidSchema;
       this.colsByPos_ = ImmutableList.copyOf(cols);
       this.numClusteringCols_ = numClusteringCols;
       colsByName_ = indexColumnNames(colsByPos_);
@@ -356,7 +388,8 @@ abstract class LocalTable implements FeTable {
 
 
     public List<Column> getNonClusteringColumns() {
-      return colsByPos_.subList(numClusteringCols_, colsByPos_.size());
+      return colsByPos_.subList(numClusteringCols_ + (hasRowIdCol_ ? 1 : 0),
+          colsByPos_.size());
     }
 
     public List<Column> getClusteringColumns() {
@@ -370,7 +403,14 @@ abstract class LocalTable implements FeTable {
     private static StructType columnsToStructType(List<Column> cols) {
       List<StructField> fields = Lists.newArrayListWithCapacity(cols.size());
       for (Column col : cols) {
-        fields.add(new StructField(col.getName(), col.getType(), col.getComment()));
+        if (col instanceof IcebergColumn) {
+          // Get 'IcebergStructField' for Iceberg tables.
+          IcebergColumn iCol = (IcebergColumn) col;
+          fields.add(new IcebergStructField(iCol.getName(), iCol.getType(),
+              iCol.getComment(), iCol.getFieldId()));
+        } else {
+          fields.add(new StructField(col.getName(), col.getType(), col.getComment()));
+        }
       }
       return new StructType(fields);
     }

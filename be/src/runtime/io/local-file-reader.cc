@@ -34,7 +34,7 @@ DECLARE_int32(stress_disk_read_delay_ms);
 namespace impala {
 namespace io {
 
-Status LocalFileReader::Open(bool use_file_handle_cache) {
+Status LocalFileReader::Open() {
   unique_lock<SpinLock> fs_lock(lock_);
   RETURN_IF_ERROR(scan_range_->cancel_status_);
 

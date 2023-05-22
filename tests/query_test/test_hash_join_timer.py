@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 import re
 
@@ -118,9 +119,9 @@ class TestHashJoinTimer(ImpalaTestSuite):
     join_node_name = "03:%s" % (join_type)
     for line in exec_summary:
       if line['operator'] == join_node_name:
-        avg_time_ms = line['avg_time'] / self.NANOS_PER_MILLI
+        avg_time_ms = line['avg_time'] // self.NANOS_PER_MILLI
         self.__verify_join_time(avg_time_ms, "ExecSummary Avg")
-        max_time_ms = line['max_time'] / self.NANOS_PER_MILLI
+        max_time_ms = line['max_time'] // self.NANOS_PER_MILLI
         self.__verify_join_time(max_time_ms, "ExecSummary Max")
         check_execsummary_count += 1
     assert (check_execsummary_count == 1), \
@@ -135,6 +136,10 @@ class TestHashJoinTimer(ImpalaTestSuite):
     check_fragment_count = 0
     asyn_build = False
     for line in profile.split("\n"):
+      if ("skew(s)" in line):
+        # Sample line:
+        # skew(s) found at: HASH_JOIN_NODE (id=3), EXCHANGE_NODE (id=8)
+        continue
       if ("(id=3)" in line):
         # Sample line:
         # HASH_JOIN_NODE (id=3):(Total: 3s580ms, non-child: 11.89ms, % non-child: 0.31%)

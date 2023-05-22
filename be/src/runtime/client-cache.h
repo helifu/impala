@@ -15,29 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_RUNTIME_CLIENT_CACHE_H
-#define IMPALA_RUNTIME_CLIENT_CACHE_H
+#pragma once
 
-#include <vector>
+#include <cstdint>
 #include <list>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <ostream>
 #include <string>
-#include <boost/unordered_map.hpp>
-#include <boost/thread/mutex.hpp>
-#include <boost/bind.hpp>
-#include <gutil/strings/substitute.h>
+#include <typeinfo>
 
-#include "catalog/catalog-service-client-wrapper.h"
+#include <boost/bind.hpp>
+#include <boost/function.hpp>
+#include <boost/unordered_map.hpp>
+#include <thrift/Thrift.h>
+#include <thrift/transport/TTransportException.h>
+
+#include "common/logging.h"
+#include "common/status.h"
+#include "gen-cpp/ErrorCodes_types.h"
+#include "gen-cpp/Types_types.h"
+#include "gutil/strings/substitute.h"
 #include "rpc/thrift-client.h"
 #include "rpc/thrift-util.h"
-#include "runtime/client-cache-types.h"
-#include "util/debug-util.h"
+#include "util/container-util.h"
 #include "util/metrics-fwd.h"
 #include "util/network-util.h"
 #include "util/time.h"
 
-#include "common/status.h"
-
 namespace impala {
+
+class MetricGroup;
+template <class T> class ClientCache;
 
 /// Opaque pointer type which allows users of ClientCache to refer to particular client
 /// instances without requiring that we parameterise ClientCacheHelper by type.
@@ -144,14 +154,14 @@ class ClientCacheHelper {
   /// until they are released for the first time.
   struct PerHostCache {
     /// Protects clients.
-    boost::mutex lock;
+    std::mutex lock;
 
     /// List of client keys for this entry's host.
     std::list<ClientKey> clients;
   };
 
   /// Protects per_host_caches_
-  boost::mutex cache_lock_;
+  std::mutex cache_lock_;
 
   /// Map from an address to a PerHostCache containing a list of keys that have entries in
   /// client_map_ for that host. The value type is wrapped in a shared_ptr so that the
@@ -161,7 +171,7 @@ class ClientCacheHelper {
   PerHostCacheMap per_host_caches_;
 
   /// Protects client_map_.
-  boost::mutex client_map_lock_;
+  std::mutex client_map_lock_;
 
   /// Map from client key back to its associated ThriftClientImpl transport. This is where
   /// all the clients are actually stored, and client instances are owned by this class
@@ -443,6 +453,7 @@ class ClientCache {
 
  private:
   friend class ClientConnection<T>;
+  friend class ClientCacheTest;
 
   /// Most operations in this class are thin wrappers around the
   /// equivalent in ClientCacheHelper, which is a non-templated cache
@@ -492,5 +503,3 @@ class ClientCache {
 };
 
 }
-
-#endif

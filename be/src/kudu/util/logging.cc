@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 #include "kudu/util/logging.h"
 
 #include <unistd.h>
@@ -23,6 +24,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <functional>
+#include <initializer_list>
 #include <mutex>
 #include <utility>
 
@@ -31,7 +34,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "kudu/gutil/callback.h"  // IWYU pragma: keep
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/spinlock.h"
 #include "kudu/gutil/stringprintf.h"
@@ -46,6 +49,7 @@
 #include "kudu/util/signal.h"
 #include "kudu/util/status.h"
 
+// Defined in Impala.
 DECLARE_string(log_filename);
 TAG_FLAG(log_filename, stable);
 
@@ -59,19 +63,22 @@ DEFINE_int32(log_async_buffer_bytes_per_level, 2 * 1024 * 1024,
              "level. Only relevant when --log_async is enabled.");
 TAG_FLAG(log_async_buffer_bytes_per_level, hidden);
 
+// Defined in Impala.
 DECLARE_int32(max_log_files);
 TAG_FLAG(max_log_files, runtime);
-TAG_FLAG(max_log_files, experimental);
+TAG_FLAG(max_log_files, stable);
 
 #define PROJ_NAME "kudu"
 
 bool logging_initialized = false;
 
-using namespace std; // NOLINT(*)
-using namespace boost::uuids; // NOLINT(*)
-
 using base::SpinLock;
 using base::SpinLockHolder;
+using boost::uuids::random_generator;
+using std::string;
+using std::ofstream;
+using std::ostream;
+using std::ostringstream;
 
 namespace kudu {
 
@@ -109,7 +116,7 @@ class SimpleSink : public google::LogSink {
       default:
         LOG(FATAL) << "Unknown glog severity: " << severity;
     }
-    cb_.Run(kudu_severity, full_filename, line, tm_time, message, message_len);
+    cb_(kudu_severity, full_filename, line, tm_time, message, message_len);
   }
 
  private:
@@ -170,7 +177,7 @@ void FlushCoverageOnExit() {
   static std::once_flag once;
   std::call_once(once, [] {
       static const char msg[] = "Flushing coverage data before crash...\n";
-      write(STDERR_FILENO, msg, arraysize(msg));
+      ignore_result(write(STDERR_FILENO, msg, arraysize(msg)));
       TryFlushCoverage();
     });
   in_call = false;
@@ -212,13 +219,12 @@ void InitGoogleLoggingSafe(const char* arg) {
     }
   }
 
-  // This forces our logging to use /tmp rather than looking for a
+  // This forces our logging to default to /tmp rather than looking for a
   // temporary directory if none is specified. This is done so that we
   // can reliably construct the log file name without duplicating the
   // complex logic that glog uses to guess at a temporary dir.
-  if (FLAGS_log_dir.empty()) {
-    FLAGS_log_dir = "/tmp";
-  }
+  CHECK_NE("", google::SetCommandLineOptionWithMode("log_dir",
+     "/tmp", google::FlagSettingMode::SET_FLAGS_DEFAULT));
 
   if (!FLAGS_logtostderr) {
     // Verify that a log file can be created in log_dir by creating a tmp file.
@@ -269,7 +275,7 @@ void InitGoogleLoggingSafe(const char* arg) {
 
   // For minidump support. Must be called before logging threads started.
   // Disabled by Impala, which does not link Kudu's minidump library.
-  // CHECK_OK(BlockSigUSR1());
+  //CHECK_OK(BlockSigUSR1());
 
   if (FLAGS_log_async) {
     EnableAsyncLogging();

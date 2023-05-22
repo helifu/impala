@@ -42,9 +42,8 @@ class InProcessImpalaServer {
  public:
   /// Initialises the server, but does not start any network-attached
   /// services or run any threads.
-  InProcessImpalaServer(const std::string& hostname, int backend_port, int krpc_port,
-                        int subscriber_port, int webserver_port,
-                        const std::string& statestore_host, int statestore_port);
+  InProcessImpalaServer(const std::string& hostname, int krpc_port, int subscriber_port,
+      int webserver_port, const std::string& statestore_host, int statestore_port);
 
   /// Starts an in-process Impala server with ephemeral ports that are independent of the
   /// ports used by a concurrently running normal Impala daemon. The hostname is set to
@@ -80,7 +79,7 @@ class InProcessImpalaServer {
   int GetHS2Port() const;
 
  private:
-  uint32_t backend_port_;
+  uint32_t krpc_port_;
 
   uint32_t beeswax_port_;
 
@@ -89,7 +88,7 @@ class InProcessImpalaServer {
   uint32_t hs2_http_port_;
 
   /// The ImpalaServer that handles client and backend requests.
-  boost::shared_ptr<ImpalaServer> impala_server_;
+  std::shared_ptr<ImpalaServer> impala_server_;
 
   /// ExecEnv holds much of the per-service state
   boost::scoped_ptr<ExecEnv> exec_env_;

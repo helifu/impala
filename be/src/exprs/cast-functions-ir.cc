@@ -18,23 +18,21 @@
 #include "exprs/cast-functions.h"
 
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
-#include <boost/date_time/gregorian/gregorian.hpp>
-#include <boost/date_time/posix_time/posix_time.hpp>
-#include <boost/lexical_cast.hpp>
+#include <gutil/strings/numbers.h>
 #include <gutil/strings/substitute.h>
 
 #include "exprs/anyval-util.h"
 #include "exprs/cast-format-expr.h"
 #include "exprs/decimal-functions.h"
-#include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
 #include "util/string-parser.h"
-#include "string-functions.h"
 
 #include "common/names.h"
 
@@ -46,10 +44,174 @@ using namespace datetime_parse_util;
 // double) as a string. 24 = 17 (maximum significant digits) + 1 (decimal point) + 1 ('E')
 // + 3 (exponent digits) + 2 (negative signs) (see http://stackoverflow.com/a/1701085)
 const int MAX_FLOAT_CHARS = 24;
+// bigint max length is 20, give 22 as gutil required
+const int MAX_EXACT_NUMERIC_CHARS = 22;
+// -9.2e18 or unsigned 2^64=1.8e19
+const int MAX_BIGINT_CHARS = 20;
+// -2^31=-2.1e9
+const int MAX_INT_CHARS = 11;
+// -2^15=-32768
+const int MAX_SMALLINT_CHARS = 6;
+// -128~127 or unsigned 0~255
+const int MAX_TINYINT_CHARS = 4;
+// 1 0
+const int MAX_BOOLEAN_CHARS = 1;
+
+namespace {
+
+// This struct is used as a helper in the validation of casts. For a cast from 'FROM_TYPE'
+// to 'TO_TYPE' it provides compile time constants about what type of conversion it is.
+// These constants are used in the template specifications of the 'Validate()' function to
+// group together the relevant cases.
+template <class FROM_TYPE, class TO_TYPE>
+struct ConversionType {
+  // std::is_integral includes 'bool' but 'bool' behaves differently from integers in
+  // conversions.
+  template <class T>
+  static constexpr bool is_non_bool_integer =
+      std::is_integral_v<T> &&
+      !std::is_same_v<T, bool>;
+
+  ///////////////////////////////////
+  // Conversions that cannot fail. //
+  ///////////////////////////////////
+  static constexpr bool same_type_conversion = std::is_same_v<FROM_TYPE, TO_TYPE>;
+
+  static constexpr bool integer_to_integer_conversion =
+      is_non_bool_integer<FROM_TYPE> &&
+      is_non_bool_integer<TO_TYPE>;
+
+  static constexpr bool boolean_conversion =
+    std::is_same_v<FROM_TYPE, bool> ||
+    std::is_same_v<TO_TYPE, bool>;
+
+  // Integer to floating point cannot fail because a 32-bit float can represent the min
+  // and max value of a 64-bit integer.
+  static constexpr bool integer_to_floatingpoint_conversion =
+      is_non_bool_integer<FROM_TYPE> &&
+      std::is_floating_point_v<TO_TYPE>;
+
+  static constexpr bool float_to_double_conversion =
+      std::is_same_v<FROM_TYPE, float> &&
+      std::is_same_v<TO_TYPE, double>;
+
+  static constexpr bool conversion_always_succeeds =
+      same_type_conversion ||
+      integer_to_integer_conversion ||
+      boolean_conversion ||
+      integer_to_floatingpoint_conversion ||
+      float_to_double_conversion;
+
+  ////////////////////////////////
+  // Conversions that can fail. //
+  ////////////////////////////////
+  static constexpr bool floatingpoint_to_integer_conversion =
+      std::is_floating_point_v<FROM_TYPE> &&
+      is_non_bool_integer<TO_TYPE>;
+
+  static constexpr bool double_to_float_conversion =
+      std::is_same_v<FROM_TYPE, double> &&
+      std::is_same_v<TO_TYPE, float>;
+};
+
+template <class FROM_TYPE, class TO_TYPE, typename std::enable_if_t<
+    ConversionType<FROM_TYPE, TO_TYPE>::conversion_always_succeeds
+    >* = nullptr>
+bool Validate(FROM_TYPE from, FunctionContext* ctx) {
+  return true;
+}
+
+template <class FROM_TYPE, class TO_TYPE, typename std::enable_if_t<
+    ConversionType<FROM_TYPE, TO_TYPE>::floatingpoint_to_integer_conversion
+    >* = nullptr>
+bool Validate(FROM_TYPE from, FunctionContext* ctx) {
+  // Rules for conversion from floating point types to integral types:
+  //  1. the fractional part is discarded
+  //  2. if the destination type can hold the integer part, that is used as the result,
+  //     otherwise the behaviour is undefined.
+  // See https://en.cppreference.com/w/cpp/language/implicit_conversion
+  //
+  // We need to check whether the floating point number 'from' fits within the range of
+  // the integer type 'TO_TYPE'. We convert the max and min value of 'TO_TYPE' to
+  // 'FROM_TYPE'. This conversion may not be exact but in this case either the closest
+  // higher or the closest lower value is selected. This guarentees that if 'from' is
+  // within these values, it can be converted to 'TO_TYPE'.
+  //
+  // Note that we cannot allow equality in the general case because the maximal value of
+  // 'TO_TYPE' converted to floating point may be larger than the maximal value of
+  // 'TO_TYPE' because of inexact conversion (and similarly for the minimal value).
+  //
+  // A 'double' can exactly represent the maximal and minimal values of 32-bit and smaller
+  // integers, but not of 64-bit integers. For a 'float' 32-bit integers are too big but
+  // 16-bit and smaller integers are ok.
+  constexpr FROM_TYPE upper_limit = static_cast<FROM_TYPE>(
+      std::numeric_limits<TO_TYPE>::max());
+  constexpr FROM_TYPE lower_limit = static_cast<FROM_TYPE>(
+      std::numeric_limits<TO_TYPE>::lowest());
+
+  constexpr int INT_SIZE_LIMIT = std::is_same_v<FROM_TYPE, double> ? 4 : 2;
+  bool is_ok = false;
+  if (sizeof(TO_TYPE) <= INT_SIZE_LIMIT) {
+    is_ok = lower_limit <= from && from <= upper_limit;
+  } else {
+    is_ok = lower_limit < from && from < upper_limit;
+  }
+
+  if (UNLIKELY(!is_ok)) {
+    if (std::isnan(from)) {
+      ctx->SetError("NaN value cannot be converted to integer type.");
+    } else if (!std::isfinite(from)) {
+      ctx->SetError("Non-finite value cannot be converted to integer type.");
+    } else {
+      ctx->SetError("Out-of-range floating point value cannot be converted to "
+          "integer type.");
+    }
+  }
+
+  return is_ok;
+}
+
+template <class FROM_TYPE, class TO_TYPE, typename std::enable_if_t<
+    ConversionType<FROM_TYPE, TO_TYPE>::double_to_float_conversion
+    >* = nullptr>
+bool Validate(FROM_TYPE from, FunctionContext* ctx) {
+  // Rules for conversion from floating point types to integral types:
+  //  1. If the source value can be represented exactly in the destination type, it does
+  //     not change.
+  //  2. If the source value is between two representable values of the destination type,
+  //     the result is one of those two values (it is implementation-defined which one).
+  //  3. Otherwise, the behavior is undefined.
+  // See https://en.cppreference.com/w/cpp/language/implicit_conversion
+  //
+  // The algorithm is similar to the case of floating point to integer conversion. We
+  // check whether the double value 'from' is within the range of float. The min and max
+  // values of float can be exactly represented as double, so we allow equality.
+  constexpr FROM_TYPE upper_limit = std::numeric_limits<TO_TYPE>::max();
+  constexpr FROM_TYPE lower_limit = std::numeric_limits<TO_TYPE>::lowest();
+  const bool in_range = lower_limit <= from && from <= upper_limit;
+
+  // In-range values, NaNs and infinite values can be converted to float.
+  const bool is_ok = in_range || std::isnan(from) || !std::isfinite(from);
+
+  if (UNLIKELY(!is_ok)) {
+      ctx->SetError(
+          "Out-of-range double value cannot be converted to float.");
+  }
+
+  return is_ok;
+}
+
+} // anonymous namespace
 
 #define CAST_FUNCTION(from_type, to_type) \
   to_type CastFunctions::CastTo##to_type(FunctionContext* ctx, const from_type& val) { \
     if (val.is_null) return to_type::null(); \
+    using from_underlying_type = decltype(from_type::val); \
+    using to_underlying_type = decltype(to_type::val); \
+    const bool valid = Validate<from_underlying_type, to_underlying_type>(val.val, ctx); \
+    /* The query will be aborted because 'Validate()' sets an error but we have to return
+     * something so we return NULL. */\
+    if (UNLIKELY(!valid)) return to_type::null(); \
     return to_type(val.val); \
   }
 
@@ -120,18 +282,33 @@ CAST_FROM_STRING(BigIntVal, int64_t, StringToInt)
 CAST_FROM_STRING(FloatVal, float, StringToFloat)
 CAST_FROM_STRING(DoubleVal, double, StringToFloat)
 
-#define CAST_TO_STRING(num_type) \
+
+#define CAST_EXACT_NUMERIC_TO_STRING(num_type, max_char_size, to_string_method) \
   StringVal CastFunctions::CastToStringVal(FunctionContext* ctx, const num_type& val) { \
     if (val.is_null) return StringVal::null(); \
-    StringVal sv = AnyValUtil::FromString(ctx, lexical_cast<string>(val.val)); \
+    DCHECK_LE(max_char_size, MAX_EXACT_NUMERIC_CHARS); \
+    char char_buffer[MAX_EXACT_NUMERIC_CHARS];\
+    char* end_position = to_string_method(val.val, char_buffer); \
+    size_t len = end_position - char_buffer; \
+    DCHECK_GT(len, 0); \
+    DCHECK_LE(len, max_char_size); \
+    StringVal sv = StringVal::CopyFrom(ctx,\
+       reinterpret_cast<const uint8_t *> (char_buffer), len); \
+    if (UNLIKELY(sv.is_null)) { \
+      DCHECK(!ctx->impl()->state()->GetQueryStatus().ok()); \
+      return sv; \
+    } \
     AnyValUtil::TruncateIfNecessary(ctx->GetReturnType(), &sv); \
     return sv; \
   }
 
-CAST_TO_STRING(BooleanVal);
-CAST_TO_STRING(SmallIntVal);
-CAST_TO_STRING(IntVal);
-CAST_TO_STRING(BigIntVal);
+// boolean, tinyint, smallint will be casted to int here via one of the gutil methods.
+CAST_EXACT_NUMERIC_TO_STRING(BooleanVal, MAX_BOOLEAN_CHARS, FastInt32ToBufferLeft);
+CAST_EXACT_NUMERIC_TO_STRING(TinyIntVal, MAX_TINYINT_CHARS, FastInt32ToBufferLeft);
+CAST_EXACT_NUMERIC_TO_STRING(SmallIntVal, MAX_SMALLINT_CHARS, FastInt32ToBufferLeft);
+CAST_EXACT_NUMERIC_TO_STRING(IntVal, MAX_INT_CHARS, FastInt32ToBufferLeft);
+CAST_EXACT_NUMERIC_TO_STRING(BigIntVal, MAX_BIGINT_CHARS, FastInt64ToBufferLeft);
+
 
 #define CAST_FLOAT_TO_STRING(float_type, format) \
   StringVal CastFunctions::CastToStringVal(FunctionContext* ctx, const float_type& val) { \
@@ -157,15 +334,6 @@ CAST_TO_STRING(BigIntVal);
 CAST_FLOAT_TO_STRING(FloatVal, "%.9g");
 CAST_FLOAT_TO_STRING(DoubleVal, "%.17g");
 
-// Special-case tinyint because boost thinks it's a char and handles it differently.
-// e.g. '0' is written as an empty string.
-StringVal CastFunctions::CastToStringVal(FunctionContext* ctx, const TinyIntVal& val) {
-  if (val.is_null) return StringVal::null();
-  int64_t tmp_val = val.val;
-  StringVal sv = AnyValUtil::FromString(ctx, lexical_cast<string>(tmp_val));
-  AnyValUtil::TruncateIfNecessary(ctx->GetReturnType(), &sv);
-  return sv;
-}
 
 StringVal CastFunctions::CastToStringVal(FunctionContext* ctx, const TimestampVal& val) {
   DCHECK(ctx != nullptr);
@@ -174,14 +342,8 @@ StringVal CastFunctions::CastToStringVal(FunctionContext* ctx, const TimestampVa
   const DateTimeFormatContext* format_ctx =
       reinterpret_cast<const DateTimeFormatContext*>(
           ctx->GetFunctionState(FunctionContext::FRAGMENT_LOCAL));
-  StringVal sv;
-  if (format_ctx == nullptr) {
-    sv = AnyValUtil::FromString(ctx, tv.ToString());
-  } else {
-    string formatted_timestamp = tv.Format(*format_ctx);
-    if (formatted_timestamp.empty()) return StringVal::null();
-    sv = AnyValUtil::FromString(ctx, formatted_timestamp);
-  }
+  StringVal sv =
+      (format_ctx == nullptr) ? tv.ToStringVal(ctx) : tv.ToStringVal(ctx, *format_ctx);
   AnyValUtil::TruncateIfNecessary(ctx->GetReturnType(), &sv);
   return sv;
 }
@@ -245,7 +407,8 @@ StringVal CastFunctions::CastToChar(FunctionContext* ctx, const StringVal& val) 
     if (val.is_null) return to_type::null(); \
     TimestampValue tv = TimestampValue::FromTimestampVal(val); \
     time_t result; \
-    if (!tv.ToUnixTime(ctx->impl()->state()->local_time_zone(), &result)) { \
+    const Timezone* tz = ctx->impl()->state()->time_zone_for_unix_time_conversions(); \
+    if (!tv.ToUnixTime(tz, &result)) { \
       return to_type::null(); \
     } \
     return to_type(result); \
@@ -263,7 +426,8 @@ CAST_FROM_TIMESTAMP(BigIntVal);
     if (val.is_null) return to_type::null(); \
     TimestampValue tv = TimestampValue::FromTimestampVal(val); \
     double result; \
-    if (!tv.ToSubsecondUnixTime(ctx->impl()->state()->local_time_zone(), &result)) { \
+    const Timezone* tz = ctx->impl()->state()->time_zone_for_unix_time_conversions(); \
+    if (!tv.ToSubsecondUnixTime(tz, &result)) { \
       return to_type::null(); \
     } \
     return to_type(result);\
@@ -276,8 +440,9 @@ CAST_FROM_SUBSECOND_TIMESTAMP(DoubleVal);
   TimestampVal CastFunctions::CastToTimestampVal(FunctionContext* ctx, \
                                                  const from_type& val) { \
     if (val.is_null) return TimestampVal::null(); \
+    const Timezone* tz = ctx->impl()->state()->time_zone_for_unix_time_conversions(); \
     TimestampValue timestamp_value = TimestampValue::FromSubsecondUnixTime(val.val, \
-        ctx->impl()->state()->local_time_zone()); \
+        tz); \
     TimestampVal result; \
     timestamp_value.ToTimestampVal(&result); \
     return result; \
@@ -290,8 +455,8 @@ CAST_TO_SUBSECOND_TIMESTAMP(DoubleVal);
   TimestampVal CastFunctions::CastToTimestampVal(FunctionContext* ctx, \
                                                  const from_type& val) { \
     if (val.is_null) return TimestampVal::null(); \
-    TimestampValue timestamp_value = TimestampValue::FromUnixTime(val.val, \
-        ctx->impl()->state()->local_time_zone()); \
+    const Timezone* tz = ctx->impl()->state()->time_zone_for_unix_time_conversions(); \
+    TimestampValue timestamp_value = TimestampValue::FromUnixTime(val.val, tz); \
     TimestampVal result; \
     timestamp_value.ToTimestampVal(&result); \
     return result; \
@@ -356,8 +521,15 @@ DateVal CastFunctions::CastToDateVal(FunctionContext* ctx, const StringVal& val)
   }
   if (UNLIKELY(!dv.IsValid())) {
     string invalid_val = string(string_val, val.len);
-    ctx->SetError(Substitute("String to Date parse failed. Invalid string val: \"$0\"",
-        invalid_val).c_str());
+    string error_msg;
+    if (format_ctx == nullptr) {
+      error_msg = Substitute("String to Date parse failed. Invalid string val: '$0'",
+        invalid_val);
+    } else {
+      error_msg = Substitute("String to Date parse failed. Input '$0' doesn't match "
+        "with format '$1'", invalid_val, format_ctx->fmt);
+    }
+    ctx->SetError(error_msg.c_str());
     return DateVal::null();
   }
   return dv.ToDateVal();
@@ -366,12 +538,6 @@ DateVal CastFunctions::CastToDateVal(FunctionContext* ctx, const StringVal& val)
 DateVal CastFunctions::CastToDateVal(FunctionContext* ctx, const TimestampVal& val) {
   if (val.is_null) return DateVal::null();
   TimestampValue tv = TimestampValue::FromTimestampVal(val);
-  if (UNLIKELY(!tv.HasDate())) {
-    ctx->SetError("Timestamp to Date conversion failed. "
-        "Timestamp has no date component.");
-    return DateVal::null();
-  }
-
   DateValue dv(tv.DaysSinceUnixEpoch());
   return dv.ToDateVal();
 }

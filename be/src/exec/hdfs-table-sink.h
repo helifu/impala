@@ -21,12 +21,9 @@
 
 #include <hdfs.h>
 #include <boost/unordered_map.hpp>
-#include <boost/scoped_ptr.hpp>
 
-/// needed for scoped_ptr to work on ObjectPool
-#include "common/object-pool.h"
 #include "exec/data-sink.h"
-#include "exec/hdfs-table-writer.h"
+#include "exec/output-partition.h"
 #include "runtime/descriptors.h"
 
 namespace impala {
@@ -37,61 +34,19 @@ class TupleRow;
 class RuntimeState;
 class MemTracker;
 
-/// Records the temporary and final Hdfs file name, the opened temporary Hdfs file, and
-/// the number of appended rows of an output partition.
-struct OutputPartition {
-  /// In the below, <unique_id_str> is the unique ID passed to HdfsTableSink in string
-  /// form. It is typically the fragment ID that owns the sink.
+class HdfsTableSinkConfig : public DataSinkConfig {
+ public:
+  DataSink* CreateSink(RuntimeState* state) const override;
+  void Close() override;
 
-  /// Full path to root of the group of files that will be created for this partition.
-  /// Each file will have a sequence number appended.  A table writer may produce multiple
-  /// files per partition. The root is either partition_descriptor->location (if
-  /// non-empty, i.e. the partition has a custom location) or table_dir/partition_name/
-  /// Path: <root>/<unique_id_str>
-  std::string final_hdfs_file_name_prefix;
+  /// Expressions for computing the target partitions to which a row is written.
+  std::vector<ScalarExpr*> partition_key_exprs_;
 
-  /// File name for current output, with sequence number appended.
-  /// This is a temporary file that will get moved to a  permanent location
-  /// when we commit the insert.
-  /// Path: <hdfs_base_dir>/<partition_values>/<unique_id_str>.<sequence number>
-  std::string current_file_name;
+  ~HdfsTableSinkConfig() override {}
 
-  /// Name of the temporary directory that files for this partition are staged to before
-  /// the coordinator moves them to their permanent location once the query completes.
-  /// Not used if 'skip_staging' is true.
-  /// Path: <base_table_dir/<staging_dir>/<unique_id>_dir/
-  std::string tmp_hdfs_dir_name;
-
-  /// Base prefix for temporary files, to save building it every time a temporary file is
-  /// created.
-  /// Path: tmp_hdfs_dir_name/partition_name/<unique_id_str>
-  std::string tmp_hdfs_file_name_prefix;
-
-  /// key1=val1/key2=val2/ etc. Used to identify partitions to the metastore.
-  std::string partition_name;
-
-  /// Connection to hdfs.
-  hdfsFS hdfs_connection;
-
-  /// Hdfs file at tmp_hdfs_file_name.
-  hdfsFile tmp_hdfs_file;
-
-  /// Records number of rows appended to the current file in this partition.
-  int64_t num_rows;
-
-  /// Number of files created in this partition.
-  int32_t num_files;
-
-  /// Table format specific writer functions.
-  boost::scoped_ptr<HdfsTableWriter> writer;
-
-  /// The descriptor for this partition.
-  const HdfsPartitionDescriptor* partition_descriptor;
-
-  /// The block size decided on for this file.
-  int64_t block_size;
-
-  OutputPartition();
+ protected:
+  Status Init(const TDataSink& tsink, const RowDescriptor* input_row_desc,
+      FragmentState* state) override;
 };
 
 /// The sink consumes all row batches of its child execution tree, and writes the
@@ -134,8 +89,8 @@ struct OutputPartition {
 /// <table base dir>/<partition dirs>/<ACID base or delta directory>
 class HdfsTableSink : public DataSink {
  public:
-  HdfsTableSink(TDataSinkId sink_id, const RowDescriptor* row_desc,
-      const TDataSink& tsink, RuntimeState* state);
+  HdfsTableSink(TDataSinkId sink_id, const HdfsTableSinkConfig& sink_config,
+    const THdfsTableSink& hdfs_sink, RuntimeState* state);
 
   /// Prepares output_exprs and partition_key_exprs, and connects to HDFS.
   virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker);
@@ -157,7 +112,12 @@ class HdfsTableSink : public DataSink {
 
   int skip_header_line_count() const { return skip_header_line_count_; }
   const vector<int32_t>& sort_columns() const { return sort_columns_; }
+  TSortingOrder::type sorting_order() const { return sorting_order_; }
   const HdfsTableDescriptor& TableDesc() { return *table_desc_; }
+
+  const std::map<string, int64_t>& GetParquetBloomFilterColumns() const {
+    return parquet_bloom_filter_columns_;
+  }
 
   RuntimeProfile::Counter* rows_inserted_counter() { return rows_inserted_counter_; }
   RuntimeProfile::Counter* bytes_written_counter() { return bytes_written_counter_; }
@@ -167,17 +127,32 @@ class HdfsTableSink : public DataSink {
 
   std::string DebugString() const;
 
- protected:
-  virtual Status Init(const std::vector<TExpr>& thrift_output_exprs,
-      const TDataSink& tsink, RuntimeState* state) WARN_UNUSED_RESULT;
-
  private:
+  /// Build a map from partition key values to partition descriptor for multiple output
+  /// format support. The map is keyed on the concatenation of the non-constant keys of
+  /// the PARTITION clause of the INSERT statement.
+  void BuildPartitionDescMap();
+
   /// Initialises the filenames of a given output partition, and opens the temporary file.
   /// The partition key is derived from 'row'. If the partition will not have any rows
   /// added to it, empty_partition must be true.
   Status InitOutputPartition(RuntimeState* state,
       const HdfsPartitionDescriptor& partition_descriptor, const TupleRow* row,
       OutputPartition* output_partition, bool empty_partition) WARN_UNUSED_RESULT;
+
+  /// Constructs the partition name using 'partition_key_expr_evals_'.
+  /// 'url_encoded_partition_name' is the full partition name in URL encoded form. E.g.:
+  /// it's "a=12%2F31%2F11/b=10" if we have 2 partition columns "a" and "b", and "a" has
+  /// the value of "12/31/11" and "b" has the value of 10. Since this is URL encoded,
+  /// can be used for paths.
+  /// 'raw_partition_name' is a vector of partition key-values in a non-encoded format.
+  /// Staying with the above example this would hold ["a=12/31/11", "b=10"].
+  /// 'external_partition_name' is a subset of 'url_encoded_partition_name'.
+  void ConstructPartitionNames(
+      const TupleRow* row,
+      string* url_encoded_partition_name,
+      std::vector<std::string>* raw_partition_names,
+      string* external_partition_name);
 
   /// Add a temporary file to an output partition.  Files are created in a
   /// temporary directory and then moved to the real partition directory by the
@@ -204,6 +179,9 @@ class HdfsTableSink : public DataSink {
   void GetHashTblKey(const TupleRow* row,
       const std::vector<ScalarExprEvaluator*>& evals, std::string* key);
 
+  /// Returns partition descriptor object for the given key.
+  const HdfsPartitionDescriptor* GetPartitionDescriptor(const std::string& key);
+
   /// Given a hashed partition key, get the output partition structure from
   /// the 'partition_keys_to_output_partitions_'. 'no_more_rows' indicates that no more
   /// rows will be added to the partition.
@@ -216,7 +194,7 @@ class HdfsTableSink : public DataSink {
   /// the partition_key_names_ and the evaluated partition_key_exprs_.
   /// The Hdfs file name is the unique_id_str_.
   void BuildHdfsFileNames(const HdfsPartitionDescriptor& partition_descriptor,
-      OutputPartition* output);
+      OutputPartition* output, const std::string &external_partition_path);
 
   /// Writes all rows referenced by the row index vector in 'partition_pair' to the
   /// partition's writer and clears the row index vector afterwards.
@@ -237,6 +215,9 @@ class HdfsTableSink : public DataSink {
   Status ClosePartitionFile(RuntimeState* state, OutputPartition* partition)
       WARN_UNUSED_RESULT;
 
+  /// Returns the ith partition name of the table.
+  std::string GetPartitionName(int i);
+
   // Returns TRUE if the staging step should be skipped for this partition. This allows
   // for faster INSERT query completion time for the S3A filesystem as the coordinator
   // does not have to copy the file(s) from the staging locaiton to the final location. We
@@ -245,8 +226,17 @@ class HdfsTableSink : public DataSink {
   // to the final location and need to write to the temporary staging location.
   bool ShouldSkipStaging(RuntimeState* state, OutputPartition* partition);
 
-  /// Returns TRUE if the target table is an insert-only ACID table.
-  bool IsTransactional() const { return write_id_ != -1; }
+  /// Returns TRUE if the target table is transactional.
+  bool IsTransactional() const { return IsHiveAcid() || IsIceberg(); }
+
+  /// Returns TRUE for Hive ACID tables.
+  bool IsHiveAcid() const { return write_id_ != -1; }
+
+  /// Returns TRUE for Iceberg tables.
+  bool IsIceberg() const { return table_desc_->IsIcebergTable(); }
+
+  /// Returns TRUE if an external output directory was provided.
+  bool HasExternalOutputDir() { return !external_output_dir_.empty(); }
 
   /// Descriptor of target table. Set in Prepare().
   const HdfsTableDescriptor* table_desc_;
@@ -279,6 +269,9 @@ class HdfsTableSink : public DataSink {
   // populate the RowGroup::sorting_columns list in parquet files.
   const std::vector<int32_t>& sort_columns_;
 
+  // Represents the sorting order used in SORT BY queries.
+  const TSortingOrder::type sorting_order_;
+
   /// Stores the current partition during clustered inserts across subsequent row batches.
   /// Only set if 'input_is_clustered_' is true.
   PartitionPair* current_clustered_partition_;
@@ -290,6 +283,18 @@ class HdfsTableSink : public DataSink {
   /// The directory in which to write intermediate results. Set to
   /// <hdfs_table_base_dir>/_impala_insert_staging/ during Prepare()
   std::string staging_dir_;
+
+  /// The directory in which an external FE expects results to be written to.
+  std::string external_output_dir_;
+
+  /// How deep into the partition specification in which to start creating partition
+  // directories. Used in conjunction with external_output_dir_ to inform the table
+  // sink which directories are pre-created.
+  int external_output_partition_depth_ = 0;
+
+  /// Map from column names to Parquet Bloom filter bitset sizes. Columns for which
+  /// Parquet Bloom filtering is not enabled are not listed.
+  std::map<std::string, int64_t> parquet_bloom_filter_columns_;
 
   /// string representation of the unique fragment instance id. Used for per-partition
   /// Hdfs file names, and for tmp Hdfs directories. Set in Prepare();
@@ -303,7 +308,7 @@ class HdfsTableSink : public DataSink {
   PartitionMap partition_keys_to_output_partitions_;
 
   /// Expressions for computing the target partitions to which a row is written.
-  std::vector<ScalarExpr*> partition_key_exprs_;
+  const std::vector<ScalarExpr*>& partition_key_exprs_;
   std::vector<ScalarExprEvaluator*> partition_key_expr_evals_;
 
   /// Subset of partition_key_expr_evals_ which are not constant. Set in Prepare().
@@ -329,6 +334,8 @@ class HdfsTableSink : public DataSink {
   RuntimeProfile::Counter* hdfs_write_timer_;
   /// Time spent compressing data
   RuntimeProfile::Counter* compress_timer_;
+  /// Will the output of this sink be used for query results
+  const bool is_result_sink_;
 };
 
 }

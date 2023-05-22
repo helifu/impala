@@ -79,7 +79,7 @@ class ScalarFnCall : public ScalarExpr {
 
   ScalarFnCall(const TExprNode& node);
   virtual Status Init(const RowDescriptor& row_desc, bool is_entry_point,
-      RuntimeState* state) override WARN_UNUSED_RESULT;
+      FragmentState* state) override WARN_UNUSED_RESULT;
   virtual Status OpenEvaluator(FunctionContext::FunctionStateScope scope,
       RuntimeState* state, ScalarExprEvaluator* eval) const override WARN_UNUSED_RESULT;
   virtual void CloseEvaluator(FunctionContext::FunctionStateScope scope,
@@ -104,11 +104,11 @@ class ScalarFnCall : public ScalarExpr {
   /// The UDF's prepare function, if specified. This is initialized in Prepare() and
   /// called in Open() (since we may have needed to codegen the function if it's from an
   /// IR module).
-  impala_udf::UdfPrepare prepare_fn_;
+  CodegenFnPtr<impala_udf::UdfPrepare> prepare_fn_;
 
   /// THe UDF's close function, if specified. This is initialized in Prepare() and called
   /// in Close().
-  impala_udf::UdfClose close_fn_;
+  CodegenFnPtr<impala_udf::UdfClose> close_fn_;
 
   /// A pointer to the function implementation, used by the interpreted code path. Set in
   /// Init() for BUILTIN and NATIVE functions. Not set for IR UDFs.
@@ -129,8 +129,8 @@ class ScalarFnCall : public ScalarExpr {
   /// Loads the native or IR function 'symbol' from HDFS and puts the result in *fn.
   /// If the function is loaded from an IR module, it cannot be called until the module
   /// has been JIT'd (i.e. after GetCodegendComputeFnImpl() has been called).
-  Status GetFunction(
-      LlvmCodeGen* codegen, const std::string& symbol, void** fn) WARN_UNUSED_RESULT;
+  Status GetFunction(LlvmCodeGen* codegen, const std::string& symbol,
+      CodegenFnPtrBase* fn) WARN_UNUSED_RESULT;
 
   /// Loads the Prepare() and Close() functions for this ScalarFnCall. They could be
   /// native or IR functions. To load IR functions, the codegen object must have

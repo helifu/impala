@@ -101,6 +101,23 @@ class UtilityFunctions {
   /// the compiler generate the corresponding fully-qualified function name.
   template <typename T> static StringVal TypeOf(FunctionContext* ctx, const T& input_val);
 
+  /// Implementation of sha1 function. Returns the SHA-1 digest for a given string.
+  static StringVal Sha1(FunctionContext* ctx, const StringVal& input_str);
+
+  /// Implementation of sha2 function. Returns the SHA-2 family of hash
+  /// functions (SHA-224, SHA-256, SHA-384, and SHA-512) for a given string.
+  /// 'bit_len' specifies the length of bit. Allowed values are: 224, 256, 384, 512.
+  static StringVal Sha2(FunctionContext* ctx, const StringVal& input_str,
+      const IntVal& bit_len);
+
+  /// Implementation of MD5 function. Returns the 128-bit MD5 checksum for a given
+  /// string.
+  static StringVal Md5(FunctionContext* ctx, const StringVal& input_str);
+
+  /// Implementation of the typeOf() for BINARY type, which is generally not
+  /// differentiated from STRING by the backend.
+  static StringVal TypeOfBinary(FunctionContext* ctx, const StringVal& input_val);
+
  private:
   static StringVal GenUuid(FunctionContext* ctx);
 };

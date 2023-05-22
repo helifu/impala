@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
@@ -86,6 +87,35 @@ class TestSetAndUnset(CustomClusterTestSuite, HS2TestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
+      default_query_options=[('debug_action', 'custom')])
+  @needs_session(TCLIService.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6)
+  def test_unset_all(self):
+    """
+    Starts Impala cluster with a custom query option, and checks unset option
+    works correctly.
+
+    The Beeswax API and the HiveServer2 implementations are slightly different,
+    so the same test is run in both contexts.
+    """
+    # Beeswax API:
+    result = self.execute_query_expect_success(self.client, "set all")
+    assert "DEBUG_ACTION\tcustom\tDEVELOPMENT" in result.data, "baseline"
+    self.execute_query_expect_success(self.client, "set debug_action=hey")
+    assert "DEBUG_ACTION\they\tDEVELOPMENT" in \
+        self.execute_query_expect_success(self.client, "set all").data, "session override"
+    self.execute_query_expect_success(self.client, 'unset all')
+    assert "DEBUG_ACTION\tcustom\tDEVELOPMENT" in \
+        self.execute_query_expect_success(self.client, "set all").data, "unset all"
+
+    # HS2:
+    assert ("DEBUG_ACTION", "custom") in self.get_set_results(), "baseline"
+    self.execute_statement("set debug_action='hey'")
+    assert ("DEBUG_ACTION", "hey") in self.get_set_results(), "session override"
+    self.execute_statement("unset all")
+    assert ("DEBUG_ACTION", "custom") in self.get_set_results(), "unset all"
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
       impalad_args="--idle_session_timeout=321")
   @needs_session(TCLIService.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6)
   def test_set_and_unset_session_timeout(self):
@@ -141,5 +171,5 @@ class TestSetAndUnset(CustomClusterTestSuite, HS2TestSuite):
     fetch_results_req.operationHandle = execute_statement_resp.operationHandle
     fetch_results_req.maxRows = 100
     fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
-    return zip(fetch_results_resp.results.columns[0].stringVal.values,
-            fetch_results_resp.results.columns[1].stringVal.values)
+    return list(zip(fetch_results_resp.results.columns[0].stringVal.values,
+            fetch_results_resp.results.columns[1].stringVal.values))

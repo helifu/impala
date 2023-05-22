@@ -20,7 +20,6 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#include <iostream>
 #include <fstream>
 #include <sstream>
 #include <boost/algorithm/string.hpp>
@@ -38,7 +37,6 @@ using boost::algorithm::join;
 using boost::algorithm::split;
 using boost::algorithm::token_compress_on;
 using boost::algorithm::trim;
-using std::to_string;
 
 using namespace strings;
 
@@ -145,7 +143,7 @@ void ProcessStateInfo::ReadProcFileDescriptorCount() {
     }
     closedir(dir_stream);
   }
-  process_state_map_["fd/count"] = to_string(fd_count);
+  process_state_map_["fd/count"] = std::to_string(fd_count);
 }
 
 ProcessStateInfo::ProcessStateInfo(bool get_extended_metrics)

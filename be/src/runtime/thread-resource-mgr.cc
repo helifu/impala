@@ -17,10 +17,11 @@
 
 #include "runtime/thread-resource-mgr.h"
 
+#include <cmath>
+#include <mutex>
 #include <vector>
 
 #include <boost/algorithm/string.hpp>
-#include <boost/thread/locks.hpp>
 #include <gflags/gflags.h>
 
 #include "common/logging.h"

@@ -22,6 +22,7 @@
 #include "exprs/scalar-expr-evaluator.h"
 #include "exprs/scalar-expr.h"
 #include "gen-cpp/PlanNodes_types.h"
+#include "runtime/fragment-state.h"
 #include "runtime/raw-value.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
@@ -43,7 +44,7 @@ SelectNode::SelectNode(
     child_row_batch_(NULL),
     child_row_idx_(0),
     child_eos_(false),
-    codegend_copy_rows_fn_(nullptr) {}
+    codegend_copy_rows_fn_(pnode.codegend_copy_rows_fn_) {}
 
 Status SelectNode::Prepare(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
@@ -51,15 +52,14 @@ Status SelectNode::Prepare(RuntimeState* state) {
   return Status::OK();
 }
 
-void SelectNode::Codegen(RuntimeState* state) {
+void SelectPlanNode::Codegen(FragmentState* state) {
   DCHECK(state->ShouldCodegen());
-  ExecNode::Codegen(state);
+  PlanNode::Codegen(state);
   if (IsNodeCodegenDisabled()) return;
-  Status codegen_status = CodegenCopyRows(state);
-  runtime_profile()->AddCodegenMsg(codegen_status.ok(), codegen_status);
+  AddCodegenStatus(CodegenCopyRows(state));
 }
 
-Status SelectNode::CodegenCopyRows(RuntimeState* state) {
+Status SelectPlanNode::CodegenCopyRows(FragmentState* state) {
   LlvmCodeGen* codegen = state->codegen();
   DCHECK(codegen != nullptr);
   llvm::Function* copy_rows_fn =
@@ -75,8 +75,7 @@ Status SelectNode::CodegenCopyRows(RuntimeState* state) {
   DCHECK_REPLACE_COUNT(replaced, 1);
   copy_rows_fn = codegen->FinalizeFunction(copy_rows_fn);
   if (copy_rows_fn == nullptr) return Status("Failed to finalize CopyRows().");
-  codegen->AddFunctionToJit(copy_rows_fn,
-      reinterpret_cast<void**>(&codegend_copy_rows_fn_));
+  codegen->AddFunctionToJit(copy_rows_fn, &codegend_copy_rows_fn_);
   return Status::OK();
 }
 
@@ -103,8 +102,10 @@ Status SelectNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) 
       // consumed completely or it is empty.
       RETURN_IF_ERROR(child(0)->GetNext(state, child_row_batch_.get(), &child_eos_));
     }
-    if (codegend_copy_rows_fn_ != nullptr) {
-      codegend_copy_rows_fn_(this, row_batch);
+
+    SelectPlanNode::CopyRowsFn copy_rows_fn = codegend_copy_rows_fn_.load();
+    if (copy_rows_fn != nullptr) {
+      copy_rows_fn(this, row_batch);
     } else {
       CopyRows(row_batch);
     }

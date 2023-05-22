@@ -22,7 +22,6 @@
 #include "cctz/civil_time.h"
 #include "common/names.h"
 #include "runtime/string-value.h"
-#include "runtime/string-value.inline.h"
 #include "util/string-parser.h"
 
 using boost::unordered_map;
@@ -39,6 +38,7 @@ const int SimpleDateFormatTokenizer::DEFAULT_TIME_FMT_LEN = 8;
 const int SimpleDateFormatTokenizer::DEFAULT_TIME_FRAC_FMT_LEN = 18;
 const int SimpleDateFormatTokenizer::DEFAULT_SHORT_DATE_TIME_FMT_LEN = 19;
 const int SimpleDateFormatTokenizer::DEFAULT_DATE_TIME_FMT_LEN = 29;
+const int SimpleDateFormatTokenizer::FRACTIONAL_MAX_LEN = 9;
 
 DateTimeFormatContext SimpleDateFormatTokenizer::DEFAULT_SHORT_DATE_TIME_CTX;
 DateTimeFormatContext SimpleDateFormatTokenizer::DEFAULT_SHORT_ISO_DATE_TIME_CTX;
@@ -53,41 +53,40 @@ void SimpleDateFormatTokenizer::InitCtx() {
 
   // Setup the default date/time context yyyy-MM-dd HH:mm:ss.SSSSSSSSS
   const char* DATE_TIME_CTX_FMT = "yyyy-MM-dd HH:mm:ss.SSSSSSSSS";
-  const int FRACTIONAL_MAX_LEN = 9;
   for (int i = FRACTIONAL_MAX_LEN; i >= 0; --i) {
     DEFAULT_DATE_TIME_CTX[i].Reset(DATE_TIME_CTX_FMT,
         DEFAULT_DATE_TIME_FMT_LEN - (FRACTIONAL_MAX_LEN - i));
-    Tokenize(&DEFAULT_DATE_TIME_CTX[i]);
+    Tokenize(&DEFAULT_DATE_TIME_CTX[i], PARSE);
   }
 
   // Setup the default ISO date/time context yyyy-MM-ddTHH:mm:ss.SSSSSSSSS
   for (int i = FRACTIONAL_MAX_LEN; i >= 0; --i) {
     DEFAULT_ISO_DATE_TIME_CTX[i].Reset("yyyy-MM-ddTHH:mm:ss.SSSSSSSSS",
         DEFAULT_DATE_TIME_FMT_LEN - (FRACTIONAL_MAX_LEN - i));
-    Tokenize(&DEFAULT_ISO_DATE_TIME_CTX[i]);
+    Tokenize(&DEFAULT_ISO_DATE_TIME_CTX[i], PARSE);
   }
 
   // Setup the short default date/time context yyyy-MM-dd HH:mm:ss
   DEFAULT_SHORT_DATE_TIME_CTX.Reset("yyyy-MM-dd HH:mm:ss");
-  Tokenize(&DEFAULT_SHORT_DATE_TIME_CTX);
+  Tokenize(&DEFAULT_SHORT_DATE_TIME_CTX, PARSE);
 
   // Setup the short default ISO date/time context yyyy-MM-ddTHH:mm:ss
   DEFAULT_SHORT_ISO_DATE_TIME_CTX.Reset("yyyy-MM-ddTHH:mm:ss");
-  Tokenize(&DEFAULT_SHORT_ISO_DATE_TIME_CTX);
+  Tokenize(&DEFAULT_SHORT_ISO_DATE_TIME_CTX, PARSE);
 
   // Setup the default short date context yyyy-MM-dd
   DEFAULT_DATE_CTX.Reset("yyyy-MM-dd");
-  Tokenize(&DEFAULT_DATE_CTX);
+  Tokenize(&DEFAULT_DATE_CTX, PARSE);
 
   // Setup the default short time context HH:mm:ss
   DEFAULT_TIME_CTX.Reset("HH:mm:ss");
-  Tokenize(&DEFAULT_TIME_CTX);
+  Tokenize(&DEFAULT_TIME_CTX, PARSE, true, true);
 
   // Setup the default short time context with fractional seconds HH:mm:ss.SSSSSSSSS
   for (int i = FRACTIONAL_MAX_LEN; i >= 0; --i) {
     DEFAULT_TIME_FRAC_CTX[i].Reset(DATE_TIME_CTX_FMT + 11,
         DEFAULT_TIME_FRAC_FMT_LEN - (FRACTIONAL_MAX_LEN - i));
-    Tokenize(&DEFAULT_TIME_FRAC_CTX[i]);
+    Tokenize(&DEFAULT_TIME_FRAC_CTX[i], PARSE, true, true);
   }
 
   // Flag that the parser is ready.
@@ -112,8 +111,9 @@ bool SimpleDateFormatTokenizer::IsValidTZOffset(const char* str_begin,
   return false;
 }
 
-bool SimpleDateFormatTokenizer::Tokenize(DateTimeFormatContext* dt_ctx,
-    bool accept_time_toks) {
+bool SimpleDateFormatTokenizer::Tokenize(
+    DateTimeFormatContext* dt_ctx, CastDirection cast_mode, bool accept_time_toks,
+    bool accept_time_toks_only) {
   DCHECK(dt_ctx != NULL);
   DCHECK(dt_ctx->fmt != NULL);
   DCHECK(dt_ctx->fmt_len > 0);
@@ -189,8 +189,14 @@ bool SimpleDateFormatTokenizer::Tokenize(DateTimeFormatContext* dt_ctx,
     if (tok_len == 1) ++dt_ctx->fmt_out_len;
     DateTimeFormatToken tok(tok_type, str - str_begin, tok_len, str);
     str += tok.len;
+    if (tok_type == YEAR) {
+      tok.divisor = std::pow(10, tok_len);
+    } else if (tok_type == FRACTION) {
+      tok.divisor = std::pow(10, FRACTIONAL_MAX_LEN - tok_len);
+    }
     dt_ctx->toks.push_back(tok);
   }
+  if (cast_mode == PARSE && !accept_time_toks_only) return dt_ctx->has_date_toks;
   return dt_ctx->has_date_toks || dt_ctx->has_time_toks;
 }
 
@@ -215,7 +221,7 @@ const char* SimpleDateFormatTokenizer::ParseSeparatorToken(const char* str,
 }
 
 bool SimpleDateFormatTokenizer::TokenizeByStr( DateTimeFormatContext* dt_ctx,
-    bool accept_time_toks, bool accept_time_toks_only) {
+    bool accept_time_toks) {
   DCHECK(dt_ctx != NULL);
   DCHECK(dt_ctx->fmt != NULL);
   DCHECK_GT(dt_ctx->fmt_len, 0);
@@ -286,7 +292,7 @@ bool SimpleDateFormatTokenizer::TokenizeByStr( DateTimeFormatContext* dt_ctx,
   if (!accept_time_toks) return false;
   // If no date tokens were found and time tokens on their own are not allowed, return
   // false.
-  if (!dt_ctx->has_date_toks && !accept_time_toks_only) return false;
+  if (!dt_ctx->has_date_toks) return false;
 
   // Parse the 1 or 2 digit hour
   if (tok_end - str != 1 && tok_end - str != 2) return false;
@@ -354,6 +360,7 @@ const DateTimeFormatContext* SimpleDateFormatTokenizer::GetDefaultFormatContext(
   DCHECK(initialized);
   DCHECK(str != nullptr);
   DCHECK(len > 0);
+  DCHECK(!accept_time_toks_only || accept_time_toks);
 
   if (LIKELY(len >= DEFAULT_TIME_FMT_LEN)) {
     // Check if this string starts with a date component
@@ -408,23 +415,15 @@ const DateTimeFormatContext* SimpleDateFormatTokenizer::GetDefaultFormatContext(
           break;
         }
       }
-    } else {
-      // 'str' string does not start with a date component.
-      // Do we accept time component only?
-      if (!accept_time_toks || !accept_time_toks_only) return nullptr;
-
-      // Parse time component.
-      if (str[2] == ':' && str[5] == ':' && isdigit(str[7])) {
-        len = min(len, DEFAULT_TIME_FRAC_FMT_LEN);
-        if (len > DEFAULT_TIME_FMT_LEN && str[8] == '.') {
-          return &DEFAULT_TIME_FRAC_CTX[len - DEFAULT_TIME_FMT_LEN - 1];
-        } else {
-          return &DEFAULT_TIME_CTX;
-        }
+    } else if (accept_time_toks_only && str[2] == ':' && str[5] == ':') {
+      if (len == DEFAULT_TIME_FMT_LEN) return &DEFAULT_TIME_CTX;
+      // There is only time component.
+      len = min(len, DEFAULT_TIME_FRAC_FMT_LEN);
+      if (len > DEFAULT_TIME_FMT_LEN && str[8] == '.') {
+        return &DEFAULT_TIME_FRAC_CTX[len - DEFAULT_TIME_FMT_LEN - 1];
       }
     }
   }
-
   return nullptr;
 }
 

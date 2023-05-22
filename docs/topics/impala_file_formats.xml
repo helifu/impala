@@ -106,7 +106,7 @@ under the License.
             <entry>
               Structured
             </entry>
-            <entry> Snappy, gzip, zstd, lz4; currently Snappy by default </entry>
+            <entry>Snappy, gzip, zstd, lz4; currently Snappy by default </entry>
             <entry>
               Yes.
             </entry>
@@ -125,14 +125,8 @@ under the License.
             <entry>
               gzip, Snappy, LZO, LZ4; currently gzip by default
             </entry>
-            <entry>
-              Yes, in Impala 2.12.0 and higher.
-
-              <p>
-                The ORC support is an experimental feature since Impala-2.12. To disable it, set
-                <codeph>--enable_orc_scanner</codeph> to <codeph>false</codeph> when starting
-                the cluster.
-              </p>
+            <entry> Yes, in Impala 2.12.0 and higher. <p>By default, ORC reads are enabled in Impala
+              3.4.0 and higher. </p>
             </entry>
             <entry>
               No. Import data by using <codeph>LOAD DATA</codeph> on data files already in the
@@ -147,9 +141,7 @@ under the License.
             <entry>
               Unstructured
             </entry>
-            <entry rev="2.0.0">
-              LZO, gzip, bzip2, Snappy
-            </entry>
+            <entry rev="2.0.0">bzip2, deflate, gzip, LZO, Snappy, zstd</entry>
             <entry>
               Yes. For <codeph>CREATE TABLE</codeph> with no <codeph>STORED AS</codeph> clause,
               the default file format is uncompressed text, with values separated by ASCII
@@ -180,6 +172,16 @@ under the License.
               <varname>table_name</varname></codeph> in Impala.
             </entry>
 <!-- <entry rev="2.0.0">Yes, in Impala 2.0 and higher. For earlier Impala releases, load data through <codeph>LOAD DATA</codeph> on data files already in the right format, or use <codeph>INSERT</codeph> in Hive.</entry> -->
+          </row>
+          <row id="hudi_support">
+            <entry>
+              <xref href="impala_hudi.xml#hudi">Hudi</xref>
+            </entry>
+            <entry>Structured</entry>
+            <entry>Snappy, gzip, zstd, lz4; currently Snappy by default </entry>
+            <entry>Yes, support for Read Optimized Queries is experimental.</entry>
+            <entry>No. Create an external table in Impala. Set the table location to the Hudi table
+              directory. Alternatively, create the Hudi table in Hive. </entry>
           </row>
           <row id="rcfile_support">
             <entry>
@@ -276,9 +278,7 @@ under the License.
         </dt>
 
         <dd>
-          <p>
-            Not supported for text files.
-          </p>
+          <p> Supported for AVRO, RC, Sequence, and text files. </p>
         </dd>
 
       </dlentry>
@@ -314,7 +314,7 @@ under the License.
       </dlentry>
       <dlentry>
         <dt>Zstd</dt>
-        <dd>For Parquet files only.</dd>
+        <dd>For Parquet and text files only.</dd>
       </dlentry>
 
       <dlentry>

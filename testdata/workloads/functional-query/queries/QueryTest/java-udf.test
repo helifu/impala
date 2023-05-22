@@ -85,6 +85,13 @@ string, string, string, string, string, string
 'why hello there','why hello there','why hello there','NULL','NULL','NULL'
 ====
 ---- QUERY
+select identity(cast("a" as binary)), identity(cast(NULL as binary));
+---- TYPES
+binary, binary
+---- RESULTS
+'a','NULL'
+====
+---- QUERY
 # IMPALA-1134. Each "identity" call below tests a different type (BytesWritable, Text,
 # and String). The different types are handled slightly differently.
 select length(identity("0123456789")),
@@ -96,26 +103,14 @@ int, int, int
 10,20,30
 ====
 ---- QUERY
-# IMPALA-1392: Hive UDFs that throw exceptions should return NULL
 select throws_exception();
----- TYPES
-boolean
----- RESULTS
-NULL
+---- CATCH
+Test exception
 ====
 ---- QUERY
 select throws_exception() from functional.alltypestiny;
----- TYPES
-boolean
----- RESULTS
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
+---- CATCH
+Test exception
 ====
 ---- QUERY
 select hive_add(cast(1 as int), cast(2 as int));
@@ -231,6 +226,13 @@ string
 'abc'
 ====
 ---- QUERY
+# BINARY is only supported when the function is created
+# specifically with BINARY arguments / return type (IMPALA-11340).
+select identity_anytype(cast("a" as binary));
+---- CATCH
+AnalysisException: No matching function with signature
+====
+---- QUERY
 # IMPALA-3378: test many Java UDFs being opened and run concurrently
 select * from
 (select max(int_col) from functional.alltypesagg
@@ -316,4 +318,69 @@ select import_nearby_classes("placeholder");
 string
 ---- RESULTS
 'Hello'
+====
+---- QUERY
+# In the interpreted code path of HiveUdfCall, we use ScalarExprEvaluator::GetValue which
+# evaluates the child expression and returns a nullptr if it is NULL. But in the case of
+# TYPE_DATE it also returns nullptr if the date is invalid, so the interpreted path would
+# handle invalid dates as nulls. Java UDFs involving Date are not allowed yet, this test
+# is a reminder that we'll have to handle this case in codegen when we add support for Date.
+create function identity(Date) returns Date
+location '$FILESYSTEM_PREFIX/test-warehouse/impala-hive-udfs.jar'
+symbol='org.apache.impala.TestUdf';
+---- CATCH
+AnalysisException: Type DATE is not supported for Java UDFs.
+====
+---- QUERY
+# Timestamp values are not supported in Java UDFs yet and the implementation may have been
+# written without Timestamps in mind. This test is a reminder that we'll need to review
+# and test the implementation of HiveUdfCall (especially codegen) with Timestamp values
+# when we add support for them.
+create function identity(Timestamp) returns Timestamp
+location '$FILESYSTEM_PREFIX/test-warehouse/impala-hive-udfs.jar'
+symbol='org.apache.impala.TestUdf';
+---- CATCH
+AnalysisException: Type TIMESTAMP is not supported for Java UDFs.
+====
+---- QUERY
+create function var_args_func(int...) returns int
+location '$FILESYSTEM_PREFIX/test-warehouse/impala-hive-udfs.jar'
+symbol='org.apache.impala.TestUdf';
+---- CATCH
+CatalogException: Variable arguments not supported in Hive UDFs.
+====
+---- QUERY
+select increment("a");
+---- TYPES
+STRING
+---- RESULTS
+'b'
+====
+---- QUERY
+select increment(NULL);
+---- TYPES
+STRING
+---- RESULTS
+'NULL'
+====
+---- QUERY
+select increment("");
+---- TYPES
+STRING
+---- RESULTS
+''
+====
+---- QUERY
+select increment(cast("a" as binary));
+---- TYPES
+BINARY
+---- RESULTS
+'b'
+====
+---- QUERY
+select copy_and_increment(cast("bbb" as binary), cast("aaaa" as binary));
+---- TYPES
+BINARY
+---- RESULTS
+'baaa'
 ====

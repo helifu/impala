@@ -55,11 +55,13 @@ import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.service.FeCatalogManager;
 import org.apache.impala.service.Frontend;
+import org.apache.impala.service.FrontendProfile;
 import org.apache.impala.testutil.ImpaladTestCatalog;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TSessionState;
 import org.apache.impala.util.EventSequence;
+import org.apache.impala.util.TSessionStateUtil;
 import org.junit.Assert;
 
 import com.google.common.base.Preconditions;
@@ -154,6 +156,8 @@ public class FrontendTestBase extends AbstractFrontendTest {
       "d2 decimal(10, 0), d3 decimal(20, 10), d4 decimal(38, 38), d5 decimal(10, 5), " +
       "timestamp_col timestamp, string_col string, varchar_col varchar(50), " +
       "char_col char (30), date_col date)");
+    // TODO: no BINARY column added at the moment, as this table is used to test all
+    //       columns with sampled_ndv, which is currently not enabled for BINARY
   }
 
   /**
@@ -192,9 +196,17 @@ public class FrontendTestBase extends AbstractFrontendTest {
   /**
    * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
    * If 'expectedWarning' is not null, asserts that a warning is produced.
+   * Otherwise, asserts no warnings.
    */
   public ParseNode AnalyzesOk(String stmt, String expectedWarning) {
-    return AnalyzesOk(stmt, createAnalysisCtx(), expectedWarning);
+    return AnalyzesOk(stmt, createAnalysisCtx(), expectedWarning, true);
+  }
+
+  /**
+   * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error or warnings.
+   */
+  public ParseNode AnalyzesOkWithoutWarnings(String stmt) {
+    return AnalyzesOk(stmt, createAnalysisCtx(), null, true);
   }
 
   protected AnalysisContext createAnalysisCtx() {
@@ -239,22 +251,36 @@ public class FrontendTestBase extends AbstractFrontendTest {
   /**
    * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
    * If 'expectedWarning' is not null, asserts that a warning is produced.
+   * Otherwise, asserts no warnings if 'assertNoWarnings' is true.
    */
+  public ParseNode AnalyzesOk(String stmt, AnalysisContext ctx, String expectedWarning,
+      boolean assertNoWarnings) {
+    try (FrontendProfile.Scope scope = FrontendProfile.createNewWithScope()) {
+      return feFixture_.analyzeStmt(stmt, ctx, expectedWarning, assertNoWarnings);
+    }
+  }
+
   public ParseNode AnalyzesOk(String stmt, AnalysisContext ctx, String expectedWarning) {
-    return feFixture_.analyzeStmt(stmt, ctx, expectedWarning);
+    return AnalyzesOk(stmt, ctx, expectedWarning, false);
+  }
+
+  public ParseNode AnalyzesOkWithoutWarnings(String stmt, AnalysisContext ctx) {
+    return AnalyzesOk(stmt, ctx, null, true);
   }
 
   /**
    * Analyzes the given statement without performing rewrites or authorization.
    */
   public StatementBase AnalyzesOkNoRewrite(StatementBase stmt) throws ImpalaException {
-    AnalysisContext ctx = createAnalysisCtx();
-    StmtMetadataLoader mdLoader =
-        new StmtMetadataLoader(frontend_, ctx.getQueryCtx().session.database, null);
-    StmtTableCache loadedTables = mdLoader.loadTables(stmt);
-    Analyzer analyzer = ctx.createAnalyzer(loadedTables);
-    stmt.analyze(analyzer);
-    return stmt;
+    try (FrontendProfile.Scope scope = FrontendProfile.createNewWithScope()) {
+      AnalysisContext ctx = createAnalysisCtx();
+      StmtMetadataLoader mdLoader =
+          new StmtMetadataLoader(frontend_, ctx.getQueryCtx().session.database, null);
+      StmtTableCache loadedTables = mdLoader.loadTables(stmt);
+      Analyzer analyzer = ctx.createAnalyzer(loadedTables);
+      stmt.analyze(analyzer);
+      return stmt;
+    }
   }
 
   /**
@@ -307,12 +333,15 @@ public class FrontendTestBase extends AbstractFrontendTest {
 
   protected AnalysisResult parseAndAnalyze(String stmt, AnalysisContext ctx, Frontend fe)
       throws ImpalaException {
-    ctx.getQueryCtx().getClient_request().setStmt(stmt);
-    StatementBase parsedStmt = Parser.parse(stmt, ctx.getQueryOptions());
-    StmtMetadataLoader mdLoader =
-        new StmtMetadataLoader(fe, ctx.getQueryCtx().session.database, null);
-    StmtTableCache stmtTableCache = mdLoader.loadTables(parsedStmt);
-    return ctx.analyzeAndAuthorize(parsedStmt, stmtTableCache, fe.getAuthzChecker());
+    try (FrontendProfile.Scope scope = FrontendProfile.createNewWithScope()) {
+      ctx.getQueryCtx().getClient_request().setStmt(stmt);
+      StatementBase parsedStmt = Parser.parse(stmt, ctx.getQueryOptions());
+      User user = new User(TSessionStateUtil.getEffectiveUser(ctx.getQueryCtx().session));
+      StmtMetadataLoader mdLoader =
+          new StmtMetadataLoader(fe, ctx.getQueryCtx().session.database, null, user);
+      StmtTableCache stmtTableCache = mdLoader.loadTables(parsedStmt);
+      return ctx.analyzeAndAuthorize(parsedStmt, stmtTableCache, fe.getAuthzChecker());
+    }
   }
 
   /**
@@ -385,6 +414,33 @@ public class FrontendTestBase extends AbstractFrontendTest {
           public void invalidateAuthorizationCache() {}
 
           @Override
+          public boolean needsMaskingOrFiltering(User user, String dbName,
+              String tableName, List<String> requiredColumns) {
+            return false;
+          }
+
+          @Override
+          public boolean needsRowFiltering(User user, String dbName, String tableName) {
+            return false;
+          }
+
+          @Override
+          public String createColumnMask(User user, String dbName, String tableName,
+              String columnName, AuthorizationContext authzCtx) {
+            return null;
+          }
+
+          @Override
+          public String createRowFilter(User user, String dbName, String tableName,
+              AuthorizationContext rangerCtx) {
+            return null;
+          }
+
+          @Override
+          public void postAnalyze(AuthorizationContext authzCtx) {
+          }
+
+          @Override
           public AuthorizationContext createAuthorizationContext(boolean doAudits,
               String sqlStmt, TSessionState sessionState,
               Optional<EventSequence> timeline) {
@@ -402,6 +458,11 @@ public class FrontendTestBase extends AbstractFrontendTest {
       @Override
       public AuthorizationManager newAuthorizationManager(CatalogServiceCatalog catalog) {
         return new NoopAuthorizationManager();
+      }
+
+      @Override
+      public boolean supportsTableMasking() {
+        return false;
       }
     };
   }

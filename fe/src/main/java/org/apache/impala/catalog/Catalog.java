@@ -21,8 +21,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -34,12 +36,14 @@ import org.apache.hadoop.hive.metastore.api.LockType;
 import org.apache.impala.analysis.FunctionName;
 import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.monitor.CatalogMonitor;
 import org.apache.impala.common.TransactionException;
 import org.apache.impala.common.TransactionKeepalive;
 import org.apache.impala.common.TransactionKeepalive.HeartbeatContext;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TFunction;
+import org.apache.impala.thrift.THdfsPartition;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TTable;
@@ -89,6 +93,15 @@ public abstract class Catalog implements AutoCloseable {
   // Cache of data sources.
   protected final CatalogObjectCache<DataSource> dataSources_;
 
+  // Cache of transaction to write id mapping for the open transactions which are detected
+  // by the catalogd via events processor. The entries get cleaned up on receiving commit
+  // transaction or abort transaction events.
+  // We need this mapping because not all the write ids for a commit event can be
+  // retrieved from HMS. We can fetch write id for write events via getAllWriteEventInfo.
+  // However, we don't have API to fetch write ids for DDL events.
+  protected final ConcurrentHashMap<Long, Set<TableWriteId>> txnToWriteIds_ =
+      new ConcurrentHashMap<>();
+
   // Cache of known HDFS cache pools. Allows for checking the existence
   // of pools without hitting HDFS.
   protected final CatalogObjectCache<HdfsCachePool> hdfsCachePools_ =
@@ -121,6 +134,11 @@ public abstract class Catalog implements AutoCloseable {
   public Catalog() {
     this(new MetaStoreClientPool(0, 0));
   }
+
+  /**
+   * Returns the Hive ACID user id used by this catalog.
+   */
+  public abstract String getAcidUserId();
 
   /**
    * Adds a new database to the catalog, replacing any existing database with the same
@@ -208,7 +226,7 @@ public abstract class Catalog implements AutoCloseable {
     if (db == null) return null;
     Table tbl = db.removeTable(tableName.getTable_name());
     if (tbl != null && !tbl.isStoredInImpaladCatalogCache()) {
-      CatalogUsageMonitor.INSTANCE.removeTable(tbl);
+      CatalogMonitor.INSTANCE.getCatalogTableMetrics().removeTable(tbl);
     }
     return tbl;
   }
@@ -503,16 +521,17 @@ public abstract class Catalog implements AutoCloseable {
           throw new CatalogException("Table not found: " +
               objectDesc.getTable().getTbl_name());
         }
-        table.getLock().lock();
+        table.takeReadLock();
         try {
           result.setType(table.getCatalogObjectType());
           result.setCatalog_version(table.getCatalogVersion());
           result.setTable(table.toThrift());
         } finally {
-          table.getLock().unlock();
+          table.releaseReadLock();
         }
         break;
       }
+      // TODO(IMPALA-9935): support HDFS_PARTITION
       case FUNCTION: {
         TFunction tfn = objectDesc.getFn();
         Function desc = Function.fromThrift(tfn);
@@ -619,10 +638,18 @@ public abstract class Catalog implements AutoCloseable {
       case DATABASE:
         return "DATABASE:" + catalogObject.getDb().getDb_name().toLowerCase();
       case TABLE:
-      case VIEW:
         TTable tbl = catalogObject.getTable();
         return "TABLE:" + tbl.getDb_name().toLowerCase() + "." +
             tbl.getTbl_name().toLowerCase();
+      case VIEW:
+        TTable view = catalogObject.getTable();
+        return "VIEW:" + view.getDb_name().toLowerCase() + "." +
+            view.getTbl_name().toLowerCase();
+      case HDFS_PARTITION:
+        THdfsPartition part = catalogObject.getHdfs_partition();
+        return "HDFS_PARTITION:" + part.getDb_name().toLowerCase() + "." +
+            part.getTbl_name().toLowerCase() + ":" +
+            Preconditions.checkNotNull(part.getPartition_name());
       case FUNCTION:
         return "FUNCTION:" + catalogObject.getFn().getName() + "(" +
             catalogObject.getFn().getSignature() + ")";
@@ -676,7 +703,7 @@ public abstract class Catalog implements AutoCloseable {
    */
   public Transaction openTransaction(IMetaStoreClient hmsClient, HeartbeatContext ctx)
       throws TransactionException {
-    return new Transaction(hmsClient, transactionKeepalive_, "Impala Catalog", ctx);
+    return new Transaction(hmsClient, transactionKeepalive_, getAcidUserId(), ctx);
   }
 
   /**
@@ -686,11 +713,14 @@ public abstract class Catalog implements AutoCloseable {
    * 'releaseTableLock()'.
    * @param dbName Name of the DB where the particular table is.
    * @param tableName Name of the table where the lock is acquired.
+   * @param lockMaxWaitTime Maximum wait time on the ACID lock.
    * @throws TransactionException
    */
-  public long lockTableStandalone(String dbName, String tableName, HeartbeatContext ctx)
+  public long lockTableStandalone(String dbName, String tableName, HeartbeatContext ctx,
+      int lockMaxWaitTime)
       throws TransactionException {
-    return lockTableInternal(dbName, tableName, 0L, DataOperationType.NO_TXN, ctx);
+    return lockTableInternal(dbName, tableName, 0L, DataOperationType.NO_TXN, ctx,
+        lockMaxWaitTime);
   }
 
   /**
@@ -700,13 +730,16 @@ public abstract class Catalog implements AutoCloseable {
    * @param dbName Name of the DB where the particular table is.
    * @param tableName Name of the table where the lock is acquired.
    * @param transaction the transaction that needs to lock the table.
+   * @param lockMaxWaitTime Maximum wait time on the ACID lock.
    * @throws TransactionException
    */
   public void lockTableInTransaction(String dbName, String tableName,
-      Transaction transaction, DataOperationType opType, HeartbeatContext ctx)
+      Transaction transaction, DataOperationType opType, HeartbeatContext ctx,
+      int lockMaxWaitTime)
       throws TransactionException {
     Preconditions.checkState(transaction.getId() > 0);
-    lockTableInternal(dbName, tableName, transaction.getId(), opType, ctx);
+    lockTableInternal(dbName, tableName, transaction.getId(), opType, ctx,
+        lockMaxWaitTime);
   }
 
   /**
@@ -715,10 +748,12 @@ public abstract class Catalog implements AutoCloseable {
    * @param dbName Name of the DB where the particular table is.
    * @param tableName Name of the table where the lock is acquired.
    * @param txnId id of the transaction, 0 for standalone locks.
+   * @param lockMaxWaitTime Maximum wait time on the ACID lock.
    * @throws TransactionException
    */
   private long lockTableInternal(String dbName, String tableName, long txnId,
-      DataOperationType opType, HeartbeatContext ctx) throws TransactionException {
+      DataOperationType opType, HeartbeatContext ctx, int lockMaxWaitTime)
+      throws TransactionException {
     Preconditions.checkState(txnId >= 0);
     LockComponent lockComponent = new LockComponent();
     lockComponent.setDbname(dbName);
@@ -729,7 +764,8 @@ public abstract class Catalog implements AutoCloseable {
     List<LockComponent> lockComponents = Arrays.asList(lockComponent);
     long lockId = -1L;
     try (MetaStoreClient client = metaStoreClientPool_.getClient()) {
-      lockId = MetastoreShim.acquireLock(client.getHiveClient(), txnId, lockComponents);
+      lockId = MetastoreShim.acquireLock(client.getHiveClient(), txnId, lockComponents,
+          lockMaxWaitTime);
       if (txnId == 0L) transactionKeepalive_.addLock(lockId, ctx);
     }
     return lockId;
@@ -744,5 +780,41 @@ public abstract class Catalog implements AutoCloseable {
       transactionKeepalive_.deleteLock(lockId);
       MetastoreShim.releaseLock(client.getHiveClient(), lockId);
     }
+  }
+
+  /**
+   * Returns write ids for an open txn from the Catalog. If there is no write id
+   * associated with the txnId, it returns empty set.
+   */
+  public Set<TableWriteId> getWriteIds(Long txnId) {
+    Preconditions.checkNotNull(txnId);
+    return Collections.unmodifiableSet(txnToWriteIds_.getOrDefault(txnId,
+        Collections.emptySet()));
+  }
+
+  /**
+   * Adds a mapping from txnId to tableWriteId to the Catalog.
+   */
+  public void addWriteId(Long txnId, TableWriteId tableWriteId) {
+    Preconditions.checkNotNull(txnId);
+    Preconditions.checkNotNull(tableWriteId);
+    txnToWriteIds_.computeIfAbsent(txnId, k -> new HashSet<>()).add(tableWriteId);
+  }
+
+  /**
+   * Removes and returns all write id records for a transaction. If there is no write id
+   * associated with the txnId, it returns empty set.
+   */
+  public Set<TableWriteId> removeWriteIds(Long txnId) {
+    Preconditions.checkNotNull(txnId);
+    Set<TableWriteId> resultSet = txnToWriteIds_.remove(txnId);
+    return resultSet != null ? resultSet : Collections.emptySet();
+  }
+
+  /**
+   * Clears all write id records.
+   */
+  public void clearWriteIds() {
+    txnToWriteIds_.clear();
   }
 }

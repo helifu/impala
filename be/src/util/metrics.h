@@ -17,13 +17,13 @@
 
 #pragma once
 
+#include <iosfwd>
 #include <map>
-#include <sstream>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <boost/function.hpp>
 #include <boost/scoped_ptr.hpp>
-#include <boost/thread/locks.hpp>
 #include <gtest/gtest_prod.h> // for FRIEND_TEST
 #include <rapidjson/fwd.h>
 
@@ -35,11 +35,12 @@
 #include "util/debug-util.h"
 #include "util/metrics-fwd.h"
 #include "util/spinlock.h"
-#include "util/webserver.h"
 
 using kudu::HttpStatusCode;
 
 namespace impala {
+
+class Webserver;
 
 /// Singleton that provides metric definitions. Metrics are defined in metrics.json
 /// and generate_metrics.py produces MetricDefs.thrift. This singleton wraps an instance
@@ -186,13 +187,13 @@ class LockedMetric : public ScalarMetric<T, metric_kind_t> {
 
   /// Atomically reads the current value.
   virtual T GetValue() override {
-    boost::lock_guard<SpinLock> l(lock_);
+    std::lock_guard<SpinLock> l(lock_);
     return value_;
   }
 
   /// Atomically sets the value.
   void SetValue(const T& value) {
-    boost::lock_guard<SpinLock> l(lock_);
+    std::lock_guard<SpinLock> l(lock_);
     value_ = value;
   }
 
@@ -269,9 +270,11 @@ class AtomicHighWaterMarkGauge : public ScalarMetric<int64_t, TMetricKind::GAUGE
 
   /// Adds 'delta' to the current value atomically.
   /// The hwm value is also updated atomically.
-  void Increment(int64_t delta) {
+  /// The updated current value is also returned.
+  int64_t Increment(int64_t delta) {
     const int64_t new_val = current_value_->Increment(delta);
     UpdateMax(new_val);
+    return new_val;
   }
 
   IntGauge* current_value() const { return current_value_; }
@@ -359,7 +362,7 @@ class MetricGroup {
   template <typename M>
   M* RegisterMetric(M* metric) {
     DCHECK(!metric->key_.empty());
-    boost::lock_guard<SpinLock> l(lock_);
+    std::lock_guard<SpinLock> l(lock_);
     DCHECK(metric_map_.find(metric->key_) == metric_map_.end()) << metric->key_;
     std::shared_ptr<M> metric_ptr(metric);
     metric_map_[metric->key_] = metric_ptr;
@@ -372,7 +375,7 @@ class MetricGroup {
   void RemoveMetric(const std::string& key, const std::string& metric_def_arg = "") {
     TMetricDef metric_def = MetricDefs::Get(key, metric_def_arg);
     DCHECK(!metric_def.key.empty());
-    boost::lock_guard<SpinLock> l(lock_);
+    std::lock_guard<SpinLock> l(lock_);
     DCHECK(metric_map_.find(metric_def.key) != metric_map_.end()) << metric_def.key;
     metric_map_.erase(metric_def.key);
     }
@@ -422,7 +425,7 @@ class MetricGroup {
 
   /// Register page callbacks with the webserver. Only the root of any metric group
   /// hierarchy needs to do this.
-  Status Init(Webserver* webserver);
+  Status RegisterHttpHandlers(Webserver* webserver);
 
   /// Converts this metric group (and optionally all of its children recursively) to JSON.
   void ToJson(bool include_children, rapidjson::Document* document,
@@ -463,25 +466,26 @@ class MetricGroup {
   typedef std::unordered_map<std::string, MetricGroup*> ChildGroupMap;
   ChildGroupMap children_;
 
+  // Forward declaration for Webserver::WebRequest.
+  using WebRequest = kudu::WebCallbackRegistry::WebRequest;
+
   /// Webserver callback for /metrics. Produces a tree of JSON values, each representing a
   /// metric group, and each including a list of metrics, and a list of immediate
   /// children.  If args contains a paramater 'metric', only the json for that metric is
   /// returned.
-  void TemplateCallback(const Webserver::WebRequest& req,
-      rapidjson::Document* document);
+  void TemplateCallback(const WebRequest& req, rapidjson::Document* document);
 
   /// Webserver callback for /metricsPrometheus. Produces string in prometheus format,
   /// each representing metric group, and each including a list of metrics, and a list
   /// of immediate children.  If args contains a paramater 'metric', only the json for
   /// that metric is returned.
-  void PrometheusCallback(const Webserver::WebRequest& req, std::stringstream* data,
+  void PrometheusCallback(const WebRequest& req, std::stringstream* data,
       HttpStatusCode* response);
 
   /// Legacy webpage callback for CM 5.0 and earlier. Produces a flattened map of (key,
   /// value) pairs for all metrics in this hierarchy.
   /// If args contains a paramater 'metric', only the json for that metric is returned.
-  void CMCompatibleCallback(const Webserver::WebRequest& req,
-      rapidjson::Document* document);
+  void CMCompatibleCallback(const WebRequest& req, rapidjson::Document* document);
 
   /// Non-templated implementation for FindMetricForTesting() that does not cast.
   Metric* FindMetricForTestingInternal(const std::string& key);

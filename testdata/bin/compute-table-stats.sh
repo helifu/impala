@@ -34,7 +34,8 @@ COMPUTE_STATS_SCRIPT="${IMPALA_HOME}/tests/util/compute_table_stats.py --impalad
 ${COMPUTE_STATS_SCRIPT} --db_names=functional\
     --table_names="alltypes,alltypesagg,alltypesaggmultifilesnopart,alltypesaggnonulls,
     alltypessmall,alltypestiny,jointbl,dimtbl,stringpartitionkey,nulltable,nullrows,
-    date_tbl,chars_medium"
+    date_tbl,chars_medium,part_strings_with_quotes,alltypes_date_partition,
+    alltypes_date_partition_2,mv1_alltypes_jointbl,binary_tbl,binary_tbl_big"
 
 # We cannot load HBase on s3 and isilon yet.
 if [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
@@ -44,7 +45,4 @@ fi
 ${COMPUTE_STATS_SCRIPT} --db_names=tpch,tpch_parquet,tpch_orc_def \
     --table_names=customer,lineitem,nation,orders,part,partsupp,region,supplier
 ${COMPUTE_STATS_SCRIPT} --db_names=tpch_nested_parquet,tpcds,tpcds_parquet
-
-if "$KUDU_IS_SUPPORTED"; then
-  ${COMPUTE_STATS_SCRIPT} --db_names=functional_kudu,tpch_kudu
-fi
+${COMPUTE_STATS_SCRIPT} --db_names=functional_kudu,tpch_kudu

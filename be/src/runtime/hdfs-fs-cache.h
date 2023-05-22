@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_RUNTIME_HDFS_FS_CACHE_H
-#define IMPALA_RUNTIME_HDFS_FS_CACHE_H
-
+#include <mutex>
 #include <string>
 #include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
-#include <boost/thread/mutex.hpp>
 #include "common/hdfs.h"
 
 #include "common/status.h"
@@ -42,6 +40,7 @@ namespace impala {
 class HdfsFsCache {
  public:
   typedef boost::unordered_map<std::string, hdfsFS> HdfsFsMap;
+  typedef std::vector<std::pair<string, string>> HdfsConnOptions;
 
   static HdfsFsCache* instance() { return HdfsFsCache::instance_.get(); }
 
@@ -53,14 +52,15 @@ class HdfsFsCache {
 
   /// Get connection to specific fs by specifying a path.  Optionally, a local cache can
   /// be provided so that the process-wide lock can be avoided on subsequent calls for
-  /// the same filesystem.  The caller is responsible for synchronizing the local cache
+  /// the same filesystem. Also, options can be provided to create the hdfs connection.
+  /// The caller is responsible for synchronizing the local cache
   /// (e.g. by passing a thread-local cache).
-  Status GetConnection(const std::string& path, hdfsFS* fs,
-      HdfsFsMap* local_cache = NULL);
+  Status GetConnection(const std::string& path, hdfsFS* fs, HdfsFsMap* local_cache = NULL,
+      const HdfsConnOptions* options = NULL);
 
   /// Get NameNode info from path, set error message if path is not valid.
   /// Exposed as a static method for testing purpose.
-  static string GetNameNodeFromPath(const string& path, string* err);
+  static std::string GetNameNodeFromPath(const std::string& path, std::string* err);
 
   /// S3A access key retrieved by running command in Init().
   /// If either s3a_secret_key_ or this are empty, the default value is taken from the
@@ -76,7 +76,7 @@ class HdfsFsCache {
   /// Singleton instance. Instantiated in Init().
   static boost::scoped_ptr<HdfsFsCache> instance_;
 
-  boost::mutex lock_;  // protects fs_map_
+  std::mutex lock_; // protects fs_map_
   HdfsFsMap fs_map_;
 
   HdfsFsCache() { }
@@ -85,5 +85,3 @@ class HdfsFsCache {
 };
 
 }
-
-#endif

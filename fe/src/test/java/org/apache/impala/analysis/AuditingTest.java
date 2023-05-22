@@ -236,16 +236,16 @@ public class AuditingTest extends FrontendTestBase {
 
     // Dropping a table that fails loading should still result in an access event.
     accessEvents = AnalyzeAccessEvents(
-        "drop table functional.unsupported_partition_types");
+        "drop table functional.unsupported_binary_partition");
     Assert.assertEquals(accessEvents, Sets.newHashSet(new TAccessEvent(
-        "functional.unsupported_partition_types", TCatalogObjectType.TABLE, "DROP")));
+        "functional.unsupported_binary_partition", TCatalogObjectType.TABLE, "DROP")));
 
     // Dropping a table without using a fully qualified path should generate the correct
     // access event (see IMPALA-5318).
     accessEvents = AnalyzeAccessEvents(
-        "drop table unsupported_partition_types", "functional");
+        "drop table unsupported_binary_partition", "functional");
     Assert.assertEquals(accessEvents, Sets.newHashSet(new TAccessEvent(
-        "functional.unsupported_partition_types", TCatalogObjectType.TABLE, "DROP")));
+        "functional.unsupported_binary_partition", TCatalogObjectType.TABLE, "DROP")));
   }
 
   @Test
@@ -300,6 +300,16 @@ public class AuditingTest extends FrontendTestBase {
             "functional_seq_snap.alltypes", TCatalogObjectType.TABLE, "ALTER"),
         new TAccessEvent(
             "functional_seq_snap.alltypes", TCatalogObjectType.TABLE, "SELECT")));
+
+    // COMPUTE STATS results in two registrations of the ALTER event. Check we do not have
+    // duplicate ALTER events when the fully-qualified table name is not in lowercase.
+    accessEvents = AnalyzeAccessEvents(
+        "COMPUTE STATS FUNCTIONAL_SEQ_SNAP.ALLTYPES");
+    Assert.assertEquals(accessEvents, Sets.newHashSet(
+        new TAccessEvent(
+            "functional_seq_snap.alltypes", TCatalogObjectType.TABLE, "ALTER"),
+        new TAccessEvent(
+            "functional_seq_snap.alltypes", TCatalogObjectType.TABLE, "SELECT")));
   }
 
   @Test
@@ -345,13 +355,25 @@ public class AuditingTest extends FrontendTestBase {
   }
 
   @Test
-  public void TestShow() throws AnalysisException, AuthorizationException{
+  public void TestShowViewMetadata() throws AnalysisException, AuthorizationException{
     String[] statsQuals = new String[]{ "partitions", "table stats", "column stats" };
     for (String qual: statsQuals) {
       Set<TAccessEvent> accessEvents =
           AnalyzeAccessEvents(String.format("show %s functional.alltypes", qual));
       Assert.assertEquals(accessEvents, Sets.newHashSet(new TAccessEvent(
           "functional.alltypes", TCatalogObjectType.TABLE, "VIEW_METADATA")));
+    }
+  }
+
+  @Test
+  public void TestShowAny() throws AnalysisException, AuthorizationException {
+    String[] statsQuals = new String[] { "tables", "functions" };
+    for (String qual : statsQuals) {
+        Set<TAccessEvent> accessEvents = AnalyzeAccessEvents(String.format(
+            "show %s in functional", qual));
+        Assert.assertEquals(accessEvents,
+            Sets.newHashSet(new TAccessEvent("functional", TCatalogObjectType
+            .DATABASE, "ANY")));
     }
   }
 

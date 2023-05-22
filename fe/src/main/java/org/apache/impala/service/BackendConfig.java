@@ -24,7 +24,9 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.authentication.util.KerberosName;
 import org.apache.impala.analysis.SqlScanner;
 import org.apache.impala.thrift.TBackendGflags;
+import org.apache.impala.thrift.TGeospatialLibrary;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 
@@ -37,15 +39,27 @@ public class BackendConfig {
 
   private TBackendGflags backendCfg_;
 
+  // Thresholds in warning slow or large catalog responses.
+  private long warnCatalogResponseSize_;
+  private long warnCatalogResponseDurationMs_;
+
   private BackendConfig(TBackendGflags cfg) {
     backendCfg_ = cfg;
+    warnCatalogResponseSize_ = cfg.warn_catalog_response_size_mb * 1024L * 1024L;
+    warnCatalogResponseDurationMs_ = cfg.warn_catalog_response_duration_s * 1000L;
   }
 
   public static void create(TBackendGflags cfg) {
+    BackendConfig.create(cfg, true);
+  }
+
+  public static void create(TBackendGflags cfg, boolean initialize) {
     Preconditions.checkNotNull(cfg);
     INSTANCE = new BackendConfig(cfg);
-    SqlScanner.init(cfg.getReserved_words_version());
-    initAuthToLocal();
+    if (initialize) {
+      SqlScanner.init(cfg.getReserved_words_version());
+      initAuthToLocal();
+    }
   }
 
   public TBackendGflags getBackendCfg() { return backendCfg_; }
@@ -67,12 +81,11 @@ public class BackendConfig {
   }
   public int getKuduClientTimeoutMs() { return backendCfg_.kudu_operation_timeout_ms; }
 
+  public String getKuduSaslProtocolName() { return backendCfg_.kudu_sasl_protocol_name; }
+
   public String getImpalaBuildVersion() { return backendCfg_.impala_build_version; }
   public int getImpalaLogLevel() { return backendCfg_.impala_log_lvl; }
   public int getNonImpalaJavaVlogLevel() { return backendCfg_.non_impala_java_vlog; }
-  public long getSentryCatalogPollingFrequency() {
-    return backendCfg_.sentry_catalog_polling_frequency_s;
-  }
 
   public int maxHdfsPartsParallelLoad() {
     return backendCfg_.max_hdfs_partitions_parallel_load;
@@ -88,6 +101,10 @@ public class BackendConfig {
 
   public boolean isAuthorizedProxyGroupEnabled() {
     return !Strings.isNullOrEmpty(backendCfg_.authorized_proxy_group_config);
+  }
+
+  public boolean isShellBasedGroupsMappingEnabled() {
+    return backendCfg_.enable_shell_based_groups_mapping_support;
   }
 
   public boolean disableCatalogDataOpsDebugOnly() {
@@ -126,9 +143,7 @@ public class BackendConfig {
     return backendCfg_.hms_event_polling_interval_s;
   }
 
-  public boolean isOrcScannerEnabled() {
-    return backendCfg_.enable_orc_scanner;
-  }
+  public boolean isInsertEventsEnabled() { return backendCfg_.enable_insert_events; }
 
   /**
    * Returns the value of the `authorization_factory_class` flag or `null` if
@@ -139,14 +154,6 @@ public class BackendConfig {
   public String getAuthorizationFactoryClass() {
     final String val =  backendCfg_.getAuthorization_factory_class();
     return "".equals(val) ? null : val;
-  }
-
-  public boolean isMtDopUnlocked() {
-    return backendCfg_.unlock_mt_dop;
-  }
-
-  public boolean mtDopAutoFallback() {
-    return backendCfg_.mt_dop_auto_fallback;
   }
 
   public boolean recursivelyListPartitions() {
@@ -197,6 +204,79 @@ public class BackendConfig {
     return backendCfg_.min_privilege_set_for_show_stmts;
   }
 
+  public int getNumCheckAuthorizationThreads() {
+    return backendCfg_.num_check_authorization_threads;
+  }
+
+  public boolean useCustomizedUserGroupsMapperForRanger() {
+    return backendCfg_.use_customized_user_groups_mapper_for_ranger;
+  }
+
+  public void setColumnMaskingEnabled(boolean columnMaskingEnabled) {
+    backendCfg_.setEnable_column_masking(columnMaskingEnabled);
+  }
+
+  public void setRowFilteringEnabled(boolean rowFilteringEnabled) {
+    backendCfg_.setEnable_row_filtering(rowFilteringEnabled);
+  }
+
+  public boolean isColumnMaskingEnabled() { return backendCfg_.enable_column_masking; }
+  public boolean isRowFilteringEnabled() { return backendCfg_.enable_row_filtering; }
+
+  public boolean isCompactCatalogTopic() { return backendCfg_.compact_catalog_topic; }
+
+  public boolean isIncrementalMetadataUpdatesEnabled() {
+    return backendCfg_.enable_incremental_metadata_updates;
+  }
+
+  public String getSaml2KeystorePath() { return backendCfg_.saml2_keystore_path; }
+
+  public String getSaml2KeystorePassword() {
+    return backendCfg_.saml2_keystore_password;
+  }
+
+  public String getSaml2PrivateKeyPassword() {
+    return backendCfg_.saml2_private_key_password;
+  }
+
+  public String getSaml2IdpMetadata() { return backendCfg_.saml2_idp_metadata; }
+
+  public String getSaml2SpEntityId() { return backendCfg_.saml2_sp_entity_id; }
+
+  public String getSaml2SpCallbackUrl() { return backendCfg_.saml2_sp_callback_url; }
+
+  public boolean getSaml2WantAsserationsSigned() {
+    return backendCfg_.saml2_want_assertations_signed;
+  }
+
+  public boolean getSaml2SignRequest() { return backendCfg_.saml2_sign_requests; }
+
+  public int getSaml2CallbackTokenTtl() {
+    return backendCfg_.saml2_callback_token_ttl;
+  }
+
+  public String getSaml2GroupAttibuteName() { return backendCfg_.saml2_group_attribute_name; }
+
+  public String getSaml2GroupFilter() { return backendCfg_.saml2_group_filter; }
+
+  public boolean getSaml2EETestMode() { return backendCfg_.saml2_ee_test_mode; }
+
+  public String getScratchDirs() { return backendCfg_.scratch_dirs; }
+
+  public boolean getAllowOrdinalsInHaving() {
+    return backendCfg_.allow_ordinals_in_having;
+  }
+
+  public void setAllowOrdinalsInHaving(boolean allow_ordinals_in_having) {
+    backendCfg_.allow_ordinals_in_having = allow_ordinals_in_having;
+  }
+
+  public long getWarnCatalogResponseSize() { return warnCatalogResponseSize_; }
+
+  public long getWarnCatalogResponseDurationMs() {
+    return warnCatalogResponseDurationMs_;
+  }
+
   // Inits the auth_to_local configuration in the static KerberosName class.
   private static void initAuthToLocal() {
     // If auth_to_local is enabled, we read the configuration hadoop.security.auth_to_local
@@ -215,5 +295,107 @@ public class BackendConfig {
       // just extract the simple user name
       KerberosName.setRules(defaultRule);
     }
+  }
+
+  public boolean isDedicatedCoordinator() {
+    return (backendCfg_.is_executor == false) && (backendCfg_.is_coordinator == true);
+  }
+
+  public int getMaxWaitTimeForSyncDdlSecs() {
+    return backendCfg_.max_wait_time_for_sync_ddl_s;
+  }
+
+  public boolean startHmsServer() {
+    return backendCfg_.start_hms_server;
+  }
+
+  public int getHMSPort() {
+    return backendCfg_.hms_port;
+  }
+
+  public boolean fallbackToHMSOnErrors() {
+    return backendCfg_.fallback_to_hms_on_errors;
+  }
+
+  @VisibleForTesting
+  public void setEnableCatalogdHMSCache(boolean flag) {
+    backendCfg_.enable_catalogd_hms_cache = flag;
+  }
+
+  public boolean enableCatalogdHMSCache() {
+    return backendCfg_.enable_catalogd_hms_cache;
+  }
+
+  public boolean invalidateCatalogdHMSCacheOnDDLs() {
+    return backendCfg_.invalidate_hms_cache_on_ddls;
+  }
+
+  public String getStartupFilesystemCheckDirectories() {
+    return backendCfg_.startup_filesystem_check_directories;
+  }
+
+  public boolean getHMSEventIncrementalRefreshTransactionalTable() {
+    return backendCfg_.hms_event_incremental_refresh_transactional_table;
+  }
+
+  public boolean isAutoCheckCompaction() {
+    return backendCfg_.auto_check_compaction;
+  }
+
+  @VisibleForTesting
+  public void setInvalidateCatalogdHMSCacheOnDDLs(boolean flag) {
+    backendCfg_.invalidate_hms_cache_on_ddls = flag;
+  }
+
+  public boolean enableSyncToLatestEventOnDdls() {
+    return backendCfg_.enable_sync_to_latest_event_on_ddls;
+  }
+
+  @VisibleForTesting
+  public void setEnableSyncToLatestEventOnDdls(boolean flag) {
+    backendCfg_.enable_sync_to_latest_event_on_ddls = flag;
+  }
+
+  public boolean enableReloadEvents() {
+    return backendCfg_.enable_reload_events;
+  }
+
+  @VisibleForTesting
+  public void setEnableReloadEvents(boolean flag) {
+    backendCfg_.enable_reload_events = flag;
+  }
+
+  public boolean pullTableTypesAndComments() {
+    return backendCfg_.pull_table_types_and_comments;
+  }
+
+  public boolean useHmsColumnOrderForHBaseTables() {
+    return backendCfg_.use_hms_column_order_for_hbase_tables;
+  }
+
+  public String getIgnoredDirPrefixList() {
+    return backendCfg_.ignored_dir_prefix_list;
+  }
+
+  public TGeospatialLibrary getGeospatialLibrary() {
+    return backendCfg_.geospatial_library;
+  }
+
+  public double getQueryCpuCountDivisor() { return backendCfg_.query_cpu_count_divisor; }
+
+  public boolean isProcessingCostUseEqualExprWeight() {
+    return backendCfg_.processing_cost_use_equal_expr_weight;
+  }
+
+  public long getMinProcessingPerThread() {
+    return backendCfg_.min_processing_per_thread;
+  }
+
+  public boolean isSkipResourceCheckingOnLastExecutorGroupSet() {
+    return backendCfg_.skip_resource_checking_on_last_executor_group_set;
+  }
+
+  public int getThriftRpcMaxMessageSize() {
+    return backendCfg_.thrift_rpc_max_message_size;
   }
 }

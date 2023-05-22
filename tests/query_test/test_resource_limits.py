@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfEC, SkipIfKudu, SkipIfLocal, SkipIfS3, SkipIfABFS, \
-    SkipIfADLS
+from tests.common.skip import SkipIfEC, SkipIfLocal, SkipIfFS
 from tests.common.test_dimensions import create_parquet_dimension
 
 
@@ -35,7 +35,7 @@ class TestResourceLimits(ImpalaTestSuite):
         create_parquet_dimension(cls.get_workload()))
 
   @SkipIfLocal.multiple_impalad
-  @SkipIfEC.fix_later
+  @SkipIfEC.parquet_file_size
   def test_thread_limits(self, vector):
     # Remove option from vector to allow test file to override it per query.
     del vector.get_value('exec_option')['num_nodes']
@@ -45,14 +45,11 @@ class TestResourceLimits(ImpalaTestSuite):
   def test_resource_limits(self, vector):
     self.run_test_case('QueryTest/query-resource-limits', vector)
 
-  @SkipIfS3.hbase
-  @SkipIfADLS.hbase
-  @SkipIfABFS.hbase
+  @SkipIfFS.hbase
   @SkipIfLocal.multiple_impalad
   def test_resource_limits_hbase(self, vector):
     self.run_test_case('QueryTest/query-resource-limits-hbase', vector)
 
-  @SkipIfKudu.unsupported_env
   @SkipIfLocal.multiple_impalad
   def test_resource_limits_kudu(self, vector):
     self.run_test_case('QueryTest/query-resource-limits-kudu', vector)

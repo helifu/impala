@@ -17,9 +17,13 @@
 #
 # Impala tests for ALTER TABLE RECOVER PARTITIONS statement
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import os
+import shutil
+from six.moves import urllib
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfLocal, SkipIfS3, SkipIfCatalogV2
+from tests.common.skip import SkipIfLocal, SkipIfFS, SkipIfCatalogV2
 from tests.common.test_dimensions import ALL_NODES_ONLY
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.util.filesystem_utils import WAREHOUSE, IS_S3
@@ -54,7 +58,7 @@ class TestRecoverPartitions(ImpalaTestSuite):
         create_uncompressed_text_dimension(cls.get_workload()))
 
   def __get_fs_location(self, db_name, table_name):
-    return 'test-warehouse/%s.db/%s/' % (db_name, table_name)
+    return '%s/%s.db/%s/' % (WAREHOUSE, db_name, table_name)
 
   @SkipIfLocal.hdfs_client
   def test_recover_partitions(self, vector, unique_database):
@@ -169,28 +173,36 @@ class TestRecoverPartitions(ImpalaTestSuite):
 
     TBL_NAME = "test_recover_partitions"
     FQ_TBL_NAME = unique_database + "." + TBL_NAME
-    TBL_LOCATION = self.__get_fs_location(unique_database, TBL_NAME)
+    DB_LOCATION = '%s/%s.db/' % (WAREHOUSE, unique_database)
 
     self.execute_query_expect_success(self.client,
         "CREATE TABLE %s (c int) PARTITIONED BY (s string)" % (FQ_TBL_NAME))
 
     # Create 700 partitions externally
-    for i in xrange(1, 700):
-        PART_DIR = "s=part%d/" % i
-        FILE_PATH = "test"
-        INSERTED_VALUE = "666"
-        self.create_fs_partition(TBL_LOCATION, PART_DIR, FILE_PATH, INSERTED_VALUE)
+    try:
+      SRC_DIR = os.path.join("/tmp", unique_database, TBL_NAME)
+      if os.path.exists(SRC_DIR):
+          shutil.rmtree(SRC_DIR)
+      os.makedirs(SRC_DIR)
+      for i in range(1, 700):
+        partition_dir = os.path.join(SRC_DIR, "s=part%d/" % i)
+        os.makedirs(partition_dir)
+        with open(os.path.join(partition_dir, "test"), 'w') as f:
+          f.write("666")
+      self.filesystem_client.copy_from_local(SRC_DIR, DB_LOCATION)
+    finally:
+      shutil.rmtree(SRC_DIR)
 
     result = self.execute_query_expect_success(self.client,
         "SHOW PARTITIONS %s" % FQ_TBL_NAME)
-    for i in xrange(1, 700):
+    for i in range(1, 700):
         PART_DIR = "part%d\t" % i
         assert not self.has_value(PART_DIR, result.data)
     self.execute_query_expect_success(self.client,
         "ALTER TABLE %s RECOVER PARTITIONS" % FQ_TBL_NAME)
     result = self.execute_query_expect_success(self.client,
         "SHOW PARTITIONS %s" % FQ_TBL_NAME)
-    for i in xrange(1, 700):
+    for i in range(1, 700):
         PART_DIR = "part%d\t" % i
         assert self.has_value(PART_DIR, result.data)
 
@@ -342,7 +354,7 @@ class TestRecoverPartitions(ImpalaTestSuite):
 
     # Running ALTER TABLE RECOVER PARTITIONS multiple times should only produce
     # a single partition when adding a single partition.
-    for i in xrange(3):
+    for i in range(3):
       self.execute_query_expect_success(
         self.client, "ALTER TABLE %s RECOVER PARTITIONS" % FQ_TBL_NAME)
       result = self.execute_query_expect_success(
@@ -354,7 +366,30 @@ class TestRecoverPartitions(ImpalaTestSuite):
         FQ_TBL_NAME
 
   @SkipIfLocal.hdfs_client
-  @SkipIfS3.empty_directory
+  def test_unescaped_string_partition(self, vector, unique_database):
+    """IMPALA-7784: Test that RECOVER PARTITIONS correctly parses unescaped string
+       values"""
+    tbl_name = "test_unescaped_string_partition"
+    fq_tbl_name = unique_database + "." + tbl_name
+    tbl_location = self.__get_fs_location(unique_database, tbl_name)
+
+    self.execute_query_expect_success(
+        self.client, "CREATE TABLE %s (i int) PARTITIONED BY (p string)" % fq_tbl_name)
+    parts = ["\'", "\"", "\\\'", "\\\"", "\\\\\'", "\\\\\""]
+    for i in range(len(parts)):
+      # When creating partition directories, Hive replaces special characters in
+      # partition value string using the %xx escape. e.g. p=' will become p=%27.
+      hex_part = urllib.parse.quote(parts[i])
+      self.create_fs_partition(tbl_location, "p=%s" % hex_part, "file_%d" % i, str(i))
+
+    self.execute_query_expect_success(
+        self.client, "ALTER TABLE %s RECOVER PARTITIONS" % fq_tbl_name)
+    result = self.execute_query_expect_success(
+        self.client, "SHOW PARTITIONS %s" % fq_tbl_name)
+    self.verify_partitions(parts, result.data)
+
+  @SkipIfLocal.hdfs_client
+  @SkipIfFS.empty_directory
   def test_empty_directory(self, vector, unique_database):
     """Explicitly test how empty directories are handled when partitions are recovered."""
 
@@ -367,7 +402,7 @@ class TestRecoverPartitions(ImpalaTestSuite):
 
     # Adds partition directories.
     num_partitions = 10
-    for i in xrange(1, num_partitions):
+    for i in range(1, num_partitions):
         PART_DIR = "i=%d/s=part%d" % (i,i)
         self.filesystem_client.make_dir(TBL_LOCATION + PART_DIR)
 
@@ -385,7 +420,7 @@ class TestRecoverPartitions(ImpalaTestSuite):
     result = self.execute_query_expect_success(self.client,
         "SHOW PARTITIONS %s" % FQ_TBL_NAME)
     assert num_partitions - 1 == self.count_partition(result.data)
-    for i in xrange(1, num_partitions):
+    for i in range(1, num_partitions):
         PART_DIR = "part%d\t" % i
         assert self.has_value(PART_DIR, result.data)
 
@@ -432,4 +467,11 @@ class TestRecoverPartitions(ImpalaTestSuite):
 
   def count_value(self, value, lines):
     """Count the number of lines that contain value."""
-    return len(filter(lambda line: line.find(value) != -1, lines))
+    return len([line for line in lines if line.find(value) != -1])
+
+  def verify_partitions(self, expected_parts, lines):
+    """Check if all partition values are expected"""
+    values = [line.split('\t')[0] for line in lines]
+    assert len(values) == len(expected_parts) + 1
+    for p in expected_parts:
+      assert p in values

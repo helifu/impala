@@ -28,7 +28,7 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Reference;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -89,7 +89,7 @@ public class IsNullPredicate extends Predicate {
 
   @Override
   public String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("notNull", isNotNull_)
         .addValue(super.debugString())
         .toString();
@@ -136,12 +136,19 @@ public class IsNullPredicate extends Predicate {
     }
 
     // determine selectivity
+    computeSelectivity();
+  }
+
+  protected void computeSelectivity() {
+    if (hasValidSelectivityHint()) {
+      return;
+    }
     // TODO: increase this to make sure we don't end up favoring broadcast joins
     // due to underestimated cardinalities?
     Reference<SlotRef> slotRefRef = new Reference<SlotRef>();
     if (isSingleColumnPredicate(slotRefRef, null)) {
       SlotDescriptor slotDesc = slotRefRef.getRef().getDesc();
-      if (!slotDesc.getStats().hasNulls()) return;
+      if (!slotDesc.getStats().hasNullsStats()) return;
       FeTable table = slotDesc.getParent().getTable();
       if (table != null && table.getNumRows() > 0) {
         long numRows = table.getNumRows();

@@ -16,6 +16,11 @@
 // under the License.
 package org.apache.impala.catalog;
 
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -27,6 +32,9 @@ import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
 import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
@@ -44,13 +52,15 @@ import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TResultSetMetadata;
+import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.util.ListMap;
 import org.apache.impala.util.TAccessLevelUtil;
 import org.apache.impala.util.TResultRowBuilder;
+import org.apache.thrift.TException;
 
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Frontend interface for interacting with a filesystem-backed table.
@@ -61,6 +71,12 @@ import com.google.common.collect.Lists;
 public interface FeFsTable extends FeTable {
   /** hive's default value for table property 'serialization.null.format' */
   public static final String DEFAULT_NULL_COLUMN_VALUE = "\\N";
+
+  // Caching this configuration object makes calls to getFileSystem much quicker
+  // (saves ~50ms on a standard plan)
+  // TODO(henry): confirm that this is thread safe - cursory inspection of the class
+  // and its usage in getFileSystem suggests it should be.
+  public static final Configuration CONF = new Configuration();
 
   /**
    * @return true if the table and all its partitions reside at locations which
@@ -162,7 +178,7 @@ public interface FeFsTable extends FeTable {
   Map<Long, ? extends PrunablePartition> getPartitionMap();
 
   /**
-   * @param the index of the target partitioning column
+   * @param col the index of the target partitioning column
    * @return a map from value to a set of partitions for which column 'col'
    * has that value.
    */
@@ -182,14 +198,89 @@ public interface FeFsTable extends FeTable {
   List<? extends FeFsPartition> loadPartitions(Collection<Long> ids);
 
   /**
-   * @return: Primary keys information.
+   * @return: SQL Constraints Information.
    */
-  List<SQLPrimaryKey> getPrimaryKeys();
+  SqlConstraints getSqlConstraints();
+
+  default FileSystem getFileSystem() throws CatalogException {
+    FileSystem tableFs;
+    try {
+      tableFs = (new Path(getLocation())).getFileSystem(CONF);
+    } catch (IOException e) {
+      throw new CatalogException("Invalid table path for table: " + getFullName(), e);
+    }
+    return tableFs;
+  }
+
+  public static FileSystem getFileSystem(Path filePath) throws CatalogException {
+    FileSystem tableFs;
+    try {
+      tableFs = filePath.getFileSystem(CONF);
+    } catch (IOException e) {
+      throw new CatalogException("Invalid path: " + filePath.toString(), e);
+    }
+    return tableFs;
+  }
 
   /**
-   * @return Foreign keys information.
+   * @return  List of primary keys column names, useful for toSqlUtils. In local
+   * catalog mode, this causes load of constraints.
    */
-  List<SQLForeignKey> getForeignKeys();
+  default List<String> getPrimaryKeyColumnNames() throws TException {
+    List<String> primaryKeyColNames = new ArrayList<>();
+    List<SQLPrimaryKey> primaryKeys = getSqlConstraints().getPrimaryKeys();
+    if (!primaryKeys.isEmpty()) {
+      primaryKeys.stream().forEach(p -> primaryKeyColNames.add(p.getColumn_name()));
+    }
+    return primaryKeyColNames;
+  }
+
+  /**
+   * Returns true if the table is partitioned, false otherwise.
+   */
+  default boolean isPartitioned() {
+    return getMetaStoreTable().getPartitionKeysSize() > 0;
+  }
+
+  /**
+   * Get foreign keys information as strings. Useful for toSqlUtils.
+   * @return List of strings of the form "(col1, col2,..) REFERENCES [pk_db].pk_table
+   * (colA, colB,..)". In local catalog mode, this causes load of constraints.
+   */
+  default List<String> getForeignKeysSql() throws TException{
+    List<String> foreignKeysSql = new ArrayList<>();
+    // Iterate through foreign keys list. This list may contain multiple foreign keys
+    // and each foreign key may contain multiple columns. The outerloop collects
+    // information common to a foreign key (pk table information). The inner
+    // loop collects column information.
+    List<SQLForeignKey> foreignKeys = getSqlConstraints().getForeignKeys();
+    for (int i = 0; i < foreignKeys.size(); i++) {
+      String pkTableDb = foreignKeys.get(i).getPktable_db();
+      String pkTableName = foreignKeys.get(i).getPktable_name();
+      List<String> pkList = new ArrayList<>();
+      List<String> fkList = new ArrayList<>();
+      StringBuilder sb = new StringBuilder();
+      sb.append("(");
+      for (; i < foreignKeys.size(); i++) {
+        fkList.add(foreignKeys.get(i).getFkcolumn_name());
+        pkList.add(foreignKeys.get(i).getPkcolumn_name());
+        // Foreign keys for a table can consist of multiple columns, they are represented
+        // as different SQLForeignKey structures. A key_seq is used to stitch together
+        // the entire sequence that forms the foreign key. Hence, we bail out of inner
+        // loop if the key_seq of the next SQLForeignKey is 1.
+        if (i + 1 < foreignKeys.size() && foreignKeys.get(i + 1).getKey_seq() == 1) {
+          break;
+        }
+      }
+      Joiner.on(", ").appendTo(sb, fkList).append(") ");
+      sb.append("REFERENCES ");
+      if (pkTableDb != null) sb.append(pkTableDb + ".");
+      sb.append(pkTableName + "(");
+      Joiner.on(", ").appendTo(sb, pkList).append(")");
+      foreignKeysSql.add(sb.toString());
+    }
+    return foreignKeysSql;
+  }
 
   /**
    * Parses and returns the value of the 'skip.header.line.count' table property. If the
@@ -200,7 +291,7 @@ public interface FeFsTable extends FeTable {
     org.apache.hadoop.hive.metastore.api.Table msTbl = getMetaStoreTable();
     if (msTbl == null ||
         !msTbl.getParameters().containsKey(
-          FeFsTable.Utils.TBL_PROP_SKIP_HEADER_LINE_COUNT)) {
+            FeFsTable.Utils.TBL_PROP_SKIP_HEADER_LINE_COUNT)) {
       return 0;
     }
     return Utils.parseSkipHeaderLineCount(msTbl.getParameters(), error);
@@ -212,10 +303,70 @@ public interface FeFsTable extends FeTable {
   ListMap<TNetworkAddress> getHostIndex();
 
   /**
+   * Check if 'col_name' appears in the list of sort-by columns by searching the
+   * 'sort.columns' table property and return the index in the list if so. Return
+   * -1 otherwise.
+   */
+  default int getSortByColumnIndex(String col_name) {
+    // Get the names of all sort by columns (specified in the SORT BY clause in
+    // CREATE TABLE DDL) from TBLPROPERTIES.
+    Map<String, String> parameters = getMetaStoreTable().getParameters();
+    if (parameters == null) return -1;
+    String sort_by_columns_string = parameters.get("sort.columns");
+    if (sort_by_columns_string == null) return -1;
+    String[] sort_by_columns = sort_by_columns_string.split(",");
+    if (sort_by_columns == null) return -1;
+    for (int i = 0; i < sort_by_columns.length; i++) {
+      if (sort_by_columns[i].equals(col_name)) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * Check if 'col_name' names the leading sort-by column.
+   */
+  default boolean isLeadingSortByColumn(String col_name) {
+    return getSortByColumnIndex(col_name) == 0;
+  }
+
+  /**
+   * Check if 'col_name' appears in the list of sort-by columns.
+   */
+  default boolean isSortByColumn(String col_name) {
+    return getSortByColumnIndex(col_name) >= 0;
+  }
+
+  /**
+   * Return the sort order for the sort by columns if exists. Return null otherwise.
+   */
+  default TSortingOrder getSortOrderForSortByColumn() {
+    Map<String, String> parameters = getMetaStoreTable().getParameters();
+    if (parameters == null) return null;
+    String sortOrder = parameters.get("sort.order");
+    if (sortOrder == null) return null;
+    if (sortOrder.equals("LEXICAL")) return TSortingOrder.LEXICAL;
+    if (sortOrder.equals("ZORDER")) return TSortingOrder.ZORDER;
+    return null;
+  }
+
+  /**
+   * Return true if the sort order for the sort by columns is lexical. Return false
+   * otherwise.
+   */
+  default boolean IsLexicalSortByColumn() {
+    TSortingOrder sortOrder = getSortOrderForSortByColumn();
+    if (sortOrder == null) return false;
+    return sortOrder == TSortingOrder.LEXICAL;
+  }
+
+  /**
    * Utility functions for operating on FeFsTable. When we move fully to Java 8,
    * these can become default methods of the interface.
    */
   abstract class Utils {
+
+    private final static Logger LOG = LoggerFactory.getLogger(Utils.class);
+
     // Table property key for skip.header.line.count
     public static final String TBL_PROP_SKIP_HEADER_LINE_COUNT = "skip.header.line.count";
 
@@ -286,7 +437,12 @@ public interface FeFsTable extends FeTable {
       resultSchema.addToColumns(new TColumn("Path", Type.STRING.toThrift()));
       resultSchema.addToColumns(new TColumn("Size", Type.STRING.toThrift()));
       resultSchema.addToColumns(new TColumn("Partition", Type.STRING.toThrift()));
+      resultSchema.addToColumns(new TColumn("EC Policy", Type.STRING.toThrift()));
       result.setRows(new ArrayList<>());
+
+      if (table instanceof FeIcebergTable) {
+        return FeIcebergTable.Utils.getIcebergTableFiles((FeIcebergTable) table, result);
+      }
 
       List<? extends FeFsPartition> orderedPartitions;
       if (partitionSet == null) {
@@ -302,9 +458,11 @@ public interface FeFsTable extends FeTable {
         Collections.sort(orderedFds);
         for (FileDescriptor fd: orderedFds) {
           TResultRowBuilder rowBuilder = new TResultRowBuilder();
-          rowBuilder.add(p.getLocation() + "/" + fd.getRelativePath());
+          String absPath = fd.getAbsolutePath(p.getLocation());
+          rowBuilder.add(absPath);
           rowBuilder.add(PrintUtils.printBytes(fd.getFileLength()));
           rowBuilder.add(p.getPartitionName());
+          rowBuilder.add(FileSystemUtil.getErasureCodingPolicy(new Path(absPath)));
           result.addToRows(rowBuilder.get());
         }
       }
@@ -321,6 +479,8 @@ public interface FeFsTable extends FeTable {
      * Its implementation tries to minimize the constant factor and object generation.
      * The given 'randomSeed' is used for random number generation.
      * The 'percentBytes' parameter must be between 0 and 100.
+     *
+     * TODO(IMPALA-9883): Fix this for full ACID tables.
      */
     public static Map<HdfsScanNode.SampledPartitionMetadata, List<FileDescriptor>>
         getFilesSample(FeFsTable table, Collection<? extends FeFsPartition> inputParts,

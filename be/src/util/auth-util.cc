@@ -17,13 +17,17 @@
 
 #include "util/auth-util.h"
 
-#include <boost/algorithm/string.hpp>
+#include <ostream>
 
-#include "service/client-request-state.h"
-#include "util/network-util.h"
+#include <boost/algorithm/string/classification.hpp>
+
+#include "common/logging.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
+#include "gutil/strings/substitute.h"
 #include "kudu/security/init.h"
-#include "exec/kudu-util.h"
+#include "kudu/util/status.h"
+#include "util/kudu-status-util.h"
+#include "util/network-util.h"
 
 using namespace std;
 using boost::algorithm::is_any_of;

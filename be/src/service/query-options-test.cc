@@ -21,6 +21,7 @@
 #include <boost/preprocessor/seq/for_each.hpp>
 #include <boost/preprocessor/tuple/to_seq.hpp>
 
+#include "gen-cpp/Query_constants.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/runtime-filter.h"
 #include "testutil/gtest-util.h"
@@ -152,6 +153,12 @@ TEST(QueryOptions, SetByteOptions) {
       {MAKE_OPTIONDEF(topn_bytes_limit), {-1, I64_MAX}},
       {MAKE_OPTIONDEF(mem_limit_executors), {-1, I64_MAX}},
       {MAKE_OPTIONDEF(broadcast_bytes_limit), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(preagg_bytes_limit), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(sort_run_bytes_limit), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(targeted_kudu_scan_range_length), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(scratch_limit), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(max_result_spooling_mem), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(max_spilled_result_spooling_mem), {-1, I64_MAX}},
   };
   vector<pair<OptionDef<int32_t>, Range<int32_t>>> case_set_i32{
       {MAKE_OPTIONDEF(runtime_filter_min_size),
@@ -216,15 +223,19 @@ TEST(QueryOptions, SetEnumOptions) {
   TestEnumCase(options, CASE(explain_level, TExplainLevel,
       (MINIMAL, STANDARD, EXTENDED, VERBOSE)), true);
   TestEnumCase(options, CASE(parquet_fallback_schema_resolution,
-      TParquetFallbackSchemaResolution, (POSITION, NAME)), true);
+      TSchemaResolutionStrategy, (POSITION, NAME, FIELD_ID)), true);
   TestEnumCase(options, CASE(parquet_array_resolution, TParquetArrayResolution,
       (THREE_LEVEL, TWO_LEVEL, TWO_LEVEL_THEN_THREE_LEVEL)), true);
   TestEnumCase(options, CASE(default_file_format, THdfsFileFormat,
-      (TEXT, RC_FILE, SEQUENCE_FILE, AVRO, PARQUET, KUDU, ORC)), true);
+      (TEXT, RC_FILE, SEQUENCE_FILE, AVRO, PARQUET, KUDU, ORC, HUDI_PARQUET, ICEBERG,
+      JSON)), true);
   TestEnumCase(options, CASE(runtime_filter_mode, TRuntimeFilterMode,
       (OFF, LOCAL, GLOBAL)), true);
   TestEnumCase(options, CASE(kudu_read_mode, TKuduReadMode,
       (DEFAULT, READ_LATEST, READ_AT_SNAPSHOT)), true);
+  TestEnumCase(options,
+      CASE(kudu_replica_selection, TKuduReplicaSelection, (LEADER_ONLY, CLOSEST_REPLICA)),
+      true);
 #undef CASE
 #undef ENTRIES
 #undef ENTRY
@@ -233,6 +244,7 @@ TEST(QueryOptions, SetEnumOptions) {
 // Test integer options. Some of them have lower/upper bounds.
 TEST(QueryOptions, SetIntOptions) {
   TQueryOptions options;
+  QueryConstants qc;
   // List of pairs of Key and its valid range
   pair<OptionDef<int32_t>, Range<int32_t>> case_set[]{
       {MAKE_OPTIONDEF(runtime_filter_wait_time_ms),    {0, I32_MAX}},
@@ -246,6 +258,13 @@ TEST(QueryOptions, SetIntOptions) {
       {MAKE_OPTIONDEF(thread_reservation_aggregate_limit), {-1, I32_MAX}},
       {MAKE_OPTIONDEF(statement_expression_limit),
           {MIN_STATEMENT_EXPRESSION_LIMIT, I32_MAX}},
+      {MAKE_OPTIONDEF(max_cnf_exprs),                  {-1, I32_MAX}},
+      {MAKE_OPTIONDEF(max_fs_writers),                 {0, I32_MAX}},
+      {MAKE_OPTIONDEF(default_ndv_scale),              {1, 10}},
+      {MAKE_OPTIONDEF(processing_cost_min_threads),
+          {1, qc.MAX_FRAGMENT_INSTANCES_PER_NODE}},
+      {MAKE_OPTIONDEF(max_fragment_instances_per_node),
+          {1, qc.MAX_FRAGMENT_INSTANCES_PER_NODE}},
   };
   for (const auto& test_case : case_set) {
     const OptionDef<int32_t>& option_def = test_case.first;
@@ -269,6 +288,8 @@ TEST(QueryOptions, SetBigIntOptions) {
   pair<OptionDef<int64_t>, Range<int64_t>> case_set[] {
       {MAKE_OPTIONDEF(cpu_limit_s), {0, I64_MAX}},
       {MAKE_OPTIONDEF(num_rows_produced_limit), {0, I64_MAX}},
+      {MAKE_OPTIONDEF(join_rows_produced_limit), {0, I64_MAX}},
+      {MAKE_OPTIONDEF(analytic_rank_pushdown_threshold), {-1, I64_MAX}},
   };
   for (const auto& test_case : case_set) {
     const OptionDef<int64_t>& option_def = test_case.first;
@@ -362,6 +383,26 @@ TEST(QueryOptions, SetSpecialOptions) {
     TestOk("128KB", 128 * 1024);
     TestError("8191"); // default value of FLAGS_min_buffer_size is 8KB
     TestOk("64KB", 64 * 1024);
+  }
+  {
+    // RUNTIME_FILTER_ERROR_RATE is a double in range (0.0, 1.0)
+    OptionDef<double> key_def = MAKE_OPTIONDEF(runtime_filter_error_rate);
+    auto TestOk = MakeTestOkFn(options, key_def);
+    auto TestError = MakeTestErrFn(options, key_def);
+    TestOk("0.5", 0.5);
+    TestOk("0.01", 0.01);
+    TestOk("0.001", 0.001);
+    TestOk("0.0001", 0.0001);
+    TestOk("0.0000000001", 0.0000000001);
+    TestOk("0.999999999", 0.999999999);
+    TestOk(" 0.9", 0.9);
+    // Out of range values
+    TestError("1");
+    TestError("0");
+    TestError("-1");
+    TestError("-0.1");
+    TestError("1.1");
+    TestError("Not a number!");
   }
 }
 
@@ -517,6 +558,62 @@ TEST(QueryOptions, CompressionCodec) {
 #undef CASE
 #undef ENTRIES
 #undef ENTRY
+}
+
+void VerifyFilterTypes(const set<TRuntimeFilterType::type>& types,
+    const std::initializer_list<TRuntimeFilterType::type>& expects) {
+  EXPECT_EQ(expects.size(), types.size());
+  for (const auto t : expects) {
+    EXPECT_NE(types.end(), types.find(t));
+  }
+}
+
+// Tests for setting of ENABLED_RUNTIME_FILTER_TYPES.
+TEST(QueryOptions, EnabledRuntimeFilterTypes) {
+  const string KEY = "enabled_runtime_filter_types";
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "all", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+        {
+            TRuntimeFilterType::BLOOM,
+            TRuntimeFilterType::MIN_MAX,
+            TRuntimeFilterType::IN_LIST
+        });
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "bloom,min_max,in_list", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+        {
+            TRuntimeFilterType::BLOOM,
+            TRuntimeFilterType::MIN_MAX,
+            TRuntimeFilterType::IN_LIST
+        });
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "bloom", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types, {TRuntimeFilterType::BLOOM});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "bloom,min_max", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+        {
+            TRuntimeFilterType::BLOOM,
+            TRuntimeFilterType::MIN_MAX
+        });
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "in_list,bloom", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+                      {
+                          TRuntimeFilterType::BLOOM,
+                          TRuntimeFilterType::IN_LIST
+                      });
+  }
 }
 
 // Tests for setting of MAX_RESULT_SPOOLING_MEM and

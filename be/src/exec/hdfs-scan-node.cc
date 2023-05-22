@@ -17,6 +17,7 @@
 
 #include "exec/hdfs-scan-node.h"
 
+#include <chrono>
 #include <memory>
 #include <sstream>
 
@@ -25,6 +26,7 @@
 #include "exec/exec-node-util.h"
 #include "exec/hdfs-scanner.h"
 #include "exec/scanner-context.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "runtime/blocking-row-batch-queue.h"
 #include "runtime/descriptors.h"
 #include "runtime/fragment-instance-state.h"
@@ -81,7 +83,7 @@ Status HdfsScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   ScopedGetNextEventAdder ea(this, eos);
 
-  if (!initial_ranges_issued_) {
+  if (!initial_ranges_issued_.Load()) {
     // We do this in GetNext() to maximise the amount of work we can do while waiting for
     // runtime filters to show up. The scanner threads have already started (in Open()),
     // so we need to tell them there is work to do.
@@ -103,7 +105,7 @@ Status HdfsScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
     // Release the scanner threads
     discard_result(ranges_issued_barrier_.Notify());
 
-    if (progress_.done()) SetDone();
+    if (shared_state_->progress().done()) SetDone();
   }
 
   Status status = GetNextInternal(state, row_batch, eos);
@@ -181,9 +183,9 @@ void HdfsScanNode::Close(RuntimeState* state) {
   // At this point, the other threads have been joined, and
   // remaining_scan_range_submissions_ should be 0, if the
   // query started and wasn't cancelled or exited early.
-  if (ranges_issued_barrier_.pending() == 0 && initial_ranges_issued_
-      && progress_.done()) {
-    DCHECK_EQ(remaining_scan_range_submissions_.Load(), 0);
+  if (ranges_issued_barrier_.pending() == 0 && initial_ranges_issued_.Load()
+      && shared_state_->progress().done()) {
+    DCHECK_EQ(shared_state_->RemainingScanRangeSubmissions(), 0);
   }
 #endif
   HdfsScanNodeBase::Close(state);
@@ -195,11 +197,6 @@ void HdfsScanNode::RangeComplete(const THdfsFileFormat::type& file_type,
   HdfsScanNodeBase::RangeComplete(file_type, compression_type, skipped);
 }
 
-void HdfsScanNode::TransferToScanNodePool(MemPool* pool) {
-  unique_lock<timed_mutex> l(lock_);
-  HdfsScanNodeBase::TransferToScanNodePool(pool);
-}
-
 void HdfsScanNode::AddMaterializedRowBatch(unique_ptr<RowBatch> row_batch) {
   InitNullCollectionValues(row_batch.get());
   thread_state_.EnqueueBatch(move(row_batch));
@@ -207,7 +204,7 @@ void HdfsScanNode::AddMaterializedRowBatch(unique_ptr<RowBatch> row_batch) {
 
 Status HdfsScanNode::AddDiskIoRanges(const vector<ScanRange*>& ranges,
     EnqueueLocation enqueue_location) {
-  DCHECK_GT(remaining_scan_range_submissions_.Load(), 0);
+  DCHECK_GT(shared_state_->RemainingScanRangeSubmissions(), 0);
   RETURN_IF_ERROR(reader_context_->AddScanRanges(ranges, enqueue_location));
   if (!ranges.empty()) ThreadTokenAvailableCb(runtime_state_->resource_pool());
   return Status::OK();
@@ -224,8 +221,8 @@ int64_t HdfsScanNode::EstimateScannerThreadMemConsumption() const {
   // Note: this is crude and we could try to refine it by factoring in the number of
   // columns, etc, but it is unclear how beneficial this would be.
   int64_t est_non_reserved_bytes = FLAGS_hdfs_scanner_thread_max_estimated_bytes;
-  auto it = per_type_files_.find(THdfsFileFormat::TEXT);
-  if (it != per_type_files_.end()) {
+  auto it = shared_state_->per_type_files().find(THdfsFileFormat::TEXT);
+  if (it != shared_state_->per_type_files().end()) {
     for (HdfsFileDesc* file : it->second) {
       if (file->file_compression != THdfsCompression::NONE) {
         int64_t compressed_text_est_bytes =
@@ -269,7 +266,7 @@ void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourcePool* pool) {
   // Case 4. We have not issued the initial ranges so don't start a scanner thread.
   // Issuing ranges will call this function and we'll start the scanner threads then.
   // TODO: It would be good to have a test case for that.
-  if (!initial_ranges_issued_) return;
+  if (!initial_ranges_issued_.Load()) return;
 
   ScannerMemLimiter* scanner_mem_limiter =
       runtime_state_->query_state()->scanner_mem_limiter();
@@ -288,7 +285,7 @@ void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourcePool* pool) {
     // TODO: This still leans heavily on starvation-free locks, come up with a more
     // correct way to communicate between this method and ScannerThread().
     if (done()) break;
-    unique_lock<timed_mutex> lock(lock_, boost::chrono::milliseconds(10));
+    unique_lock<timed_mutex> lock(lock_, std::chrono::milliseconds(10));
     if (!lock.owns_lock()) {
       continue;
     }
@@ -299,7 +296,7 @@ void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourcePool* pool) {
     const int64_t scanner_thread_reservation = resource_profile_.min_reservation;
     // Cases 1, 2, 3.
     if (done() || all_ranges_started_ ||
-        num_active_scanner_threads >= progress_.remaining()) {
+        num_active_scanner_threads >= shared_state_->progress().remaining()) {
       break;
     }
 
@@ -397,9 +394,10 @@ void HdfsScanNode::ScannerThread(bool first_thread, int64_t scanner_thread_reser
     // Take a snapshot of remaining_scan_range_submissions before calling
     // StartNextScanRange().  We don't want it to go to zero between the return from
     // StartNextScanRange() and the check for when all ranges are complete.
-    int remaining_scan_range_submissions = remaining_scan_range_submissions_.Load();
+    int remaining_scan_range_submissions = shared_state_->RemainingScanRangeSubmissions();
     ScanRange* scan_range;
-    Status status = StartNextScanRange(&scanner_thread_reservation, &scan_range);
+    Status status =
+        StartNextScanRange(filter_ctxs, &scanner_thread_reservation, &scan_range);
     if (!status.ok()) {
       unique_lock<timed_mutex> l(lock_);
       // If there was already an error, the main thread will do the cleanup
@@ -417,7 +415,7 @@ void HdfsScanNode::ScannerThread(bool first_thread, int64_t scanner_thread_reser
     }
 
     // Done with range and it completed successfully
-    if (progress_.done()) {
+    if (shared_state_->progress().done()) {
       // All ranges are finished.  Indicate we are done.
       SetDone();
       break;
@@ -470,23 +468,6 @@ void HdfsScanNode::ProcessSplit(const vector<FilterContext>& filter_ctxs,
   DCHECK(partition != nullptr) << "table_id=" << hdfs_table_->id()
                                << " partition_id=" << partition_id
                                << "\n" << PrintThrift(runtime_state_->instance_ctx());
-
-  if (!PartitionPassesFilters(partition_id, FilterStats::SPLITS_KEY, filter_ctxs)) {
-    // Avoid leaking unread buffers in scan_range.
-    scan_range->Cancel(Status::CancelledInternal("HDFS partition pruning"));
-    HdfsFileDesc* desc = GetFileDesc(partition_id, *scan_range->file_string());
-    if (metadata->is_sequence_header) {
-      // File ranges haven't been issued yet, skip entire file.
-      UpdateRemainingScanRangeSubmissions(-1);
-      SkipFile(partition->file_format(), desc);
-    } else {
-      // Mark this scan range as done.
-      HdfsScanNodeBase::RangeComplete(partition->file_format(), desc->file_compression,
-          true);
-    }
-    return;
-  }
-
   ScannerContext context(runtime_state_, this, buffer_pool_client(),
       *scanner_thread_reservation, partition, filter_ctxs, expr_results_pool);
   context.AddStream(scan_range, *scanner_thread_reservation);
@@ -536,7 +517,7 @@ void HdfsScanNode::ProcessSplit(const vector<FilterContext>& filter_ctxs,
     SetError(status);
   }
   // Transfer remaining resources to a final batch and add it to the row batch queue and
-  // decrement progress_ to indicate that the scan range is complete.
+  // decrement progress() to indicate that the scan range is complete.
   scanner->Close();
   // Reservation may have been increased by the scanner, e.g. Parquet may allocate
   // additional reservation to scan columns.
@@ -564,4 +545,9 @@ void HdfsScanNode::SetError(const Status& status) {
   discard_result(ExecDebugAction(TExecNodePhase::SCANNER_ERROR, runtime_state_));
   unique_lock<timed_mutex> l(lock_);
   SetDoneInternal(status);
+}
+
+Status HdfsScanNode::GetNextScanRangeToRead(
+    io::ScanRange** scan_range, bool* needs_buffers) {
+  return reader_context_->GetNextUnstartedRange(scan_range, needs_buffers);
 }

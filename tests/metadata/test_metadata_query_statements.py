@@ -17,17 +17,17 @@
 
 # Impala tests for queries that query metadata and set session settings
 
+from __future__ import absolute_import, division, print_function
 import pytest
 import re
 
-from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIfIsilon, SkipIfS3, SkipIfABFS, SkipIfADLS,
-                               SkipIfLocal, SkipIfCatalogV2)
+from tests.common.skip import SkipIfFS, SkipIfCatalogV2
 from tests.common.test_dimensions import ALL_NODES_ONLY
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_dimensions import create_uncompressed_text_dimension
 from tests.util.filesystem_utils import get_fs_path
+from tests.util.event_processor_utils import EventProcessorUtils
 
 # TODO: For these tests to pass, all table metadata must be created exhaustively.
 # the tests should be modified to remove that requirement.
@@ -66,6 +66,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
   def test_show(self, vector):
     self.run_test_case('QueryTest/show', vector)
 
+  @SkipIfFS.incorrent_reported_ec
   def test_show_stats(self, vector):
     self.run_test_case('QueryTest/show-stats', vector, "functional")
 
@@ -74,12 +75,10 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
 
   # Missing Coverage: Describe formatted compatibility between Impala and Hive when the
   # data doesn't reside in hdfs.
-  @SkipIfIsilon.hive
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_describe_formatted(self, vector, unique_database):
+    # IMPALA-10176: test_describe_formatted is broken, so disable it for now
+    pytest.skip()
     # For describe formmated, we try to match Hive's output as closely as possible.
     # However, we're inconsistent with our handling of NULLs vs theirs - Impala sometimes
     # specifies 'NULL' where Hive uses an empty string, and Hive somtimes specifies 'null'
@@ -102,7 +101,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
     self.exec_and_compare_hive_and_impala_hs2("describe formatted functional.alltypes",
         compare=compare_describe_formatted)
     self.exec_and_compare_hive_and_impala_hs2(
-        "describe formatted functional_text_lzo.alltypes",
+        "describe formatted functional_text_gzip.alltypes",
         compare=compare_describe_formatted)
 
     # Describe an unpartitioned table.
@@ -133,6 +132,19 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
         "describe formatted functional.alltypes_view_sub",
         compare=compare_describe_formatted)
 
+    # test for primary / foreign constraints
+    self.exec_and_compare_hive_and_impala_hs2(\
+        "describe formatted functional.child_table",
+        compare=compare_describe_formatted)
+
+    self.exec_and_compare_hive_and_impala_hs2(\
+        "describe formatted functional.parent_table_2",
+        compare=compare_describe_formatted)
+
+    self.exec_and_compare_hive_and_impala_hs2(\
+        "describe formatted tpcds.store_returns",
+        compare=compare_describe_formatted)
+
   @pytest.mark.execute_serially # due to data src setup/teardown
   @SkipIfCatalogV2.data_sources_unsupported()
   def test_show_data_sources(self, vector):
@@ -151,11 +163,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
     for name in self.TEST_DATA_SRC_NAMES:
       self.client.execute(self.CREATE_DATA_SRC_STMT % (name,))
 
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially  # because of use of hardcoded database
   def test_describe_db(self, vector, cluster_properties):
     self.__test_describe_db_cleanup()
@@ -167,23 +175,29 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
                           "location '" + get_fs_path("/testdb") + "'")
       self.client.execute("create database impala_test_desc_db4 comment 'test comment' "
                           "location \"" + get_fs_path("/test2.db") + "\"")
+      self.client.execute("create database impala_test_desc_db5 comment 'test comment' "
+                          "managedlocation \"" + get_fs_path("/test2.db") + "\"")
       self.run_stmt_in_hive("create database hive_test_desc_db comment 'test comment' "
                            "with dbproperties('pi' = '3.14', 'e' = '2.82')")
+      self.run_stmt_in_hive("create database hive_test_desc_db2 comment 'test comment' "
+                           "managedlocation '" + get_fs_path("/test2.db") + "'")
       if cluster_properties.is_event_polling_enabled():
         # Using HMS event processor - wait until the database shows up.
-        self.wait_for_db_to_appear("hive_test_desc_db", timeout_s=30)
+        assert EventProcessorUtils.get_event_processor_status() == "ACTIVE"
+        EventProcessorUtils.wait_for_event_processing(self)
+        self.confirm_db_exists("hive_test_desc_db")
       else:
         # Invalidate metadata to pick up hive-created db.
         self.client.execute("invalidate metadata")
       self.run_test_case('QueryTest/describe-db', vector)
-      if not cluster_properties.is_catalog_v2_cluster():
-        self.run_test_case('QueryTest/describe-hive-db', vector)
     finally:
       self.__test_describe_db_cleanup()
 
   def __test_describe_db_cleanup(self):
     self.cleanup_db('hive_test_desc_db')
+    self.cleanup_db('hive_test_desc_db2')
     self.cleanup_db('impala_test_desc_db1')
     self.cleanup_db('impala_test_desc_db2')
     self.cleanup_db('impala_test_desc_db3')
     self.cleanup_db('impala_test_desc_db4')
+    self.cleanup_db('impala_test_desc_db5')

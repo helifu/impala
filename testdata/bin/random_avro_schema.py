@@ -17,6 +17,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from random import choice, randint, random, shuffle
 from os.path import join as join_path
 from optparse import OptionParser

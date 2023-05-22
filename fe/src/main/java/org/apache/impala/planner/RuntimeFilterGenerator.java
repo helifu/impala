@@ -18,6 +18,7 @@
 package org.apache.impala.planner;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -33,7 +34,10 @@ import org.apache.impala.analysis.BinaryPredicate.Operator;
 import org.apache.impala.analysis.CastExpr;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ExprSubstitutionMap;
+import org.apache.impala.analysis.FunctionCallExpr;
 import org.apache.impala.analysis.IsNullPredicate;
+import org.apache.impala.analysis.LiteralExpr;
+import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.Predicate;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotId;
@@ -42,19 +46,28 @@ import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.analysis.TupleId;
 import org.apache.impala.analysis.TupleIsNullPredicate;
 import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeIcebergTable;
+import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.KuduColumn;
+import org.apache.impala.catalog.PrimitiveType;
+import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.IdGenerator;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.planner.JoinNode.DistributionMode;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.FeSupport;
+import org.apache.impala.thrift.TColumnValue;
+import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TRuntimeFilterDesc;
 import org.apache.impala.thrift.TRuntimeFilterMode;
 import org.apache.impala.thrift.TRuntimeFilterTargetDesc;
 import org.apache.impala.thrift.TRuntimeFilterType;
 import org.apache.impala.util.BitUtil;
+import org.apache.impala.util.TColumnValueUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -96,6 +109,14 @@ public final class RuntimeFilterGenerator {
   // Should be in sync with corresponding values in runtime-filter-bank.cc.
   private static final long MIN_BLOOM_FILTER_SIZE = 4 * 1024;
   private static final long MAX_BLOOM_FILTER_SIZE = 512 * 1024 * 1024;
+  // Should be in sync with the corresponding value in in-list-filter.h.
+  private static final long IN_LIST_FILTER_STRING_SET_MAX_TOTAL_LENGTH = 4 * 1024 * 1024;
+
+  private static final Set<PrimitiveType> IN_LIST_FILTER_SUPPORTED_TYPES =
+      new HashSet<>(Arrays.asList(
+          PrimitiveType.TINYINT, PrimitiveType.SMALLINT, PrimitiveType.INT,
+          PrimitiveType.BIGINT, PrimitiveType.DATE, PrimitiveType.STRING,
+          PrimitiveType.CHAR, PrimitiveType.VARCHAR));
 
   // Map of base table tuple ids to a list of runtime filters that
   // can be applied at the corresponding scan nodes.
@@ -108,17 +129,23 @@ public final class RuntimeFilterGenerator {
 
   /**
    * Internal class that encapsulates the max, min and default sizes used for creating
-   * bloom filter objects.
+   * bloom filter objects, and entry limit for in-list filters.
    */
   private class FilterSizeLimits {
-    // Maximum filter size, in bytes, rounded up to a power of two.
+    // Maximum bloom filter size, in bytes, rounded up to a power of two.
     public final long maxVal;
 
-    // Minimum filter size, in bytes, rounded up to a power of two.
+    // Minimum bloom filter size, in bytes, rounded up to a power of two.
     public final long minVal;
 
-    // Pre-computed default filter size, in bytes, rounded up to a power of two.
+    // Pre-computed default bloom filter size, in bytes, rounded up to a power of two.
     public final long defaultVal;
+
+    // Target false positive probability for bloom filters, between 0 and 1 exclusive.
+    public final double targetFpp;
+
+    // Maximum entry size for in-list filters.
+    public final long inListFilterEntryLimit;
 
     public FilterSizeLimits(TQueryOptions tQueryOptions) {
       // Round up all limits to a power of two and make sure filter size is more
@@ -135,15 +162,24 @@ public final class RuntimeFilterGenerator {
       long defaultValue = tQueryOptions.getRuntime_bloom_filter_size();
       defaultValue = Math.max(defaultValue, minVal);
       defaultVal = BitUtil.roundUpToPowerOf2(Math.min(defaultValue, maxVal));
-    }
-  };
 
-  // Contains size limits for bloom filters.
-  private FilterSizeLimits bloomFilterSizeLimits_;
+      // Target FPP is determined by runtime_filter_error_rate query option, or if that
+      // is not set, --max_filter_error_rate, which was the legacy option controlling
+      // this that also had other effects.
+      targetFpp = tQueryOptions.isSetRuntime_filter_error_rate() ?
+          tQueryOptions.getRuntime_filter_error_rate() :
+          BackendConfig.INSTANCE.getMaxFilterErrorRate();
+
+      inListFilterEntryLimit = tQueryOptions.getRuntime_in_list_filter_entry_limit();
+    }
+  }
+
+  // Contains size limits for runtime filters.
+  final private FilterSizeLimits filterSizeLimits_;
 
   private RuntimeFilterGenerator(TQueryOptions tQueryOptions) {
-    bloomFilterSizeLimits_ = new FilterSizeLimits(tQueryOptions);
-  };
+    filterSizeLimits_ = new FilterSizeLimits(tQueryOptions);
+  }
 
   /**
    * Internal representation of a runtime filter. A runtime filter is generated from
@@ -193,6 +229,9 @@ public final class RuntimeFilterGenerator {
     private boolean finalized_ = false;
     // The type of filter to build.
     private final TRuntimeFilterType type_;
+    // If set, indicates that the filter is targeted for Kudu scan node with source
+    // timestamp truncation.
+    private boolean isTimestampTruncation_ = false;
 
     /**
      * Internal representation of a runtime filter target.
@@ -206,14 +245,23 @@ public final class RuntimeFilterGenerator {
       public final boolean isBoundByPartitionColumns;
       // Indicates if 'node' is in the same fragment as the join that produces the filter
       public final boolean isLocalTarget;
+      // The low and high value of the column on which the filter is applied
+      public final TColumnValue lowValue;
+      public final TColumnValue highValue;
+      // Indicates if the data is actually stored in the data files
+      public final boolean isColumnInDataFile;
 
       public RuntimeFilterTarget(ScanNode targetNode, Expr targetExpr,
-          boolean isBoundByPartitionColumns, boolean isLocalTarget) {
+          boolean isBoundByPartitionColumns, boolean isColumnInDataFile,
+          boolean isLocalTarget, TColumnValue lowValue, TColumnValue highValue) {
         Preconditions.checkState(targetExpr.isBoundByTupleIds(targetNode.getTupleIds()));
         node = targetNode;
         expr = targetExpr;
         this.isBoundByPartitionColumns = isBoundByPartitionColumns;
+        this.isColumnInDataFile = isColumnInDataFile;
         this.isLocalTarget = isLocalTarget;
+        this.lowValue = lowValue;
+        this.highValue = highValue;
       }
 
       public TRuntimeFilterTargetDesc toThrift() {
@@ -227,6 +275,9 @@ public final class RuntimeFilterGenerator {
         tFilterTarget.setTarget_expr_slotids(tSlotIds);
         tFilterTarget.setIs_bound_by_partition_columns(isBoundByPartitionColumns);
         tFilterTarget.setIs_local_target(isLocalTarget);
+        if (node instanceof HdfsScanNode) {
+          tFilterTarget.setIs_column_in_data_file(isColumnInDataFile);
+        }
         if (node instanceof KuduScanNode) {
           // assignRuntimeFilters() only assigns KuduScanNode targets if the target expr
           // is a slot ref, possibly with an implicit cast, pointing to a column.
@@ -235,6 +286,23 @@ public final class RuntimeFilterGenerator {
           tFilterTarget.setKudu_col_name(col.getKuduName());
           tFilterTarget.setKudu_col_type(col.getType().toThrift());
         }
+        tFilterTarget.setLow_value(lowValue);
+        tFilterTarget.setHigh_value(highValue);
+        boolean minMaxValuePresent = false;
+        if (node instanceof HdfsScanNode) {
+          // Set the min/max value present flag to avoid repeated check of the presence
+          // of the two values during execution.
+          SlotRef slotRefInScan = expr.unwrapSlotRef(true);
+          if (slotRefInScan != null) {
+            Column col = slotRefInScan.getDesc().getColumn();
+            if (col != null) {
+              Type col_type = col.getType();
+              minMaxValuePresent = TColumnValueUtil.isFieldSet(col_type, lowValue)
+                  && TColumnValueUtil.isFieldSet(col_type, highValue);
+            }
+          }
+        }
+        tFilterTarget.setIs_min_max_value_present(minMaxValuePresent);
         return tFilterTarget;
       }
 
@@ -244,14 +312,18 @@ public final class RuntimeFilterGenerator {
         return output.append("Target Id: " + node.getId() + " ")
             .append("Target expr: " + expr.debugString() + " ")
             .append("Partition columns: " + isBoundByPartitionColumns)
+            .append("Is column stored in data files: " + isColumnInDataFile)
             .append("Is local: " + isLocalTarget)
+            .append("lowValue: " + (lowValue != null ? lowValue.toString() : -1))
+            .append("highValue: " + (highValue != null ? highValue.toString() : -1))
             .toString();
       }
     }
 
     private RuntimeFilter(RuntimeFilterId filterId, JoinNode filterSrcNode, Expr srcExpr,
         Expr origTargetExpr, Operator exprCmpOp, Map<TupleId, List<SlotId>> targetSlots,
-        TRuntimeFilterType type, FilterSizeLimits filterSizeLimits) {
+        TRuntimeFilterType type, FilterSizeLimits filterSizeLimits,
+        boolean isTimestampTruncation) {
       id_ = filterId;
       src_ = filterSrcNode;
       srcExpr_ = srcExpr;
@@ -259,6 +331,7 @@ public final class RuntimeFilterGenerator {
       exprCmpOp_ = exprCmpOp;
       targetSlotsByTid_ = targetSlots;
       type_ = type;
+      isTimestampTruncation_ = isTimestampTruncation;
       computeNdvEstimate();
       calculateFilterSize(filterSizeLimits);
     }
@@ -282,10 +355,12 @@ public final class RuntimeFilterGenerator {
       TRuntimeFilterDesc tFilter = new TRuntimeFilterDesc();
       tFilter.setFilter_id(id_.asInt());
       tFilter.setSrc_expr(srcExpr_.treeToThrift());
+      tFilter.setSrc_node_id(src_.getId().asInt());
       tFilter.setIs_broadcast_join(isBroadcastJoin_);
       tFilter.setNdv_estimate(ndvEstimate_);
       tFilter.setHas_local_targets(hasLocalTargets_);
       tFilter.setHas_remote_targets(hasRemoteTargets_);
+      tFilter.setCompareOp(exprCmpOp_.getThriftOp());
       boolean appliedOnPartitionColumns = true;
       for (int i = 0; i < targets_.size(); ++i) {
         RuntimeFilterTarget target = targets_.get(i);
@@ -307,17 +382,75 @@ public final class RuntimeFilterGenerator {
      */
     public static RuntimeFilter create(IdGenerator<RuntimeFilterId> idGen,
         Analyzer analyzer, Expr joinPredicate, JoinNode filterSrcNode,
-        TRuntimeFilterType type, FilterSizeLimits filterSizeLimits) {
+        TRuntimeFilterType type, FilterSizeLimits filterSizeLimits,
+        boolean isTimestampTruncation) {
       Preconditions.checkNotNull(idGen);
       Preconditions.checkNotNull(joinPredicate);
       Preconditions.checkNotNull(filterSrcNode);
-      // Only consider binary equality predicates
-      if (!Predicate.isEquivalencePredicate(joinPredicate)) return null;
+      // Only consider binary equality predicates under hash joins for runtime bloom
+      // filters and in-list filters.
+      if (type == TRuntimeFilterType.BLOOM || type == TRuntimeFilterType.IN_LIST) {
+        if (!Predicate.isEquivalencePredicate(joinPredicate)
+            || filterSrcNode instanceof NestedLoopJoinNode) {
+          return null;
+        }
+      }
+      if (type == TRuntimeFilterType.IN_LIST) {
+        PrimitiveType lhsType = joinPredicate.getChild(0).getType().getPrimitiveType();
+        PrimitiveType rhsType = joinPredicate.getChild(1).getType().getPrimitiveType();
+        Preconditions.checkState(lhsType == rhsType, "Unanalyzed equivalence pred!");
+        if (!IN_LIST_FILTER_SUPPORTED_TYPES.contains(lhsType)) {
+          return null;
+        }
+      }
 
-      BinaryPredicate normalizedJoinConjunct =
-          SingleNodePlanner.getNormalizedEqPred(joinPredicate,
-              filterSrcNode.getChild(0).getTupleIds(),
-              filterSrcNode.getChild(1).getTupleIds(), analyzer);
+      BinaryPredicate normalizedJoinConjunct = null;
+      if (type == TRuntimeFilterType.MIN_MAX) {
+        if (filterSrcNode instanceof HashJoinNode) {
+          if (!Predicate.isSqlEquivalencePredicate(joinPredicate)) {
+            return null;
+          } else {
+            normalizedJoinConjunct = SingleNodePlanner.getNormalizedEqPred(joinPredicate,
+                filterSrcNode.getChild(0).getTupleIds(),
+                filterSrcNode.getChild(1).getTupleIds(), analyzer);
+          }
+        } else if (filterSrcNode instanceof NestedLoopJoinNode) {
+          if (Predicate.isSingleRangePredicate(joinPredicate)) {
+            PlanNode child1 = filterSrcNode.getChild(1);
+            if (child1 instanceof ExchangeNode) {
+              child1 = child1.getChild(0);
+            }
+            // When immediate or the indirect child below an Exchange is an
+            // AggregationNode that implements a non-correlated scalar subquery
+            // returning at most one value, a min/max filter can be generated.
+            if (!(child1 instanceof AggregationNode)
+                || !((AggregationNode) (child1)).isNonCorrelatedScalarSubquery()) {
+              return null;
+            }
+          } else {
+            return null;
+          }
+          normalizedJoinConjunct = SingleNodePlanner.getNormalizedSingleRangePred(
+                joinPredicate, filterSrcNode.getChild(0).getTupleIds(),
+                filterSrcNode.getChild(1).getTupleIds(), analyzer);
+          if (normalizedJoinConjunct != null) {
+            // MinMaxFilter can't handle range predicates with decimals stored
+            // in __int128_t for the following reason:
+            //  1) Both numeric_limits<__int128_t>::min() and
+            //     numeric_limits<__int128_t>::max() return 0.
+            if (normalizedJoinConjunct.getChild(0).getType().isDecimal()) {
+              ScalarType decimalType =
+                  (ScalarType) (normalizedJoinConjunct.getChild(0).getType());
+              if (decimalType.storageBytesForDecimal() == 16) return null;
+            }
+          }
+        }
+      } else {
+        normalizedJoinConjunct = SingleNodePlanner.getNormalizedEqPred(
+          joinPredicate, filterSrcNode.getChild(0).getTupleIds(),
+          filterSrcNode.getChild(1).getTupleIds(), analyzer);
+      }
+
       if (normalizedJoinConjunct == null) return null;
 
       // Ensure that the target expr does not contain TupleIsNull predicates as these
@@ -326,15 +459,66 @@ public final class RuntimeFilterGenerator {
           TupleIsNullPredicate.unwrapExpr(normalizedJoinConjunct.getChild(0).clone());
       Expr srcExpr = normalizedJoinConjunct.getChild(1);
 
+      if (isTimestampTruncation) {
+        Preconditions.checkArgument(srcExpr.isAnalyzed());
+        Preconditions.checkArgument(srcExpr.getType() == Type.TIMESTAMP);
+        Expr toUnixTimeExpr =
+            new FunctionCallExpr("utc_to_unix_micros", Lists.newArrayList(srcExpr));
+        try {
+          toUnixTimeExpr.analyze(analyzer);
+        } catch (AnalysisException e) {
+          // Expr analysis failed. Skip this runtime filter since we cannot serialize
+          // it to thrift.
+          LOG.warn("Skipping runtime filter because analysis failed: "
+                  + toUnixTimeExpr.toSql(),
+              e);
+          return null;
+        }
+        srcExpr = toUnixTimeExpr;
+      }
+
       Map<TupleId, List<SlotId>> targetSlots = getTargetSlots(analyzer, targetExpr);
       Preconditions.checkNotNull(targetSlots);
       if (targetSlots.isEmpty()) return null;
+
+      if (filterSrcNode.getJoinOp().isLeftOuterJoin() ||
+              filterSrcNode.getJoinOp().isFullOuterJoin()) {
+        try {
+          LiteralExpr nullSlotVal = analyzer.evalWithNullSlots(srcExpr);
+          if (nullSlotVal == null || !(nullSlotVal instanceof NullLiteral)) {
+            // IMPALA-10252: if the source expression returns a non-NULL value for a NULL
+            // input then it is not safe to generate a runtime filter from a LEFT OUTER
+            // JOIN or FULL OUTER JOIN because the generated filter would be missing a
+            // possible non-NULL value of the expression.
+            // E.g. If the source expression is zeroifnull(y), column y has values
+            // [1, 2, 3], and y comes from the right input of a left outer join , then
+            // the generated runtime filter would only contain the values [1, 2, 3] but
+            // not the value zeroifnull(NULL) = 0 that would be present for an unmatched
+            // row. For now we avoid the problem by skipping this filter. In future we
+            // could generate valid runtime filters for these join types by adding
+            // backend support to calculate and insert the missing value.
+            // It's also possible that the expression did not evaluate to a constant after
+            // null slot substitution. In this case, we also want to disable runtime
+            // filtering.
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Skipping runtime filter because source expression returns " +
+                      "non-null after null substitution: " + srcExpr.toSql());
+            }
+            return null;
+          }
+        } catch (AnalysisException e) {
+          LOG.warn("Skipping runtime filter because analysis after null substitution " +
+              "failed: " + srcExpr.toSql(), e);
+          return null;
+        }
+      }
 
       if (LOG.isTraceEnabled()) {
         LOG.trace("Generating runtime filter from predicate " + joinPredicate);
       }
       return new RuntimeFilter(idGen.getNextId(), filterSrcNode, srcExpr, targetExpr,
-          normalizedJoinConjunct.getOp(), targetSlots, type, filterSizeLimits);
+          normalizedJoinConjunct.getOp(), targetSlots, type, filterSizeLimits,
+          isTimestampTruncation);
     }
 
     /**
@@ -441,6 +625,20 @@ public final class RuntimeFilterGenerator {
     public TRuntimeFilterType getType() { return type_; }
     public Operator getExprCompOp() { return exprCmpOp_; }
     public long getFilterSize() { return filterSizeBytes_; }
+    public boolean isTimestampTruncation() { return isTimestampTruncation_; }
+
+    /**
+     * Return TIMESTAMP if the isTimestampTruncation_ is set as true so that
+     * the source expr type could be matching with target expr type when
+     * assigning bloom filter to target scan node.
+     */
+    public Type getSrcExprType() {
+      if (!isTimestampTruncation_) {
+        return srcExpr_.getType();
+      } else {
+        return Type.TIMESTAMP;
+      }
+    }
 
     /**
      * Estimates the selectivity of a runtime filter as the cardinality of the
@@ -473,19 +671,31 @@ public final class RuntimeFilterGenerator {
     }
 
     /**
-     * Sets the filter size (in bytes) required for a bloom filter to achieve the
-     * configured maximum false-positive rate based on the expected NDV. Also bounds the
-     * filter size between the max and minimum filter sizes supplied to it by
-     * 'filterSizeLimits'.
+     * Sets the filter size (in bytes) based on the filter type.
+     * For bloom filters, the size should be able to achieve the configured maximum
+     * false-positive rate based on the expected NDV. Also bounds the filter size between
+     * the max and minimum filter sizes supplied to it by 'filterSizeLimits'.
+     * For min-max filters, we ignore the size since each filter only keeps two values.
+     * For in-list filters, the size is calculated based on the data types.
      */
     private void calculateFilterSize(FilterSizeLimits filterSizeLimits) {
       if (type_ == TRuntimeFilterType.MIN_MAX) return;
+      if (type_ == TRuntimeFilterType.IN_LIST) {
+        Type colType = srcExpr_.getType();
+        if (colType.isStringType()) {
+          filterSizeBytes_ = IN_LIST_FILTER_STRING_SET_MAX_TOTAL_LENGTH;
+        } else {
+          filterSizeBytes_ =
+              filterSizeLimits.inListFilterEntryLimit * colType.getSlotSize();
+        }
+        return;
+      }
       if (ndvEstimate_ == -1) {
         filterSizeBytes_ = filterSizeLimits.defaultVal;
         return;
       }
-      double fpp = BackendConfig.INSTANCE.getMaxFilterErrorRate();
-      int logFilterSize = FeSupport.GetMinLogSpaceForBloomFilter(ndvEstimate_, fpp);
+      double targetFpp = filterSizeLimits.targetFpp;
+      int logFilterSize = FeSupport.GetMinLogSpaceForBloomFilter(ndvEstimate_, targetFpp);
       filterSizeBytes_ = 1L << logFilterSize;
       filterSizeBytes_ = Math.max(filterSizeBytes_, filterSizeLimits.minVal);
       filterSizeBytes_ = Math.min(filterSizeBytes_, filterSizeLimits.maxVal);
@@ -503,6 +713,7 @@ public final class RuntimeFilterGenerator {
     public String debugString() {
       StringBuilder output = new StringBuilder();
       return output.append("FilterID: " + id_ + " ")
+          .append("Type: " + type_ + " ")
           .append("Source: " + src_.getId() + " ")
           .append("SrcExpr: " + getSrcExpr().debugString() +  " ")
           .append("Target(s): ")
@@ -546,11 +757,29 @@ public final class RuntimeFilterGenerator {
         if (numBloomFilters >= maxNumBloomFilters) continue;
         ++numBloomFilters;
       }
-      filter.setIsBroadcast(
-          filter.src_.getDistributionMode() == DistributionMode.BROADCAST);
+      DistributionMode distMode = filter.src_.getDistributionMode();
+      filter.setIsBroadcast(distMode == DistributionMode.BROADCAST);
+      if (filter.getType() == TRuntimeFilterType.IN_LIST
+          && distMode == DistributionMode.PARTITIONED) {
+        LOG.trace("Skip IN-list filter on partitioned join: {}", filter.debugString());
+        continue;
+      }
       filter.computeHasLocalTargets();
       if (LOG.isTraceEnabled()) LOG.trace("Runtime filter: " + filter.debugString());
       filter.assignToPlanNodes();
+    }
+
+    arrangeRuntimefiltersForParquet(plan);
+  }
+
+  public static void arrangeRuntimefiltersForParquet(
+      PlanNode root) {
+    if (root instanceof HdfsScanNode) {
+      ((HdfsScanNode)root).arrangeRuntimefiltersForParquet();
+    } else {
+      for (PlanNode childNode: root.getChildren()) {
+        arrangeRuntimefiltersForParquet(childNode);
+      }
     }
   }
 
@@ -581,8 +810,8 @@ public final class RuntimeFilterGenerator {
    * (scan) nodes. Filters that cannot be assigned to a scan node are discarded.
    */
   private void generateFilters(PlannerContext ctx, PlanNode root) {
-    if (root instanceof HashJoinNode) {
-      HashJoinNode joinNode = (HashJoinNode) root;
+    if (root instanceof HashJoinNode || root instanceof NestedLoopJoinNode) {
+      JoinNode joinNode = (JoinNode) root;
       List<Expr> joinConjuncts = new ArrayList<>();
       if (!joinNode.getJoinOp().isLeftOuterJoin()
           && !joinNode.getJoinOp().isFullOuterJoin()
@@ -593,14 +822,35 @@ public final class RuntimeFilterGenerator {
         joinConjuncts.addAll(joinNode.getEqJoinConjuncts());
       }
       joinConjuncts.addAll(joinNode.getConjuncts());
+
       List<RuntimeFilter> filters = new ArrayList<>();
-      for (TRuntimeFilterType type : TRuntimeFilterType.values()) {
+      Set<TRuntimeFilterType> enabledRuntimeFilterTypes =
+          ctx.getQueryOptions().getEnabled_runtime_filter_types();
+      for (TRuntimeFilterType filterType : TRuntimeFilterType.values()) {
+        if (!enabledRuntimeFilterTypes.contains(filterType)) continue;
         for (Expr conjunct : joinConjuncts) {
-          RuntimeFilter filter = RuntimeFilter.create(filterIdGenerator,
-              ctx.getRootAnalyzer(), conjunct, joinNode, type, bloomFilterSizeLimits_);
-          if (filter == null) continue;
-          registerRuntimeFilter(filter);
-          filters.add(filter);
+          RuntimeFilter filter =
+              RuntimeFilter.create(filterIdGenerator, ctx.getRootAnalyzer(), conjunct,
+                  joinNode, filterType, filterSizeLimits_,
+                  /* isTimestampTruncation */ false);
+          if (filter != null) {
+            registerRuntimeFilter(filter);
+            filters.add(filter);
+          }
+          // For timestamp bloom filters, we also generate a RuntimeFilter with the
+          // src timestamp truncated for Kudu scan node targets.
+          if (filterType == TRuntimeFilterType.BLOOM
+              && Predicate.isEquivalencePredicate(conjunct)
+              && conjunct.getChild(0).getType().isTimestamp()
+              && conjunct.getChild(1).getType().isTimestamp()) {
+            RuntimeFilter filter2 =
+                RuntimeFilter.create(filterIdGenerator, ctx.getRootAnalyzer(), conjunct,
+                    joinNode, filterType, filterSizeLimits_,
+                    /* isTimestampTruncation */ true);
+            if (filter2 == null) continue;
+            registerRuntimeFilter(filter2);
+            filters.add(filter2);
+          }
         }
       }
       generateFilters(ctx, root.getChild(0));
@@ -662,6 +912,13 @@ public final class RuntimeFilterGenerator {
     runtimeFilter.markFinalized();
   }
 
+  public static boolean enableOverlapFilter(TQueryOptions queryOptions) {
+    return queryOptions.parquet_read_statistics
+        && ((queryOptions.isMinmax_filter_sorted_columns()
+                || queryOptions.getMinmax_filter_threshold() > 0.0)
+            || queryOptions.isMinmax_filter_partition_columns());
+  }
+
   /**
    * Assigns runtime filters to a specific scan node 'scanNode'.
    * The assigned filters are the ones for which 'scanNode' can be used as a destination
@@ -673,10 +930,15 @@ public final class RuntimeFilterGenerator {
    *    to 'scanNode' if the filter is produced within the same fragment that contains the
    *    scan node.
    * 3. Only Hdfs and Kudu scan nodes are supported:
-   *     a. If the target is an HdfsScanNode, the filter must be type BLOOM.
-   *     b. If the target is a KuduScanNode, the filter must be type MIN_MAX, the target
-   *         must be a slot ref on a column, and the comp op cannot be 'not distinct'.
-   * A scan node may be used as a destination node for multiple runtime filters.
+   *     a. If the target is an HdfsScanNode, the filter must be type BLOOM/IN_LIST for
+   *        non Parquet tables, or type BLOOM/MIN_MAX/IN_LIST for Parquet tables.
+   *     b. If the target is a KuduScanNode, the filter could be type MIN_MAX, and/or
+   *        BLOOM, the target must be a slot ref on a column, and the comp op cannot
+   *        be 'not distinct'.
+   * A scan node may be used as a destination node for multiple runtime filters. This
+   * method is called once per scan node to process all filters accumulated for it
+   * for the entire query, per top-down traversal nature of the calling method
+   * generateFilters().
    */
   private void assignRuntimeFilters(PlannerContext ctx, ScanNode scanNode) {
     if (!(scanNode instanceof HdfsScanNode || scanNode instanceof KuduScanNode)) return;
@@ -685,7 +947,16 @@ public final class RuntimeFilterGenerator {
     Analyzer analyzer = ctx.getRootAnalyzer();
     boolean disableRowRuntimeFiltering =
         ctx.getQueryOptions().isDisable_row_runtime_filtering();
+    boolean enable_overlap_filter = enableOverlapFilter(ctx.getQueryOptions());
     TRuntimeFilterMode runtimeFilterMode = ctx.getQueryOptions().getRuntime_filter_mode();
+    Set<TRuntimeFilterType> enabledRuntimeFilterTypes =
+        ctx.getQueryOptions().getEnabled_runtime_filter_types();
+
+    // Init the overlap predicate for the hdfs scan node.
+    if (scanNode instanceof HdfsScanNode && enable_overlap_filter) {
+      ((HdfsScanNode) scanNode).initOverlapPredicate(analyzer);
+    }
+
     for (RuntimeFilter filter: runtimeFiltersByTid_.get(tid)) {
       if (filter.isFinalized()) continue;
       Expr targetExpr = computeTargetExpr(filter, tid, analyzer);
@@ -693,31 +964,103 @@ public final class RuntimeFilterGenerator {
       boolean isBoundByPartitionColumns = isBoundByPartitionColumns(analyzer, targetExpr,
           scanNode);
       if (disableRowRuntimeFiltering && !isBoundByPartitionColumns) continue;
+      boolean isColumnInDataFile = isColumnInDataFile(scanNode.getTupleDesc().getTable(),
+          isBoundByPartitionColumns);
       boolean isLocalTarget = isLocalTarget(filter, scanNode);
       if (runtimeFilterMode == TRuntimeFilterMode.LOCAL && !isLocalTarget) continue;
 
       // Check that the scan node supports applying filters of this type and targetExpr.
-      if (scanNode instanceof HdfsScanNode
-          && filter.getType() != TRuntimeFilterType.BLOOM) {
-        continue;
-      } else if (scanNode instanceof KuduScanNode) {
-        if (filter.getType() != TRuntimeFilterType.MIN_MAX) continue;
-        SlotRef slotRef = targetExpr.unwrapSlotRef(true);
-        // Kudu only supports targeting a single column, not general exprs, so the target
-        // must be a SlotRef pointing to a column. We can allow implicit integer casts
-        // by casting the min/max values before sending them to Kudu.
-        // Kudu also cannot currently return nulls if a filter is applied, so it does not
-        // work with "is not distinct".
-        if (slotRef == null || slotRef.getDesc().getColumn() == null
-            || (targetExpr instanceof CastExpr && !targetExpr.getType().isIntegerType())
-            || filter.getExprCompOp() == Operator.NOT_DISTINCT) {
+      if (scanNode instanceof HdfsScanNode) {
+        if (filter.isTimestampTruncation()) {
+          continue;
+        }
+        if (filter.getType() == TRuntimeFilterType.MIN_MAX) {
+          Preconditions.checkState(
+              enabledRuntimeFilterTypes.contains(TRuntimeFilterType.MIN_MAX),
+              "MIN_MAX filters should not be generated");
+          if (!enable_overlap_filter) continue;
+          // Try to compute an overlap predicate for the filter. This predicate will be
+          // used to filter out partitions, or row groups, pages or rows in Parquet data
+          // files.
+          if (!((HdfsScanNode) scanNode)
+                   .tryToComputeOverlapPredicate(
+                       analyzer, filter, targetExpr, isBoundByPartitionColumns)) {
+            continue;
+          }
+        } else if (filter.getType() == TRuntimeFilterType.IN_LIST) {
+          // Only assign IN-list filters on ORC tables.
+          if (!((HdfsScanNode) scanNode).getFileFormats().contains(HdfsFileFormat.ORC)) {
+            continue;
+          }
+        }
+      } else {
+        // assign filters to KuduScanNode
+        if (filter.getType() == TRuntimeFilterType.BLOOM) {
+          Preconditions.checkState(
+              enabledRuntimeFilterTypes.contains(TRuntimeFilterType.BLOOM),
+              "BLOOM filters should not be generated!");
+          // TODO: Support Kudu VARCHAR Bloom Filter
+          if (targetExpr.getType().isVarchar()) continue;
+          // Kudu only supports targeting a single column, not general exprs, so the
+          // target must be a SlotRef pointing to a column without casting.
+          // For timestamp bloom filter, assign it to Kudu if it has src timestamp
+          // truncation.
+          if (!(targetExpr instanceof SlotRef)
+              || filter.getExprCompOp() == Operator.NOT_DISTINCT
+              || (targetExpr.getType().isTimestamp()
+                     && !filter.isTimestampTruncation())) {
+            continue;
+          }
+          SlotRef slotRef = (SlotRef) targetExpr;
+          if (slotRef.getDesc().getColumn() == null) continue;
+        } else if (filter.getType() == TRuntimeFilterType.MIN_MAX) {
+          Preconditions.checkState(
+              enabledRuntimeFilterTypes.contains(TRuntimeFilterType.MIN_MAX),
+              "MIN_MAX filters should not be generated!");
+          // TODO: IMPALA-9580: Support Kudu VARCHAR Min/Max Filters
+          if (targetExpr.getType().isVarchar()) continue;
+          SlotRef slotRef = targetExpr.unwrapSlotRef(true);
+          // Kudu only supports targeting a single column, not general exprs, so the
+          // target must be a SlotRef pointing to a column. We can allow implicit
+          // integer casts by casting the min/max values before sending them to Kudu.
+          // Kudu also cannot currently return nulls if a filter is applied, so it
+          // does not work with "is not distinct".
+          if (slotRef == null || slotRef.getDesc().getColumn() == null
+              || (targetExpr instanceof CastExpr && !targetExpr.getType().isIntegerType())
+              || filter.getExprCompOp() == Operator.NOT_DISTINCT) {
+            continue;
+          }
+        } else {
+          Preconditions.checkState(filter.getType() == TRuntimeFilterType.IN_LIST);
+          Preconditions.checkState(
+              enabledRuntimeFilterTypes.contains(TRuntimeFilterType.IN_LIST),
+              "IN_LIST filters should not be generated!");
+          // TODO(IMPALA-11066): Runtime IN-list filters for Kudu tables
           continue;
         }
       }
-
-      RuntimeFilter.RuntimeFilterTarget target = new RuntimeFilter.RuntimeFilterTarget(
-          scanNode, targetExpr, isBoundByPartitionColumns, isLocalTarget);
+      TColumnValue lowValue = null;
+      TColumnValue highValue = null;
+      if (scanNode instanceof HdfsScanNode) {
+        SlotRef slotRefInScan = targetExpr.unwrapSlotRef(true);
+        if (slotRefInScan != null) {
+          Column col = slotRefInScan.getDesc().getColumn();
+          if (col != null) {
+            lowValue = col.getStats().getLowValue();
+            highValue = col.getStats().getHighValue();
+          }
+        }
+      }
+      RuntimeFilter.RuntimeFilterTarget target =
+          new RuntimeFilter.RuntimeFilterTarget(scanNode, targetExpr,
+              isBoundByPartitionColumns, isColumnInDataFile, isLocalTarget,
+              lowValue, highValue);
       filter.addTarget(target);
+    }
+
+    // finalize the overlap predicate for the hdfs scan node.
+    if (scanNode instanceof HdfsScanNode && enable_overlap_filter) {
+      ((HdfsScanNode) scanNode).finalizeOverlapPredicate();
     }
   }
 
@@ -736,17 +1079,31 @@ public final class RuntimeFilterGenerator {
     Preconditions.checkState(targetExpr.isBoundByTupleIds(targetNode.getTupleIds()));
     TupleDescriptor baseTblDesc = targetNode.getTupleDesc();
     FeTable tbl = baseTblDesc.getTable();
-    if (tbl.getNumClusteringCols() == 0) return false;
+    if (tbl.getNumClusteringCols() == 0 && !(tbl instanceof FeIcebergTable)) return false;
     List<SlotId> sids = new ArrayList<>();
     targetExpr.getIds(null, sids);
     for (SlotId sid : sids) {
-      SlotDescriptor slotDesc = analyzer.getSlotDesc(sid);
-      if (slotDesc.getColumn() == null
-          || slotDesc.getColumn().getPosition() >= tbl.getNumClusteringCols()) {
+      Column col = analyzer.getSlotDesc(sid).getColumn();
+      if (col == null) return false;
+      if (!tbl.isClusteringColumn(col) && !tbl.isComputedPartitionColumn(col)) {
         return false;
       }
     }
     return true;
+  }
+
+  /**
+   * Return true if the column is actually stored in the data file. E.g. partition
+   * columns are not stored in most cases.
+   */
+  private static boolean isColumnInDataFile(FeTable tbl,
+      boolean isBoundByPartitionColumns) {
+    // Non-partition values are always sotred in the data files.
+    if (!isBoundByPartitionColumns) return true;
+    // Iceberg uses hidden partitioning which means all columns are stored in the data
+    // files.
+    if (tbl instanceof FeIcebergTable) return true;
+    return false;
   }
 
   /**
@@ -781,7 +1138,7 @@ public final class RuntimeFilterGenerator {
         return null;
       }
     }
-    Type srcType = filter.getSrcExpr().getType();
+    Type srcType = filter.getSrcExprType();
     // Types of targetExpr and srcExpr must be exactly the same since runtime filters are
     // based on hashing.
     if (!targetExpr.getType().equals(srcType)) {

@@ -17,11 +17,12 @@
 
 # Validates all aggregate functions across all datatypes
 #
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 
 from testdata.common import widetable
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
     create_exec_option_dimension_from_dict,
@@ -117,7 +118,6 @@ class TestAggregation(ImpalaTestSuite):
       return False
     return True
 
-  @SkipIfS3.eventually_consistent
   def test_aggregation(self, vector):
     exec_option = vector.get_value('exec_option')
     disable_codegen = exec_option['disable_codegen']
@@ -152,7 +152,8 @@ class TestAggregation(ImpalaTestSuite):
       # NDV is inherently approximate. Compare with some tolerance.
       err = abs(result_lut[key] - int(actual_string))
       rel_err =  err / float(result_lut[key])
-      print key, result_lut[key], actual_string,abs(result_lut[key] - int(actual_string))
+      print(key, result_lut[key], actual_string,
+            abs(result_lut[key] - int(actual_string)))
       assert err <= 1 or rel_err < 0.05
     elif data_type in ('float', 'double') and agg_func != 'count':
       # Compare with a margin of error.
@@ -277,6 +278,49 @@ class TestAggregationQueries(ImpalaTestSuite):
     vector.get_value('exec_option')['batch_size'] = 1
     self.run_test_case('QueryTest/kudu-stats-agg', vector, unique_database)
 
+  def test_ndv(self):
+    """Test the version of NDV() that accepts a scale value argument against
+    different column data types. The scale argument is an integer in range
+    [1, 10]."""
+
+    ndv_results = [
+      [2, 9, 96, 988, 980, 1000, 944, 1030, 1020, 990, 1010, 957, 1030, 1027, 9845, 9898],
+      [2, 9, 97, 957, 1008, 1016, 1005, 963, 994, 993, 1018, 1004, 963, 1014, 10210,
+          10280],
+      [2, 9, 98, 977, 1024, 1020, 975, 977, 1002, 991, 994, 1006, 977, 999, 10118, 9923],
+      [2, 9, 99, 986, 1009, 1011, 994, 980, 997, 994, 1002, 997, 980, 988, 10148, 9987],
+      [2, 9, 99, 995, 996, 1000, 998, 988, 995, 999, 997, 999, 988, 979, 9974, 9960],
+      [2, 9, 99, 998, 1005, 999, 1003, 994, 1000, 993, 999, 998, 994, 992, 9899, 9941],
+      [2, 9, 99, 993, 1001, 1007, 1000, 998, 1002, 997, 999, 998, 998, 999, 9923, 9931],
+      [2, 9, 99, 994, 998, 1002, 1002, 999, 998, 999, 997, 1000, 999, 997, 9937, 9973],
+      [2, 9, 99, 995, 997, 998, 1001, 999, 1001, 996, 997, 1000, 999, 998, 9989, 9981],
+      [2, 9, 99, 998, 998, 997, 999, 998, 1000, 998, 1000, 998, 998, 1000, 10000, 10003]
+    ]
+
+    # For each possible integer value, genereate one query and test it out.
+    for i in range(1, 11):
+      ndv_stmt = """
+        select ndv(bool_col, {0}), ndv(tinyint_col, {0}),
+               ndv(smallint_col, {0}), ndv(int_col, {0}),
+               ndv(bigint_col, {0}), ndv(float_col, {0}),
+               ndv(double_col, {0}), ndv(string_col, {0}),
+               ndv(cast(double_col as decimal(5, 0)), {0}),
+               ndv(cast(double_col as decimal(10, 5)), {0}),
+               ndv(cast(double_col as decimal(20, 10)), {0}),
+               ndv(cast(double_col as decimal(38, 33)), {0}),
+               ndv(cast(string_col as varchar(20)), {0}),
+               ndv(cast(string_col as char(10)), {0}),
+               ndv(timestamp_col, {0}), ndv(id, {0})
+        from functional_parquet.alltypesagg""".format(i)
+      ndv_result = self.execute_query(ndv_stmt)
+      ndv_vals = ndv_result.data[0].split('\t')
+
+      # Verify that each ndv() value (one per column for a total of 11) is identical
+      # to the corresponding known value. Since NDV() invokes Hash64() hash function
+      # with a fixed seed value, ndv() result is deterministic.
+      for j in range(0, 11):
+        assert(ndv_results[i - 1][j] == int(ndv_vals[j]))
+
   def test_sampled_ndv(self, vector, unique_database):
     """The SAMPLED_NDV() function is inherently non-deterministic and cannot be
     reasonably made deterministic with existing options so we test it separately.
@@ -330,7 +374,7 @@ class TestAggregationQueries(ImpalaTestSuite):
       assert len(sampled_ndv_vals) == len(ndv_vals)
       # Low NDV columns. We expect a reasonaby accurate estimate regardless of the
       # sampling percent.
-      for i in xrange(0, 14):
+      for i in range(0, 14):
         self.appx_equals(int(sampled_ndv_vals[i]), int(ndv_vals[i]), 0.1)
       # High NDV columns. We expect the estimate to have high variance and error.
       # Since we give NDV() and SAMPLED_NDV() the same input data, i.e., we are not
@@ -338,8 +382,14 @@ class TestAggregationQueries(ImpalaTestSuite):
       # be bigger than NDV() proportional to the sampling percent.
       # For example, the column 'id' is a PK so we expect the result of SAMPLED_NDV()
       # with a sampling percent of 0.1 to be approximately 10x of the NDV().
-      for i in xrange(14, 16):
+      for i in range(14, 16):
         self.appx_equals(int(sampled_ndv_vals[i]) * sample_perc, int(ndv_vals[i]), 2.0)
+
+  def test_grouping_sets(self, vector):
+    """Tests for ROLLUP, CUBE and GROUPING SETS."""
+    if vector.get_value('table_format').file_format == 'hbase':
+      pytest.xfail(reason="IMPALA-283 - HBase null handling is inconsistent")
+    self.run_test_case('QueryTest/grouping-sets', vector)
 
 
 class TestDistinctAggregation(ImpalaTestSuite):
@@ -435,3 +485,6 @@ class TestTPCHAggregationQueries(ImpalaTestSuite):
 
   def test_tpch_stress(self, vector):
     self.run_test_case('tpch-stress-aggregations', vector)
+
+  def test_min_multiple_distinct(self, vector, unique_database):
+    self.run_test_case('min-multiple-distinct-aggs', vector)

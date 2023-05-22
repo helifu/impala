@@ -85,7 +85,7 @@ public class SubplanNode extends PlanNode {
   }
 
   @Override
-  protected void computeStats(Analyzer analyzer) {
+  public void computeStats(Analyzer analyzer) {
     super.computeStats(analyzer);
     if (getChild(0).cardinality_ != -1 && getChild(1).cardinality_ != -1) {
       cardinality_ =
@@ -94,6 +94,11 @@ public class SubplanNode extends PlanNode {
       cardinality_ = -1;
     }
     cardinality_ = capCardinalityAtLimit(cardinality_);
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = ProcessingCost.basicCost(getDisplayLabel(), getCardinality(), 0);
   }
 
   @Override

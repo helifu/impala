@@ -22,8 +22,9 @@ import static org.junit.Assert.*;
 import java.util.List;
 import java.util.Set;
 
+import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
+import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
 import org.apache.hive.service.rpc.thrift.TGetColumnsReq;
-import org.apache.hive.service.rpc.thrift.TGetSchemasReq;
 import org.apache.hive.service.rpc.thrift.TGetTablesReq;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ToSqlUtils;
@@ -36,24 +37,28 @@ import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.IcebergContentFileStore;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.fb.FbFileBlock;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.service.Frontend;
-import org.apache.impala.service.MetadataOp;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TIcebergContentFileStore;
 import org.apache.impala.thrift.TMetadataOpRequest;
 import org.apache.impala.thrift.TMetadataOpcode;
-import org.apache.impala.thrift.TResultRow;
+import org.apache.impala.thrift.TNetworkAddress;
+import org.apache.impala.thrift.TPartialTableInfo;
 import org.apache.impala.thrift.TResultSet;
+import org.apache.impala.util.IcebergUtil;
+import org.apache.impala.util.ListMap;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.impala.util.PatternMatcher;
 import org.hamcrest.CoreMatchers;
 import org.junit.Assert;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Test;
 
 import com.google.common.base.Joiner;
@@ -155,11 +160,82 @@ public class LocalCatalogTest {
   }
 
   @Test
+  public void testLoadBinaryTableBasics() throws Exception {
+    FeDb functionalDb = catalog_.getDb("functional");
+    CatalogTest.checkTableCols(functionalDb, "binary_tbl", 0,
+        new String[] {"id", "string_col", "binary_col"},
+        new Type[] {Type.INT, Type.STRING, Type.BINARY});
+    FeTable t = functionalDb.getTable("binary_tbl");
+    assertEquals(8, t.getNumRows());
+
+    assertTrue(t instanceof LocalFsTable);
+    FeFsTable fsTable = (FeFsTable) t;
+    assertEquals(MetaStoreUtil.DEFAULT_NULL_PARTITION_KEY_VALUE,
+        fsTable.getNullPartitionKeyValue());
+
+    // Stats should have one row per partition, plus a "total" row.
+    TResultSet stats = fsTable.getTableStats();
+    assertEquals(1, stats.getRowsSize());
+  }
+
+  @Test
   public void testPartitioning() throws Exception {
     FeFsTable t = (FeFsTable) catalog_.getTable("functional",  "alltypes");
-    // TODO(todd): once we support file descriptors in LocalCatalog,
-    // run the full test.
-    CatalogTest.checkAllTypesPartitioning(t, /*checkFileDescriptors=*/false);
+    CatalogTest.checkAllTypesPartitioning(t);
+  }
+
+  /**
+   * Test SQL constraints such as primary keys and foreign keys
+   */
+  @Test
+  public void testGetSqlConstraints() throws Exception {
+    FeFsTable t = (FeFsTable) catalog_.getTable("functional", "parent_table");
+    assertNotNull(t);
+    assertTrue(t instanceof LocalFsTable);
+    List<SQLPrimaryKey> primaryKeys = t.getSqlConstraints().getPrimaryKeys();
+    List<SQLForeignKey> foreignKeys = t.getSqlConstraints().getForeignKeys();
+    assertEquals(2, primaryKeys.size());
+    assertEquals(0, foreignKeys.size());
+    for (SQLPrimaryKey pk: primaryKeys) {
+      assertEquals("functional", pk.getTable_db());
+      assertEquals("parent_table", pk.getTable_name());
+    }
+    assertEquals("id", primaryKeys.get(0).getColumn_name());
+    assertEquals("year", primaryKeys.get(1).getColumn_name());
+
+    t = (FeFsTable) catalog_.getTable("functional", "child_table");
+    assertNotNull(t);
+    assertTrue(t instanceof LocalFsTable);
+    primaryKeys = t.getSqlConstraints().getPrimaryKeys();
+    foreignKeys = t.getSqlConstraints().getForeignKeys();
+    assertEquals(1, primaryKeys.size());
+    assertEquals(3, foreignKeys.size());
+    assertEquals("functional", primaryKeys.get(0).getTable_db());
+    assertEquals("child_table",primaryKeys.get(0).getTable_name());
+    for (SQLForeignKey fk : foreignKeys) {
+      assertEquals("functional", fk.getFktable_db());
+      assertEquals("child_table", fk.getFktable_name());
+      assertEquals("functional", fk.getPktable_db());
+    }
+    assertEquals("parent_table", foreignKeys.get(0).getPktable_name());
+    assertEquals("parent_table", foreignKeys.get(1).getPktable_name());
+    assertEquals("parent_table_2", foreignKeys.get(2).getPktable_name());
+    assertEquals("id", foreignKeys.get(0).getPkcolumn_name());
+    assertEquals("year", foreignKeys.get(1).getPkcolumn_name());
+    assertEquals("a", foreignKeys.get(2).getPkcolumn_name());
+    // FK name for the composite primary key (id, year) should be equal.
+    assertEquals(foreignKeys.get(0).getFk_name(), foreignKeys.get(1).getFk_name());
+
+    // Check tables without constraints.
+    t = (FeFsTable) catalog_.getTable("functional", "alltypes");
+    assertNotNull(t);
+    assertTrue(t instanceof FeFsTable);
+    primaryKeys = t.getSqlConstraints().getPrimaryKeys();
+    foreignKeys = t.getSqlConstraints().getForeignKeys();
+    assertNotNull(primaryKeys);
+    assertNotNull(foreignKeys);
+    assertEquals(0, primaryKeys.size());
+    assertEquals(0, foreignKeys.size());
   }
 
   /**
@@ -195,6 +271,43 @@ public class LocalCatalogTest {
     assertTrue(t.getHostIndex().size() > 0);
   }
 
+  /**
+   * This test verifies that the network addresses used by the LocalIcebergTable are
+   * the same used by CatalogD.
+   */
+  @Test
+  public void testLoadIcebergFileDescriptors() throws Exception {
+    LocalIcebergTable t = (LocalIcebergTable)catalog_.getTable(
+        "functional_parquet", "iceberg_partitioned");
+    IcebergContentFileStore fileStore = t.getContentFileStore();
+    TPartialTableInfo tblInfo = provider_.loadIcebergTable(t.ref_);
+    ListMap<TNetworkAddress> catalogdHostIndexes = new ListMap<>();
+    catalogdHostIndexes.populate(tblInfo.getNetwork_addresses());
+    IcebergContentFileStore catalogFileStore = IcebergContentFileStore.fromThrift(
+        tblInfo.getIceberg_table().getContent_files(),
+        null, null);
+    TIcebergContentFileStore icebergContentFileStore = catalogFileStore.toThrift();
+    assertEquals(tblInfo.getIceberg_table().getContent_files(), icebergContentFileStore);
+    for (FileDescriptor localFd : fileStore.getAllDataFiles()) {
+      String path = localFd.getAbsolutePath(t.getLocation());
+      // For this test table the manifest files contain data paths without FS-scheme, so
+      // they are loaded to the file content store without them.
+      path = path.substring(path.indexOf("/test-warehouse"));
+      String pathHash = IcebergUtil.getFilePathHash(path);
+      FileDescriptor catalogFd = catalogFileStore.getDataFileDescriptor(pathHash);
+      assertEquals(localFd.getNumFileBlocks(), 1);
+      FbFileBlock localBlock = localFd.getFbFileBlock(0);
+      FbFileBlock catalogBlock = catalogFd.getFbFileBlock(0);
+      assertEquals(localBlock.replicaHostIdxsLength(), 3);
+      for (int i = 0; i < localBlock.replicaHostIdxsLength(); ++i) {
+        TNetworkAddress localAddr = t.getHostIndex().getEntry(
+            localBlock.replicaHostIdxs(i));
+        TNetworkAddress catalogAddr = catalogdHostIndexes.getEntry(
+            catalogBlock.replicaHostIdxs(i));
+        assertEquals(localAddr, catalogAddr);
+      }
+    }
+  }
 
   @Test
   public void testLoadFileDescriptorsUnpartitioned() throws Exception {
@@ -240,6 +353,16 @@ public class LocalCatalogTest {
     stats = t.getColumn("date_col").getStats();
     assertEquals(16, stats.getNumDistinctValues());
     assertEquals(2, stats.getNumNulls());
+  }
+
+  @Test
+  public void testBinaryColumnStats() throws Exception {
+    FeFsTable t = (FeFsTable) catalog_.getTable("functional",  "binary_tbl");
+    ColumnStats stats = t.getColumn("binary_col").getStats();
+    assertEquals(26, stats.getMaxSize());
+    assertEquals(8.714285850524902, stats.getAvgSize(), 0.0001);
+    assertEquals(-1, stats.getNumDistinctValues());
+    assertEquals(1, stats.getNumNulls());
   }
 
   @Test
@@ -337,6 +460,19 @@ public class LocalCatalogTest {
         ")\n" +
         "STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'\n" +
         "WITH SERDEPROPERTIES ('hbase.columns.mapping'=':key,d:date_col,d:date_part', " +
+        "'serialization.format'='1')"
+    ));
+
+    t = (LocalHbaseTable) catalog_.getTable("functional_hbase", "binary_tbl");
+    Assert.assertThat(ToSqlUtils.getCreateTableSql(t), CoreMatchers.startsWith(
+        "CREATE EXTERNAL TABLE functional_hbase.binary_tbl (\n" +
+        "  id INT,\n" +
+        "  binary_col BINARY,\n" +
+        "  string_col STRING\n" +
+        ")\n" +
+        "STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'\n" +
+        "WITH SERDEPROPERTIES (" +
+        "'hbase.columns.mapping'=':key,d:string_col,d:binary_col', " +
         "'serialization.format'='1')"
     ));
   }

@@ -15,10 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdlib.h>
-#include <stdio.h>
-
-#include <iostream>
 #include <utility>
 
 #include "runtime/mem-tracker.h"
@@ -26,7 +22,6 @@
 #include "runtime/timestamp-value.h"
 #include "testutil/gtest-util.h"
 #include "testutil/rand-util.h"
-#include "util/bit-packing.inline.h"
 #include "util/dict-encoding.h"
 #include "util/encoding-test-util.h"
 
@@ -153,9 +148,10 @@ TEST(DictTest, TestTimestamps) {
 template<typename InternalType>
 void IncrementValue(InternalType* t) { ++(*t); }
 
-template <> void IncrementValue(Decimal4Value* t) { ++(t->value()); }
-template <> void IncrementValue(Decimal8Value* t) { ++(t->value()); }
-template <> void IncrementValue(Decimal16Value* t) { ++(t->value()); }
+template <class T> void IncrementValue(DecimalValue<T>* t) {
+  const T value = t->value();
+  t->set_value(value + 1);
+}
 
 template<typename InternalType, parquet::Type::type PARQUET_TYPE>
 void TestNumbers(int max_value, int repeat, int value_byte_size) {

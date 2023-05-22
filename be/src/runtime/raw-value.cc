@@ -18,16 +18,21 @@
 #include <sstream>
 #include <boost/functional/hash.hpp>
 
+#include "kudu/gutil/strings/escaping.h"
 #include "runtime/collection-value.h"
 #include "runtime/date-value.h"
+#include "runtime/raw-value.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/tuple.h"
+#include "udf/udf-internal.h"
 #include "util/ubsan.h"
 
 #include "common/names.h"
 
 namespace impala {
+
+using impala_udf::StructVal;
 
 const int RawValue::ASCII_PRECISION;
 constexpr double RawValue::CANONICAL_DOUBLE_NAN;
@@ -88,15 +93,13 @@ void RawValue::PrintValueAsBytes(const void* value, const ColumnType& type,
 void RawValue::PrintValue(const void* value, const ColumnType& type, int scale,
                           string* str) {
   if (value == NULL) {
-    *str = "NULL";
+    *str = NullLiteral(true);
     return;
   }
 
-  stringstream out;
-  out.precision(ASCII_PRECISION);
   const StringValue* string_val = NULL;
-  string tmp;
   bool val;
+  string tmp;
 
   // Special case types that we can print more efficiently without using a stringstream
   switch (type.type) {
@@ -113,16 +116,28 @@ void RawValue::PrintValue(const void* value, const ColumnType& type, int scale,
     case TYPE_CHAR:
       *str = string(reinterpret_cast<const char*>(value), type.len);
       return;
+    case TYPE_TIMESTAMP:
+      *str = reinterpret_cast<const TimestampValue*>(value)->ToString();
+      return;
+    case TYPE_DATE:
+      *str = reinterpret_cast<const DateValue*>(value)->ToString();
+      return;
     case TYPE_FIXED_UDA_INTERMEDIATE:
       *str = "Intermediate UDA step, no value printed";
       return;
     default:
-      PrintValue(value, type, scale, &out);
+      break;
   }
+
+  stringstream out;
+  out.precision(ASCII_PRECISION);
+
+  PrintValue(value, type, scale, &out);
+
   *str = out.str();
 }
 
-void RawValue::Write(const void* value, void* dst, const ColumnType& type,
+void RawValue::WriteNonNullPrimitive(const void* value, void* dst, const ColumnType& type,
     MemPool* pool) {
   DCHECK(value != NULL);
   switch (type.type) {
@@ -167,9 +182,9 @@ void RawValue::Write(const void* value, void* dst, const ColumnType& type,
       dest->len = src->len;
       if (type.type == TYPE_VARCHAR) DCHECK_LE(dest->len, type.len);
       if (pool != NULL) {
-        // Note: if this changes to TryAllocate(), CodegenAnyVal::WriteToSlot() will need
-        // to reflect this change as well (the codegen'd Allocate() call is actually
-        // generated in CodegenAnyVal::StoreToNativePtr()).
+        // Note: if this changes to TryAllocate(), SlotDescriptor::CodegenWriteToSlot()
+        // will need to reflect this change as well (the codegen'd Allocate() call is
+        // actually generated in SlotDescriptor::CodegenWriteStringOrCollectionToSlot()).
         dest->ptr = reinterpret_cast<char*>(pool->Allocate(dest->len));
         Ubsan::MemCpy(dest->ptr, src->ptr, dest->len);
       } else {
@@ -186,32 +201,155 @@ void RawValue::Write(const void* value, void* dst, const ColumnType& type,
       break;
     case TYPE_ARRAY:
     case TYPE_MAP: {
-      DCHECK(pool == NULL) << "RawValue::Write(): deep copy of CollectionValues NYI";
-      const CollectionValue* src = reinterpret_cast<const CollectionValue*>(value);
-      CollectionValue* dest = reinterpret_cast<CollectionValue*>(dst);
-      dest->num_tuples = src->num_tuples;
-      dest->ptr = src->ptr;
+      // Collections should be handled by a different Write() function within this class.
+      DCHECK(false);
       break;
     }
+    case TYPE_STRUCT: {
+      // Structs should be handled by a different Write() function within this class.
+      DCHECK(false);
+    }
     default:
-      DCHECK(false) << "RawValue::Write(): bad type: " << type.DebugString();
+      DCHECK(false) << "RawValue::WriteNonNullPrimitive(): bad type: "
+          << type.DebugString();
   }
 }
 
 void RawValue::Write(const void* value, Tuple* tuple, const SlotDescriptor* slot_desc,
-                     MemPool* pool) {
-  if (value == NULL) {
-    tuple->SetNull(slot_desc->null_indicator_offset());
+    MemPool* pool) {
+  RawValue::Write<false>(value, tuple, slot_desc, pool, nullptr, nullptr);
+}
+
+template <bool COLLECT_VAR_LEN_VALS>
+void RawValue::Write(const void* value, Tuple* tuple, const SlotDescriptor* slot_desc,
+    MemPool* pool, std::vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values) {
+  if (value == nullptr) {
+    if (slot_desc->type().IsStructType()) {
+      tuple->SetStructToNull(slot_desc);
+    } else {
+      tuple->SetNull(slot_desc->null_indicator_offset());
+    }
   } else {
-    void* slot = tuple->GetSlot(slot_desc->tuple_offset());
-    RawValue::Write(value, slot, slot_desc->type(), pool);
+    RawValue::WriteNonNull<COLLECT_VAR_LEN_VALS>(value, tuple, slot_desc, pool,
+        string_values, collection_values);
+  }
+}
+
+template <bool COLLECT_VAR_LEN_VALS>
+void RawValue::WriteNonNull(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool,
+    vector<StringValue*>* string_values,
+    vector<pair<CollectionValue*, int64_t>>* collection_values) {
+  DCHECK(value != nullptr && tuple != nullptr && slot_desc != nullptr);
+
+  if (COLLECT_VAR_LEN_VALS) {
+    DCHECK(string_values != nullptr);
+    DCHECK(string_values->size() == 0);
+    DCHECK(collection_values != nullptr);
+    DCHECK(collection_values->size() == 0);
+  }
+
+  if (slot_desc->type().IsStructType()) {
+    WriteStruct<COLLECT_VAR_LEN_VALS>(value, tuple, slot_desc, pool,
+        string_values, collection_values);
+  } else if (slot_desc->type().IsCollectionType()) {
+    WriteCollection<COLLECT_VAR_LEN_VALS>(value, tuple, slot_desc, pool,
+        string_values, collection_values);
+  } else {
+    WritePrimitiveCollectVarlen<COLLECT_VAR_LEN_VALS>(value, tuple, slot_desc, pool,
+        string_values, collection_values);
+  }
+}
+
+template <bool COLLECT_VAR_LEN_VALS>
+void RawValue::WriteStruct(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool, vector<StringValue*>* string_values,
+    vector<pair<CollectionValue*, int64_t>>* collection_values) {
+  DCHECK(tuple != nullptr);
+  DCHECK(slot_desc->type().IsStructType());
+  DCHECK(slot_desc->children_tuple_descriptor() != nullptr);
+  if (value == nullptr) {
+    tuple->SetStructToNull(slot_desc);
+    return;
+  }
+  const StructVal* src = reinterpret_cast<const StructVal*>(value);
+  const TupleDescriptor* children_tuple_desc = slot_desc->children_tuple_descriptor();
+  DCHECK_EQ(src->num_children, children_tuple_desc->slots().size());
+
+  for (int i = 0; i < src->num_children; ++i) {
+    SlotDescriptor* child_slot = children_tuple_desc->slots()[i];
+    uint8_t* src_child = src->ptr[i];
+    if (child_slot->type().IsStructType()) {
+      // Recursive call in case of nested structs.
+      WriteStruct<COLLECT_VAR_LEN_VALS>(src_child, tuple, child_slot, pool,
+          string_values, collection_values);
+      continue;
+    }
+    if (src_child == nullptr) {
+      tuple->SetNull(child_slot->null_indicator_offset());
+    } else {
+      WritePrimitiveCollectVarlen<COLLECT_VAR_LEN_VALS>(src_child, tuple, child_slot,
+          pool, string_values, collection_values);
+    }
+  }
+}
+
+template <bool COLLECT_VAR_LEN_VALS>
+void RawValue::WriteCollection(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool, vector<StringValue*>* string_values,
+    vector<pair<CollectionValue*, int64_t>>* collection_values) {
+  DCHECK(slot_desc->type().IsCollectionType());
+
+  void* dst = tuple->GetSlot(slot_desc->tuple_offset());
+
+  // TODO IMPALA-10939: Enable recursive collections.
+  const CollectionValue* src = reinterpret_cast<const CollectionValue*>(value);
+  CollectionValue* dest = reinterpret_cast<CollectionValue*>(dst);
+  dest->num_tuples = src->num_tuples;
+
+  int64_t byte_size = dest->ByteSize(*slot_desc->children_tuple_descriptor());
+  if (pool != nullptr) {
+    // Note: if this changes to TryAllocate(), SlotDescriptor::CodegenWriteToSlot() will
+    // need to reflect this change as well (the codegen'd Allocate() call is actually
+    // generated in SlotDescriptor::CodegenWriteStringOrCollectionToSlot()).
+    dest->ptr = reinterpret_cast<uint8_t*>(pool->Allocate(byte_size));
+    Ubsan::MemCpy(dest->ptr, src->ptr, byte_size);
+  } else {
+    dest->ptr = src->ptr;
+  }
+
+  if (COLLECT_VAR_LEN_VALS) {
+    DCHECK(string_values != nullptr);
+    DCHECK(collection_values != nullptr);
+    collection_values->push_back(std::make_pair(dest, byte_size));
+  }
+}
+
+template <bool COLLECT_VAR_LEN_VALS>
+void RawValue::WritePrimitiveCollectVarlen(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool, vector<StringValue*>* string_values,
+    vector<pair<CollectionValue*, int64_t>>* collection_values) {
+  DCHECK(value != nullptr && tuple != nullptr && slot_desc != nullptr);
+
+  void* dst = tuple->GetSlot(slot_desc->tuple_offset());
+  WriteNonNullPrimitive(value, dst, slot_desc->type(), pool);
+  if (COLLECT_VAR_LEN_VALS) {
+    DCHECK(string_values != nullptr);
+    DCHECK(collection_values != nullptr);
+    if (slot_desc->type().IsVarLenStringType()) {
+      string_values->push_back(reinterpret_cast<StringValue*>(dst));
+    } else if (slot_desc->type().IsCollectionType()) {
+      DCHECK(false) << "Collections should be handled in WriteCollection.";
+    }
   }
 }
 
 void RawValue::PrintValue(
-    const void* value, const ColumnType& type, int scale, std::stringstream* stream) {
+    const void* value, const ColumnType& type, int scale, std::stringstream* stream,
+    bool quote_val) {
   if (value == NULL) {
-    *stream << "NULL";
+    *stream << NullLiteral(true);
     return;
   }
 
@@ -229,7 +367,7 @@ void RawValue::PrintValue(
     case TYPE_BOOLEAN: {
       bool val = *reinterpret_cast<const bool*>(value);
       *stream << (val ? "true" : "false");
-      return;
+      break;
     }
     case TYPE_TINYINT:
       // Extra casting for chars since they should not be interpreted as ASCII.
@@ -266,13 +404,31 @@ void RawValue::PrintValue(
     case TYPE_STRING:
       string_val = reinterpret_cast<const StringValue*>(value);
       if (type.type == TYPE_VARCHAR) DCHECK(string_val->len <= type.len);
-      stream->write(string_val->ptr, string_val->len);
+      if (quote_val) {
+        string str(string_val->ptr, string_val->len);
+        str = strings::Utf8SafeCEscape(str);
+        *stream << "\"";
+        stream->write(str.c_str(), str.size());
+        *stream << "\"";
+      } else {
+        stream->write(string_val->ptr, string_val->len);
+      }
       break;
     case TYPE_TIMESTAMP:
+      if (quote_val) *stream << "\"";
       *stream << *reinterpret_cast<const TimestampValue*>(value);
+      if (quote_val) *stream << "\"";
       break;
     case TYPE_CHAR:
-      stream->write(reinterpret_cast<const char*>(value), type.len);
+      if (quote_val) {
+        string str(reinterpret_cast<const char*>(value), type.len);
+        str = strings::Utf8SafeCEscape(str);
+        *stream << "\"";
+        stream->write(str.c_str(), str.size());
+        *stream << "\"";
+      } else {
+        stream->write(reinterpret_cast<const char*>(value), type.len);
+      }
       break;
     case TYPE_DECIMAL:
       switch (type.GetByteSize()) {
@@ -289,13 +445,51 @@ void RawValue::PrintValue(
       }
       break;
     case TYPE_DATE: {
-        *stream << *reinterpret_cast<const DateValue*>(value);
-      }
-      break;
+      if (quote_val) *stream << "\"";
+      *stream << *reinterpret_cast<const DateValue*>(value);
+      if (quote_val) *stream << "\"";
+    } break;
     default: DCHECK(false) << "Unknown type: " << type;
   }
   stream->precision(old_precision);
   // Undo setting stream to fixed
   stream->flags(old_flags);
 }
+
+template void RawValue::Write<true>(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool,
+    std::vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
+template void RawValue::Write<false>(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool,
+    std::vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
+
+template void RawValue::WriteNonNull<true>(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool,
+    std::vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
+template void RawValue::WriteNonNull<false>(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool,
+    std::vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
+
+template void RawValue::WriteStruct<true>(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool,
+    std::vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
+template void RawValue::WriteStruct<false>(const void* value, Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool,
+    std::vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
+
+template void RawValue::WritePrimitiveCollectVarlen<true>(const void* value,
+    Tuple* tuple, const SlotDescriptor* slot_desc, MemPool* pool,
+    std::vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
+template void RawValue::WritePrimitiveCollectVarlen<false>(const void* value,
+    Tuple* tuple,
+    const SlotDescriptor* slot_desc, MemPool* pool,
+    std::vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
 }

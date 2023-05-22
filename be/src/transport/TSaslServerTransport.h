@@ -18,14 +18,13 @@
  * under the License.
  */
 
-#ifndef IMPALA_TRANSPORT_TSASLSERVERTRANSPORT_H
-#define IMPALA_TRANSPORT_TSASLSERVERTRANSPORT_H
+#pragma once
 
-#include <string>
 #include <pthread.h>
+#include <mutex>
+#include <string>
 
 #include <boost/shared_ptr.hpp>
-#include <boost/thread/mutex.hpp>
 #include <thrift/transport/TTransport.h>
 #include "transport/TSasl.h"
 #include "transport/TSaslTransport.h"
@@ -100,7 +99,7 @@ class TSaslServerTransport : public TSaslTransport {
 
   /* Wrap the passed transport in a transport for the defined server. */
   TSaslServerTransport(const std::map<std::string, TSaslServerDefinition*>& serverMap,
-                       boost::shared_ptr<TTransport> transport);
+                       std::shared_ptr<TTransport> transport);
 
  public:
 
@@ -109,7 +108,7 @@ class TSaslServerTransport : public TSaslTransport {
    * transport: the underlying transport used to read and write data.
    *
    */
-  TSaslServerTransport(boost::shared_ptr<TTransport> transport);
+  TSaslServerTransport(std::shared_ptr<TTransport> transport);
 
   /**
    * Construct a new TSaslTrasnport, passing in the components of the definition.
@@ -121,7 +120,7 @@ class TSaslServerTransport : public TSaslTransport {
                        unsigned flags,
                        const std::map<std::string, std::string>& props,
                        const std::vector<struct sasl_callback>& callbacks,
-                       boost::shared_ptr<TTransport> transport);
+                       std::shared_ptr<TTransport> transport);
 
   /* Add a definition to a server transport */
   void addServerDefinition(const std::string& mechanism,
@@ -166,8 +165,8 @@ class TSaslServerTransport : public TSaslTransport {
     /**
      * Wraps the transport with the Sasl protocol.
      */
-    virtual boost::shared_ptr<TTransport> getTransport(
-        boost::shared_ptr<TTransport> trans);
+    virtual std::shared_ptr<TTransport> getTransport(
+        std::shared_ptr<TTransport> trans);
 
     /* Add a definition to a server transport factory */
     void addServerDefinition(const std::string& mechanism,
@@ -185,19 +184,8 @@ class TSaslServerTransport : public TSaslTransport {
    private:
     /* Map for holding and returning server definitions. */
     std::map<std::string, TSaslServerDefinition*> serverDefinitionMap_;
-
-    /* Map from a transport to its Sasl Transport (wrapped by a TBufferedTransport). */
-    typedef std::map<boost::shared_ptr<TTransport>,
-                     boost::shared_ptr<TBufferedTransport>> TransportMap;
-    TransportMap transportMap_;
-
-    /* Lock to synchronize the transport map. */
-    boost::mutex transportMap_mutex_;
-
   };
 
 };
 
 }}} // apache::thrift::transport
-
-#endif // #ifndef IMPALA_TRANSPORT_TSSLSERVERTRANSPORT_H

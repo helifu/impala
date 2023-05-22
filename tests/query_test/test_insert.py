@@ -17,18 +17,22 @@
 
 # Targeted Impala insert tests
 
+from __future__ import absolute_import, division, print_function
 import os
 import pytest
+import re
 
 from testdata.common import widetable
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import SkipIfABFS, SkipIfEC, SkipIfLocal, \
-    SkipIfHive2, SkipIfNotHdfsMinicluster, SkipIfS3, SkipIfDockerizedCluster
+from tests.common.skip import (SkipIfFS, SkipIfLocal, SkipIfHive2,
+    SkipIfNotHdfsMinicluster)
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
-    create_uncompressed_text_dimension)
+    create_uncompressed_text_dimension,
+    create_single_exec_option_dimension,
+    is_supported_insert_format)
 from tests.common.test_result_verifier import (
     QueryTestResult,
     parse_result_rows)
@@ -87,6 +91,7 @@ class TestInsertQueries(ImpalaTestSuite):
     table_name = unique_database + ".insert_largestring"
 
     self.client.set_configuration_option("mem_limit", "4gb")
+    self.client.set_configuration_option("max_row_size", "257mb")
     file_format = vector.get_value('table_format').file_format
     if file_format == "parquet":
       stored_as = file_format
@@ -113,11 +118,14 @@ class TestInsertQueries(ImpalaTestSuite):
 
     # IMPALA-7648: test that we gracefully fail when there is not enough memory
     # to fit the scanned string in memory.
+    # IMPALA-9856: Disable result spooling for this query since it is intended to test
+    # for OOM.
+    self.client.set_configuration_option("spool_query_results", "0")
     self.client.set_configuration_option("mem_limit", "50M")
     try:
       self.client.execute("select s from {0}".format(table_name))
       assert False, "Expected query to fail"
-    except Exception, e:
+    except Exception as e:
       assert "Memory limit exceeded" in str(e)
 
 
@@ -125,17 +133,17 @@ class TestInsertQueries(ImpalaTestSuite):
   def setup_class(cls):
     super(TestInsertQueries, cls).setup_class()
 
-  @pytest.mark.execute_serially
-  # Erasure coding doesn't respect memory limit
-  @SkipIfEC.fix_later
+  @UniqueDatabase.parametrize(sync_ddl=True)
   # ABFS partition names cannot end in periods
-  @SkipIfABFS.file_or_folder_name_ends_with_period
-  def test_insert(self, vector):
+  @SkipIfFS.file_or_folder_name_ends_with_period
+  def test_insert(self, vector, unique_database):
     if (vector.get_value('table_format').file_format == 'parquet'):
       vector.get_value('exec_option')['COMPRESSION_CODEC'] = \
           vector.get_value('compression_codec')
-    self.run_test_case('QueryTest/insert', vector,
-        multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
+    self.run_test_case('QueryTest/insert', vector, unique_database,
+        multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1,
+        test_file_vars={'$ORIGINAL_DB': ImpalaTestSuite
+        .get_db_name_from_format(vector.get_value('table_format'))})
 
   @SkipIfHive2.acid
   @UniqueDatabase.parametrize(sync_ddl=True)
@@ -160,14 +168,17 @@ class TestInsertQueries(ImpalaTestSuite):
     self.run_test_case('QueryTest/acid-insert-fail', vector, unique_database,
         multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
 
+  @UniqueDatabase.parametrize(sync_ddl=True)
   @pytest.mark.execute_serially
   @SkipIfNotHdfsMinicluster.tuned_for_minicluster
-  def test_insert_mem_limit(self, vector):
+  def test_insert_mem_limit(self, vector, unique_database):
     if (vector.get_value('table_format').file_format == 'parquet'):
       vector.get_value('exec_option')['COMPRESSION_CODEC'] = \
           vector.get_value('compression_codec')
-    self.run_test_case('QueryTest/insert-mem-limit', vector,
-        multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
+    self.run_test_case('QueryTest/insert-mem-limit', vector, unique_database,
+        multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1,
+        test_file_vars={'$ORIGINAL_DB': ImpalaTestSuite
+        .get_db_name_from_format(vector.get_value('table_format'))})
     # IMPALA-7023: These queries can linger and use up memory, causing subsequent
     # tests to hit memory limits. Wait for some time to allow the query to
     # be reclaimed.
@@ -176,19 +187,22 @@ class TestInsertQueries(ImpalaTestSuite):
     for v in verifiers:
       v.wait_for_metric("impala-server.num-fragments-in-flight", 0, timeout=180)
 
-  @pytest.mark.execute_serially
-  @SkipIfS3.eventually_consistent
-  def test_insert_overwrite(self, vector):
-    self.run_test_case('QueryTest/insert_overwrite', vector,
-        multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  def test_insert_overwrite(self, vector, unique_database):
+    self.run_test_case('QueryTest/insert_overwrite', vector, unique_database,
+        multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1,
+        test_file_vars={'$ORIGINAL_DB': ImpalaTestSuite
+        .get_db_name_from_format(vector.get_value('table_format'))})
 
-  @pytest.mark.execute_serially
-  def test_insert_bad_expr(self, vector):
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  def test_insert_bad_expr(self, vector, unique_database):
     # The test currently relies on codegen being disabled to trigger an error in
     # the output expression of the table sink.
     if vector.get_value('exec_option')['disable_codegen']:
-      self.run_test_case('QueryTest/insert_bad_expr', vector,
-          multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
+      self.run_test_case('QueryTest/insert_bad_expr', vector, unique_database,
+          multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1,
+          test_file_vars={'$ORIGINAL_DB': ImpalaTestSuite
+          .get_db_name_from_format(vector.get_value('table_format'))})
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_insert_random_partition(self, vector, unique_database):
@@ -306,9 +320,10 @@ class TestInsertNullQueries(ImpalaTestSuite):
   def setup_class(cls):
     super(TestInsertNullQueries, cls).setup_class()
 
-  @pytest.mark.execute_serially
-  def test_insert_null(self, vector):
-    self.run_test_case('QueryTest/insert_null', vector)
+  def test_insert_null(self, vector, unique_database):
+    self.run_test_case('QueryTest/insert_null', vector, unique_database,
+        test_file_vars={'$ORIGINAL_DB': ImpalaTestSuite
+        .get_db_name_from_format(vector.get_value('table_format'))})
 
 
 class TestInsertFileExtension(ImpalaTestSuite):
@@ -321,21 +336,130 @@ class TestInsertFileExtension(ImpalaTestSuite):
 
   @classmethod
   def add_test_dimensions(cls):
-    cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension(
-        'table_format_and_file_extension',
-        *[('parquet', '.parq'), ('textfile', '.txt')]))
+    super(TestInsertFileExtension, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        is_supported_insert_format(v.get_value('table_format')))
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
 
   @classmethod
   def setup_class(cls):
     super(TestInsertFileExtension, cls).setup_class()
 
   def test_file_extension(self, vector, unique_database):
-    table_format = vector.get_value('table_format_and_file_extension')[0]
-    file_extension = vector.get_value('table_format_and_file_extension')[1]
+    table_format = vector.get_value('table_format').file_format
+    if table_format == 'parquet':
+      file_extension = '.parq'
+      stored_as_format = 'parquet'
+    else:
+      file_extension = '.txt'
+      stored_as_format = 'textfile'
     table_name = "{0}_table".format(table_format)
     ctas_query = "create table {0}.{1} stored as {2} as select 1".format(
-        unique_database, table_name, table_format)
+        unique_database, table_name, stored_as_format)
     self.execute_query_expect_success(self.client, ctas_query)
     for path in self.filesystem_client.ls("test-warehouse/{0}.db/{1}".format(
         unique_database, table_name)):
       if not path.startswith('_'): assert path.endswith(file_extension)
+
+
+class TestInsertHdfsWriterLimit(ImpalaTestSuite):
+  """Test to make sure writer fragment instances are distributed evenly when using max
+      hdfs_writers query option."""
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestInsertHdfsWriterLimit, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        (v.get_value('table_format').file_format == 'parquet'))
+
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+  def test_insert_writer_limit(self, unique_database):
+    # Root internal (non-leaf) fragment.
+    query = "create table {0}.test1 as select int_col from " \
+            "functional_parquet.alltypes".format(unique_database)
+    self.__run_insert_and_verify_instances(query, max_fs_writers=2, mt_dop=0,
+                                           expected_num_instances_per_host=[1, 2, 2])
+    # Root coordinator fragment.
+    query = "create table {0}.test2 as select int_col from " \
+            "functional_parquet.alltypes limit 100000".format(unique_database)
+    self.__run_insert_and_verify_instances(query, max_fs_writers=2, mt_dop=0,
+                                           expected_num_instances_per_host=[1, 1, 2])
+    # Root scan fragment. Instance count within limit.
+    query = "create table {0}.test3 as select int_col from " \
+            "functional_parquet.alltypes".format(unique_database)
+    self.__run_insert_and_verify_instances(query, max_fs_writers=4, mt_dop=0,
+                                           expected_num_instances_per_host=[1, 1, 1])
+
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+  def test_mt_dop_writer_limit(self, unique_database):
+    # Root internal (non-leaf) fragment.
+    query = "create table {0}.test1 as select int_col from " \
+            "functional_parquet.alltypes".format(unique_database)
+    self.__run_insert_and_verify_instances(query, max_fs_writers=11, mt_dop=10,
+                                           expected_num_instances_per_host=[11, 12, 12])
+    # Root coordinator fragment.
+    query = "create table {0}.test2 as select int_col from " \
+            "functional_parquet.alltypes limit 100000".format(unique_database)
+    self.__run_insert_and_verify_instances(query, max_fs_writers=2, mt_dop=10,
+                                           expected_num_instances_per_host=[8, 8, 9])
+    # Root scan fragment. Instance count within limit.
+    query = "create table {0}.test3 as select int_col from " \
+            "functional_parquet.alltypes".format(unique_database)
+    self.__run_insert_and_verify_instances(query, max_fs_writers=30, mt_dop=10,
+                                           expected_num_instances_per_host=[8, 8, 8])
+
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+  def test_processing_cost_writer_limit(self, unique_database):
+    # Root internal (non-leaf) fragment.
+    query = "create table {0}.test1 as select int_col from " \
+            "functional_parquet.alltypes".format(unique_database)
+    self.__run_insert_and_verify_instances(query, max_fs_writers=11, mt_dop=0,
+                                           expected_num_instances_per_host=[4, 5, 5],
+                                           processing_cost_min_threads=10)
+    # Root coordinator fragment.
+    query = "create table {0}.test2 as select int_col from " \
+            "functional_parquet.alltypes limit 100000".format(unique_database)
+    self.__run_insert_and_verify_instances(query, max_fs_writers=2, mt_dop=0,
+                                           expected_num_instances_per_host=[1, 1, 2],
+                                           processing_cost_min_threads=10)
+    # Root scan fragment. Instance count within limit.
+    query = "create table {0}.test3 as select int_col from " \
+            "functional_parquet.alltypes".format(unique_database)
+    self.__run_insert_and_verify_instances(query, max_fs_writers=30, mt_dop=0,
+                                           expected_num_instances_per_host=[8, 8, 8],
+                                           processing_cost_min_threads=10)
+
+  def __run_insert_and_verify_instances(self, query, max_fs_writers, mt_dop,
+                                        expected_num_instances_per_host,
+                                        processing_cost_min_threads=0):
+    self.client.set_configuration_option("max_fs_writers", max_fs_writers)
+    self.client.set_configuration_option("mt_dop", mt_dop)
+    if processing_cost_min_threads > 0:
+      self.client.set_configuration_option("compute_processing_cost", "true")
+      self.client.set_configuration_option("processing_cost_min_threads",
+          processing_cost_min_threads)
+    # Test depends on both planner and scheduler to see the same state of the cluster
+    # having 3 executors, so to reduce flakiness we make sure all 3 executors are up
+    # and running.
+    self.impalad_test_service.wait_for_metric_value("cluster-membership.backends.total",
+                                                    3)
+    result = self.client.execute(query)
+    assert 'HDFS WRITER' in result.exec_summary[0]['operator'], result.runtime_profile
+    assert int(result.exec_summary[0]['num_instances']) <= int(
+      max_fs_writers), result.runtime_profile
+    regex = r'Per Host Number of Fragment Instances' \
+            r':.*?\((.*?)\).*?\((.*?)\).*?\((.*?)\).*?\n'
+    matches = re.findall(regex, result.runtime_profile)
+    assert len(matches) == 1 and len(matches[0]) == 3, result.runtime_profile
+    num_instances_per_host = [int(i) for i in matches[0]]
+    num_instances_per_host.sort()
+    expected_num_instances_per_host.sort()
+    assert num_instances_per_host == expected_num_instances_per_host, \
+      result.runtime_profile
+    self.client.clear_configuration()

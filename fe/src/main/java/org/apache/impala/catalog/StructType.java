@@ -84,6 +84,31 @@ public class StructType extends Type {
     fieldMap_.clear();
   }
 
+  /**
+   * Update field by parameter, currently we use this method to update Iceberg
+   * tables' field.
+   */
+  public void updateFields(int pos, StructField field) {
+    if (fields_.size() >= pos) {
+      fieldMap_.put(field.getName(), field);
+      fields_.set(pos, field);
+    }
+  }
+
+  /**
+   * The size of a struct slot is the sum of the size of its children. Don't have to
+   * count for null indicators as they are not stored on the level of the struct slot,
+   * instead it's on the topmost tuple's level.
+   */
+  @Override
+  public int getSlotSize() {
+    int size = 0;
+    for (StructField structField : fields_) {
+      size += structField.getType().getSlotSize();
+    }
+    return size;
+  }
+
   @Override
   public boolean equals(Object other) {
     if (!(other instanceof StructType)) return false;

@@ -19,14 +19,16 @@
 
 #include "common/constant-strings.h"
 #include "common/thread-debug-info.h"
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "rpc/rpc-mgr.h"
 #include "rpc/rpc-mgr.inline.h"
+#include "rpc/sidecar-util.h"
 #include "runtime/coordinator.h"
 #include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/query-driver.h"
 #include "runtime/query-exec-mgr.h"
 #include "runtime/query-state.h"
 #include "service/client-request-state.h"
@@ -47,7 +49,11 @@ using kudu::rpc::RpcContext;
 
 static const string QUEUE_LIMIT_MSG = "(Advanced) Limit on RPC payloads consumption for "
     "ControlService. " + Substitute(MEM_UNITS_HELP_MSG, "the process memory limit");
-DEFINE_string(control_service_queue_mem_limit, "50MB", QUEUE_LIMIT_MSG.c_str());
+DEFINE_string(control_service_queue_mem_limit, "1%", QUEUE_LIMIT_MSG.c_str());
+DEFINE_int64(control_service_queue_mem_limit_floor_bytes, 50L * 1024L * 1024L,
+    "Lower bound on --control_service_queue_mem_limit in bytes. If "
+    "--control_service_queue_mem_limit works out to be less than this amount, "
+    "this value is used instead");
 DEFINE_int32(control_service_num_svc_threads, 0, "Number of threads for processing "
     "control service's RPCs. if left at default value 0, it will be set to number of "
     "CPU cores. Set it to a positive value to change from the default.");
@@ -66,6 +72,7 @@ ControlService::ControlService(MetricGroup* metric_group)
     CLEAN_EXIT_WITH_ERROR(Substitute("Invalid mem limit for control service queue: "
         "'$0'.", FLAGS_control_service_queue_mem_limit));
   }
+  bytes_limit = max(bytes_limit, FLAGS_control_service_queue_mem_limit_floor_bytes);
   mem_tracker_.reset(new MemTracker(
       bytes_limit, "Control Service Queue", process_mem_tracker));
   MemTrackerMetric::CreateMetrics(metric_group, mem_tracker_.get(), "ControlService");
@@ -77,11 +84,12 @@ Status ControlService::Init() {
   // The maximum queue length is set to maximum 32-bit value. Its actual capacity is
   // bound by memory consumption against 'mem_tracker_'.
   RETURN_IF_ERROR(ExecEnv::GetInstance()->rpc_mgr()->RegisterService(num_svc_threads,
-      std::numeric_limits<int32_t>::max(), this, mem_tracker_.get()));
+      std::numeric_limits<int32_t>::max(), this, mem_tracker_.get(),
+      ExecEnv::GetInstance()->rpc_metrics()));
   return Status::OK();
 }
 
-Status ControlService::GetProxy(const TNetworkAddress& address, const string& hostname,
+Status ControlService::GetProxy(const NetworkAddressPB& address, const string& hostname,
     unique_ptr<ControlServiceProxy>* proxy) {
   // Create a ControlService proxy to the destination.
   RETURN_IF_ERROR(ExecEnv::GetInstance()->rpc_mgr()->GetProxy(address, hostname, proxy));
@@ -113,18 +121,6 @@ Status ControlService::GetProfile(const ReportExecStatusRequestPB& request,
   return Status::OK();
 }
 
-// Retrieves the sidecar at 'sidecar_idx' from 'rpc_context' and deserializes it into
-// 'thrift_obj'.
-template <typename T>
-static Status GetSidecar(int sidecar_idx, RpcContext* rpc_context, T* thrift_obj) {
-  kudu::Slice sidecar_slice;
-  KUDU_RETURN_IF_ERROR(rpc_context->GetInboundSidecar(sidecar_idx, &sidecar_slice),
-      "Failed to get sidecar");
-  uint32_t len = sidecar_slice.size();
-  RETURN_IF_ERROR(DeserializeThriftMsg(sidecar_slice.data(), &len, true, thrift_obj));
-  return Status::OK();
-}
-
 void ControlService::ExecQueryFInstances(const ExecQueryFInstancesRequestPB* request,
     ExecQueryFInstancesResponsePB* response, RpcContext* rpc_context) {
   DebugActionNoFail(FLAGS_debug_actions, "EXEC_QUERY_FINSTANCES_DELAY");
@@ -151,7 +147,8 @@ void ControlService::ExecQueryFInstances(const ExecQueryFInstancesRequestPB* req
   ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_ctx.query_id);
   VLOG_QUERY << "ExecQueryFInstances():"
              << " query_id=" << PrintId(query_ctx.query_id)
-             << " coord=" << TNetworkAddressToString(query_ctx.coord_address)
+             << " coord=" << query_ctx.coord_hostname << ":"
+             << query_ctx.coord_ip_address.port
              << " #instances=" << fragment_info.fragment_instance_ctxs.size();
   Status resp_status = ExecEnv::GetInstance()->query_exec_mgr()->StartQuery(
       request, query_ctx, fragment_info);
@@ -165,13 +162,14 @@ void ControlService::ExecQueryFInstances(const ExecQueryFInstancesRequestPB* req
 void ControlService::ReportExecStatus(const ReportExecStatusRequestPB* request,
     ReportExecStatusResponsePB* response, RpcContext* rpc_context) {
   const TUniqueId query_id = ProtoToQueryId(request->query_id());
-  shared_ptr<ClientRequestState> request_state =
-      ExecEnv::GetInstance()->impala_server()->GetClientRequestState(query_id);
+  QueryHandle query_handle;
+  Status status =
+      ExecEnv::GetInstance()->impala_server()->GetQueryHandle(query_id, &query_handle);
 
   // This failpoint is to allow jitter to be injected.
   DebugActionNoFail(FLAGS_debug_actions, "REPORT_EXEC_STATUS_DELAY");
 
-  if (request_state.get() == nullptr) {
+  if (!status.ok()) {
     // This is expected occasionally (since a report RPC might be in flight while
     // cancellation is happening). Return an error to the caller to get it to stop.
     const string& err = Substitute("ReportExecStatus(): Received report for unknown "
@@ -190,10 +188,10 @@ void ControlService::ReportExecStatus(const ReportExecStatusRequestPB* request,
   TRuntimeProfileForest thrift_profiles;
   if (LIKELY(request->has_thrift_profiles_sidecar_idx())) {
     const Status& profile_status =
-        GetProfile(*request, *request_state.get(), rpc_context, &thrift_profiles);
+        GetProfile(*request, *query_handle, rpc_context, &thrift_profiles);
     if (UNLIKELY(!profile_status.ok())) {
       LOG(ERROR) << Substitute("ReportExecStatus(): Failed to deserialize profile "
-          "for query ID $0: $1", PrintId(request_state->query_id()),
+          "for query ID $0: $1", PrintId(query_handle->query_id()),
           profile_status.GetDetail());
       // Do not expose a partially deserialized profile.
       TRuntimeProfileForest empty_profiles;
@@ -201,7 +199,7 @@ void ControlService::ReportExecStatus(const ReportExecStatusRequestPB* request,
     }
   }
 
-  Status resp_status = request_state->UpdateBackendExecStatus(*request, thrift_profiles);
+  Status resp_status = query_handle->UpdateBackendExecStatus(*request, thrift_profiles);
   RespondAndReleaseRpc(resp_status, response, rpc_context);
 }
 

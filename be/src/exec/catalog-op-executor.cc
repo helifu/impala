@@ -28,6 +28,7 @@
 #include "service/frontend.h"
 #include "service/impala-server.h"
 #include "service/hs2-util.h"
+#include "util/debug-util.h"
 #include "util/runtime-profile-counters.h"
 #include "util/string-parser.h"
 #include "util/test-info.h"
@@ -54,6 +55,8 @@ DECLARE_int32(catalog_client_connection_num_retries);
 DECLARE_int32(catalog_client_rpc_timeout_ms);
 DECLARE_int32(catalog_client_rpc_retry_interval_ms);
 
+DEFINE_int32_hidden(inject_latency_before_catalog_fetch_ms, 0,
+    "Latency (ms) to be injected before fetching catalog data from the catalogd");
 DEFINE_int32_hidden(inject_latency_after_catalog_fetch_ms, 0,
     "Latency (ms) to be injected after fetching catalog data from the catalogd");
 
@@ -63,6 +66,29 @@ static Status CatalogRpcDebugFn(int* attempt) {
   return (*attempt)++ == 0 ?
       DebugAction(FLAGS_debug_actions, "CATALOG_RPC_FIRST_ATTEMPT") :
       Status::OK();
+}
+
+/// Used in LocalCatalog mode to verify the catalog RPC reponse only contains minimal
+/// catalog objects, i.e. database objects have only db names and table objects have only
+/// db and table names.
+static void VerifyMinimalResponse(const TCatalogUpdateResult& result) {
+  for (const TCatalogObject& obj : result.updated_catalog_objects) {
+    if (obj.type == impala::TCatalogObjectType::TABLE) {
+      // Make sure the table object only contains db_name and tbl_name and nothing else.
+      DCHECK(!obj.table.__isset.metastore_table);
+      DCHECK(!obj.table.__isset.columns);
+      DCHECK(!obj.table.__isset.clustering_columns);
+      DCHECK(!obj.table.__isset.table_stats);
+      DCHECK(!obj.table.__isset.hdfs_table);
+      DCHECK(!obj.table.__isset.kudu_table);
+      DCHECK(!obj.table.__isset.hbase_table);
+      DCHECK(!obj.table.__isset.iceberg_table);
+      DCHECK(!obj.table.__isset.data_source_table);
+    } else if (obj.type == impala::TCatalogObjectType::DATABASE) {
+      DCHECK(!obj.db.__isset.metastore_db)
+          << "Minimal database TCatalogObject should have empty metastore_db";
+    }
+  }
 }
 
 Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
@@ -87,6 +113,7 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
               FLAGS_catalog_client_rpc_retry_interval_ms,
               [&attempt]() { return CatalogRpcDebugFn(&attempt); }, exec_response_.get());
       RETURN_IF_ERROR(rpc_status.status);
+      if (FLAGS_use_local_catalog) VerifyMinimalResponse(exec_response_.get()->result);
       catalog_update_result_.reset(
           new TCatalogUpdateResult(exec_response_.get()->result));
       Status status(exec_response_->result.status);
@@ -109,6 +136,7 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
               FLAGS_catalog_client_rpc_retry_interval_ms,
               [&attempt]() { return CatalogRpcDebugFn(&attempt); }, &response);
       RETURN_IF_ERROR(rpc_status.status);
+      if (FLAGS_use_local_catalog) VerifyMinimalResponse(response.result);
       catalog_update_result_.reset(new TCatalogUpdateResult(response.result));
       return Status(response.result.status);
     }
@@ -130,7 +158,11 @@ Status CatalogOpExecutor::ExecComputeStats(
   catalog_op_req.__set_sync_ddl(compute_stats_request.sync_ddl);
   TDdlExecRequest& update_stats_req = catalog_op_req.ddl_params;
   update_stats_req.__set_ddl_type(TDdlType::ALTER_TABLE);
-  update_stats_req.__set_sync_ddl(compute_stats_request.sync_ddl);
+  update_stats_req.query_options.__set_sync_ddl(compute_stats_request.sync_ddl);
+  update_stats_req.query_options.__set_debug_action(
+      compute_stats_request.ddl_params.query_options.debug_action);
+  update_stats_req.__set_header(TCatalogServiceRequestHeader());
+  update_stats_req.header.__set_want_minimal_response(FLAGS_use_local_catalog);
 
   const TComputeStatsParams& compute_stats_params =
       compute_stats_request.ddl_params.compute_stats_params;
@@ -283,13 +315,28 @@ void CatalogOpExecutor::SetColumnStats(const TTableSchema& col_stats_schema,
   // Set per-column stats. For a column at position i in its source table,
   // the NDVs and the number of NULLs are at position i and i + 1 of the
   // col_stats_row, respectively. Positions i + 2 and i + 3 contain the max/avg
-  // length for string columns, and -1 for non-string columns.
-  for (int i = 0; i < col_stats_row.colVals.size(); i += 4) {
+  // length for string columns. Positions i+4 and i+5 contain the numTrues/numFalses
+  // (-1 for non-string columns). Positions i+6 and i+7 contain the min and the max.
+  for (int i = 0; i < col_stats_row.colVals.size(); i += 8) {
     TColumnStats col_stats;
     col_stats.__set_num_distinct_values(col_stats_row.colVals[i].i64Val.value);
     col_stats.__set_num_nulls(col_stats_row.colVals[i + 1].i64Val.value);
     col_stats.__set_max_size(col_stats_row.colVals[i + 2].i32Val.value);
     col_stats.__set_avg_size(col_stats_row.colVals[i + 3].doubleVal.value);
+    col_stats.__set_num_trues(col_stats_row.colVals[i + 4].i64Val.value);
+    col_stats.__set_num_falses(col_stats_row.colVals[i + 5].i64Val.value);
+    // By default, the low and high value in TColumnStats are unset. Set both
+    // conditionally.
+    TColumnValue low_value = ConvertToTColumnValue(
+        col_stats_schema.columns[i + 6], col_stats_row.colVals[i + 6]);
+    if (isOneFieldSet(low_value)) {
+      col_stats.__set_low_value(low_value);
+    }
+    TColumnValue high_value = ConvertToTColumnValue(
+        col_stats_schema.columns[i + 7], col_stats_row.colVals[i + 7]);
+    if (isOneFieldSet(high_value)) {
+      col_stats.__set_high_value(high_value);
+    }
     params->column_stats[col_stats_schema.columns[i].columnName] = col_stats;
   }
   params->__isset.column_stats = true;
@@ -321,6 +368,9 @@ Status CatalogOpExecutor::GetPartialCatalogObject(
   DCHECK(FLAGS_use_local_catalog || TestInfo::is_test());
   const TNetworkAddress& address =
       MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
+  if (FLAGS_inject_latency_before_catalog_fetch_ms > 0) {
+    SleepForMs(FLAGS_inject_latency_before_catalog_fetch_ms);
+  }
   int attempt = 0; // Used for debug action only.
   CatalogServiceConnection::RpcStatus rpc_status =
       CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
@@ -359,21 +409,6 @@ Status CatalogOpExecutor::GetPartitionStats(
   CatalogServiceConnection::RpcStatus rpc_status =
       CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
           &CatalogServiceClientWrapper::GetPartitionStats, req,
-          FLAGS_catalog_client_connection_num_retries,
-          FLAGS_catalog_client_rpc_retry_interval_ms,
-          [&attempt]() { return CatalogRpcDebugFn(&attempt); }, result);
-  RETURN_IF_ERROR(rpc_status.status);
-  return Status::OK();
-}
-
-Status CatalogOpExecutor::SentryAdminCheck(const TSentryAdminCheckRequest& req,
-    TSentryAdminCheckResponse* result) {
-  const TNetworkAddress& address =
-      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
-  int attempt = 0; // Used for debug action only.
-  CatalogServiceConnection::RpcStatus rpc_status =
-      CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
-          &CatalogServiceClientWrapper::SentryAdminCheck, req,
           FLAGS_catalog_client_connection_num_retries,
           FLAGS_catalog_client_rpc_retry_interval_ms,
           [&attempt]() { return CatalogRpcDebugFn(&attempt); }, result);

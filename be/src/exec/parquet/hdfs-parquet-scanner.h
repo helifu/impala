@@ -19,20 +19,21 @@
 #ifndef IMPALA_EXEC_HDFS_PARQUET_SCANNER_H
 #define IMPALA_EXEC_HDFS_PARQUET_SCANNER_H
 
-#include "codegen/impala-ir.h"
-#include "exec/hdfs-scanner.h"
+#include "exec/hdfs-columnar-scanner.h"
 #include "exec/parquet/parquet-column-stats.h"
 #include "exec/parquet/parquet-common.h"
 #include "exec/parquet/parquet-metadata-utils.h"
 #include "exec/parquet/parquet-page-index.h"
-#include "exec/parquet/parquet-scratch-tuple-batch.h"
-#include "runtime/scoped-buffer.h"
+#include "exec/scratch-tuple-batch.h"
+#include "runtime/bufferpool/buffer-pool.h"
 #include "util/runtime-profile-counters.h"
 
 namespace impala {
 
 class CollectionValueBuilder;
 struct HdfsFileDesc;
+class Literal;
+class ParquetBloomFilter;
 
 /// Internal schema representation and resolution.
 struct SchemaNode;
@@ -41,14 +42,15 @@ struct SchemaNode;
 class ParquetLevelDecoder;
 
 /// Per column reader.
-class ParquetColumnReader;
+class BaseScalarColumnReader;
 class CollectionColumnReader;
 class ColumnStatsReader;
-class BaseScalarColumnReader;
+class ComplexColumnReader;
+class ParquetColumnReader;
+class ParquetPageReader;
 template<typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
 class ScalarColumnReader;
 class BoolColumnReader;
-class ParquetPageReader;
 
 /// This scanner parses Parquet files located in HDFS, and writes the content as tuples in
 /// the Impala in-memory representation of data, e.g.  (tuples, rows, row batches).
@@ -334,7 +336,7 @@ class ParquetPageReader;
 /// conjuncts against the column index and determines the surviving pages with the help of
 /// the offset index. Then it will configure the column readers to only scan the pages
 /// and row ranges that have a chance to store rows that pass the conjuncts.
-class HdfsParquetScanner : public HdfsScanner {
+class HdfsParquetScanner : public HdfsColumnarScanner {
  public:
   HdfsParquetScanner(HdfsScanNodeBase* scan_node, RuntimeState* state);
   virtual ~HdfsParquetScanner() {}
@@ -345,16 +347,13 @@ class HdfsParquetScanner : public HdfsScanner {
                                    const std::vector<HdfsFileDesc*>& files)
                                    WARN_UNUSED_RESULT;
 
-  virtual Status Open(ScannerContext* context) WARN_UNUSED_RESULT;
-  virtual Status ProcessSplit() WARN_UNUSED_RESULT;
-  virtual void Close(RowBatch* row_batch);
+  virtual Status Open(ScannerContext* context) override WARN_UNUSED_RESULT;
+  virtual Status ProcessSplit() override WARN_UNUSED_RESULT;
+  virtual void Close(RowBatch* row_batch) override;
 
-  /// Codegen ProcessScratchBatch(). Stores the resulting function in
-  /// 'process_scratch_batch_fn' if codegen was successful or NULL otherwise.
-  static Status Codegen(HdfsScanNodeBase* node,
-      const std::vector<ScalarExpr*>& conjuncts,
-      llvm::Function** process_scratch_batch_fn)
-      WARN_UNUSED_RESULT;
+  THdfsFileFormat::type file_format() const override {
+    return THdfsFileFormat::PARQUET;
+  }
 
   /// Helper function to create ColumnStatsReader object. 'col_order' might be NULL.
   ColumnStatsReader CreateColumnStatsReader(
@@ -365,8 +364,35 @@ class HdfsParquetScanner : public HdfsScanner {
   /// of the column.
   ParquetTimestampDecoder CreateTimestampDecoder(const parquet::SchemaElement& element);
 
-  /// Class name in LLVM IR.
-  static const char* LLVM_CLASS_NAME;
+  ///  Return page ranges in 'skipped_ranges' that need to be skipped.
+  ///
+  ///  The 'min_vals' and 'max_vals' array must contain ascendingly sorted values, with
+  ///  each pair min_vals[i] and max_vals[i] defining the min and the max for the ith
+  ///  page. 'start_page_idx' and 'end_page_idx' specify the range in the two arrays for
+  ///  not-null pages from which some of them can be skipped. The min and max in
+  ///  'minmax_filter' define a range R for pages to be retained. Any pages with their
+  ///  [min, max] outside R (i.e. the complement of R) will be skipped.
+  ///
+  ///  Since the pages are sorted and filtered with min/max filters, the followings are
+  ///  possible:
+  ///    return empty, i.e. no pages can be skipped;
+  ///    return ['start_page_idx', 'end_page_idx'], i.e. every page is skipped;
+  ///    return ['start_page_idx', K], i.e. a page range at the beginning is skipped;
+  ///    return [L, 'end_page_idx'], i.e. a page range at the end is skipped;
+  ///    return ['start_page_idx', K], [L, 'end_page_idx'], i.e. some pages at the middle
+  ///    are retained.
+  static void CollectSkippedPageRangesForSortedColumn(const MinMaxFilter* minmax_filter,
+      const ColumnType& col_type, const vector<string>& min_vals,
+      const vector<string>& max_vals, int start_page_idx, int end_page_idx,
+      vector<PageRange>* skipped_ranges);
+
+  /// Size of the file footer for Parquet. This is a guess. If this value is too
+  /// little, we will need to issue another read.
+  static const int64_t PARQUET_FOOTER_SIZE = 1024 * 100;
+  static_assert(PARQUET_FOOTER_SIZE <= READ_SIZE_MIN_VALUE,
+      "PARQUET_FOOTER_SIZE can not be greater than READ_SIZE_MIN_VALUE.\n"
+      "You can increase PARQUET_FOOTER_SIZE if you want, "
+      "just don't forget to increase READ_SIZE_MIN_VALUE as well.");
 
  private:
   friend class ParquetColumnReader;
@@ -397,9 +423,13 @@ class HdfsParquetScanner : public HdfsScanner {
   /// Tuple to hold values when reading parquet::Statistics. Owned by perm_pool_.
   Tuple* min_max_tuple_;
 
-  /// Clone of Min/max statistics conjunct evaluators. Has the same life time as
-  /// the scanner. Stored in 'obj_pool_'.
-  vector<ScalarExprEvaluator*> min_max_conjunct_evals_;
+  /// Clone of statistics conjunct evaluators. Has the same life time as the scanner.
+  /// Stored in 'obj_pool_'.
+  vector<ScalarExprEvaluator*> stats_conjunct_evals_;
+
+  /// A map from indices of columns that participate in an EQ conjunct to the hash of the
+  /// literal value of the EQ conjunct. Used in Parquet Bloom filtering.
+  std::unordered_map<int, uint64_t> eq_conjunct_info_;
 
   /// Pool used for allocating caches of definition/repetition levels and tuples for
   /// dictionary filtering. The definition/repetition levels are populated by the
@@ -411,10 +441,10 @@ class HdfsParquetScanner : public HdfsScanner {
 
   /// Column reader for each top-level materialized slot in the output tuple.
   std::vector<ParquetColumnReader*> column_readers_;
-
-  /// Column readers will write slot values into this scratch batch for
-  /// top-level tuples. See AssembleRows().
-  boost::scoped_ptr<ScratchTupleBatch> scratch_batch_;
+  /// Column readers among 'column_readers_' used for filtering
+  std::vector<ParquetColumnReader*> filter_readers_;
+  /// Column readers among 'column_readers_' not used for filtering
+  std::vector<ParquetColumnReader*> non_filter_readers_;
 
   /// File metadata thrift object
   parquet::FileMetaData file_metadata_;
@@ -422,12 +452,16 @@ class HdfsParquetScanner : public HdfsScanner {
   /// Version of the application that wrote this file.
   ParquetFileVersion file_version_;
 
-  /// Scan range for the metadata.
-  const io::ScanRange* metadata_range_;
-
   /// Pool to copy dictionary page buffer into. This pool is shared across all the
   /// pages in a column chunk.
   boost::scoped_ptr<MemPool> dictionary_pool_;
+
+  /// Pool to hold batch read min/max stats. This pool is shared across all the
+  /// pages in a column chunk.
+  boost::scoped_ptr<MemPool> stats_batch_read_pool_;
+
+  /// True, if we filter pages based on the Parquet page index.
+  bool filter_pages_ = false;
 
   /// Contains the leftover ranges after evaluating the page index.
   /// If all rows were eliminated, then the row group is skipped immediately after
@@ -446,14 +480,21 @@ class HdfsParquetScanner : public HdfsScanner {
   /// or nested within a collection.
   std::vector<BaseScalarColumnReader*> non_dict_filterable_readers_;
 
+  /// Runtime filters that depend on only a single column. These filters can be used
+  /// during dictionary filtering.
+  std::unordered_map<SlotId, std::vector<const FilterContext*>> single_col_filter_ctxs_;
+
   /// Flattened list of all scalar column readers in column_readers_.
   std::vector<BaseScalarColumnReader*> scalar_readers_;
 
   /// Flattened collection column readers that point to readers in column_readers_.
-  std::vector<CollectionColumnReader*> collection_readers_;
+  std::vector<ComplexColumnReader*> complex_readers_;
 
   /// Mapping from Parquet column indexes to scalar readers.
   std::unordered_map<int, BaseScalarColumnReader*> scalar_reader_map_;
+
+  /// List of slot ids used by conjuncts and runtime filters.
+  std::vector<SlotId> conjunct_slot_ids_;
 
   /// Memory used to store the tuples used for dictionary filtering. Tuples owned by
   /// perm_pool_.
@@ -462,18 +503,22 @@ class HdfsParquetScanner : public HdfsScanner {
   /// Timer for materializing rows.  This ignores time getting the next buffer.
   ScopedTimer<MonotonicStopWatch> assemble_rows_timer_;
 
-  /// Average and min/max time spent processing the footer by each split.
-  RuntimeProfile::SummaryStatsCounter* process_footer_timer_stats_;
-
   /// Average and min/max time spent processing the page index for each row group.
   RuntimeProfile::SummaryStatsCounter* process_page_index_stats_;
-
-  /// Number of columns that need to be read.
-  RuntimeProfile::Counter* num_cols_counter_;
 
   /// Number of row groups that are skipped because of Parquet statistics, either by
   /// row group level statistics, or page level statistics.
   RuntimeProfile::Counter* num_stats_filtered_row_groups_counter_;
+
+  /// Number of row groups that are skipped because of Parquet row group level statistics
+  /// and HJ min/max filters.
+  RuntimeProfile::Counter* num_minmax_filtered_row_groups_counter_;
+
+  /// Number of row groups that are skipped because of Parquet Bloom filters.
+  RuntimeProfile::Counter* num_bloom_filtered_row_groups_counter_;
+
+  /// Number of row groups that are skipped by unuseful filters.
+  RuntimeProfile::Counter* num_rowgroups_skipped_by_unuseful_filters_counter_;
 
   /// Number of row groups that need to be read.
   RuntimeProfile::Counter* num_row_groups_counter_;
@@ -484,15 +529,21 @@ class HdfsParquetScanner : public HdfsScanner {
   /// Number of pages that are skipped because of Parquet page statistics.
   RuntimeProfile::Counter* num_stats_filtered_pages_counter_;
 
+  /// Number of pages that are skipped because of Parquet page level statistics
+  /// and HJ min/max filters.
+  RuntimeProfile::Counter* num_minmax_filtered_pages_counter_;
+
   /// Number of pages need to be examined. We need to scan
   /// 'num_pages_counter_ - num_stats_filtered_pages_counter_' pages.
   RuntimeProfile::Counter* num_pages_counter_;
 
-  /// Number of scanners that end up doing no reads because their splits don't overlap
-  /// with the midpoint of any row-group in the file.
-  RuntimeProfile::Counter* num_scanners_with_no_reads_counter_;
+  /// Number of pages skipped by late materialization as they did not have any
+  /// rows that survived filtering.
+  RuntimeProfile::Counter* num_pages_skipped_by_late_materialization_counter_;
 
-  /// Number of row groups skipped due to dictionary filter
+  /// Number of row groups skipped due to dictionary filter. This is an aggregated counter
+  /// that includes the number of filtered row groups as a result of evaluating conjuncts
+  /// and runtime bloom filters on the dictionary entries.
   RuntimeProfile::Counter* num_dict_filtered_row_groups_counter_;
 
   /// Tracks the size of any compressed pages read. If no compressed pages are read, this
@@ -511,15 +562,31 @@ class HdfsParquetScanner : public HdfsScanner {
   /// AssembleRows() and then is reset to 0.
   int64_t coll_items_read_counter_;
 
-  typedef int (*ProcessScratchBatchFn)(HdfsParquetScanner*, RowBatch*);
-  /// The codegen'd version of ProcessScratchBatch() if available, NULL otherwise.
-  ProcessScratchBatchFn codegend_process_scratch_batch_fn_;
-
   ParquetPageIndex page_index_;
 
-  const char* filename() const { return metadata_range_->file(); }
+  /// Defines late materialization threshold for column readers. While materializing
+  /// values and putting them into scratch_batch_, we try to avoid materializing values
+  /// that were filtered out already. Threshold defines minimum number of contiguous
+  /// rows that have to be filtered out to skip materializing them.
+  /// For example, if the threshold is 5 and rows surviving filters are 1-20 and 27-35,
+  /// then we can skip materializing 6 rows (21-26) as threshold 5 is less than 6. But
+  /// if threshold is 10, then rows 21-26 will be materialized instead.
+  int32_t late_materialization_threshold_;
 
-  virtual Status GetNextInternal(RowBatch* row_batch) WARN_UNUSED_RESULT;
+  /// In late Materializing, we try to materialize only the portition of a batch that
+  /// survive after filtering and call it micro batch. This represents a micro batch
+  /// that spans entire batch of length 'scratch_batch_->capacity'.
+  ScratchMicroBatch complete_micro_batch_;
+
+  virtual Status GetNextInternal(RowBatch* row_batch) override WARN_UNUSED_RESULT;
+
+  /// Return true if we can evaluate this type of predicate on parquet statistic.
+  /// FE could populate stats-predicates that can't be evaluated here if the table
+  /// contains both Parquet and ORC format partitions. Here we only pick min-max
+  /// predicates, i.e. <, >, <=, and >=.
+  bool IsSupportedStatsConjunct(std::string fn_name) {
+    return fn_name == "lt" || fn_name == "gt" || fn_name == "le" || fn_name == "ge";
+  }
 
   /// Evaluates the min/max predicates of the 'scan_node_' using the parquet::Statistics
   /// of 'row_group'. 'file_metadata' is used to determine the ordering that was used to
@@ -535,21 +602,129 @@ class HdfsParquetScanner : public HdfsScanner {
   /// to be OK as well.
   Status NextRowGroup() WARN_UNUSED_RESULT;
 
-  /// High-level function for initializing page filtering for the scalar readers.
-  /// Sets 'filter_pages' to true if found any page to filter out.
-  Status ProcessPageIndex(bool* filter_pages);
+  /// Evaluates the overlap predicates of the 'scan_node_' using the parquet::Statistics
+  /// of 'row_group'. 'file_metadata' is used to determine the ordering that was used to
+  /// compute the statistics. Sets 'skip_row_group' to true if the row group can be
+  /// skipped, 'false' otherwise.
+  Status EvaluateOverlapForRowGroup(
+    const parquet::FileMetaData& file_metadata, const parquet::RowGroup& row_group,
+    bool* skip_row_group);
 
-  /// Evaluates 'min_max_conjunct_evals_' against the column index and determines the row
+  /// Return true if filter 'minmax_filter' of fitler id 'filter_id' is too close to
+  /// column min/max stats available at the target desc entry targets[0] in
+  /// 'filter_ctxs_[idx]', utilizing 'threshold' as the threshold. Return 'false'
+  /// otherwise.
+  ///
+  /// Side effect enabled_for_rowgroup, enabled_for_row and enabled_for_page in
+  /// filter_stats_[idx], FilterStats::ROW_GROUPS_KEY in filter_ctxs_[idx] and
+  /// num_column_stats_rejected_rowgroups_counter_ in this scanner.
+  bool FilterAlreadyDisabledOrOverlapWithColumnStats(
+      int filter_id, MinMaxFilter* minmax_filter, int idx, float threshold);
+
+  /// Detect if a column is a collection or missing for a column chunk described by a
+  /// schema path in a slot descriptor 'slot_desc'.
+  /// On return:
+  ///   Case 1: return Status::OK() and 'missing_field' is set accordingly.
+  ///   'schema_node_ptr' is optional and set to the schema node if not null.
+  //
+  ///   Case 2: return a Status with an error message when the column chunk is a
+  ///   collection.
+  Status ResolveSchemaForStatFiltering(SlotDescriptor* slot_desc, bool* missing_field,
+      SchemaNode** schema_node_ptr = nullptr);
+
+  /// Create a ColumnStatsReader object for a column chunk described by a schema
+  /// path in a slot descriptor 'slot_desc'. 'file_metadata', 'row_group', 'node',
+  /// and 'col_type' provide extra data needed.
+  /// On return:
+  ///   A column chunk stats reader ('ColumnStatsReader') is returned.
+  ColumnStatsReader CreateStatsReader(const parquet::FileMetaData& file_metadata,
+      const parquet::RowGroup& row_group, SchemaNode* node, const ColumnType& col_type);
+
+  /// Return the overlap predicate descs from the HDFS scan plan.
+  const vector<TOverlapPredicateDesc>& GetOverlapPredicateDescs();
+
+  /// Return the min/max filter of 'filter'.
+  /// Return nullptr if no min/max filter is present.
+  MinMaxFilter* GetMinMaxFilter(const RuntimeFilter* filter);
+
+  /// Return true when the filter at filter_ctx_[filter_idx] is bound by a
+  /// partition column and false otherwise.
+  bool IsBoundByPartitionColumn(int filter_idx);
+
+  /// Return the memory addresses of the min and the max slot in min_max_tuple_ at
+  /// location overlap_slot_idx and overlap_slot_idx+1.
+  void GetMinMaxSlotsForOverlapPred(
+      int overlap_slot_idx, void** min_slot, void** max_slot);
+
+  /// Decide whether page index should be processed. Return true when
+  ///  1. Query option parquet_read_page_index is set to true, and
+  ///  2. there exist min/max conjuncts or some min/max filters from joins are available.
+  bool ShouldProcessPageIndex();
+
+  /// Find skip ranges for pages in the current row group that are outside the min/max
+  /// ranges defined by overlap predicate min/max filters. These filters are specified
+  /// by GetOverlapPredStartIndex().
+  /// Return OK if all pages have been evaluated against the filters and *'skip_ranges'
+  /// is appended with those skip ranges found (if any).
+  /// Returns a non-OK status when some error is encountered.
+  Status FindSkipRangesForPagesWithMinMaxFilters(vector<RowRange>* skip_ranges);
+
+  /// Construct a RowRange with the begin and end row in page 'page_idx' and store the
+  /// object into 'skip_ranges'.
+  Status AddToSkipRanges(void* min_slot, void* max_slot, parquet::RowGroup& row_group,
+      int page_idx, const ColumnType& col_type, int col_idx,
+      const parquet::ColumnChunk& col_chunk, vector<RowRange>* skip_ranges,
+      int* filtered_pages);
+
+  /// Batch read a range ['start_page_idx', 'end_page_idx'] of min/max stats of non-null
+  /// pages for column 'col_idx' from 'column_index' and filter out those that are outside
+  /// the min/max range specified in 'minmax_filter'.
+  ///
+  /// On return:
+  ///   *skip_ranges is appended with new row ranges in those skipped pages,
+  //    *filtered_pages is incremented with the number of skipped pages.
+  Status SkipPagesBatch(parquet::RowGroup& row_group,
+      const ColumnStatsReader& stats_reader, const parquet::ColumnIndex& column_index,
+      int start_page_idx, int end_page_idx, const ColumnType& col_type, int col_idx,
+      const parquet::ColumnChunk& col_chunk, const MinMaxFilter* minmax_filter,
+      vector<RowRange>* skip_ranges, int* filtered_pages);
+
+  /// Convert page column stats of column 'column_index' and type 'col_type' into internal
+  /// format. The range of the pages to convert is ['start_page_idx', 'end_page_idx'].
+  ///
+  /// On return:
+  ///   1. Status::OK() object with *min_values and *max_values pointed to memory
+  //       allocated from 'stats_batch_read_pool_' and populated with the min/max values
+  //       in runtime value format (e.g. RawValue for int32, or StringValue for string)
+  //       respectively, or
+  ///   2. An error condition.
+  Status ConvertStatsIntoInternalValuesBatch(const ColumnStatsReader& stats_reader,
+      const parquet::ColumnIndex& column_index, int start_page_idx, int end_page_idx,
+      const ColumnType& col_type, uint8_t** min_values, uint8_t** max_values);
+
+  /// Resets page index filtering state, i.e. clears 'candidate_ranges_' and resets
+  /// scalar readers' page filtering as well.
+  void ResetPageFiltering();
+
+  /// High-level function for initializing page filtering for the scalar readers.
+  /// Sets 'filter_pages_' to true if found any page to filter out.
+  Status ProcessPageIndex();
+
+  /// Evaluates 'stats_conjunct_evals_' against the column index and determines the row
   /// ranges that might contain data we are looking for.
-  /// Sets 'filter_pages' to true if found any page to filter out.
-  Status EvaluatePageIndex(bool* filter_pages);
+  /// Sets 'filter_pages_' to true if found any page to filter out.
+  Status EvaluatePageIndex();
 
   /// Based on 'candidate_ranges_' it determines the candidate pages for each
   /// scalar reader.
-  Status ComputeCandidatePagesForColumns(bool* filter_pages);
+  Status ComputeCandidatePagesForColumns();
 
   /// Check that the scalar readers agree on the top-level row being scanned.
   Status CheckPageFiltering();
+
+  /// Find out if the enabled_for_page flag at filter_stats_[filter_idx] is true. If so,
+  /// the filter at filter_ctx_[filter_idx] is worthy to evaluate the overlap predicate.
+  bool IsFilterWorthyForOverlapCheck(int filter_idx);
 
   /// Reads statistics data for a page of given column. Page is specified by 'page_idx',
   /// column is specified by 'column_index'. 'stats_field' specifies whether we should
@@ -560,31 +735,39 @@ class HdfsParquetScanner : public HdfsScanner {
       const parquet::ColumnIndex& column_index, int page_idx,
       ColumnStatsReader::StatsField stats_field, bool* is_null_page, void* slot);
 
+  /// Reads both min and max statistics data for a page of given column. Page is
+  /// specified by 'page_idx', column is specified by 'column_index'. 'is_null_page'
+  /// is set to true for null pages, in that case there is no min nor max value.
+  /// Returns true if the read of the min and the max value was successful, in this
+  /// case 'min_slot' will hold the min and 'max_slot' will hold the max value.
+  static bool ReadStatFromIndex(const ColumnStatsReader& stats_reader,
+      const parquet::ColumnIndex& column_index, int page_idx,
+      bool* is_null_page, void* min_slot, void* max_slot);
+
   /// Reads data using 'column_readers' to materialize top-level tuples into 'row_batch'.
   /// Returns a non-OK status if a non-recoverable error was encountered and execution
   /// of this query should be terminated immediately.
   /// May set *skip_row_group to indicate that the current row group should be skipped,
   /// e.g., due to a parse error, but execution should continue.
-  Status AssembleRows(const std::vector<ParquetColumnReader*>& column_readers,
-      RowBatch* row_batch, bool* skip_row_group) WARN_UNUSED_RESULT;
+  template <bool USE_PAGE_INDEX>
+  Status AssembleRows(RowBatch* row_batch, bool* skip_row_group) WARN_UNUSED_RESULT;
+
+  /// Check 'AssembleRows' for details.
+  /// 'AssembleRows' implements late materialization whereas this function does not.
+  Status AssembleRowsWithoutLateMaterialization(
+      const vector<ParquetColumnReader*>& column_readers, RowBatch* row_batch,
+      bool* skip_row_group) WARN_UNUSED_RESULT;
+
+  /// Returns true if any of the 'column_readers' or their children is a Struct column
+  /// reader.
+  bool HasStructColumnReader(
+      const std::vector<ParquetColumnReader*>& column_readers) const;
 
   /// Commit num_rows to the given row batch.
   /// Returns OK if the query is not cancelled and hasn't exceeded any mem limits.
   /// Scanner can call this with 0 rows to flush any pending resources (attached pools
   /// and io buffers) to minimize memory consumption.
   Status CommitRows(RowBatch* dst_batch, int num_rows) WARN_UNUSED_RESULT;
-
-  /// Evaluates runtime filters and conjuncts (if any) against the tuples in
-  /// 'scratch_batch_', and adds the surviving tuples to the given batch.
-  /// Transfers the ownership of tuple memory to the target batch when the
-  /// scratch batch is exhausted.
-  /// Returns the number of rows that should be committed to the given batch.
-  int TransferScratchTuples(RowBatch* dst_batch);
-
-  /// Processes a single row batch for TransferScratchTuples, looping over scratch_batch_
-  /// until it is exhausted or the output is full. Called for the case when there are
-  /// materialized tuples. This is a separate function so it can be codegened.
-  int ProcessScratchBatch(RowBatch* dst_batch);
 
   /// Reads data using 'column_readers' to materialize the tuples of a CollectionValue
   /// allocated from 'coll_value_builder'. Increases 'coll_items_read_counter_' by the
@@ -613,7 +796,7 @@ class HdfsParquetScanner : public HdfsScanner {
       bool materialize_tuple, MemPool* pool, Tuple* tuple) const;
 
   /// Process the file footer and parse file_metadata_.  This should be called with the
-  /// last FOOTER_SIZE bytes in context_.
+  /// last PARQUET_FOOTER_SIZE bytes in context_.
   Status ProcessFooter() WARN_UNUSED_RESULT;
 
   /// Populates 'column_readers' for the slots in 'tuple_desc', including creating child
@@ -625,7 +808,7 @@ class HdfsParquetScanner : public HdfsScanner {
       std::vector<ParquetColumnReader*>* column_readers) WARN_UNUSED_RESULT;
 
   /// Returns the total number of scalar column readers in 'column_readers', including
-  /// the children of collection readers.
+  /// the children of complex readers.
   int CountScalarColumns(const std::vector<ParquetColumnReader*>& column_readers);
 
   /// Creates a column reader that reads one value for each item in the table or
@@ -644,32 +827,12 @@ class HdfsParquetScanner : public HdfsScanner {
 
   /// Walks file_metadata_ and initiates reading the materialized columns.  This
   /// initializes 'scalar_readers_' and divides reservation between the columns but
-  /// does not start any scan ranges.
-  Status InitScalarColumns() WARN_UNUSED_RESULT;
+  /// does not start any scan ranges. 'row_group_first_row' is the index of the first
+  /// row in this row group, it is used to track the file position of the rows.
+  Status InitScalarColumns(int64_t row_group_first_row) WARN_UNUSED_RESULT;
 
-  /// Decides how to divide stream_->reservation() between the columns. May increase
-  /// the reservation if more reservation would enable more efficient I/O for the
-  /// current columns being scanned. Sets the reservation on each corresponding reader
-  /// in 'column_readers'.
-  Status DivideReservationBetweenColumns(
-      const std::vector<BaseScalarColumnReader*>& column_readers);
-
-  /// Compute the ideal reservation to scan a file with scan range lengths
-  /// 'col_range_lengths' given the min and max buffer size of the singleton DiskIoMgr
-  /// in ExecEnv.
-  static int64_t ComputeIdealReservation(const std::vector<int64_t>& col_range_lengths);
-
-  /// Helper for DivideReservationBetweenColumns(). Implements the core algorithm for
-  /// dividing a reservation of 'reservation_to_distribute' bytes between columns with
-  /// scan range lengths 'col_range_lengths' given a min and max buffer size. Returns
-  /// a vector with an entry per column with the index into 'col_range_lengths' and the
-  /// amount of reservation in bytes to give to that column.
-  static std::vector<std::pair<int, int64_t>> DivideReservationBetweenColumnsHelper(
-      int64_t min_buffer_size, int64_t max_buffer_size,
-      const std::vector<int64_t>& col_range_lengths, int64_t reservation_to_distribute);
-
-  /// Initializes the column readers in collection_readers_.
-  void InitCollectionColumns();
+  /// Initializes the column readers in complex_readers_.
+  void InitComplexColumns();
 
   /// Initialize dictionaries for all column readers
   Status InitDictionaries(const std::vector<BaseScalarColumnReader*>& column_readers)
@@ -681,7 +844,7 @@ class HdfsParquetScanner : public HdfsScanner {
       int row_group_idx, int64_t rows_read) WARN_UNUSED_RESULT;
 
   /// Part of the HdfsScanner interface, not used in Parquet.
-  Status InitNewRange() WARN_UNUSED_RESULT { return Status::OK(); }
+  Status InitNewRange() override WARN_UNUSED_RESULT { return Status::OK(); }
 
   /// Transfers the remaining resources backing tuples such as IO buffers and memory
   /// from mem pools to the given row batch. Closes all column readers.
@@ -700,7 +863,7 @@ class HdfsParquetScanner : public HdfsScanner {
   bool IsDictFilterable(BaseScalarColumnReader* col_reader);
 
   /// Partitions the readers into scalar and collection readers. The collection readers
-  /// are flattened into collection_readers_. The scalar readers are partitioned into
+  /// are flattened into complex_readers_. The scalar readers are partitioned into
   /// dict_filterable_readers_ and non_dict_filterable_readers_ depending on whether
   /// dictionary filtering is enabled and the reader can be dictionary filtered. All
   /// scalar readers are also flattened into scalar_readers_.
@@ -708,7 +871,7 @@ class HdfsParquetScanner : public HdfsScanner {
                         bool can_eval_dict_filters);
 
   /// Divides the column readers into dict_filterable_readers_,
-  /// non_dict_filterable_readers_ and collection_readers_. Allocates memory for
+  /// non_dict_filterable_readers_ and complex_readers_. Allocates memory for
   /// dict_filter_tuple_map_.
   Status InitDictFilterStructures() WARN_UNUSED_RESULT;
 
@@ -721,6 +884,37 @@ class HdfsParquetScanner : public HdfsScanner {
   Status EvalDictionaryFilters(const parquet::RowGroup& row_group,
       bool* skip_row_group) WARN_UNUSED_RESULT;
 
+  /// Read 'size' bytes from 'metadata_range_' starting at 'offset' into 'buffer'. The
+  /// provided buffer must be preallocated to hold at least 'size' bytes.
+  Status ReadToBuffer(uint64_t offset, uint8_t* buffer, uint64_t size) WARN_UNUSED_RESULT;
+
+  /// Processes 'stats_conjunct_evals_' to extract equality (EQ) conjuncts. These are
+  /// now represented as two conjuncts: an LE and a GE. This function finds such pairs and
+  /// fills the map 'eq_conjunct_info_' with the hash of the literal in the EQ conjunct.
+  /// See 'eq_conjunct_info_'.
+  Status CreateColIdx2EqConjunctMap();
+
+  /// Try to read the Bloom filter header located in the file at offset
+  /// 'bloom_filter_offset'. Uses 'buffer' to store bytes read from the file. As the size
+  /// of the header is not known in advance, several read attempts may be needed,
+  /// increasing the number of bytes read in each turn until reaching a limit, in which
+  /// case an error status is returned. Because of this, after a successful read, 'buffer'
+  /// may contain bytes that are not actually part of the serialised header but come after
+  /// it in the file. 'header_size' is set to the actual length of the serialised header.
+  /// The Bloom filter header object is returned in 'bloom_filter_header'.
+  Status ReadBloomFilterHeader(uint64_t bloom_filter_offset, ScopedBuffer* buffer,
+      uint32_t* header_size, parquet::BloomFilterHeader* bloom_filter_header)
+      WARN_UNUSED_RESULT;
+
+  /// Checks to see if this row group can be eliminated based on applying conjuncts to the
+  /// Bloom filters. Specifically, if the Bloom filter of any column (for which Bloom
+  /// filtering is enabled) reports that it has no values that pass the relevant
+  /// conjuncts, then the row group can be skipped. Because Bloom filters may report false
+  /// positives, it is possible that we cannot skip a row group that actually contains no
+  /// values that pass the conjuncts.
+  Status ProcessBloomFilter(const parquet::RowGroup& row_group,
+      bool* skip_row_group) WARN_UNUSED_RESULT;
+
   /// Updates the counter parquet_compressed_page_size_counter_ with the given compressed
   /// page size. Called by ParquetColumnReader for each page read.
   void UpdateCompressedPageSizeCounter(int64_t compressed_page_size);
@@ -728,6 +922,30 @@ class HdfsParquetScanner : public HdfsScanner {
   /// Updates the counter parquet_uncompressed_page_size_counter_ with the given
   /// uncompressed page size. Called by ParquetColumnReader for each page read.
   void UpdateUncompressedPageSizeCounter(int64_t uncompressed_page_size);
+
+  /// Initialize 'conjunct_slot_ids_' with the SlotIds used in the conjuncts.
+  void InitSlotIdsForConjuncts();
+
+  /// Fill 'micro_batches' with the data read by 'column_readers'.
+  /// Micro batches are sub ranges in 0..num_tuples-1 which needs to be read.
+  /// Tuple memory to write to is specified by 'scratch_batch->tuple_mem'.
+  Status FillScratchMicroBatches(const vector<ParquetColumnReader*>& column_readers,
+      RowBatch* row_batch, bool* skip_row_group, const ScratchMicroBatch* micro_batches,
+      int num_micro_batches, int max_num_tuples, int* num_tuples);
+
+  /// Partition 'column_readers' into filter and non-filter readers. All 'filter_readers'
+  /// are the readers reading columns involved in either static filter or runtime filter.
+  /// All 'non_filter_readers' are responsible for reading surviving rows from those
+  /// columns that are not involved in filtering.
+  void DivideFilterAndNonFilterColumnReaders(
+      const vector<ParquetColumnReader*>& column_readers,
+      vector<ParquetColumnReader*>* filter_readers,
+      vector<ParquetColumnReader*>* non_filter_readers) const;
+
+  /// Skip 'num_rows_to_skip' for all 'column_readers'. If Page filtering is enabled
+  /// then we skip to row index 'skip_to_row'.
+  Status SkipRowsForColumns(const vector<ParquetColumnReader*>& column_readers,
+      int64_t* num_rows_to_skip, int64_t* skip_to_row);
 };
 
 } // namespace impala

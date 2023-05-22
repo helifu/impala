@@ -21,13 +21,13 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <ostream>
 #include <string>
 
 #include <glog/logging.h>
 
 #include "kudu/gutil/bits.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/fastmem.h"
 
 namespace kudu {
 
@@ -85,18 +85,46 @@ inline bool BitmapFindFirstZero(const uint8_t *bitmap, size_t offset,
 }
 
 // Returns true if the bitmap contains only ones.
-inline bool BitMapIsAllSet(const uint8_t *bitmap, size_t offset, size_t bitmap_size) {
-  DCHECK_LT(offset, bitmap_size);
+inline bool BitmapIsAllSet(const uint8_t *bitmap, size_t offset, size_t bitmap_size) {
+  DCHECK_LE(offset, bitmap_size);
   size_t idx;
   return !BitmapFindFirstZero(bitmap, offset, bitmap_size, &idx);
 }
 
 // Returns true if the bitmap contains only zeros.
 inline bool BitmapIsAllZero(const uint8_t *bitmap, size_t offset, size_t bitmap_size) {
-  DCHECK_LT(offset, bitmap_size);
+  DCHECK_LE(offset, bitmap_size);
   size_t idx;
   return !BitmapFindFirstSet(bitmap, offset, bitmap_size, &idx);
 }
+
+// Returns true if the two bitmaps are equal.
+//
+// It is assumed that both bitmaps have 'bitmap_size' number of bits.
+inline bool BitmapEquals(const uint8_t* bm1, const uint8_t* bm2, size_t bitmap_size) {
+  // Use memeq() to check all of the full bytes.
+  size_t num_full_bytes = bitmap_size >> 3;
+  if (!strings::memeq(bm1, bm2, num_full_bytes)) {
+    return false;
+  }
+
+  // Check any remaining bits in one extra operation.
+  size_t num_remaining_bits = bitmap_size - (num_full_bytes << 3);
+  if (num_remaining_bits == 0) {
+    return true;
+  }
+  DCHECK_LT(num_remaining_bits, 8);
+  uint8_t mask = (1 << num_remaining_bits) - 1;
+  return (bm1[num_full_bytes] & mask) == (bm2[num_full_bytes] & mask);
+}
+
+// Copies a slice of 'src' to 'dst'. Offsets and sizing are all expected to be
+// bit quantities.
+//
+// Note: 'src' and 'dst' may not overlap.
+void BitmapCopy(uint8_t* dst, size_t dst_offset,
+                const uint8_t* src, size_t src_offset,
+                size_t num_bits);
 
 std::string BitmapToString(const uint8_t *bitmap, size_t num_bits);
 
@@ -147,72 +175,87 @@ class BitmapIterator {
   const uint8_t *map_;
 };
 
-// Iterator which yields the set bits in a bitmap.
-// Example usage:
-//   for (TrueBitIterator iter(bitmap, n_bits);
-//        !iter.done();
-//        ++iter) {
-//     int next_onebit_position = *iter;
-//   }
-class TrueBitIterator {
- public:
-  TrueBitIterator(const uint8_t *bitmap, size_t n_bits)
-    : bitmap_(bitmap),
-      cur_byte_(0),
-      cur_byte_idx_(0),
-      n_bits_(n_bits),
-      n_bytes_(BitmapSize(n_bits_)),
-      bit_idx_(0) {
-    if (n_bits_ == 0) {
-      cur_byte_idx_ = 1; // sets done
-    } else {
-      cur_byte_ = bitmap[0];
-      AdvanceToNextOneBit();
+// Iterate over the bits in 'bitmap' and call 'func' for each set bit.
+// 'func' should take a single argument which is the bit's index.
+template<class F>
+void ForEachSetBit(const uint8_t* __restrict__ bitmap,
+                   int n_bits,
+                   const F& func);
+
+// Iterate over the bits in 'bitmap' and call 'func' for each unset bit.
+// 'func' should take a single argument which is the bit's index.
+template<class F>
+void ForEachUnsetBit(const uint8_t* __restrict__ bitmap,
+                     int n_bits,
+                     const F& func);
+
+
+////////////////////////////////////////////////////////////
+// Implementation details
+////////////////////////////////////////////////////////////
+
+template<bool SET, class F>
+inline void ForEachBit(const uint8_t* bitmap,
+                       int n_bits,
+                       const F& func) {
+  int rem = n_bits;
+  int base_idx = 0;
+  while (rem >= 64) {
+    uint64_t w = UnalignedLoad<uint64_t>(bitmap);
+    if (!SET) {
+      w = ~w;
     }
-  }
+    bitmap += sizeof(uint64_t);
 
-  TrueBitIterator &operator ++() {
-    DCHECK(!done());
-    DCHECK(cur_byte_ & 1);
-    cur_byte_ &= (~1);
-    AdvanceToNextOneBit();
-    return *this;
-  }
-
-  bool done() const {
-    return cur_byte_idx_ >= n_bytes_;
-  }
-
-  size_t operator *() const {
-    DCHECK(!done());
-    return bit_idx_;
-  }
-
- private:
-  void AdvanceToNextOneBit() {
-    while (cur_byte_ == 0) {
-      cur_byte_idx_++;
-      if (cur_byte_idx_ >= n_bytes_) return;
-      cur_byte_ = bitmap_[cur_byte_idx_];
-      bit_idx_ = cur_byte_idx_ * 8;
+    // Within each word, keep flipping the least significant non-zero bit and adding
+    // the bit index to the output until none are set.
+    //
+    // Get the count up front so that the loop can be unrolled without dependencies.
+    // The 'tzcnt' instruction that's generated here has a latency of 3 so unrolling
+    // and avoiding any cross-iteration dependencies is beneficial.
+    int tot_count = Bits::CountOnes64withPopcount(w);
+#ifdef __clang__
+#pragma unroll(3)
+#elif __GNUC__ >= 8
+#pragma GCC unroll 3
+#endif
+    for (int i = 0; i < tot_count; i++) {
+      func(base_idx + Bits::FindLSBSetNonZero64(w));
+      w &= w - 1;
     }
-    DVLOG(2) << "Found next nonzero byte at " << cur_byte_idx_
-             << " val=" << cur_byte_;
-
-    DCHECK_NE(cur_byte_, 0);
-    int set_bit = Bits::FindLSBSetNonZero(cur_byte_);
-    bit_idx_ += set_bit;
-    cur_byte_ >>= set_bit;
+    base_idx += 64;
+    rem -= 64;
   }
 
-  const uint8_t *bitmap_;
-  uint8_t cur_byte_;
-  uint8_t cur_byte_idx_;
+  while (rem > 0) {
+    uint8_t b = *bitmap++;
+    if (!SET) {
+      b = ~b;
+    }
+    while (b) {
+      int idx = base_idx + Bits::FindLSBSetNonZero(b);
+      if (idx >= n_bits) break;
+      func(idx);
+      b &= b - 1;
+    }
+    base_idx += 8;
+    rem -= 8;
+  }
+}
 
-  const size_t n_bits_;
-  const size_t n_bytes_;
-  size_t bit_idx_;
-};
+template<class F>
+inline void ForEachSetBit(const uint8_t* __restrict__ bitmap,
+                          int n_bits,
+                          const F& func) {
+  ForEachBit<true, F>(bitmap, n_bits, func);
+}
+
+template<class F>
+inline void ForEachUnsetBit(const uint8_t* __restrict__ bitmap,
+                            int n_bits,
+                            const F& func) {
+  ForEachBit<false, F>(bitmap, n_bits, func);
+}
 
 } // namespace kudu
 

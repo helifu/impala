@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 
 from threading import Thread
@@ -46,7 +47,7 @@ class TestFrontendConnectionLimit(CustomClusterTestSuite):
       client.execute(query)
     except Exception as e:
       client.close()
-      raise ImpalaBeeswaxException(e.message)
+      raise ImpalaBeeswaxException(str(e))
     client.close()
 
   @pytest.mark.execute_serially

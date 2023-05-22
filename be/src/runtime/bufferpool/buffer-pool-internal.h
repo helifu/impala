@@ -72,18 +72,18 @@
 /// invariant can be increased. Operations block waiting for enough writes to complete
 /// to satisfy the invariant.
 
-#ifndef IMPALA_RUNTIME_BUFFER_POOL_INTERNAL_H
-#define IMPALA_RUNTIME_BUFFER_POOL_INTERNAL_H
+#pragma once
 
+#include <iosfwd>
 #include <memory>
-#include <sstream>
-
-#include <boost/thread/mutex.hpp>
+#include <mutex>
 
 #include "runtime/bufferpool/buffer-pool-counters.h"
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
 #include "util/condition-variable.h"
+#include "util/internal-queue.h"
+#include "util/spinlock.h"
 
 // Ensure that DCheckConsistency() function calls get removed in release builds.
 #ifndef NDEBUG
@@ -94,11 +94,16 @@
 
 namespace impala {
 
+class TmpFileGroup;
+class TmpWriteHandle;
+
 /// The internal representation of a page, which can be pinned or unpinned. See the
 /// class comment for explanation of the different page states.
 struct BufferPool::Page : public InternalList<Page>::Node {
-  Page(Client* client, int64_t len)
-    : client(client), len(len), pin_count(0), pin_in_flight(false) {}
+  // Define constructor and destructor out-of-line to avoid include of TmpWriteHandle
+  // body in header.
+  Page(Client* client, int64_t len);
+  ~Page();
 
   std::string DebugString();
 
@@ -116,12 +121,14 @@ struct BufferPool::Page : public InternalList<Page>::Node {
   int pin_count;
 
   /// True if the read I/O to pin the page was started but not completed. Only accessed
-  /// in contexts that are passed the associated PageHandle, so it cannot be accessed
-  /// by multiple threads concurrently.
-  bool pin_in_flight;
+  /// in contexts that are passed the associated PageHandle, so can only be accessed
+  /// by multiple threads concurrently via PageHandle::GetBuffer(), since other page
+  /// handle operators are not thread-safe. This is atomic so that GetBuffer() can do
+  /// optimistic checks to avoid acquiring 'buffer_lock'.
+  AtomicBool pin_in_flight;
 
   /// Non-null if there is a write in flight, the page is clean, or the page is evicted.
-  std::unique_ptr<TmpFileMgr::WriteHandle> write_handle;
+  std::unique_ptr<TmpWriteHandle> write_handle;
 
   /// Condition variable signalled when a write for this page completes. Protected by
   /// client->lock_.
@@ -175,6 +182,9 @@ class BufferPool::PageList {
   }
 
   void Iterate(boost::function<bool(Page*)> fn) { list_.Iterate(fn); }
+  void IterateFirstN(boost::function<bool(Page*)> fn, int n) {
+    list_.IterateFirstN(fn, n);
+  }
   bool Contains(Page* page) { return list_.Contains(page); }
   Page* tail() { return list_.tail(); }
   bool empty() const { return list_.empty(); }
@@ -194,7 +204,7 @@ class BufferPool::PageList {
 /// The internal state for the client.
 class BufferPool::Client {
  public:
-  Client(BufferPool* pool, TmpFileMgr::FileGroup* file_group, const string& name,
+  Client(BufferPool* pool, TmpFileGroup* file_group, const string& name,
       ReservationTracker* parent_reservation, MemTracker* mem_tracker,
       MemLimit mem_limit_mode, int64_t reservation_limit, RuntimeProfile* profile);
 
@@ -255,11 +265,14 @@ class BufferPool::Client {
   /// Implementation of ClientHandle::DecreaseReservationTo().
   Status DecreaseReservationTo(int64_t max_decrease, int64_t target_bytes) WARN_UNUSED_RESULT;
 
+  /// Implementations of ClientHandle::TransferReservationTo().
+  Status TransferReservationTo(ReservationTracker* dst, int64_t bytes, bool* transferred);
+
   /// Called after a buffer of 'len' is freed via the FreeBuffer() API to update
   /// internal accounting and release the buffer to the client's reservation. No page or
   /// client locks should be held by the caller.
   void FreedBuffer(int64_t len) {
-    boost::lock_guard<boost::mutex> cl(lock_);
+    std::lock_guard<std::mutex> cl(lock_);
     reservation_.ReleaseTo(len);
     buffers_allocated_bytes_ -= len;
     DCHECK_CONSISTENCY();
@@ -268,17 +281,18 @@ class BufferPool::Client {
   /// Wait for the in-flight write for 'page' to complete.
   /// 'lock_' must be held by the caller via 'client_lock'. page->buffer_lock should
   /// not be held.
-  void WaitForWrite(boost::unique_lock<boost::mutex>* client_lock, Page* page);
+  void WaitForWrite(std::unique_lock<std::mutex>* client_lock, Page* page);
 
   /// Test helper: wait for all in-flight writes to complete.
   /// 'lock_' must not be held by the caller.
   void WaitForAllWrites();
 
   /// Asserts that 'client_lock' is holding 'lock_'.
-  void DCheckHoldsLock(const boost::unique_lock<boost::mutex>& client_lock) {
+  void DCheckHoldsLock(const std::unique_lock<std::mutex>& client_lock) {
     DCHECK(client_lock.mutex() == &lock_ && client_lock.owns_lock());
   }
 
+  int64_t min_buffer_len() const { return pool_->min_buffer_len(); }
   ReservationTracker* reservation() { return &reservation_; }
   const BufferPoolClientCounters& counters() const { return counters_; }
   bool spilling_enabled() const { return file_group_ != NULL; }
@@ -311,8 +325,10 @@ class BufferPool::Client {
   /// Must be called once before allocating or reclaiming a buffer of 'len'. Ensures that
   /// enough dirty pages are flushed to disk to satisfy the buffer pool's internal
   /// invariants after the allocation. 'lock_' should be held by the caller via
-  /// 'client_lock'
-  Status CleanPages(boost::unique_lock<boost::mutex>* client_lock, int64_t len);
+  /// 'client_lock'. If 'lazy_flush' is true, only write out pages if needed to reclaim
+  /// 'len', and do not return a write error if the error prevents flushing enough pages.
+  Status CleanPages(std::unique_lock<std::mutex>* client_lock, int64_t len,
+      bool lazy_flush = false);
 
   /// Initiates asynchronous writes of dirty unpinned pages to disk. Ensures that at
   /// least 'min_bytes_to_write' bytes of writes will be written asynchronously. May
@@ -329,7 +345,7 @@ class BufferPool::Client {
   /// locked by the caller via 'client_lock' and handle->page must be unlocked.
   /// 'client_lock' is released then reacquired.
   Status StartMoveEvictedToPinned(
-      boost::unique_lock<boost::mutex>* client_lock, ClientHandle* client, Page* page);
+      std::unique_lock<std::mutex>* client_lock, ClientHandle* client, Page* page);
 
   /// Same as DebugString() except the caller must already hold 'lock_'.
   std::string DebugStringLocked();
@@ -339,7 +355,7 @@ class BufferPool::Client {
 
   /// The file group that should be used for allocating scratch space. If NULL, spilling
   /// is disabled.
-  TmpFileMgr::FileGroup* const file_group_;
+  TmpFileGroup* const file_group_;
 
   /// A name identifying the client.
   const std::string name_;
@@ -356,10 +372,14 @@ class BufferPool::Client {
   int debug_write_delay_ms_;
 
   /// Lock to protect the below member variables;
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// Condition variable signalled when a write for this client completes.
   ConditionVariable write_complete_cv_;
+
+  /// Used to ensure that only one thread at a time is active in CleanPages().
+  bool cleaning_pages_ = false;
+  ConditionVariable clean_pages_done_cv_;
 
   /// All non-OK statuses returned by write operations are merged into this status.
   /// All operations that depend on pages being written to disk successfully (e.g.
@@ -391,5 +411,3 @@ class BufferPool::Client {
   PageList in_flight_write_pages_;
 };
 }
-
-#endif

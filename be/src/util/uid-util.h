@@ -15,39 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_UTIL_UID_UTIL_H
-#define IMPALA_UTIL_UID_UTIL_H
+#include <string.h>
+#include <cstdint>
+#include <string>
 
-#include <boost/functional/hash.hpp>
 #include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_generators.hpp>
 
-#include "gen-cpp/Types_types.h"  // for TUniqueId
-#include "gen-cpp/control_service.pb.h"
-#include "util/debug-util.h"
-
-namespace impala {
-
-inline std::size_t hash_value(const TUniqueId& id) {
-  std::size_t seed = 0;
-  boost::hash_combine(seed, id.lo);
-  boost::hash_combine(seed, id.hi);
-  return seed;
-}
-
-}
-
-/// Hash function for std:: containers
-namespace std {
-
-template<> struct hash<impala::TUniqueId> {
-  std::size_t operator()(const impala::TUniqueId& id) const {
-    return impala::hash_value(id);
-  }
-};
-
-}
+#include "common/logging.h"
+#include "gen-cpp/Types_types.h"
+#include "gen-cpp/common.pb.h"
 
 namespace impala {
 
@@ -56,10 +34,24 @@ inline void UUIDToTUniqueId(const boost::uuids::uuid& uuid, TUniqueId* unique_id
   memcpy(&(unique_id->lo), &uuid.data[8], 8);
 }
 
+inline void UUIDToUniqueIdPB(const boost::uuids::uuid& uuid, UniqueIdPB* unique_id) {
+  uint64_t hi, lo;
+  memcpy(&hi, &uuid.data[0], 8);
+  memcpy(&lo, &uuid.data[8], 8);
+  unique_id->set_hi(hi);
+  unique_id->set_lo(lo);
+}
+
 inline void TUniqueIdToUniqueIdPB(
     const TUniqueId& t_unique_id, UniqueIdPB* unique_id_pb) {
   unique_id_pb->set_lo(t_unique_id.lo);
   unique_id_pb->set_hi(t_unique_id.hi);
+}
+
+inline void UniqueIdPBToTUniqueId(
+    const UniqueIdPB& unique_id_pb, TUniqueId* t_unique_id) {
+  t_unique_id->__set_lo(unique_id_pb.lo());
+  t_unique_id->__set_hi(unique_id_pb.hi());
 }
 
 /// Query id: uuid with bottom 4 bytes set to 0
@@ -110,6 +102,14 @@ inline TUniqueId CreateInstanceId(
   return result;
 }
 
+inline UniqueIdPB CreateInstanceId(const UniqueIdPB& query_id, int32_t instance_idx) {
+  DCHECK_EQ(GetInstanceIdx(query_id), 0); // well-formed query id
+  DCHECK_GE(instance_idx, 0);
+  UniqueIdPB result = query_id;
+  result.set_lo(result.lo() + instance_idx);
+  return result;
+}
+
 template <typename F, typename T>
 inline T CastTUniqueId(const F& from) {
   T to;
@@ -119,21 +119,14 @@ inline T CastTUniqueId(const F& from) {
 }
 
 /// generates a 16 byte UUID
-inline string GenerateUUIDString() {
-  boost::uuids::basic_random_generator<boost::mt19937> gen;
-  boost::uuids::uuid u = gen();
-  string uuid(u.begin(), u.end());
-  return uuid;
-}
+std::string GenerateUUIDString();
 
 /// generates a 16 byte UUID
 inline TUniqueId GenerateUUID() {
-  const string& u = GenerateUUIDString();
+  const std::string& u = GenerateUUIDString();
   TUniqueId uid;
   memcpy(&uid.hi, u.data(), sizeof(int64_t));
   memcpy(&uid.lo, u.data() + sizeof(int64_t), sizeof(int64_t));
   return uid;
 }
-
 } // namespace impala
-#endif

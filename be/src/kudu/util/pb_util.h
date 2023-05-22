@@ -31,8 +31,8 @@
 #include <gtest/gtest_prod.h>
 
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/util/mutex.h"
 #include "kudu/util/debug/trace_event_impl.h"
+#include "kudu/util/mutex.h"
 
 namespace google {
 namespace protobuf {
@@ -47,11 +47,11 @@ class SimpleDescriptorDatabase;
 namespace kudu {
 
 class Env;
+class RWFile;
 class RandomAccessFile;
 class SequentialFile;
 class Slice;
 class Status;
-class RWFile;
 class faststring;
 
 namespace pb_util {
@@ -64,6 +64,11 @@ enum SyncMode {
 enum CreateMode {
   OVERWRITE,
   NO_OVERWRITE
+};
+
+enum SensitivityMode {
+  SENSITIVE,
+  NOT_SENSITIVE
 };
 
 enum class FileState {
@@ -315,6 +320,9 @@ class WritablePBContainerFile {
   // only needed in the former case.
   Status Sync();
 
+  // Get current offset of underlying file.
+  uint64_t Offset() const;
+
   // Closes the container.
   //
   // Not thread-safe.
@@ -350,7 +358,7 @@ class WritablePBContainerFile {
   FileState state_;
 
   // Protects offset_.
-  Mutex offset_lock_;
+  mutable Mutex offset_lock_;
 
   // Current write offset into the file.
   uint64_t offset_;
@@ -406,8 +414,10 @@ class ReadablePBContainerFile {
     DEBUG,
     // Print each message on its own line.
     ONELINE,
-    // Dump in JSON.
-    JSON
+    // Dump in JSON compact format.
+    JSON,
+    // Dump in JSON pretty format.
+    JSON_PRETTY
   };
   Status Dump(std::ostream* os, Format format);
 
@@ -464,7 +474,8 @@ class ReadablePBContainerFile {
 // If the file does not exist, returns Status::NotFound(). Otherwise, may
 // return other Status error codes such as Status::IOError.
 Status ReadPBContainerFromPath(Env* env, const std::string& path,
-                               google::protobuf::Message* msg);
+                               google::protobuf::Message* msg,
+                               SensitivityMode sensitivity_mode);
 
 // Serialize a "containerized" protobuf to the given path.
 //
@@ -473,7 +484,8 @@ Status ReadPBContainerFromPath(Env* env, const std::string& path,
 Status WritePBContainerToPath(Env* env, const std::string& path,
                               const google::protobuf::Message& msg,
                               CreateMode create,
-                              SyncMode sync);
+                              SyncMode sync,
+                              SensitivityMode sensitivity_mode);
 
 // Wrapper for a protobuf message which lazily converts to JSON when
 // the trace buffer is dumped.

@@ -19,6 +19,7 @@ package org.apache.impala.analysis;
 
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.RowFormat;
@@ -26,7 +27,7 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterTableParams;
 import org.apache.impala.thrift.TAlterTableSetRowFormatParams;
 import org.apache.impala.thrift.TAlterTableType;
-
+import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 /**
  * Represents an ALTER TABLE [PARTITION partitionSet] SET ROW FORMAT statement.
  */
@@ -62,20 +63,26 @@ public class AlterTableSetRowFormatStmt extends AlterTableSetStmt {
       throw new AnalysisException(String.format("ALTER TABLE SET ROW FORMAT is only " +
           "supported on HDFS tables. Conflicting table: %1$s", tbl.getFullName()));
     }
+
+    if (tbl instanceof FeIcebergTable) {
+      throw new AnalysisException("ALTER TABLE SET ROWFORMAT is not supported " +
+          "on Iceberg tables: " + tbl.getFullName());
+    }
+
     if (partitionSet_ != null) {
       for (FeFsPartition partition: partitionSet_.getPartitions()) {
         if (partition.getFileFormat() != HdfsFileFormat.TEXT &&
             partition.getFileFormat() != HdfsFileFormat.SEQUENCE_FILE) {
-          throw new AnalysisException(String.format("ALTER TABLE SET ROW FORMAT is " +
-              "only supported on TEXT or SEQUENCE file formats.  " +
-              "Conflicting partition/format: %1$s / %2$s", partition.getPartitionName(),
-              HdfsFileFormat.fromHdfsInputFormatClass(
-                  partition.getFileFormat().inputFormat()).name()));
+          throw new AnalysisException(String.format("ALTER TABLE SET ROW FORMAT is "
+                  + "only supported on TEXT or SEQUENCE file formats.  "
+                  + "Conflicting partition/format: %1$s / %2$s",
+              partition.getPartitionName(), partition.getFileFormat().name()));
         }
       }
     } else {
+      StorageDescriptor sd = ((FeFsTable) tbl).getMetaStoreTable().getSd();
       HdfsFileFormat format = HdfsFileFormat.fromHdfsInputFormatClass(
-          ((FeFsTable) tbl).getMetaStoreTable().getSd().getInputFormat());
+          sd.getInputFormat(), sd.getSerdeInfo().getSerializationLib());
       if (format != HdfsFileFormat.TEXT &&
           format != HdfsFileFormat.SEQUENCE_FILE) {
         throw new AnalysisException(String.format("ALTER TABLE SET ROW FORMAT is " +

@@ -15,7 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from test_ddl_base import TestDdlBase
+
 
 class TestResetMetadata(TestDdlBase):
   def test_reset_metadata_case_sensitivity(self, unique_database):

@@ -27,15 +27,18 @@ import org.apache.impala.analysis.InsertStmt;
 import org.apache.impala.analysis.JoinOperator;
 import org.apache.impala.analysis.MultiAggregateInfo.AggPhase;
 import org.apache.impala.analysis.QueryStmt;
+import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.planner.JoinNode.DistributionMode;
+import org.apache.impala.thrift.TPartitionType;
 import org.apache.impala.util.KuduUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
 
 /**
@@ -91,7 +94,7 @@ public class DistributedPlanner {
    * otherwise it may be partitioned, depending on whether its inputs are
    * partitioned; the partition function is derived from the inputs.
    */
-  private PlanFragment createPlanFragments(
+  public PlanFragment createPlanFragments(
       PlanNode root, boolean isPartitioned, List<PlanFragment> fragments)
       throws ImpalaException {
     List<PlanFragment> childFragments = new ArrayList<>();
@@ -99,7 +102,8 @@ public class DistributedPlanner {
       // allow child fragments to be partitioned, unless they contain a limit clause
       // (the result set with the limit constraint needs to be computed centrally);
       // merge later if needed
-      boolean childIsPartitioned = !child.hasLimit();
+      boolean childIsPartitioned = child.allowPartitioned();
+
       // Do not fragment the subplan of a SubplanNode since it is executed locally.
       if (root instanceof SubplanNode && child == root.getChild(1)) continue;
       childFragments.add(createPlanFragments(child, childIsPartitioned, fragments));
@@ -143,6 +147,9 @@ public class DistributedPlanner {
           ctx_.getNextFragmentId(), root, DataPartition.UNPARTITIONED);
     } else if (root instanceof CardinalityCheckNode) {
       result = createCardinalityCheckNodeFragment((CardinalityCheckNode) root, childFragments);
+    } else if (root instanceof IcebergMetadataScanNode) {
+      result = createIcebergMetadataScanFragment(root);
+      fragments.add(result);
     } else {
       throw new InternalException("Cannot create plan fragment for this node type: "
           + root.getExplainString(ctx_.getQueryOptions()));
@@ -173,22 +180,24 @@ public class DistributedPlanner {
   }
 
   /**
-   * Decides whether to repartition the output of 'inputFragment' before feeding its
-   * data into the table sink of the given 'insertStmt'. The decision obeys the
-   * shuffle/noshuffle plan hints if present. Otherwise, returns a plan fragment that
-   * partitions the output of 'inputFragment' on the partition exprs of 'insertStmt',
-   * unless the expected number of partitions is less than the number of nodes on which
-   * inputFragment runs, or the target table is unpartitioned.
-   * For inserts into unpartitioned tables or inserts with only constant partition exprs,
-   * the shuffle hint leads to a plan that merges all rows at the coordinator where
-   * the table sink is executed.
-   * If this functions ends up creating a new fragment, appends that to 'fragments'.
+   * Decides whether to repartition the output of 'inputFragment' before feeding
+   * its data into the table sink of the given 'insertStmt'. The decision obeys
+   * the shuffle/noshuffle plan hints if present unless MAX_FS_WRITERS query
+   * option is used where the noshuffle hint is ignored. The decision is based on
+   * a number of factors including, whether the target table is partitioned or
+   * unpartitioned, the input fragment and the target table's partition
+   * expressions, expected number of output partitions, num of nodes on which the
+   * input partition will run, whether MAX_FS_WRITERS query option is used. If
+   * this functions ends up creating a new fragment, appends that to 'fragments'.
    */
   public PlanFragment createInsertFragment(
       PlanFragment inputFragment, InsertStmt insertStmt, Analyzer analyzer,
       List<PlanFragment> fragments)
       throws ImpalaException {
-    if (insertStmt.hasNoShuffleHint()) return inputFragment;
+    boolean enforce_hdfs_writer_limit = insertStmt.getTargetTable() instanceof FeFsTable
+        && analyzer.getQueryOptions().getMax_fs_writers() > 0;
+
+    if (insertStmt.hasNoShuffleHint() && !enforce_hdfs_writer_limit) return inputFragment;
 
     List<Expr> partitionExprs = Lists.newArrayList(insertStmt.getPartitionKeyExprs());
     // Ignore constants for the sake of partitioning.
@@ -199,10 +208,21 @@ public class DistributedPlanner {
     DataPartition inputPartition = inputFragment.getDataPartition();
     if (!partitionExprs.isEmpty()
         && analyzer.setsHaveValueTransfer(inputPartition.getPartitionExprs(),
-        partitionExprs, true)
-        && !(insertStmt.getTargetTable() instanceof FeKuduTable)) {
+            partitionExprs, true)
+        && !(insertStmt.getTargetTable() instanceof FeKuduTable)
+        && !enforce_hdfs_writer_limit) {
       return inputFragment;
     }
+
+    int maxHdfsWriters = analyzer.getQueryOptions().getMax_fs_writers();
+    // We also consider fragments containing union nodes along with scan fragments
+    // (leaf fragments) since they are either a part of those scan fragments or are
+    // co-located with them to maintain parallelism.
+    List<ScanNode> hdfsScanORUnionNodes = Lists.newArrayList();
+    inputFragment.collectPlanNodes(Predicates.instanceOf(HdfsScanNode.class),
+        hdfsScanORUnionNodes);
+    inputFragment.collectPlanNodes(Predicates.instanceOf(UnionNode.class),
+        hdfsScanORUnionNodes);
 
     // Make a cost-based decision only if no user hint was supplied.
     if (!insertStmt.hasShuffleHint()) {
@@ -212,12 +232,27 @@ public class DistributedPlanner {
         // TODO: make a more sophisticated decision here for partitioned tables and when
         // we have info about tablet locations.
         if (partitionExprs.isEmpty()) return inputFragment;
-      } else {
+      } else if (!enforce_hdfs_writer_limit || hdfsScanORUnionNodes.size() == 0
+          || inputFragment.getNumInstances() <= maxHdfsWriters) {
+        // Only consider skipping the addition of an exchange node if
+        // 1. The hdfs writer limit does not apply
+        // 2. Writer limit applies and there are no hdfs scan or union nodes. In this
+        //    case we will restrict the number of instances of this internal fragment.
+        // 3. Writer limit applies and there is a scan node or union node, but its num
+        //    of instances are already under the writer limit.
+        // Basically covering all cases where we don't mind restricting the parallelism
+        // of their instances.
+        int input_instances = inputFragment.getNumInstances();
+        if (enforce_hdfs_writer_limit && hdfsScanORUnionNodes.size() == 0) {
+          // For an internal fragment we enforce an upper limit based on the
+          // MAX_FS_WRITER query option.
+          input_instances = Math.min(input_instances, maxHdfsWriters);
+        }
         // If the existing partition exprs are a subset of the table partition exprs,
         // check if it is distributed across all nodes. If so, don't repartition.
         if (Expr.isSubset(inputPartition.getPartitionExprs(), partitionExprs)) {
           long numPartitions = getNumDistinctValues(inputPartition.getPartitionExprs());
-          if (numPartitions >= inputFragment.getNumNodes()) {
+          if (numPartitions >= input_instances) {
             return inputFragment;
           }
         }
@@ -230,8 +265,8 @@ public class DistributedPlanner {
         // size in the particular file format of the output table/partition.
         // We should always know on how many nodes our input is running.
         long numPartitions = getNumDistinctValues(partitionExprs);
-        Preconditions.checkState(inputFragment.getNumNodes() != -1);
-        if (numPartitions > 0 && numPartitions <= inputFragment.getNumNodes()) {
+        Preconditions.checkState(inputFragment.getNumInstances() != -1);
+        if (numPartitions > 0 && numPartitions <= input_instances) {
           return inputFragment;
         }
       }
@@ -243,7 +278,14 @@ public class DistributedPlanner {
     Preconditions.checkState(exchNode.hasValidStats());
     DataPartition partition;
     if (partitionExprs.isEmpty()) {
-      partition = DataPartition.UNPARTITIONED;
+      if (enforce_hdfs_writer_limit
+          && inputFragment.getDataPartition().getType() == TPartitionType.RANDOM) {
+        // This ensures the parallelism of the writers is maintained while maintaining
+        // legacy behavior(when not using MAX_FS_WRITER query option).
+        partition = DataPartition.RANDOM;
+      } else {
+        partition = DataPartition.UNPARTITIONED;
+      }
     } else if (insertStmt.getTargetTable() instanceof FeKuduTable) {
       partition = DataPartition.kuduPartitioned(
           KuduUtil.createPartitionExpr(insertStmt, ctx_.getRootAnalyzer()));
@@ -284,6 +326,13 @@ public class DistributedPlanner {
    */
   private PlanFragment createScanFragment(PlanNode node) {
     return new PlanFragment(ctx_.getNextFragmentId(), node, DataPartition.RANDOM);
+  }
+
+  /**
+   * Create an Iceberg Metadata scan fragment.
+   */
+  private PlanFragment createIcebergMetadataScanFragment(PlanNode node) {
+    return new PlanFragment(ctx_.getNextFragmentId(), node, DataPartition.UNPARTITIONED);
   }
 
   /**
@@ -449,22 +498,44 @@ public class DistributedPlanner {
     PlanNode rhsTree = rightChildFragment.getPlanRoot();
     long rhsDataSize = -1;
     long broadcastCost = -1;
-    // TODO: IMPALA-4224: update this once we can share the broadcast join data between
-    // finstances.
     int mt_dop = ctx_.getQueryOptions().mt_dop;
-    int leftChildInstances = leftChildFragment.getNumInstances(mt_dop);
+    int leftChildNodes = leftChildFragment.getNumNodes();
     if (rhsTree.getCardinality() != -1) {
       rhsDataSize = Math.round(
           rhsTree.getCardinality() * ExchangeNode.getAvgSerializedRowSize(rhsTree));
-      if (leftChildInstances != -1) {
-        broadcastCost = 2 * rhsDataSize * leftChildInstances;
+      if (leftChildNodes != -1) {
+        // RHS data must be broadcast once to each node.
+        // TODO: IMPALA-9176: this is inaccurate for NAAJ until IMPALA-9176 is fixed
+        // because it must be broadcast once per instance.
+        long dataPayload = rhsDataSize * leftChildNodes;
+        long hashTblBuildCost = dataPayload;
+        if (mt_dop > 1 && ctx_.getQueryOptions().use_dop_for_costing
+            && !ProcessingCost.isComputeCost(ctx_.getQueryOptions())) {
+          // In the broadcast join a single thread per node is building the hash
+          // table of size N compared to the partition case where m threads are
+          // building hash tables of size N/m each (assuming uniform distribution).
+          // Hence, the build side is faster in the latter case. For relative costing,
+          // we multiply the hash table build cost by C sqrt(m) where m = plan node's
+          // parallelism and C = a coefficient that controls the function's rate of
+          // growth (a tunable parameter). We use the sqrt to model a non-linear
+          // function since the slowdown with broadcast is not exactly linear.
+          // TODO: more analysis is needed to establish an accurate correlation.
+          // TODO: this cost calculation is disabled if COMPUTE_PROCESSING_COST=true
+          // since num instances might change after plan created during
+          // Planner.computeProcessingCost() later. Need to find way to enable this back.
+          PlanNode leftPlanRoot = leftChildFragment.getPlanRoot();
+          int actual_dop = leftPlanRoot.getNumInstances()/leftPlanRoot.getNumNodes();
+          hashTblBuildCost *= (long) (ctx_.getQueryOptions().broadcast_to_partition_factor
+              * Math.max(1.0, Math.sqrt(actual_dop)));
+        }
+        broadcastCost = dataPayload + hashTblBuildCost;
       }
     }
     if (LOG.isTraceEnabled()) {
       LOG.trace("broadcast: cost=" + Long.toString(broadcastCost));
       LOG.trace("card=" + Long.toString(rhsTree.getCardinality()) + " row_size="
-          + Float.toString(rhsTree.getAvgRowSize()) + " #instances="
-          + Integer.toString(leftChildInstances));
+          + Float.toString(rhsTree.getAvgRowSize()) + " #nodes="
+          + Integer.toString(leftChildNodes));
     }
 
     // repartition: both left- and rightChildFragment are partitioned on the
@@ -556,16 +627,11 @@ public class DistributedPlanner {
          ctx_.getQueryOptions().getDefault_join_distribution_mode());
    }
 
-   int mt_dop = ctx_.getQueryOptions().mt_dop;
-
    // Decide the distribution mode based on the estimated costs, the mem limit and
    // the broadcast bytes limit. The last value is a safety check to ensure we
    // don't broadcast very large inputs (for example in case the broadcast cost was
    // not computed correctly and the query mem limit has not been set or set too high)
    long htSize = Math.round(rhsDataSize * PlannerContext.HASH_TBL_SPACE_OVERHEAD);
-   // TODO: IMPALA-4224: update this once we can share the broadcast join data between
-   // finstances.
-   if (mt_dop > 1) htSize *= mt_dop;
    long memLimit = ctx_.getQueryOptions().mem_limit;
    long broadcast_bytes_limit = ctx_.getQueryOptions().getBroadcast_bytes_limit();
 
@@ -775,6 +841,11 @@ public class DistributedPlanner {
     childFragment.setDestination(exchangeNode);
   }
 
+  private PlanFragment createParentFragment(
+      PlanFragment childFragment, DataPartition parentPartition) throws ImpalaException {
+    return createParentFragment(childFragment, parentPartition, false);
+  }
+
   /**
    * Create a new fragment containing a single ExchangeNode that consumes the output
    * of childFragment, set the destination of childFragment to the new parent
@@ -786,11 +857,12 @@ public class DistributedPlanner {
    * correct for the input).
    */
   private PlanFragment createParentFragment(
-      PlanFragment childFragment, DataPartition parentPartition)
+      PlanFragment childFragment, DataPartition parentPartition, boolean unsetLimit)
       throws ImpalaException {
     ExchangeNode exchangeNode =
         new ExchangeNode(ctx_.getNextNodeId(), childFragment.getPlanRoot());
     exchangeNode.init(ctx_.getRootAnalyzer());
+    if (unsetLimit) exchangeNode.unsetLimit();
     PlanFragment parentFragment = new PlanFragment(ctx_.getNextFragmentId(),
         exchangeNode, parentPartition);
     childFragment.setDestination(exchangeNode);
@@ -873,7 +945,9 @@ public class DistributedPlanner {
     // if there is a limit, we need to transfer it from the pre-aggregation
     // node in the child fragment to the merge aggregation node in the parent
     long limit = node.getLimit();
-    node.unsetLimit();
+    if (node.getMultiAggInfo().hasAggregateExprs() || !node.getConjuncts().isEmpty()) {
+      node.unsetLimit();
+    }
     node.unsetNeedsFinalize();
 
     // place a merge aggregation step in a new fragment
@@ -882,6 +956,10 @@ public class DistributedPlanner {
         mergeFragment.getPlanRoot(), node.getMultiAggInfo(), AggPhase.FIRST_MERGE);
     mergeAggNode.init(ctx_.getRootAnalyzer());
     mergeAggNode.setLimit(limit);
+    // Carry the IsNonCorrelatedSclarSubquery_ flag to the merge node. This flag is
+    // applicable regardless of the partition scheme for the children since it is a
+    // logical property.
+    mergeAggNode.setIsNonCorrelatedScalarSubquery(node.isNonCorrelatedScalarSubquery());
     // Merge of non-grouping agg only processes one tuple per Impala daemon - codegen
     // will cost more than benefit.
     if (!hasGrouping) {
@@ -1002,10 +1080,7 @@ public class DistributedPlanner {
         node instanceof SortNode || node instanceof AnalyticEvalNode);
     if (node instanceof AnalyticEvalNode) {
       AnalyticEvalNode analyticNode = (AnalyticEvalNode) node;
-      if (analyticNode.getPartitionExprs().isEmpty()
-          && analyticNode.getOrderByElements().isEmpty()) {
-        // no Partition-By/Order-By exprs: compute analytic exprs in single
-        // unpartitioned fragment
+      if (analyticNode.requiresUnpartitionedEval()) {
         PlanFragment fragment = childFragment;
         if (childFragment.isPartitioned()) {
           fragment = createParentFragment(childFragment, DataPartition.UNPARTITIONED);
@@ -1021,16 +1096,75 @@ public class DistributedPlanner {
     SortNode sortNode = (SortNode) node;
     Preconditions.checkState(sortNode.isAnalyticSort());
     PlanFragment analyticFragment = childFragment;
+
+    boolean addedLowerTopN = false;
+    SortNode lowerTopN = null;
+    AnalyticEvalNode analyticNode = sortNode.getAnalyticEvalNode();
     if (sortNode.getInputPartition() != null) {
       sortNode.getInputPartition().substitute(
           childFragment.getPlanRoot().getOutputSmap(), ctx_.getRootAnalyzer());
       // Make sure the childFragment's output is partitioned as required by the sortNode.
       DataPartition sortPartition = sortNode.getInputPartition();
-      if (!childFragment.getDataPartition().equals(sortPartition)) {
-        analyticFragment = createParentFragment(childFragment, sortPartition);
+      boolean hasNullableTupleIds = childFragment.getPlanRoot().
+          getNullableTupleIds().size() > 0;
+      boolean hasCompatiblePartition = false;
+      if (hasNullableTupleIds) {
+        // If the input stream has nullable tuple ids (produced from the nullable
+        // side of an outer join), do an exact equality comparison of the child's
+        // data partition with the required partition) since a hash exchange is
+        // required to co-locate all the null values produced from the outer join
+        // (these tuples may not be originally null but became null after OJ).
+        hasCompatiblePartition = childFragment.getDataPartition().equals(sortPartition);
+      } else {
+        // Otherwise, a mutual value transfer is sufficient for compatible partitions.
+        // E.g if analytic fragment's required partition key is t2.a2 and the child is
+        // an inner join with t1.a1 = t2.a2, either a1 or a2 are sufficient to satisfy
+        // the required partitioning.
+        hasCompatiblePartition = ctx_.getRootAnalyzer().setsHaveValueTransfer(
+            childFragment.getDataPartition().getPartitionExprs(),
+            sortPartition.getPartitionExprs(), true);
+      }
+      if (!hasCompatiblePartition) {
+        if (sortNode.isTypeTopN() || sortNode.isPartitionedTopN()) {
+          lowerTopN = sortNode;
+          childFragment.addPlanRoot(lowerTopN);
+          // Update partitioning exprs to reference sort tuple.
+          sortPartition.substitute(
+                  sortNode.getSortInfo().getOutputSmap(), ctx_.getRootAnalyzer());
+          addedLowerTopN = true;
+          // When creating the analytic fragment, pass in a flag to unset the limit
+          // on the partition exchange. This ensures that the exchange does not
+          // prematurely stop sending rows in case there's a downstream operator
+          // that has a LIMIT - for instance a Sort with LIMIT after the
+          // Analytic operator.
+          analyticFragment = createParentFragment(childFragment, sortPartition, true);
+        } else {
+          analyticFragment = createParentFragment(childFragment, sortPartition);
+        }
       }
     }
-    analyticFragment.addPlanRoot(sortNode);
+    if (addedLowerTopN) {
+      // Create the upper TopN node
+      SortNode upperTopN;
+      if (lowerTopN.isTypeTopN()) {
+        upperTopN = SortNode.createTopNSortNode(ctx_.getQueryOptions(),
+              ctx_.getNextNodeId(), childFragment.getPlanRoot(),
+              lowerTopN.getSortInfo(), sortNode.getOffset(), lowerTopN.getSortLimit(),
+              lowerTopN.isIncludeTies());
+      } else {
+        upperTopN = SortNode.createPartitionedTopNSortNode(
+                ctx_.getNextNodeId(), childFragment.getPlanRoot(),
+                lowerTopN.getSortInfo(), lowerTopN.getNumPartitionExprs(),
+                lowerTopN.getPerPartitionLimit(), lowerTopN.isIncludeTies());
+      }
+      upperTopN.setIsAnalyticSort(true);
+      upperTopN.init(ctx_.getRootAnalyzer());
+      // connect this to the analytic eval node
+      analyticNode.setChild(0, upperTopN);
+      analyticFragment.addPlanRoot(upperTopN);
+    } else {
+      analyticFragment.addPlanRoot(sortNode);
+    }
     return analyticFragment;
   }
 
@@ -1048,33 +1182,60 @@ public class DistributedPlanner {
     childFragment.addPlanRoot(node);
     if (!childFragment.isPartitioned()) return childFragment;
 
-    // Remember original offset and limit.
-    boolean hasLimit = node.hasLimit();
-    long limit = node.getLimit();
-    long offset = node.getOffset();
-
     // Create a new fragment for a sort-merging exchange.
     PlanFragment mergeFragment =
         createParentFragment(childFragment, DataPartition.UNPARTITIONED);
     ExchangeNode exchNode = (ExchangeNode) mergeFragment.getPlanRoot();
-
-    // Set limit, offset and merge parameters in the exchange node.
-    exchNode.unsetLimit();
-    if (hasLimit) exchNode.setLimit(limit);
-    exchNode.setMergeInfo(node.getSortInfo(), offset);
-
-    // Child nodes should not process the offset. If there is a limit,
-    // the child nodes need only return (offset + limit) rows.
     SortNode childSortNode = (SortNode) childFragment.getPlanRoot();
-    Preconditions.checkState(node == childSortNode);
-    if (hasLimit) {
-      childSortNode.unsetLimit();
-      childSortNode.setLimit(PlanNode.checkedAdd(limit, offset));
+    if (node.isIncludeTies()) {
+      Preconditions.checkState(node.getOffset() == 0,
+              "Tie handling with offset not supported");
+      if (node.isPartitionedTopN()) {
+        // Partitioned TopN that returns ties needs special handling because ties are not
+        // handled correctly by the ExchangeNode limit. We need to generate a partitioned
+        // top-n on top of the exchange to correctly merge the input.
+        SortNode parentSortNode = SortNode.createPartitionedTopNSortNode(
+                ctx_.getNextNodeId(), exchNode, childSortNode.getSortInfo(),
+                childSortNode.getNumPartitionExprs(),
+                childSortNode.getPerPartitionLimit(), childSortNode.isIncludeTies());
+        parentSortNode.init(ctx_.getRootAnalyzer());
+        mergeFragment.addPlanRoot(parentSortNode);
+      } else {
+        Preconditions.checkState(node.isTypeTopN(), "only top-n handles ties");
+        //TopN that returns ties needs special handling because ties are not handled
+        // correctly by the ExchangeNode limit. We need to generate a top-n on top
+        // of the exchange to correctly merge the input.
+        SortNode parentSortNode = SortNode.createTopNSortNode(
+                ctx_.getQueryOptions(), ctx_.getNextNodeId(), exchNode,
+                childSortNode.getSortInfo(), 0, node.getSortLimit(),
+                childSortNode.isIncludeTies());
+        parentSortNode.init(ctx_.getRootAnalyzer());
+        mergeFragment.addPlanRoot(parentSortNode);
+      }
+    } else {
+      // Remember original offset and limit.
+      boolean hasLimit = node.hasLimit();
+      long limit = node.getLimit();
+      long offset = node.getOffset();
+
+      // Set limit, offset and merge parameters in the exchange node.
+      exchNode.unsetLimit();
+      if (hasLimit) exchNode.setLimit(limit);
+      exchNode.setMergeInfo(node.getSortInfo(), offset);
+
+      // Child nodes should not process the offset. If there is a limit,
+      // the child nodes need only return (offset + limit) rows.
+      Preconditions.checkState(node == childSortNode);
+      if (hasLimit) {
+        childSortNode.unsetLimit();
+        childSortNode.setLimit(PlanNode.checkedAdd(limit, offset));
+      }
+      childSortNode.setOffset(0);
     }
-    childSortNode.setOffset(0);
+
+
     childSortNode.computeStats(ctx_.getRootAnalyzer());
     exchNode.computeStats(ctx_.getRootAnalyzer());
-
     return mergeFragment;
   }
 }

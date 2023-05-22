@@ -27,7 +27,7 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -74,7 +74,16 @@ public class CompoundPredicate extends Predicate {
     children_.add(e1);
     Preconditions.checkArgument(op == Operator.NOT && e2 == null
         || op != Operator.NOT && e2 != null);
-    if (e2 != null) children_.add(e2);
+    if (e2 != null) {
+      children_.add(e2);
+      if ((op == Operator.AND &&
+          (Expr.IS_ALWAYS_TRUE_PREDICATE.apply(e1) &&
+              Expr.IS_ALWAYS_TRUE_PREDICATE.apply(e2))) ||
+          ((op == Operator.OR && (Expr.IS_ALWAYS_TRUE_PREDICATE.apply(e1) ||
+              Expr.IS_ALWAYS_TRUE_PREDICATE.apply(e2))))) {
+        setHasAlwaysTrueHint(true);
+      }
+    }
   }
 
   /**
@@ -94,7 +103,7 @@ public class CompoundPredicate extends Predicate {
 
   @Override
   public String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("op", op_)
         .addValue(super.debugString())
         .toString();
@@ -134,6 +143,26 @@ public class CompoundPredicate extends Predicate {
     Preconditions.checkState(fn_.getReturnType().isBoolean());
     castForFunctionCall(false, analyzer.isDecimalV2());
 
+    computeSelectivity(analyzer);
+  }
+
+  protected void computeSelectivity(Analyzer analyzer) {
+    if (hasValidSelectivityHint()) {
+      // TODO: Support selectivity hint for 'AND' compound predicates.
+      if (this.getOp() == Operator.AND) {
+        // 'AND' compound predicates will be replaced by children in Expr#getConjuncts,
+        // so selectivity hint will be missing, we add a warning here.
+        analyzer.addWarning("Selectivity hints are ignored for 'AND' compound "
+            + "predicates, either in the SQL query or internally generated.");
+      } else {
+        return;
+      }
+    }
+    computeSelectivity();
+  }
+
+  @Deprecated
+  protected void computeSelectivity() {
     if (!getChild(0).hasSelectivity() ||
         (children_.size() == 2 && !getChild(1).hasSelectivity())) {
       // Give up if one of our children has an unknown selectivity.

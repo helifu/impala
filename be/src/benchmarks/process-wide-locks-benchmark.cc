@@ -38,6 +38,7 @@
 #include "util/stopwatch.h"
 #include "util/thread.h"
 #include "util/uid-util.h"
+#include "util/unique-id-hash.h"
 
 #include "common/init.h"
 #include "common/names.h"
@@ -45,7 +46,7 @@
 /// This tests the performance of the following process wide locks:
 //
 /// 1. qs_map_lock_ (Sharded)
-/// TODO: client_request_state_map_lock_ (Sharded)
+/// TODO: query_driver_map_lock_ (Sharded)
 //
 /// A reasonable amount of queries are created and accessed multiple times via the
 /// QueryExecMgr's APIs to benchmark the time taken to acquire the lock and retrieve

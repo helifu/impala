@@ -25,7 +25,6 @@
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -46,7 +45,6 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
-using std::bind;
 using std::shared_ptr;
 using std::string;
 using std::thread;
@@ -126,15 +124,10 @@ class RpcBench : public RpcTestBase {
     LOG(INFO) << "User CPU per req: " << user_cpu_micros_per_req << "us";
     LOG(INFO) << "Sys CPU per req:  " << sys_cpu_micros_per_req << "us";
     LOG(INFO) << "Ctx Sw. per req:  " << csw_per_req;
-    LOG(INFO) << "Server Reactor load (mean):     "
-              << reactor_load.MeanValue() << "%";
-    LOG(INFO) << "Server Reactor load (95p):      "
-              << reactor_load.ValueAtPercentile(95) << "%";
-    LOG(INFO) << "Server Reactor Latency (mean):  "
-              << reactor_latency.MeanValue() << "us";
-    LOG(INFO) << "Server Reactor Latency (95p):   "
-              << reactor_latency.ValueAtPercentile(95) << "us";
-
+    LOG(INFO) << "Server reactor load histogram";
+    reactor_load.DumpHumanReadable(&LOG(INFO));
+    LOG(INFO) << "Server reactor latency histogram";
+    reactor_latency.DumpHumanReadable(&LOG(INFO));
   }
 
  protected:
@@ -237,7 +230,7 @@ class ClientAsyncWorkload {
     proxy_->AddAsync(req_,
                      &resp_,
                      &controller_,
-                     bind(&ClientAsyncWorkload::CallOneRpc, this));
+                     [this]() { this->CallOneRpc(); });
   }
 
   void Start() {

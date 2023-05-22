@@ -28,10 +28,13 @@ import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.util.FunctionUtils;
+import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Assume;
+import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 import org.slf4j.Logger;
@@ -62,6 +65,19 @@ public class AnalyzerTest extends FrontendTestBase {
     typeToLiteralValue_.put(Type.DATE, "cast('2012-12-21' as date)");
     typeToLiteralValue_.put(Type.STRING, "'Hello, World!'");
     typeToLiteralValue_.put(Type.NULL, "NULL");
+  }
+
+  @Before
+  public void setUpTest() throws Exception {
+    // Reset the RuntimeEnv - individual tests may change it.
+    RuntimeEnv.INSTANCE.reset();
+    RuntimeEnv.INSTANCE.setTestEnv(true);
+  }
+
+  @AfterClass
+  public static void cleanUpClass() throws Exception {
+    // Reset the RuntimeEnv - individual tests may have changed it.
+    RuntimeEnv.INSTANCE.reset();
   }
 
   /**
@@ -101,12 +117,10 @@ public class AnalyzerTest extends FrontendTestBase {
 
   @Test
   public void TestCompressedText() throws AnalysisException {
-    AnalyzesOk("SELECT count(*) FROM functional_text_lzo.tinyinttable");
-    // TODO: Disabling the text/{gzip,bzip,snap} analysis test until the corresponding
-    //       databases are loaded.
-    // AnalyzesOk("SELECT count(*) FROM functional_text_gzip.tinyinttable");
-    // AnalyzesOk("SELECT count(*) FROM functional_text_snap.tinyinttable");
-    // AnalyzesOk("SELECT count(*) FROM functional_text_bzip.tinyinttable");
+    AnalyzesOk("SELECT count(*) FROM functional_text_bzip.tinyinttable");
+    AnalyzesOk("SELECT count(*) FROM functional_text_def.tinyinttable");
+    AnalyzesOk("SELECT count(*) FROM functional_text_gzip.tinyinttable");
+    AnalyzesOk("SELECT count(*) FROM functional_text_snap.tinyinttable");
   }
 
   @Test
@@ -244,7 +258,8 @@ public class AnalyzerTest extends FrontendTestBase {
 
   private void checkLayoutParams(String colAlias, int byteSize, int byteOffset,
       int nullIndicatorByte, int nullIndicatorBit, Analyzer analyzer) {
-    SlotDescriptor d = analyzer.getSlotDescriptor(colAlias);
+    List<String> colAliasRawPath = Arrays.asList(colAlias.split("\\."));
+    SlotDescriptor d = analyzer.getSlotDescriptor(colAliasRawPath);
     checkLayoutParams(d, byteSize, byteOffset, nullIndicatorByte, nullIndicatorBit);
   }
 
@@ -260,7 +275,7 @@ public class AnalyzerTest extends FrontendTestBase {
    * 1. Complex types, e.g., map
    *    For tables with such types we prevent loading the table metadata.
    * 2. Primitive types
-   *    For tables with unsupported primitive types (e.g., binary)
+   *    For tables with unsupported primitive types (e.g. datetime)
    *    we can run queries as long as the unsupported columns are not referenced.
    *    We fail analysis if a query references an unsupported primitive column.
    * 3. Partition-column types
@@ -268,33 +283,32 @@ public class AnalyzerTest extends FrontendTestBase {
    */
   @Test
   public void TestUnsupportedTypes() {
-    // Select supported types from a table with mixed supported/unsupported types.
-    AnalyzesOk("select int_col, date_col, str_col, bigint_col " +
-        "from functional.unsupported_types");
+    // With DATE and BINARY support Impala can now handle the same scalar types as Hive.
+    // There is still some gap in supported types for partition columns.
 
-    // Unsupported type binary.
-    AnalysisError("select bin_col from functional.unsupported_types",
-        "Unsupported type 'BINARY' in 'bin_col'.");
-    // Unsupported type binary in a star expansion.
-    AnalysisError("select * from functional.unsupported_types",
-        "Unsupported type 'BINARY' in 'functional.unsupported_types.bin_col'.");
-    // Mixed supported/unsupported types.
-    AnalysisError("select int_col, str_col, bin_col " +
-        "from functional.unsupported_types",
-        "Unsupported type 'BINARY' in 'bin_col'.");
-    AnalysisError("create table tmp as select * from functional.unsupported_types",
-        "Unsupported type 'BINARY' in 'functional.unsupported_types.bin_col'.");
-    // Unsupported type in the target insert table.
-    AnalysisError("insert into functional.unsupported_types " +
-        "values(null, null, null, null, null, null)",
-        "Unable to INSERT into target table (functional.unsupported_types) because " +
-        "the column 'bin_col' has an unsupported type 'BINARY'");
     // Unsupported partition-column type.
-    AnalysisError("select * from functional.unsupported_partition_types",
-        "Failed to load metadata for table: 'functional.unsupported_partition_types'");
-
+    AnalysisError("select * from functional.unsupported_timestamp_partition",
+        "Failed to load metadata for table: " +
+        "'functional.unsupported_timestamp_partition'");
+    AnalysisError("select * from functional.unsupported_binary_partition",
+        "Failed to load metadata for table: 'functional.unsupported_binary_partition'");
     // Try with hbase
     AnalyzesOk("describe functional_hbase.allcomplextypes");
+    // Returning complex types with BINARY in select list is not yet implemented
+    // (IMPALA-11491). Note that this is also problematic in Hive (HIVE-26454).
+    AnalysisError(
+        "select binary_item_col from functional_parquet.binary_in_complex_types",
+        "Binary type inside collection types is not supported (IMPALA-11491).");
+    AnalysisError(
+        "select binary_member_col from functional_parquet.binary_in_complex_types",
+        "Struct containing a BINARY type is not allowed in the select list " +
+        "(IMPALA-11491).");
+    AnalysisError(
+        "select binary_key_col from functional_parquet.binary_in_complex_types",
+        "Binary type inside collection types is not supported (IMPALA-11491).");
+    AnalysisError(
+        "select binary_value_col from functional_parquet.binary_in_complex_types",
+        "Binary type inside collection types is not supported (IMPALA-11491).");
 
     for (ScalarType t: Type.getUnsupportedTypes()) {
       // Create/Alter table.
@@ -335,6 +349,42 @@ public class AnalyzerTest extends FrontendTestBase {
           String.format("Unsupported data type: %s", t.toSql()));
 
     }
+  }
+
+  @Test
+  public void TestVirtualColumnInputFileName() {
+    // Select virtual columns.
+    AnalyzesOk("select input__file__name from functional.alltypes");
+    AnalyzesOk("select input__file__name, id from functional_parquet.alltypes");
+    AnalyzesOk("select input__file__name, * from functional_orc_def.alltypes");
+    AnalyzesOk("select input__file__name, * from " +
+        "(select input__file__name, * from functional_avro.alltypes) v");
+    AnalyzesOk(
+        "select id, input__file__name from functional_parquet.iceberg_partitioned");
+    AnalyzesOk(
+            "select input__file__name, * from functional_parquet.complextypestbl c, " +
+            "c.int_array");
+    AnalyzesOk(
+        "select c.input__file__name, c.int_array.* " +
+        "from functional_parquet.complextypestbl c, c.int_array");
+
+    // Error cases:
+    AnalysisError(
+        "select id, nested_struct.input__file__name " +
+        "from functional_parquet.complextypestbl",
+        "Could not resolve column/field reference: 'nested_struct.input__file__name'");
+    AnalysisError(
+        "select c.int_array.input__file__name, c.int_array.* " +
+        "from functional_parquet.complextypestbl c, c.int_array",
+        "Could not resolve column/field reference: 'c.int_array.input__file__name'");
+    AnalysisError(
+        "select id, nested_struct.input__file__name " +
+        "from functional_parquet.complextypestbl",
+        "Could not resolve column/field reference: 'nested_struct.input__file__name'");
+    AnalysisError("select input__file__name from functional_kudu.alltypes",
+        "Could not resolve column/field reference: 'input__file__name'");
+    AnalysisError("select input__file__name from functional_hbase.alltypes",
+        "Could not resolve column/field reference: 'input__file__name'");
   }
 
   @Test
@@ -536,67 +586,58 @@ public class AnalyzerTest extends FrontendTestBase {
   @Test
   public void TestAnalyzeTransactional() {
     Assume.assumeTrue(MetastoreShim.getMajorVersion() > 2);
-    String errorMsg =
-      "Table functional_orc_def.full_transactional_table not supported. Transactional (ACID)" +
-          " tables are only supported when they are configured as insert_only.";
+    String fullAcidErrorMsg = "%s not supported on full " +
+        "transactional (ACID) table: functional_orc_def.full_transactional_table";
+    String transactionalErrorMsg = "%s not supported on " +
+        "transactional (ACID) table: %s";
+    String insertOnlyTbl = "functional.insert_only_transactional_table";
+    String fullTxnTbl = "functional_orc_def.full_transactional_table";
 
-    String insertOnlyErrorMsg = "%s not supported on " +
-      "transactional (ACID) table: functional.insert_only_transactional_table";
-
-    AnalysisError(
-        "create table test as select * from functional_orc_def.full_transactional_table",
-        errorMsg);
+    AnalyzesOk(
+        "create table test as select * from functional_orc_def.full_transactional_table");
     AnalyzesOk(
         "create table test as select * from functional.insert_only_transactional_table");
 
-    AnalysisError(
-        "create table test like functional_orc_def.full_transactional_table",
-        errorMsg);
+    AnalyzesOk("create table test like functional_orc_def.full_transactional_table");
     AnalyzesOk("create table test like functional.insert_only_transactional_table");
 
-    AnalysisError(
-        "insert into test select * from functional_orc_def.full_transactional_table",
-        errorMsg);
+    AnalyzesOk(
+        "insert into functional.testtbl " +
+        "select 1,'test',* from functional_orc_def.full_transactional_table");
     AnalyzesOk("insert into functional.testtbl select *,'test',1 " +
             "from functional.insert_only_transactional_table");
 
     AnalyzesOk("insert into functional.insert_only_transactional_table select * " +
         "from functional.insert_only_transactional_table");
 
-    AnalysisError(
-        "compute stats functional_orc_def.full_transactional_table",
-        errorMsg);
+
+    AnalyzesOk("compute stats functional_orc_def.full_transactional_table");
     AnalyzesOk("compute stats functional.insert_only_transactional_table");
 
-    AnalysisError(
-        "select * from functional_orc_def.full_transactional_table",
-        errorMsg);
+    AnalyzesOk("select * from functional_orc_def.full_transactional_table");
     AnalyzesOk("select * from functional.insert_only_transactional_table");
 
-    AnalysisError(
-        "drop table functional_orc_def.full_transactional_table",
-         errorMsg);
+    AnalyzesOk("drop table functional_orc_def.full_transactional_table");
     AnalyzesOk("drop table functional.insert_only_transactional_table");
 
-    AnalysisError(
-        "truncate table functional_orc_def.full_transactional_table",
-        errorMsg);
+    AnalysisError("truncate table functional_orc_def.full_transactional_table",
+        String.format(fullAcidErrorMsg, "TRUNCATE"));
     AnalyzesOk("truncate table functional.insert_only_transactional_table");
 
     AnalysisError(
         "alter table functional_orc_def.full_transactional_table " +
         "add columns (col2 string)",
-        errorMsg);
+        String.format(transactionalErrorMsg, "ALTER TABLE", fullTxnTbl));
     AnalysisError(
         "alter table functional.insert_only_transactional_table " +
-            "add columns (col2 string)",
-        String.format(insertOnlyErrorMsg, "ALTER TABLE"));
+        "add columns (col2 string)",
+        String.format(transactionalErrorMsg, "ALTER TABLE", insertOnlyTbl));
 
     AnalysisError(
         "drop stats functional_orc_def.full_transactional_table",
-        errorMsg);
+        String.format(transactionalErrorMsg, "DROP STATS", fullTxnTbl));
     AnalysisError("drop stats functional.insert_only_transactional_table",
-        String.format(insertOnlyErrorMsg, "DROP STATS"));
+        String.format(transactionalErrorMsg, "DROP STATS", insertOnlyTbl));
 
     AnalyzesOk("describe functional.insert_only_transactional_table");
     AnalyzesOk("describe functional_orc_def.full_transactional_table");
@@ -619,8 +660,8 @@ public class AnalyzerTest extends FrontendTestBase {
     Assume.assumeTrue(MetastoreShim.getMajorVersion() > 2);
     AnalysisError("alter table functional.materialized_view " +
         "set tblproperties ('foo'='bar')",
-      "ALTER TABLE not allowed on a " +
-      "view: functional.materialized_view");
+        "Write not supported. Table functional.materialized_view  " +
+        "access type is: READONLY");
 
     AnalysisError("insert into table functional.materialized_view " +
         "select * from functional.insert_only_transactional_table",
@@ -628,7 +669,8 @@ public class AnalyzerTest extends FrontendTestBase {
         " functional.materialized_view");
 
     AnalysisError("drop table functional.materialized_view ",
-      "DROP TABLE not allowed on a view: functional.materialized_view");
+        "Write not supported. Table functional.materialized_view  " +
+        "access type is: READONLY");
 
     AnalyzesOk("Select * from functional.materialized_view");
   }
@@ -640,7 +682,7 @@ public class AnalyzerTest extends FrontendTestBase {
   @Test
   // Test matching function signatures.
   public void TestFunctionMatching() {
-    Function[] fns = new Function[18];
+    Function[] fns = new Function[19];
     // test()
     fns[0] = createFunction(false);
 
@@ -693,6 +735,8 @@ public class AnalyzerTest extends FrontendTestBase {
     fns[16] = createFunction(true, Type.DATE);
     // test(string...)
     fns[17] = createFunction(true, Type.STRING);
+    // test(binary...)
+    fns[18] = createFunction(true, Type.BINARY);
 
     Assert.assertFalse(fns[1].compare(fns[0], Function.CompareMode.IS_SUPERTYPE_OF));
     Assert.assertTrue(fns[1].compare(fns[2], Function.CompareMode.IS_SUPERTYPE_OF));
@@ -750,6 +794,8 @@ public class AnalyzerTest extends FrontendTestBase {
     Assert.assertFalse(fns[17].compare(fns[15],
         Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
     Assert.assertFalse(fns[17].compare(fns[16],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+    Assert.assertFalse(fns[18].compare(fns[17],
         Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
 
     for (int i = 0; i < fns.length; ++i) {
@@ -886,6 +932,7 @@ public class AnalyzerTest extends FrontendTestBase {
     AnalyzesOk("show column stats functional.bucketed_table");
     AnalyzesOk("create table test as select * from functional.bucketed_table");
     AnalyzesOk("compute stats functional.bucketed_table");
+    AnalyzesOk("drop table functional.bucketed_table");
 
     String errorMsgBucketed = "functional.bucketed_table " +
         "is a bucketed table. Only read operations are supported on such tables.";
@@ -913,7 +960,6 @@ public class AnalyzerTest extends FrontendTestBase {
     AnalysisError("insert into functional.bucketed_table select * from " +
        "functional.bucketed_table", errorMsgBucketed);
     AnalysisError("create table test like functional.bucketed_table", errorMsgBucketed);
-    AnalysisError("drop table functional.bucketed_table", errorMsgBucketed);
     AnalysisError("truncate table functional.bucketed_table", errorMsgBucketed);
     AnalysisError("alter table functional.bucketed_table add columns(col3 int)",
         errorMsgBucketed);

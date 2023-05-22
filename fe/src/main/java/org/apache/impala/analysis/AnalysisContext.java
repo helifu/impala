@@ -93,6 +93,7 @@ public class AnalysisContext {
     public boolean isAlterViewStmt() { return stmt_ instanceof AlterViewStmt; }
     public boolean isComputeStatsStmt() { return stmt_ instanceof ComputeStatsStmt; }
     public boolean isQueryStmt() { return stmt_ instanceof QueryStmt; }
+    public boolean isSetOperationStmt() { return stmt_ instanceof SetOperationStmt; }
     public boolean isInsertStmt() { return stmt_ instanceof InsertStmt; }
     public boolean isDropDbStmt() { return stmt_ instanceof DropDbStmt; }
     public boolean isDropTableOrViewStmt() {
@@ -117,6 +118,9 @@ public class AnalysisContext {
     public boolean isUseStmt() { return stmt_ instanceof UseStmt; }
     public boolean isSetStmt() { return stmt_ instanceof SetStmt; }
     public boolean isShowTablesStmt() { return stmt_ instanceof ShowTablesStmt; }
+    public boolean isDescribeHistoryStmt() {
+      return stmt_ instanceof DescribeHistoryStmt;
+    }
     public boolean isShowDbsStmt() { return stmt_ instanceof ShowDbsStmt; }
     public boolean isShowDataSrcsStmt() { return stmt_ instanceof ShowDataSrcsStmt; }
     public boolean isShowStatsStmt() { return stmt_ instanceof ShowStatsStmt; }
@@ -174,7 +178,8 @@ public class AnalysisContext {
       return isShowFilesStmt() || isShowTablesStmt() || isShowDbsStmt() ||
           isShowFunctionsStmt() || isShowRolesStmt() || isShowGrantPrincipalStmt() ||
           isShowCreateTableStmt() || isShowDataSrcsStmt() || isShowStatsStmt() ||
-          isDescribeTableStmt() || isDescribeDbStmt() || isShowCreateFunctionStmt();
+          isDescribeTableStmt() || isDescribeDbStmt() || isShowCreateFunctionStmt() ||
+          isDescribeHistoryStmt();
     }
 
     private boolean isGrantRevokeStmt() {
@@ -204,7 +209,7 @@ public class AnalysisContext {
      */
     public boolean isSingleColumnPrivStmt() {
       return isDescribeTableStmt() || isResetMetadataStmt() || isUseStmt()
-          || isShowTablesStmt() || isAlterTableStmt();
+          || isShowTablesStmt() || isAlterTableStmt() || isShowFunctionsStmt();
     }
 
     public AlterTableStmt getAlterTableStmt() {
@@ -336,6 +341,11 @@ public class AnalysisContext {
       return (ShowFilesStmt) stmt_;
     }
 
+    public DescribeHistoryStmt getDescribeHistoryStmt() {
+      Preconditions.checkState(isDescribeHistoryStmt());
+      return (DescribeHistoryStmt) stmt_;
+    }
+
     public DescribeDbStmt getDescribeDbStmt() {
       Preconditions.checkState(isDescribeDbStmt());
       return (DescribeDbStmt) stmt_;
@@ -374,25 +384,62 @@ public class AnalysisContext {
     public StatementBase getStmt() { return stmt_; }
     public Analyzer getAnalyzer() { return analyzer_; }
     public Set<TAccessEvent> getAccessEvents() { return analyzer_.getAccessEvents(); }
+    public boolean canRewriteStatement() {
+      return !isCreateViewStmt() && !isAlterViewStmt() && !isShowCreateTableStmt();
+    }
     public boolean requiresSubqueryRewrite() {
-      return analyzer_.containsSubquery() && !(stmt_ instanceof CreateViewStmt)
-          && !(stmt_ instanceof AlterViewStmt) && !(stmt_ instanceof ShowCreateTableStmt);
+      return canRewriteStatement() && analyzer_.containsSubquery();
+    }
+    public boolean requiresAcidComplexScanRewrite() {
+      return canRewriteStatement() && analyzer_.hasTopLevelAcidCollectionTableRef();
+    }
+    public boolean requiresZippingUnnestRewrite() {
+      return canRewriteStatement() && isZippingUnnestInSelectList(stmt_);
     }
     public boolean requiresExprRewrite() {
       return isQueryStmt() || isInsertStmt() || isCreateTableAsSelectStmt()
           || isUpdateStmt() || isDeleteStmt();
+    }
+    public boolean requiresSetOperationRewrite() {
+      return analyzer_.containsSetOperation() && !isCreateViewStmt() && !isAlterViewStmt()
+          && !isShowCreateTableStmt();
     }
     public TLineageGraph getThriftLineageGraph() {
       return analyzer_.getThriftSerializedLineageGraph();
     }
     public void setUserHasProfileAccess(boolean value) { userHasProfileAccess_ = value; }
     public boolean userHasProfileAccess() { return userHasProfileAccess_; }
+
+    private boolean isZippingUnnestInSelectList(StatementBase stmt) {
+      if (!(stmt instanceof SelectStmt)) return false;
+      if (!stmt.analyzer_.getTableRefsFromUnnestExpr().isEmpty()) return true;
+      SelectStmt selectStmt = (SelectStmt)stmt;
+      for (TableRef tblRef : selectStmt.fromClause_.getTableRefs()) {
+        if (tblRef instanceof InlineViewRef &&
+            isZippingUnnestInSelectList(((InlineViewRef)tblRef).getViewStmt())) {
+          return true;
+        }
+      }
+      return false;
+    }
   }
 
   public Analyzer createAnalyzer(StmtTableCache stmtTableCache) {
-    Analyzer result = new Analyzer(stmtTableCache, queryCtx_, authzFactory_);
+    return createAnalyzer(stmtTableCache, null);
+  }
+
+  public Analyzer createAnalyzer(StmtTableCache stmtTableCache,
+      AuthorizationContext authzCtx) {
+    Analyzer result = new Analyzer(stmtTableCache, queryCtx_, authzFactory_, authzCtx);
     result.setUseHiveColLabels(useHiveColLabels_);
     return result;
+  }
+
+  public AnalysisResult analyzeAndAuthorize(StatementBase stmt,
+      StmtTableCache stmtTableCache, AuthorizationChecker authzChecker)
+      throws ImpalaException {
+    return analyzeAndAuthorize(
+        stmt, stmtTableCache, authzChecker, false /*disableAuthorization*/);
   }
 
   /**
@@ -402,8 +449,8 @@ public class AnalysisContext {
    * reveal the existence/absence of objects the user is not authorized to see.
    */
   public AnalysisResult analyzeAndAuthorize(StatementBase stmt,
-      StmtTableCache stmtTableCache, AuthorizationChecker authzChecker)
-      throws ImpalaException {
+      StmtTableCache stmtTableCache, AuthorizationChecker authzChecker,
+      boolean disableAuthorization) throws ImpalaException {
     // TODO: Clean up the creation/setting of the analysis result.
     analysisResult_ = new AnalysisResult();
     analysisResult_.stmt_ = stmt;
@@ -411,29 +458,46 @@ public class AnalysisContext {
 
     // Analyze statement and record exception.
     AnalysisException analysisException = null;
+    TClientRequest clientRequest = queryCtx_.getClient_request();
+    AuthorizationContext authzCtx = authzChecker.createAuthorizationContext(true,
+        clientRequest.isSetRedacted_stmt() ?
+            clientRequest.getRedacted_stmt() : clientRequest.getStmt(),
+        queryCtx_.getSession(), Optional.of(timeline_));
+    Preconditions.checkState(authzCtx != null);
     try {
-      analyze(stmtTableCache);
+      analyze(stmtTableCache, authzCtx);
     } catch (AnalysisException e) {
       analysisException = e;
+    } finally {
+      authzChecker.postAnalyze(authzCtx);
     }
-    timeline_.markEvent("Analysis finished");
+    // A statement that returns at most one row does not need to spool query results.
+    if (analysisException == null && analysisResult_.stmt_ instanceof SelectStmt &&
+        ((SelectStmt)analysisResult_.stmt_).returnsAtMostOneRow()) {
+      clientRequest.query_options.setSpool_query_results(false);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Result spooling is disabled due to the statement returning at most "
+            + "one row.");
+      }
+    }
+    long durationMs = timeline_.markEvent("Analysis finished") / 1000000;
+    LOG.info("Analysis took {} ms", durationMs);
 
     // Authorize statement and record exception. Authorization relies on information
     // collected during analysis.
     AuthorizationException authException = null;
-    AuthorizationContext authzCtx = null;
-    try {
-      TClientRequest clientRequest = queryCtx_.getClient_request();
-      authzCtx = authzChecker.createAuthorizationContext(true,
-          clientRequest.isSetRedacted_stmt() ?
-              clientRequest.getRedacted_stmt() : clientRequest.getStmt(),
-          queryCtx_.getSession(), Optional.of(timeline_));
-      authzChecker.authorize(authzCtx, analysisResult_, catalog_);
-    } catch (AuthorizationException e) {
-      authException = e;
-    } finally {
-      if (authzCtx != null) {
-        authzChecker.postAuthorize(authzCtx);
+    if (!disableAuthorization) {
+      try {
+        if (analysisResult_.getAnalyzer().encounteredMVAuthException()) {
+          throw new AuthorizationException(
+            analysisResult_.getAnalyzer().getMVAuthExceptionMsg());
+        }
+        authzChecker.authorize(authzCtx, analysisResult_, catalog_);
+      } catch (AuthorizationException e) {
+        authException = e;
+      } finally {
+        authzChecker.postAuthorize(authzCtx, authException == null,
+            analysisException == null);
       }
     }
 
@@ -449,10 +513,11 @@ public class AnalysisContext {
    * given loaded tables. Performs expr and subquery rewrites which require re-analyzing
    * the transformed statement.
    */
-  private void analyze(StmtTableCache stmtTableCache) throws AnalysisException {
+  private void analyze(StmtTableCache stmtTableCache, AuthorizationContext authzCtx)
+      throws AnalysisException {
     Preconditions.checkNotNull(analysisResult_);
     Preconditions.checkNotNull(analysisResult_.stmt_);
-    analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
+    analysisResult_.analyzer_ = createAnalyzer(stmtTableCache, authzCtx);
     analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
     // Enforce the statement expression limit at the end of analysis so that there is an
     // accurate count of the total number of expressions. The first analyze() call is not
@@ -462,26 +527,12 @@ public class AnalysisContext {
     // expensive with large expression trees. For example, a SQL that takes a few seconds
     // to analyze the first time may take 10 minutes for rewrites.
     analysisResult_.analyzer_.checkStmtExprLimit();
-    boolean isExplain = analysisResult_.isExplainStmt();
 
-    // Apply expr and subquery rewrites.
-    boolean reAnalyze = false;
-    ExprRewriter rewriter = analysisResult_.analyzer_.getExprRewriter();
-    if (analysisResult_.requiresExprRewrite()) {
-      rewriter.reset();
-      analysisResult_.stmt_.rewriteExprs(rewriter);
-      reAnalyze = rewriter.changed();
-    }
-    if (analysisResult_.requiresSubqueryRewrite()) {
-      new StmtRewriter.SubqueryRewriter().rewrite(analysisResult_);
-      reAnalyze = true;
-    }
-    if (!reAnalyze) return;
-
-    // The rewrites should have no user-visible effect. Remember the original result
-    // types and column labels to restore them after the rewritten stmt has been
-    // reset() and re-analyzed. For a CTAS statement, the types represent column types
-    // of the table that will be created, including the partition columns, if any.
+    // The rewrites should have no user-visible effect on query results, including types
+    // and labels. Remember the original result types and column labels to restore them
+    // after the rewritten stmt has been reset() and re-analyzed. For a CTAS statement,
+    // the types represent column types of the table that will be created, including the
+    // partition columns, if any.
     List<Type> origResultTypes = new ArrayList<>();
     for (Expr e : analysisResult_.stmt_.getResultExprs()) {
       origResultTypes.add(e.getType());
@@ -489,6 +540,68 @@ public class AnalysisContext {
     List<String> origColLabels =
         Lists.newArrayList(analysisResult_.stmt_.getColLabels());
 
+    // Apply column/row masking, expr, setop, and subquery rewrites.
+    boolean shouldReAnalyze = false;
+    if (authzFactory_.getAuthorizationConfig().isEnabled()) {
+      shouldReAnalyze = analysisResult_.stmt_.resolveTableMask(analysisResult_.analyzer_);
+      // If any catalog table/view is replaced by table masking views, we need to
+      // resolve them. Also re-analyze the SlotRefs to reference the output exprs of
+      // the table masking views.
+      if (shouldReAnalyze) {
+        // To be consistent with Hive, privilege requests introduced by the masking views
+        // should also be collected (IMPALA-10728).
+        reAnalyze(stmtTableCache, authzCtx, origResultTypes, origColLabels,
+            /*collectPrivileges*/ true);
+      }
+      shouldReAnalyze = false;
+    }
+    ExprRewriter rewriter = analysisResult_.analyzer_.getExprRewriter();
+    if (analysisResult_.requiresExprRewrite()) {
+      rewriter.reset();
+      analysisResult_.stmt_.rewriteExprs(rewriter);
+      shouldReAnalyze = rewriter.changed();
+    }
+    if (analysisResult_.requiresSubqueryRewrite()) {
+      new StmtRewriter.SubqueryRewriter().rewrite(analysisResult_);
+      shouldReAnalyze = true;
+    }
+    if (analysisResult_.requiresSetOperationRewrite()) {
+      new StmtRewriter().rewrite(analysisResult_);
+      shouldReAnalyze = true;
+    }
+    if (analysisResult_.requiresAcidComplexScanRewrite()) {
+      new StmtRewriter.AcidRewriter().rewrite(analysisResult_);
+      shouldReAnalyze = true;
+    }
+    if (analysisResult_.requiresZippingUnnestRewrite()) {
+      new StmtRewriter.ZippingUnnestRewriter().rewrite(analysisResult_);
+      shouldReAnalyze = true;
+    }
+    if (!shouldReAnalyze) return;
+
+    // For SetOperationStmt we must replace the query statement with the rewritten version
+    // before re-analysis and set the explain flag of the rewritten version if the
+    // original is explain statement.
+    if (analysisResult_.requiresSetOperationRewrite()) {
+      if (analysisResult_.isSetOperationStmt()) {
+        if (((SetOperationStmt) analysisResult_.getStmt()).hasRewrittenStmt()) {
+          boolean isExplain = analysisResult_.isExplainStmt();
+          analysisResult_.stmt_ =
+            ((SetOperationStmt) analysisResult_.getStmt()).getRewrittenStmt();
+          if (isExplain) analysisResult_.stmt_.setIsExplain();
+        }
+      }
+    }
+
+    reAnalyze(stmtTableCache, authzCtx, origResultTypes, origColLabels,
+        /*collectPrivileges*/ false);
+    Preconditions.checkState(!analysisResult_.requiresSubqueryRewrite());
+  }
+
+  private void reAnalyze(StmtTableCache stmtTableCache, AuthorizationContext authzCtx,
+      List<Type> origResultTypes, List<String> origColLabels, boolean collectPrivileges)
+      throws AnalysisException {
+    boolean isExplain = analysisResult_.isExplainStmt();
     // Some expressions, such as function calls with constant arguments, can get
     // folded into literals. Since literals do not require privilege requests, we
     // must save the original privileges in order to not lose them during
@@ -497,34 +610,30 @@ public class AnalysisContext {
         analysisResult_.analyzer_.getPrivilegeReqs();
 
     // Re-analyze the stmt with a new analyzer.
-    analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
-    // We restore the privileges collected in the first pass below. So, no point in
-    // collecting them again.
-    analysisResult_.analyzer_.setEnablePrivChecks(false);
+    analysisResult_.analyzer_ = createAnalyzer(stmtTableCache, authzCtx);
+    // Restore privilege requests found during the previous pass
+    for (PrivilegeRequest req : origPrivReqs) {
+      analysisResult_.analyzer_.registerPrivReq(req);
+    }
+    // Only collect privilege requests in need.
+    analysisResult_.analyzer_.setEnablePrivChecks(collectPrivileges);
     analysisResult_.stmt_.reset();
     try {
       analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
-      analysisResult_.analyzer_.setEnablePrivChecks(true); // restore
+      analysisResult_.analyzer_.setEnablePrivChecks(true); // Always restore
     } catch (AnalysisException e) {
       LOG.error(String.format("Error analyzing the rewritten query.\n" +
           "Original SQL: %s\nRewritten SQL: %s", analysisResult_.stmt_.toSql(),
-          analysisResult_.stmt_.toSql(REWRITTEN)));
+          analysisResult_.stmt_.toSql(REWRITTEN)), e);
       throw e;
     }
-
     // Restore the original result types and column labels.
     analysisResult_.stmt_.castResultExprs(origResultTypes);
     analysisResult_.stmt_.setColLabels(origColLabels);
     if (LOG.isTraceEnabled()) {
       LOG.trace("Rewritten SQL: " + analysisResult_.stmt_.toSql(REWRITTEN));
     }
-
-    // Restore privilege requests found during the first pass
-    for (PrivilegeRequest req : origPrivReqs) {
-      analysisResult_.analyzer_.registerPrivReq(req);
-    }
     if (isExplain) analysisResult_.stmt_.setIsExplain();
-    Preconditions.checkState(!analysisResult_.requiresSubqueryRewrite());
   }
 
   public Analyzer getAnalyzer() { return analysisResult_.getAnalyzer(); }

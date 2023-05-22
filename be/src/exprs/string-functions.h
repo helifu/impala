@@ -58,6 +58,10 @@ class StringFunctions {
       const BigIntVal& len);
   static StringVal Substring(FunctionContext*, const StringVal& str,
       const BigIntVal& pos);
+  static StringVal Utf8Substring(FunctionContext*, const StringVal& str,
+      const BigIntVal& pos, const BigIntVal& len);
+  static StringVal Utf8Substring(FunctionContext*, const StringVal& str,
+      const BigIntVal& pos);
   static StringVal SplitPart(FunctionContext* context, const StringVal& str,
       const StringVal& delim, const BigIntVal& field);
   static StringVal Left(FunctionContext*, const StringVal& str, const BigIntVal& len);
@@ -68,16 +72,25 @@ class StringFunctions {
       const StringVal& pad);
   static StringVal Rpad(FunctionContext*, const StringVal& str, const BigIntVal&,
       const StringVal& pad);
+  static IntVal Bytes(FunctionContext*, const StringVal& str);
   static IntVal Length(FunctionContext*, const StringVal& str);
   static IntVal CharLength(FunctionContext*, const StringVal& str);
+  static IntVal Utf8Length(FunctionContext*, const StringVal& str);
   static StringVal Lower(FunctionContext*, const StringVal& str);
+  static StringVal LowerAscii(FunctionContext*, const StringVal& str);
+  static StringVal LowerUtf8(FunctionContext*, const StringVal& str);
   static StringVal Upper(FunctionContext*, const StringVal& str);
+  static StringVal UpperAscii(FunctionContext*, const StringVal& str);
+  static StringVal UpperUtf8(FunctionContext*, const StringVal& str);
   static StringVal InitCap(FunctionContext*, const StringVal& str);
+  static StringVal InitCapAscii(FunctionContext*, const StringVal& str);
+  static StringVal InitCapUtf8(FunctionContext*, const StringVal& str);
   static void ReplacePrepare(FunctionContext*, FunctionContext::FunctionStateScope);
   static void ReplaceClose(FunctionContext*, FunctionContext::FunctionStateScope);
   static StringVal Replace(FunctionContext*, const StringVal& str,
       const StringVal& pattern, const StringVal& replace);
   static StringVal Reverse(FunctionContext*, const StringVal& str);
+  static StringVal Utf8Reverse(FunctionContext*, const StringVal& str);
   static StringVal Translate(FunctionContext*, const StringVal& str, const StringVal& src,
       const StringVal& dst);
   static StringVal Trim(FunctionContext*, const StringVal& str);
@@ -115,6 +128,7 @@ class StringFunctions {
 
   static bool SetRE2Options(const StringVal& match_parameter, std::string* error_str,
       re2::RE2::Options* opts);
+  static void SetRE2MemOpt(re2::RE2::Options* opts);
   static void RegexpPrepare(FunctionContext*, FunctionContext::FunctionStateScope);
   static void RegexpClose(FunctionContext*, FunctionContext::FunctionStateScope);
   static StringVal RegexpEscape(FunctionContext*, const StringVal& str);
@@ -141,6 +155,8 @@ class StringFunctions {
   static StringVal ParseUrlKey(FunctionContext*, const StringVal& url,
       const StringVal& key, const StringVal& part);
   static void ParseUrlClose(FunctionContext*, FunctionContext::FunctionStateScope);
+
+  static void SetRE2MemLimit(int64_t re2_mem_limit);
 
   /// Converts ASCII 'val' to corresponding character.
   static StringVal Chr(FunctionContext* context, const IntVal& val);
@@ -188,6 +204,7 @@ class StringFunctions {
       const DoubleVal& boost_threshold);
 
  private:
+  static uint64_t re2_mem_limit_;
   /// Templatized implementation of the actual string trimming function.
   /// The first parameter, 'D', is one of StringFunctions::TrimPosition values.
   /// The second parameter, 'IS_IMPLICIT_WHITESPACE', is true when the set of characters

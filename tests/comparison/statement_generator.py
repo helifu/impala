@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from copy import deepcopy
 
 from tests.comparison.common import Table
@@ -113,7 +115,7 @@ class InsertStatementGenerator(object):
     null.
     """
     values_rows = []
-    for _ in xrange(self.profile.choose_insert_values_row_count()):
+    for _ in range(self.profile.choose_insert_values_row_count()):
       values_row = []
       for col in columns:
         if col.is_primary_key:

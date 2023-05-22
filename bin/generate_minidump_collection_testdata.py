@@ -27,6 +27,8 @@
 # create the files in the interval [now - duration, now]. Minidumps are simulated by
 # making the files easily compressible by having some repeated data.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import errno
 import os
 import random
@@ -49,7 +51,6 @@ options, args = parser.parse_args()
 
 CONFIG_FILE = '''-beeswax_port=21000
 -fe_port=21000
--be_port=22000
 -hs2_port=21050
 -enable_webserver=true
 -mem_limit=108232130560
@@ -99,7 +100,7 @@ def random_bytes(num):
 def write_minidump(common_data, timestamp, target_dir):
   '''Generate and write the minidump into the target_dir. atime and mtime of the minidump
   will be set to timestamp.'''
-  file_name = ''.join(random.choice('abcdefghijklmnopqrstuvwxyz') for _ in xrange(10))
+  file_name = ''.join(random.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(10))
   with open(os.path.join(target_dir, file_name), 'wb') as f:
     # We want the minidump to be pretty similar to each other. The number 8192 was chosen
     # arbitratily and seemed like a reasonable guess.
@@ -130,7 +131,7 @@ def generate_minidumps():
       interval = 0
     else:
       interval = (end_timestamp - start_timestamp) // (options.num_minidumps - 1)
-    for i in xrange(options.num_minidumps):
+    for i in range(options.num_minidumps):
       write_minidump(common_data,
           start_timestamp + interval * i,
           os.path.join(minidump_dir, role_name))

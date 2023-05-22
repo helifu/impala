@@ -15,14 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-
-cmake_minimum_required(VERSION 2.6)
-
 add_custom_target(proto-deps)
 
 set(PROTOBUF_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/be/generated-sources/gen-cpp/)
 
-foreach(pb_src common row_batch)
+foreach(pb_src common row_batch planner)
    string(TOUPPER ${pb_src} _PB_SRC_UPPER)
    set(_PROTO_SRCS ${_PB_SRC_UPPER}_PROTO_SRCS)
    set(_PROTO_HDRS ${_PB_SRC_UPPER}_PROTO_HDRS)
@@ -38,7 +35,8 @@ foreach(pb_src common row_batch)
    set(${_PROTO_SRCS} ${${_PROTO_SRCS}} PARENT_SCOPE)
 endforeach()
 
-foreach(pb_src data_stream_service control_service rpc_test)
+foreach(pb_src data_stream_service control_service rpc_test statestore_service
+      admission_control_service)
    string(TOUPPER ${pb_src} _PB_SRC_UPPER)
    set(_PROTO_SRCS ${_PB_SRC_UPPER}_PROTO_SRCS)
    set(_PROTO_HDRS ${_PB_SRC_UPPER}_PROTO_HDRS)

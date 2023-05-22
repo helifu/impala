@@ -15,21 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_RUNTIME_RUNTIME_FILTER_H
-#define IMPALA_RUNTIME_RUNTIME_FILTER_H
+#include <mutex>
 
-#include <boost/thread/mutex.hpp>
-
+#include "gen-cpp/ExternalDataSource_types.h"
 #include "runtime/raw-value.h"
 #include "runtime/runtime-filter-bank.h"
 #include "util/bloom-filter.h"
+#include "util/in-list-filter.h"
 #include "util/condition-variable.h"
 #include "util/time.h"
 
 namespace impala {
 
 class BloomFilter;
+class RuntimeFilterTest;
 
 /// RuntimeFilters represent set-membership predicates that are computed during query
 /// execution (rather than during planning). They can then be sent to other operators to
@@ -45,8 +46,8 @@ class BloomFilter;
 class RuntimeFilter {
  public:
   RuntimeFilter(const TRuntimeFilterDesc& filter, int64_t filter_size)
-      : bloom_filter_(nullptr), min_max_filter_(nullptr), filter_desc_(filter),
-        registration_time_(MonotonicMillis()), arrival_time_(0L),
+      : bloom_filter_(nullptr), min_max_filter_(nullptr), in_list_filter_(nullptr),
+        filter_desc_(filter), registration_time_(MonotonicMillis()), arrival_time_(0L),
         filter_size_(filter_size) {
     DCHECK(filter_desc_.type == TRuntimeFilterType::MIN_MAX || filter_size_ > 0);
   }
@@ -64,12 +65,34 @@ class RuntimeFilter {
   bool is_min_max_filter() const {
     return filter_desc().type == TRuntimeFilterType::MIN_MAX;
   }
+  bool is_in_list_filter() const {
+    return filter_desc().type == TRuntimeFilterType::IN_LIST;
+  }
 
+  extdatasource::TComparisonOp::type getCompareOp() const {
+    return filter_desc().compareOp;
+  }
+
+  BloomFilter* get_bloom_filter() const { return bloom_filter_.Load(); }
   MinMaxFilter* get_min_max() const { return min_max_filter_.Load(); }
+  InListFilter* get_in_list_filter() const { return in_list_filter_.Load(); }
 
-  /// Sets the internal filter bloom_filter to 'bloom_filter'. Can only legally be called
+  /// Sets the internal filter to 'bloom_filter', 'min_max_filter' or 'in_list_filter'
+  /// depending on the type of this RuntimeFilter. Can only legally be called
   /// once per filter. Does not acquire the memory associated with 'bloom_filter'.
-  void SetFilter(BloomFilter* bloom_filter, MinMaxFilter* min_max_filter);
+  void SetFilter(BloomFilter* bloom_filter, MinMaxFilter* min_max_filter,
+      InListFilter* in_list_filter);
+
+  /// Set the internal bloom or min-max filter to the equivalent filter from 'other'.
+  /// The parameters of 'other' must be compatible and the filters must have the same
+  /// ID. Can only legally be called once per filter. Does not acquire the memory from
+  /// the other filter.
+  void SetFilter(RuntimeFilter* other);
+
+  /// Merge 'bloom_filter' or 'min_max_filter' into this filter. The caller must provide
+  /// the appropriate kind of filter for this RuntimeFilter instance.
+  /// Not thread-safe.
+  void Or(RuntimeFilter* other);
 
   /// Signal that no filter should be arriving, waking up any threads blocked in
   /// WaitForArrival().
@@ -100,6 +123,16 @@ class RuntimeFilter {
   inline bool AlwaysTrue() const;
   inline bool AlwaysFalse() const;
 
+  bool IsBoundByPartitionColumn(int plan_id) const {
+    int target_ndx = filter_desc().planid_to_target_ndx.at(plan_id);
+    return filter_desc().targets[target_ndx].is_bound_by_partition_columns;
+  }
+
+  bool IsColumnInDataFile(int plan_id) const {
+    int target_ndx = filter_desc().planid_to_target_ndx.at(plan_id);
+    return filter_desc().targets[target_ndx].is_column_in_data_file;
+  }
+
   /// Frequency with which to check for filter arrival in WaitForArrival()
   static const int SLEEP_PERIOD_MS;
 
@@ -107,6 +140,8 @@ class RuntimeFilter {
   static const char* LLVM_CLASS_NAME;
 
  private:
+  friend class RuntimeFilterTest;
+
   /// Membership bloom_filter. May be NULL even after arrival_time_ is set, meaning that
   /// it does not filter any rows, either because it was not created
   /// (filter_desc_.bloom_filter is false), there was not enough memory, or the false
@@ -115,6 +150,9 @@ class RuntimeFilter {
 
   /// May be NULL even after arrival_time_ is set if filter_desc_.min_max_filter is false.
   AtomicPtr<MinMaxFilter> min_max_filter_;
+
+  /// May be NULL even after arrival_time_ is set if filter_desc_.in_list_filter is false.
+  AtomicPtr<InListFilter> in_list_filter_;
 
   /// Reference to the filter's thrift descriptor in the thrift Plan tree.
   const TRuntimeFilterDesc& filter_desc_;
@@ -133,13 +171,14 @@ class RuntimeFilter {
   const int64_t filter_size_;
 
   /// Lock to protect 'arrival_cv_'
-  mutable boost::mutex arrival_mutex_;
+  mutable std::mutex arrival_mutex_;
 
   /// Signalled when a filter arrives or the filter is cancelled. Paired with
   /// 'arrival_mutex_'
   mutable ConditionVariable arrival_cv_;
+
+  /// Injection delay for WaitForArrival. Used in testing only.
+  /// See IMPALA-9612.
+  int64_t injection_delay_ = 0;
 };
-
 }
-
-#endif

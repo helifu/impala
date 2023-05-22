@@ -18,12 +18,10 @@
 #include "runtime/krpc-data-stream-recvr.h"
 
 #include <condition_variable>
+#include <mutex>
 #include <queue>
 
-#include <boost/thread/locks.hpp>
-#include <boost/thread/mutex.hpp>
-
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/trace.h"
@@ -641,14 +639,16 @@ void KrpcDataStreamRecvr::SenderQueue::Close() {
   current_batch_.reset();
 }
 
-Status KrpcDataStreamRecvr::CreateMerger(const TupleRowComparator& less_than) {
+Status KrpcDataStreamRecvr::CreateMerger(const TupleRowComparator& less_than,
+    const CodegenFnPtr<SortedRunMerger::HeapifyHelperFn>& codegend_heapify_helper_fn) {
   DCHECK(is_merging_);
   DCHECK(TestInfo::is_test() || FragmentInstanceState::IsFragmentExecThread());
   vector<SortedRunMerger::RunBatchSupplierFn> input_batch_suppliers;
   input_batch_suppliers.reserve(sender_queues_.size());
 
   // Create the merger that will a single stream of sorted rows.
-  merger_.reset(new SortedRunMerger(less_than, row_desc_, profile_, false));
+  merger_.reset(new SortedRunMerger(less_than, row_desc_, profile_, false,
+      codegend_heapify_helper_fn));
 
   for (SenderQueue* queue: sender_queues_) {
     input_batch_suppliers.push_back(
@@ -673,9 +673,8 @@ void KrpcDataStreamRecvr::TransferAllResources(RowBatch* transfer_batch) {
 KrpcDataStreamRecvr::KrpcDataStreamRecvr(KrpcDataStreamMgr* stream_mgr,
     MemTracker* parent_tracker, const RowDescriptor* row_desc,
     const RuntimeState& runtime_state, const TUniqueId& fragment_instance_id,
-    PlanNodeId dest_node_id, int num_senders, bool is_merging,
-    int64_t total_buffer_limit, RuntimeProfile* profile,
-    BufferPool::ClientHandle* client)
+    PlanNodeId dest_node_id, int num_senders, bool is_merging, int64_t total_buffer_limit,
+    RuntimeProfile* profile, BufferPool::ClientHandle* client)
   : mgr_(stream_mgr),
     runtime_state_(runtime_state),
     fragment_instance_id_(fragment_instance_id),
@@ -689,8 +688,8 @@ KrpcDataStreamRecvr::KrpcDataStreamRecvr(KrpcDataStreamMgr* stream_mgr,
     parent_tracker_(parent_tracker),
     buffer_pool_client_(client),
     profile_(profile),
-    dequeue_profile_(RuntimeProfile::Create(&pool_, "Dequeue")),
-    enqueue_profile_(RuntimeProfile::Create(&pool_, "Enqueue")) {
+    dequeue_profile_(RuntimeProfile::Create(&pool_, RuntimeProfile::DEQUEUE, false)),
+    enqueue_profile_(RuntimeProfile::Create(&pool_, RuntimeProfile::ENQUEUE, false)) {
   // Create one queue per sender if is_merging is true.
   int num_queues = is_merging ? num_senders : 1;
   sender_queues_.reserve(num_queues);
@@ -751,7 +750,8 @@ Status KrpcDataStreamRecvr::GetNext(RowBatch* output_batch, bool* eos) {
 
 void KrpcDataStreamRecvr::AddBatch(const TransmitDataRequestPB* request,
     TransmitDataResponsePB* response, RpcContext* rpc_context) {
-  MonoDelta duration(MonoTime::Now().GetDeltaSince(rpc_context->GetTimeReceived()));
+  MonoDelta duration(MonoTime::Now() - rpc_context->GetTimeReceived());
+  DCHECK_GE(duration.ToNanoseconds(), 0);
   dispatch_timer_->UpdateCounter(duration.ToNanoseconds());
   int use_sender_id = is_merging_ ? request->sender_id() : 0;
   // Add all batches to the same queue if is_merging_ is false.

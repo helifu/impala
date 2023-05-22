@@ -17,9 +17,9 @@ where a.int_col1 = 10 and a.int_col2 = a.int_col1 + 1 and a.int_col3 = a.int_col
 PLAN-ROOT SINK
 |
 00:SCAN HDFS [functional.widetable_250_cols a]
-   partitions=1/1 files=1 size=28.69KB
+   HDFS partitions=1/1 files=1 size=28.69KB
    predicates: a.int_col1 = 10, a.int_col2 = 11, a.int_col3 = 55, a.int_col4 = 110
-   row-size=1.21KB cardinality=unavailable
+   row-size=1.21KB cardinality=2
 ====
 # Test multiple forward propagation
 select * from functional.widetable_250_cols a
@@ -29,9 +29,9 @@ where a.int_col1 = 10 and a.int_col2 = a.int_col1 + 1 and a.int_col3 = a.int_col
 PLAN-ROOT SINK
 |
 00:SCAN HDFS [functional.widetable_250_cols a]
-   partitions=1/1 files=1 size=28.69KB
+   HDFS partitions=1/1 files=1 size=28.69KB
    predicates: a.int_col1 = 10, a.int_col2 = 11, a.int_col3 = 55, a.int_col4 = -385
-   row-size=1.21KB cardinality=unavailable
+   row-size=1.21KB cardinality=2
 ====
 # Test multiple forward propagation
 select * from functional.widetable_250_cols a
@@ -41,9 +41,9 @@ where a.int_col1 = 10 and a.int_col2 = a.int_col1 + 1 and a.int_col2 * 5 = a.int
 PLAN-ROOT SINK
 |
 00:SCAN HDFS [functional.widetable_250_cols a]
-   partitions=1/1 files=1 size=28.69KB
+   HDFS partitions=1/1 files=1 size=28.69KB
    predicates: a.int_col1 = 10, a.int_col2 = 11, a.int_col3 = 55, a.int_col4 = -495
-   row-size=1.21KB cardinality=unavailable
+   row-size=1.21KB cardinality=2
 ====
 # Test multiple forward propagation, and a reversed propagation
 # (which fails as we can't rewrite 55 = a.int_col4 / 10)
@@ -54,9 +54,9 @@ where a.int_col1 = 10 and a.int_col2 = a.int_col1 + 1 and a.int_col3 = a.int_col
 PLAN-ROOT SINK
 |
 00:SCAN HDFS [functional.widetable_250_cols a]
-   partitions=1/1 files=1 size=28.69KB
+   HDFS partitions=1/1 files=1 size=28.69KB
    predicates: a.int_col1 = 10, a.int_col2 = 11, a.int_col3 = 55, a.int_col4 / 10 = 55
-   row-size=1.21KB cardinality=unavailable
+   row-size=1.21KB cardinality=2
 ====
 # Another impossibility (a.int_col3 = a.int_col2 * 5 = a.int_col2 * -7)
 select * from functional.widetable_250_cols a
@@ -76,7 +76,7 @@ PLAN-ROOT SINK
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  row-size=8B cardinality=0
+|  row-size=8B cardinality=1
 |
 00:EMPTYSET
 ====
@@ -89,7 +89,7 @@ PLAN-ROOT SINK
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  row-size=8B cardinality=0
+|  row-size=8B cardinality=1
 |
 00:EMPTYSET
 ====
@@ -100,7 +100,7 @@ where cast(a.int_col as string) = 'abc' and cast(int_col as string) > 'xyz'
 PLAN-ROOT SINK
 |
 00:SCAN HDFS [functional.alltypes a]
-   partitions=24/24 files=24 size=478.45KB
+   HDFS partitions=24/24 files=24 size=478.45KB
    predicates: CAST(a.int_col AS STRING) = 'abc', CAST(int_col AS STRING) > 'xyz'
    row-size=89B cardinality=231
 ====
@@ -122,11 +122,11 @@ PLAN-ROOT SINK
 |
 03:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  row-size=8B cardinality=0
+|  row-size=8B cardinality=1
 |
 02:SELECT
 |  predicates: int_col = 12, int_col > 1
-|  row-size=4B cardinality=0
+|  row-size=4B cardinality=1
 |
 01:AGGREGATE [FINALIZE]
 |  group by: int_col
@@ -134,7 +134,7 @@ PLAN-ROOT SINK
 |  row-size=4B cardinality=10
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=24/24 files=24 size=478.45KB
+   HDFS partitions=24/24 files=24 size=478.45KB
    predicates: int_col = 10
    row-size=4B cardinality=730
 ====
@@ -151,7 +151,7 @@ PLAN-ROOT SINK
 |  row-size=8B cardinality=1
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=24/24 files=24 size=478.45KB
+   HDFS partitions=24/24 files=24 size=478.45KB
    predicates: int_col = 10
    row-size=4B cardinality=730
 ====
@@ -167,7 +167,7 @@ PLAN-ROOT SINK
 |  row-size=8B cardinality=1
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=24/24 files=24 size=478.45KB
+   HDFS partitions=24/24 files=24 size=478.45KB
    row-size=0B cardinality=7.30K
 ====
 # Many redundant / duplicate predicates
@@ -222,7 +222,7 @@ PLAN-ROOT SINK
 |  row-size=8B cardinality=1
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=24/24 files=24 size=478.45KB
+   HDFS partitions=24/24 files=24 size=478.45KB
    predicates: int_col = 10
    row-size=4B cardinality=730
 ====
@@ -236,7 +236,7 @@ PLAN-ROOT SINK
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  row-size=8B cardinality=0
+|  row-size=8B cardinality=1
 |
 00:EMPTYSET
 ====
@@ -254,7 +254,7 @@ PLAN-ROOT SINK
 |  row-size=8B cardinality=1
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=24/24 files=24 size=478.45KB
+   HDFS partitions=24/24 files=24 size=478.45KB
    predicates: int_col = 10
    row-size=4B cardinality=730
 ====
@@ -272,7 +272,7 @@ PLAN-ROOT SINK
 |  row-size=8B cardinality=1
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=24/24 files=24 size=478.45KB
+   HDFS partitions=24/24 files=24 size=478.45KB
    predicates: int_col = 10, TRUE OR 10 + random() * functional.alltypes.tinyint_col = 100
    row-size=5B cardinality=231
 ====
@@ -308,10 +308,10 @@ PLAN-ROOT SINK
 |     row-size=0B cardinality=10
 |
 00:SCAN HDFS [tpch_nested_parquet.customer c]
-   partitions=1/1 files=4 size=288.99MB
+   HDFS partitions=1/1 files=4 size=289.08MB
    predicates: c.c_nationkey = 10, !empty(c.c_orders)
    predicates on o: !empty(o.o_lineitems), o_orderkey = 4
-   predicates on o_lineitems: l_partkey < 10, l_suppkey = 10
+   predicates on o.o_lineitems: l_partkey < 10, l_suppkey = 10
    row-size=14B cardinality=6.00K
 ====
 # Nested predicates also get propagated
@@ -348,10 +348,10 @@ PLAN-ROOT SINK
 |     row-size=0B cardinality=10
 |
 00:SCAN HDFS [tpch_nested_parquet.customer c]
-   partitions=1/1 files=4 size=288.99MB
+   HDFS partitions=1/1 files=4 size=289.08MB
    predicates: c.c_nationkey = 10, !empty(c.c_orders)
    predicates on o: !empty(o.o_lineitems), o.o_orderkey = 10, o.o_shippriority = 10
-   predicates on o_lineitems: l_partkey < 10, l_suppkey = 10
+   predicates on o.o_lineitems: l_partkey < 10, l_suppkey = 10
    row-size=14B cardinality=6.00K
 ====
 # Using IS NULL
@@ -362,7 +362,7 @@ PLAN-ROOT SINK
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  row-size=8B cardinality=0
+|  row-size=8B cardinality=1
 |
 00:EMPTYSET
 ====
@@ -373,7 +373,7 @@ PLAN-ROOT SINK
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  row-size=8B cardinality=0
+|  row-size=8B cardinality=1
 |
 00:EMPTYSET
 ====
@@ -388,9 +388,9 @@ PLAN-ROOT SINK
 |  row-size=8B cardinality=1
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=24/24 files=24 size=478.45KB
+   HDFS partitions=24/24 files=24 size=478.45KB
    predicates: bool_col IS NULL, functional.alltypes.id IS NULL, id > 0, functional.alltypes.bool_col > 0, id = bool_col
-   row-size=5B cardinality=730
+   row-size=5B cardinality=1
 ====
 # = NULL and >
 select count(*) from functional.alltypes where id > 0 and bool_col = null
@@ -400,7 +400,174 @@ PLAN-ROOT SINK
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  row-size=8B cardinality=0
+|  row-size=8B cardinality=1
 |
 00:EMPTYSET
+====
+# IMPALA-10064
+# Constant propagation for range predicates on timestamp.
+# Also enables partition pruning.
+select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date)
+and timestamp_col between '2009-01-01' and '2009-02-01';
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
+   HDFS partitions=32/55 files=32 size=15.99KB
+   predicates: timestamp_col <= TIMESTAMP '2009-02-01 00:00:00', timestamp_col >= TIMESTAMP '2009-01-01 00:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=30
+====
+# Same as above but using a WITH clause (to emulate views)
+with dp_view as
+(select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date))
+select * from dp_view
+where timestamp_col between '2009-01-01' and '2009-02-01';
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
+   HDFS partitions=32/55 files=32 size=15.99KB
+   predicates: functional.alltypes_date_partition.timestamp_col <= TIMESTAMP '2009-02-01 00:00:00', functional.alltypes_date_partition.timestamp_col >= TIMESTAMP '2009-01-01 00:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=30
+====
+# Same as above but using < > and timestamps with time-of-day parts.
+# Regression test for IMPALA-11960.
+with dp_view as
+(select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date))
+select * from dp_view
+where timestamp_col > '2009-01-01 01:00:00' and timestamp_col < '2009-02-01 01:00:00';
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
+   HDFS partitions=32/55 files=32 size=15.99KB
+   predicates: functional.alltypes_date_partition.timestamp_col < TIMESTAMP '2009-02-01 01:00:00', functional.alltypes_date_partition.timestamp_col > TIMESTAMP '2009-01-01 01:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=30
+====
+# Same as above but using >= instead of >.
+# Regression test for IMPALA-11960.
+with dp_view as
+(select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date))
+select * from dp_view
+where timestamp_col >= '2009-01-01 01:00:00' and timestamp_col < '2009-02-01 01:00:00';
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
+   HDFS partitions=32/55 files=32 size=15.99KB
+   predicates: functional.alltypes_date_partition.timestamp_col < TIMESTAMP '2009-02-01 01:00:00', functional.alltypes_date_partition.timestamp_col >= TIMESTAMP '2009-01-01 01:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=30
+====
+# Mix of various predicates some of which are eligible for propagation
+with dp_view as
+(select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date))
+select * from dp_view
+where int_col < 100 and timestamp_col >= '2009-01-01'
+and bigint_col in (5, 10)
+and timestamp_col <= '2009-02-01';
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
+   HDFS partitions=32/55 files=32 size=15.99KB
+   predicates: functional.alltypes_date_partition.bigint_col IN (5, 10), functional.alltypes_date_partition.int_col < 100, functional.alltypes_date_partition.timestamp_col <= TIMESTAMP '2009-02-01 00:00:00', functional.alltypes_date_partition.timestamp_col >= TIMESTAMP '2009-01-01 00:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=13
+====
+# Mix of predicates. Propagate equality constant predicates to
+# one set of conjuncts and range predicates to date/timestamp
+select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date)
+and int_col = bigint_col + 1
+and timestamp_col >= '2009-01-01'
+and bigint_col = 100
+and timestamp_col <= '2009-02-01';
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
+   HDFS partitions=32/55 files=32 size=15.99KB
+   predicates: bigint_col = 100, int_col = 101, timestamp_col <= TIMESTAMP '2009-02-01 00:00:00', timestamp_col >= TIMESTAMP '2009-01-01 00:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=4
+====
+# Swapped order of <constant> <op> <column>.
+# Should create the same plan with the constant propagated.
+with dp_view as
+(select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date))
+select * from dp_view
+where int_col = bigint_col + 1
+and '2009-01-01' <= timestamp_col
+and bigint_col = 100
+and '2009-02-01' >= timestamp_col
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
+   HDFS partitions=32/55 files=32 size=15.99KB
+   predicates: functional.alltypes_date_partition.bigint_col = 100, functional.alltypes_date_partition.int_col = 101, functional.alltypes_date_partition.timestamp_col <= TIMESTAMP '2009-02-01 00:00:00', functional.alltypes_date_partition.timestamp_col >= TIMESTAMP '2009-01-01 00:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=4
+====
+# Constant propagation for equality predicates on timestamp.
+select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date)
+and timestamp_col = '2009-01-01';
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col = DATE '2009-01-01'
+   HDFS partitions=1/55 files=1 size=257B
+   predicates: timestamp_col = TIMESTAMP '2009-01-01 00:00:00'
+   row-size=65B cardinality=1
+====
+# Don't do constant propagation if range predicate is not on
+# timestamp or date column
+select * from functional.alltypes_date_partition
+where bigint_col = cast(int_col as bigint)
+and int_col > 5;
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   HDFS partitions=55/55 files=55 size=27.27KB
+   predicates: int_col > 5, bigint_col = CAST(int_col AS BIGINT)
+   row-size=65B cardinality=50
+====
+# Constant propagation when a timestamp function is used.
+select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date)
+and timestamp_col > from_timestamp('2009-02-01 00:02:00', 'yyyy-mm-dd');
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-02-01'
+   HDFS partitions=24/55 files=24 size=11.82KB
+   predicates: timestamp_col > TIMESTAMP '2009-02-01 00:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=21
+====
+# IMPALA-9745
+# Constant propagation in the presence of implicit casts
+select * from
+ (select o_orderdate, to_timestamp(o_orderdate, 'yyyy-MM-dd') ts
+  from tpch.orders) dt where ts = '1996-12-01' and o_orderdate = ts;
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [tpch.orders]
+   HDFS partitions=1/1 files=1 size=162.56MB
+   predicates: tpch.orders.o_orderdate = TIMESTAMP '1996-12-01 00:00:00'
+   row-size=22B cardinality=608
 ====

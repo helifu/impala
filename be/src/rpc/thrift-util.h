@@ -24,8 +24,10 @@
 #include <sstream>
 #include <vector>
 #include <thrift/TApplicationException.h>
+#include <thrift/TConfiguration.h>
 #include <thrift/protocol/TDebugProtocol.h>
 #include <thrift/transport/TBufferTransports.h>
+#include <thrift/transport/TSSLSocket.h>
 #include <thrift/transport/TTransportException.h>
 
 #include "common/status.h"
@@ -35,6 +37,21 @@ namespace impala {
 class TColumnValue;
 class TNetworkAddress;
 class ThriftServer;
+
+/// Default max message size from Thrift library.
+inline int ThriftDefaultMaxMessageSize() {
+  return apache::thrift::TConfiguration::DEFAULT_MAX_MESSAGE_SIZE;
+}
+
+/// Return the effective max message size based on 'thrift_rpc_max_message_size' flag.
+int ThriftRpcMaxMessageSize();
+
+/// Return the default Thrift's TConfiguration based on given backend config flags.
+std::shared_ptr<apache::thrift::TConfiguration> DefaultTConfiguration();
+
+/// Set the max message size of a given TTransport with the effective value based on
+/// 'thrift_rpc_max_message_size' flag.
+void SetMaxMessageSize(apache::thrift::transport::TTransport* transport);
 
 /// Utility class to serialize thrift objects to a binary format.  This object
 /// should be reused if possible to reuse the underlying memory.
@@ -67,7 +84,8 @@ class ThriftSerializer {
       obj->write(protocol_.get());
     } catch (std::exception& e) {
       std::stringstream msg;
-      msg << "Couldn't serialize thrift object:\n" << e.what();
+      msg << "Couldn't serialize thrift object beyond "
+          << mem_buffer_->getBufferSize() << " bytes:\n" << e.what();
       return Status(msg.str());
     }
     mem_buffer_->getBuffer(buffer, len);
@@ -81,7 +99,8 @@ class ThriftSerializer {
       obj->write(protocol_.get());
     } catch (std::exception& e) {
       std::stringstream msg;
-      msg << "Couldn't serialize thrift object:\n" << e.what();
+      msg << "Couldn't serialize thrift object beyond "
+          << mem_buffer_->getBufferSize() << " bytes:\n" << e.what();
       return Status(msg.str());
     }
     *result = mem_buffer_->getBufferAsString();
@@ -89,14 +108,14 @@ class ThriftSerializer {
   }
 
  private:
-  boost::shared_ptr<apache::thrift::transport::TMemoryBuffer> mem_buffer_;
-  boost::shared_ptr<apache::thrift::protocol::TProtocol> protocol_;
+  std::shared_ptr<apache::thrift::transport::TMemoryBuffer> mem_buffer_;
+  std::shared_ptr<apache::thrift::protocol::TProtocol> protocol_;
 };
 
 /// Utility to create a protocol (deserialization) object for 'mem'.
-boost::shared_ptr<apache::thrift::protocol::TProtocol>
+std::shared_ptr<apache::thrift::protocol::TProtocol>
 CreateDeserializeProtocol(
-    boost::shared_ptr<apache::thrift::transport::TMemoryBuffer> mem, bool compact);
+    std::shared_ptr<apache::thrift::transport::TMemoryBuffer> mem, bool compact);
 
 /// Deserialize a thrift message from buf/len.  buf/len must at least contain
 /// all the bytes needed to store the thrift message.  On return, len will be
@@ -107,9 +126,11 @@ Status DeserializeThriftMsg(const uint8_t* buf, uint32_t* len, bool compact,
   /// Deserialize msg bytes into c++ thrift msg using memory
   /// transport. TMemoryBuffer is not const-safe, although we use it in
   /// a const-safe way, so we have to explicitly cast away the const.
-  boost::shared_ptr<apache::thrift::transport::TMemoryBuffer> tmem_transport(
-      new apache::thrift::transport::TMemoryBuffer(const_cast<uint8_t*>(buf), *len));
-  boost::shared_ptr<apache::thrift::protocol::TProtocol> tproto =
+  std::shared_ptr<apache::thrift::transport::TMemoryBuffer> tmem_transport(
+      new apache::thrift::transport::TMemoryBuffer(const_cast<uint8_t*>(buf), *len,
+          apache::thrift::transport::TMemoryBuffer::MemoryPolicy::OBSERVE,
+          DefaultTConfiguration()));
+  std::shared_ptr<apache::thrift::protocol::TProtocol> tproto =
       CreateDeserializeProtocol(tmem_transport, compact);
   try {
     deserialized_msg->read(tproto.get());
@@ -125,6 +146,19 @@ Status DeserializeThriftMsg(const uint8_t* buf, uint32_t* len, bool compact,
   *len = *len - bytes_left;
   return Status::OK();
 }
+
+class ImpalaTlsSocketFactory : public apache::thrift::transport::TSSLSocketFactory {
+ public:
+  ImpalaTlsSocketFactory(apache::thrift::transport::SSLProtocol version)
+    : TSSLSocketFactory(version) {}
+
+  // 'cipher_list': TLS1.2 and below cipher list
+  // 'tls_ciphersuites': TLS1.3 and above cipher suites
+  // 'disable_tls12': Whether to disable TLS1.2 (used for testing TLS1.3).
+  void configureCiphers(const string& cipher_list, const string& tls_ciphersuites,
+      bool disable_tls12);
+};
+
 
 /// Redirects all Thrift logging to VLOG(1)
 void InitThriftLogging();
@@ -153,7 +187,6 @@ bool IsPeekTimeoutTException(const apache::thrift::transport::TTransportExceptio
 
 /// Returns true if the exception indicates the other end of the TCP socket was closed.
 bool IsConnResetTException(const apache::thrift::transport::TTransportException& e);
-
 }
 
 #endif

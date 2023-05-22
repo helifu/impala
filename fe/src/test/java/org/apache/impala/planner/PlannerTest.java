@@ -20,6 +20,8 @@ package org.apache.impala.planner;
 import static org.junit.Assert.assertEquals;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
 
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.ColumnStats;
@@ -28,24 +30,24 @@ import org.apache.impala.catalog.FeHBaseTable;
 import org.apache.impala.catalog.HBaseColumn;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
-import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.datagenerator.HBaseTestDataRegionAssignment;
-import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.Frontend.PlanCtx;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.testutil.TestUtils.IgnoreValueFilter;
+import org.apache.impala.thrift.TRuntimeFilterType;
 import org.apache.impala.thrift.TExecRequest;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TJoinDistributionMode;
+import org.apache.impala.thrift.TKuduReplicaSelection;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TRuntimeFilterMode;
 import org.junit.Assert;
-import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Collections2;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 
@@ -57,6 +59,7 @@ public class PlannerTest extends PlannerTestBase {
     PlannerTestBase.setUp();
     // Rebalance the HBase tables. This is necessary because some tests rely on HBase
     // tables being arranged in a deterministic way. See IMPALA-7061 for details.
+
     HBaseTestDataRegionAssignment assignment = new HBaseTestDataRegionAssignment();
     assignment.performAssignment("functional_hbase.alltypessmall");
     assignment.performAssignment("functional_hbase.alltypesagg");
@@ -129,7 +132,7 @@ public class PlannerTest extends PlannerTestBase {
   }
 
   @Test
-  public void testConstantPropagataion() {
+  public void testConstantPropagation() {
     runPlannerTestFile("constant-propagation");
   }
 
@@ -180,10 +183,33 @@ public class PlannerTest extends PlannerTestBase {
   }
 
   @Test
+  public void testGroupingSets() {
+    runPlannerTestFile("grouping-sets");
+  }
+
+  @Test
   public void testAnalyticFns() {
     runPlannerTestFile("analytic-fns",
         ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
   }
+
+  /**
+   * Tests for analytic functions with higher mt_dop to exercise partitioning logic that
+   * depends on estimates of # of instances.
+   */
+  @Test
+  public void testAnalyticFnsMtDop() {
+    TQueryOptions options = defaultQueryOptions();
+    options.setMt_dop(4);
+    runPlannerTestFile("analytic-fns-mt-dop", options,
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
+  }
+
+  @Test
+  public void testAnalyticRankPushdown() {
+    runPlannerTestFile("analytic-rank-pushdown");
+  }
+
 
   @Test
   public void testHbase() {
@@ -289,8 +315,6 @@ public class PlannerTest extends PlannerTestBase {
   public void testInsertSortByZorder() {
     // Add a test table with a SORT BY ZORDER clause to test that the corresponding sort
     // nodes are added by the insert statements in insert-sort-by.test.
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
-
     addTestDb("test_sort_by_zorder", "Test DB for SORT BY ZORDER clause.");
     addTestTable("create table test_sort_by_zorder.t (id int, int_col int, " +
         "bool_col boolean) partitioned by (year int, month int) " +
@@ -298,8 +322,19 @@ public class PlannerTest extends PlannerTestBase {
     addTestTable("create table test_sort_by_zorder.t_nopart (id int, int_col int, " +
         "bool_col boolean) sort by zorder (int_col, bool_col) location '/'");
     runPlannerTestFile("insert-sort-by-zorder", "test_sort_by_zorder");
+  }
 
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+  @Test
+  public void testHdfsInsertWriterLimit() {
+    addTestDb("test_hdfs_insert_writer_limit",
+        "Test DB for MAX_FS_WRITERS query option.");
+    addTestTable( "create table test_hdfs_insert_writer_limit.partitioned_table "
+        + "(id int) partitioned by (year int, month int) location '/'");
+    addTestTable("create table test_hdfs_insert_writer_limit.unpartitioned_table"
+        + " (id int) location '/'");
+    runPlannerTestFile("insert-hdfs-writer-limit", "test_hdfs_insert_writer_limit",
+        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
+            PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS));
   }
 
   @Test
@@ -309,12 +344,22 @@ public class PlannerTest extends PlannerTestBase {
 
   @Test
   public void testNestedCollections() {
-    runPlannerTestFile("nested-collections");
+    TQueryOptions options = new TQueryOptions();
+    options.setMinmax_filter_sorted_columns(false);
+    runPlannerTestFile("nested-collections", options);
   }
 
   @Test
   public void testComplexTypesFileFormats() {
     runPlannerTestFile("complex-types-file-formats");
+  }
+
+  @Test
+  public void testZippingUnnest() {
+    addTestDb("test_zipping_unnest_db", "For creating views for zipping unnest queries.");
+    addTestView("create view test_zipping_unnest_db.view_arrays as " +
+        "select id, arr1, arr2 from functional_parquet.complextypes_arrays");
+    runPlannerTestFile("zipping-unnest");
   }
 
   @Test
@@ -357,8 +402,9 @@ public class PlannerTest extends PlannerTestBase {
     // The FK/PK detection result is included in EXTENDED or higher.
     TQueryOptions options = defaultQueryOptions();
     options.setDisable_hdfs_num_rows_estimate(false);
-    runPlannerTestFile("fk-pk-join-detection-hdfs-num-rows-est-enabled",
-        options, ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN));
+    runPlannerTestFile("fk-pk-join-detection-hdfs-num-rows-est-enabled", options,
+        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
+            PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS));
   }
 
   @Test
@@ -366,6 +412,7 @@ public class PlannerTest extends PlannerTestBase {
     // The FK/PK detection result is included in EXTENDED or higher.
     TQueryOptions options = defaultQueryOptions();
     options.setDisable_hdfs_num_rows_estimate(true);
+    options.setMinmax_filter_threshold(0.0);
     runPlannerTestFile("fk-pk-join-detection",
         options, ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
             PlannerTestOption.VALIDATE_CARDINALITY));
@@ -419,9 +466,25 @@ public class PlannerTest extends PlannerTestBase {
     runPlannerTestFile("subquery-rewrite", options);
   }
 
+  /**
+   * Tests for the IMPALA-1270 optimization of automatically adding a distinct
+   * agg to semi joins.
+   */
+  @Test
+  public void testSemiJoinDistinct() {
+    runPlannerTestFile("semi-join-distinct");
+  }
+
   @Test
   public void testUnion() {
     runPlannerTestFile("union");
+  }
+
+  @Test
+  public void testSetOperationRewrite() {
+    TQueryOptions options = defaultQueryOptions();
+    options.setMinmax_filter_threshold(0.0);
+    runPlannerTestFile("setoperation-rewrite", options);
   }
 
   @Test
@@ -453,7 +516,19 @@ public class PlannerTest extends PlannerTestBase {
   public void testPartitionKeyScans() {
     TQueryOptions options = new TQueryOptions();
     options.setOptimize_partition_key_scans(true);
-    runPlannerTestFile("partition-key-scans", options);
+    runPlannerTestFile("partition-key-scans", options, ImmutableSet.of(
+            PlannerTestOption.VALIDATE_CARDINALITY));
+  }
+
+  /**
+   * Test partition key scans with the option disabled - backend support is
+   * used to only return one row per file.
+   */
+  @Test
+  public void testPartitionKeyScansDefault() {
+    TQueryOptions options = new TQueryOptions();
+    runPlannerTestFile("partition-key-scans-default", options, ImmutableSet.of(
+            PlannerTestOption.VALIDATE_CARDINALITY));
   }
 
   @Test
@@ -489,20 +564,12 @@ public class PlannerTest extends PlannerTestBase {
 
   @Test
   public void testTpchNested() {
-    runPlannerTestFile("tpch-nested", "tpch_nested_parquet",
+    TQueryOptions options = new TQueryOptions();
+    options.setMinmax_filter_sorted_columns(false);
+    runPlannerTestFile("tpch-nested", "tpch_nested_parquet", options,
         ImmutableSet.of(PlannerTestOption.INCLUDE_RESOURCE_HEADER,
             PlannerTestOption.VALIDATE_RESOURCES,
             PlannerTestOption.VALIDATE_CARDINALITY));
-  }
-
-  @Test
-  public void testTpcds() {
-    // Uses ss_sold_date_sk as the partition key of store_sales to allow static partition
-    // pruning. The original predicates were rephrased in terms of the ss_sold_date_sk
-    // partition key, with the query semantics identical to the original queries.
-    runPlannerTestFile("tpcds-all", "tpcds",
-        ImmutableSet.of(PlannerTestOption.INCLUDE_RESOURCE_HEADER,
-            PlannerTestOption.VALIDATE_RESOURCES));
   }
 
   @Test
@@ -550,8 +617,32 @@ public class PlannerTest extends PlannerTestBase {
   }
 
   @Test
+  public void testDisableRuntimeOverlapFilter() {
+    TQueryOptions options = new TQueryOptions();
+    options.setMinmax_filter_threshold(0.0);
+    runPlannerTestFile("disable-runtime-overlap-filter", options);
+
+    options.setMinmax_filter_threshold(1.0);
+    options.unsetEnabled_runtime_filter_types();
+    options.addToEnabled_runtime_filter_types(TRuntimeFilterType.BLOOM);
+    runPlannerTestFile("disable-runtime-overlap-filter", options);
+  }
+
+  @Test
   public void testRuntimeFilterQueryOptions() {
-    runPlannerTestFile("runtime-filter-query-options");
+    runPlannerTestFile("runtime-filter-query-options",
+        ImmutableSet.of(
+            PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS));
+  }
+
+  @Test
+  public void testBloomFilterAssignment() {
+    TQueryOptions options = defaultQueryOptions();
+    options.setMinmax_filter_sorted_columns(false);
+    options.setMinmax_filter_partition_columns(false);
+    runPlannerTestFile("bloom-filter-assignment",
+        ImmutableSet.of(
+            PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS));
   }
 
   @Test
@@ -567,7 +658,8 @@ public class PlannerTest extends PlannerTestBase {
   @Test
   public void testParquetFiltering() {
     runPlannerTestFile("parquet-filtering",
-        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN));
+        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
+            PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS));
   }
 
   @Test
@@ -576,50 +668,68 @@ public class PlannerTest extends PlannerTestBase {
     options.setParquet_dictionary_filtering(false);
     options.setParquet_read_statistics(false);
     runPlannerTestFile("parquet-filtering-disabled", options,
-        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN));
+        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
+            PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS));
   }
 
   @Test
   public void testKudu() {
-    Assume.assumeTrue(RuntimeEnv.INSTANCE.isKuduSupported());
+    TQueryOptions options = defaultQueryOptions();
+    options.unsetEnabled_runtime_filter_types();
+    options.addToEnabled_runtime_filter_types(TRuntimeFilterType.BLOOM);
+    options.addToEnabled_runtime_filter_types(TRuntimeFilterType.MIN_MAX);
     addTestDb("kudu_planner_test", "Test DB for Kudu Planner.");
     addTestTable("CREATE EXTERNAL TABLE kudu_planner_test.no_stats STORED AS KUDU " +
         "TBLPROPERTIES ('kudu.table_name' = 'impala::functional_kudu.alltypes');");
-    runPlannerTestFile("kudu");
+    runPlannerTestFile("kudu", options);
   }
 
   @Test
   public void testKuduUpsert() {
-    Assume.assumeTrue(RuntimeEnv.INSTANCE.isKuduSupported());
     runPlannerTestFile("kudu-upsert");
   }
 
   @Test
   public void testKuduUpdate() {
-    Assume.assumeTrue(RuntimeEnv.INSTANCE.isKuduSupported());
-    runPlannerTestFile("kudu-update");
+    TQueryOptions options = defaultQueryOptions();
+    options.unsetEnabled_runtime_filter_types();
+    options.addToEnabled_runtime_filter_types(TRuntimeFilterType.BLOOM);
+    options.addToEnabled_runtime_filter_types(TRuntimeFilterType.MIN_MAX);
+    runPlannerTestFile("kudu-update", options);
   }
 
   @Test
   public void testKuduDelete() {
-    Assume.assumeTrue(RuntimeEnv.INSTANCE.isKuduSupported());
     runPlannerTestFile("kudu-delete");
   }
 
   @Test
   public void testKuduSelectivity() {
-    Assume.assumeTrue(RuntimeEnv.INSTANCE.isKuduSupported());
     TQueryOptions options = defaultQueryOptions();
     options.setExplain_level(TExplainLevel.VERBOSE);
     runPlannerTestFile("kudu-selectivity", options);
   }
 
   @Test
+  public void testKuduReplicaSelection() {
+    TQueryOptions options = defaultQueryOptions();
+    options.setExplain_level(TExplainLevel.VERBOSE);
+    options.setKudu_replica_selection(TKuduReplicaSelection.LEADER_ONLY);
+    runPlannerTestFile("kudu-replica-selection-leader-only", options);
+
+    options.setKudu_replica_selection(TKuduReplicaSelection.CLOSEST_REPLICA);
+    runPlannerTestFile("kudu-replica-selection-closest-replica", options);
+  }
+
+  @Test
   public void testKuduTpch() {
-    Assume.assumeTrue(RuntimeEnv.INSTANCE.isKuduSupported());
-    runPlannerTestFile("tpch-kudu", ImmutableSet.of(
-        PlannerTestOption.INCLUDE_RESOURCE_HEADER,
-        PlannerTestOption.VALIDATE_RESOURCES));
+    TQueryOptions options = defaultQueryOptions();
+    options.unsetEnabled_runtime_filter_types();
+    options.addToEnabled_runtime_filter_types(TRuntimeFilterType.BLOOM);
+    options.addToEnabled_runtime_filter_types(TRuntimeFilterType.MIN_MAX);
+    runPlannerTestFile("tpch-kudu", options,
+        ImmutableSet.of(PlannerTestOption.INCLUDE_RESOURCE_HEADER,
+            PlannerTestOption.VALIDATE_RESOURCES));
   }
 
   @Test
@@ -629,38 +739,14 @@ public class PlannerTest extends PlannerTestBase {
 
   @Test
   public void testMtDopValidation() {
-    // Tests that queries supported with mt_dop > 0 produce a parallel plan, or
-    // throw a NotImplementedException otherwise (e.g. plan has a distributed join).
-    TQueryOptions options = defaultQueryOptions();
-    options.setMt_dop(3);
-    options.setDisable_hdfs_num_rows_estimate(false);
-    options.setExplain_level(TExplainLevel.EXTENDED);
-    try {
-      // Temporarily unset the test env such that unsupported queries with mt_dop > 0
-      // throw an exception. Those are otherwise allowed for testing parallel plans.
-      RuntimeEnv.INSTANCE.setEnableMtDopValidation(true);
-      runPlannerTestFile("mt-dop-validation-hdfs-num-rows-est-enabled", options);
-    } finally {
-      RuntimeEnv.INSTANCE.setEnableMtDopValidation(false);
-    }
-  }
-
-  @Test
-  public void testMtDopValidationWithHDFSNumRowsEstDisabled() {
-    // Tests that queries supported with mt_dop > 0 produce a parallel plan, or
-    // throw a NotImplementedException otherwise (e.g. plan has a distributed join).
+    // Tests that queries planned with mt_dop > 0 produce a parallel plan.
+    // Since IMPALA-9812 was fixed all plans are supported. Previously some plans
+    // were rejected.
     TQueryOptions options = defaultQueryOptions();
     options.setMt_dop(3);
     options.setDisable_hdfs_num_rows_estimate(true);
     options.setExplain_level(TExplainLevel.EXTENDED);
-    try {
-      // Temporarily unset the test env such that unsupported queries with mt_dop > 0
-      // throw an exception. Those are otherwise allowed for testing parallel plans.
-      RuntimeEnv.INSTANCE.setEnableMtDopValidation(true);
-      runPlannerTestFile("mt-dop-validation", options);
-    } finally {
-      RuntimeEnv.INSTANCE.setEnableMtDopValidation(false);
-    }
+    runPlannerTestFile("mt-dop-validation", options);
   }
 
   @Test
@@ -709,10 +795,121 @@ public class PlannerTest extends PlannerTestBase {
   }
 
   @Test
+  public void testOnlyNeededStructFieldsMaterialized() throws ImpalaException {
+    // Tests that if a struct is selected in an inline view but only a subset of its
+    // fields are selected in the top level query, only the selected fields are
+    // materialised, not the whole struct.
+    // Also tests that selecting the whole struct or fields from an inline view or
+    // directly from the table give the same row size.
+
+    TQueryOptions queryOpts = defaultQueryOptions();
+
+    String queryWholeStruct =
+        "select outer_struct from functional_orc_def.complextypes_nested_structs";
+    int rowSizeWholeStruct = getRowSize(queryWholeStruct, queryOpts);
+
+    String queryWholeStructFromInlineView =
+        "with sub as (" +
+          "select id, outer_struct from functional_orc_def.complextypes_nested_structs)" +
+        "select sub.outer_struct from sub";
+    int rowSizeWholeStructFromInlineView = getRowSize(
+        queryWholeStructFromInlineView, queryOpts);
+
+    String queryOneField =
+        "select outer_struct.str from functional_orc_def.complextypes_nested_structs";
+    int rowSizeOneField = getRowSize(queryOneField, queryOpts);
+
+    String queryOneFieldFromInlineView =
+        "with sub as (" +
+          "select id, outer_struct from functional_orc_def.complextypes_nested_structs)" +
+        "select sub.outer_struct.str from sub";
+    int rowSizeOneFieldFromInlineView = getRowSize(
+        queryOneFieldFromInlineView, queryOpts);
+
+    String queryTwoFields =
+        "select outer_struct.str, outer_struct.inner_struct1 " +
+        "from functional_orc_def.complextypes_nested_structs";
+    int rowSizeTwoFields = getRowSize(queryTwoFields, queryOpts);
+
+    String queryTwoFieldsFromInlineView =
+        "with sub as (" +
+          "select id, outer_struct from functional_orc_def.complextypes_nested_structs)" +
+        "select sub.outer_struct.str, sub.outer_struct.inner_struct1 from sub";
+    int rowSizeTwoFieldsFromInlineView = getRowSize(
+        queryTwoFieldsFromInlineView, queryOpts);
+
+    Assert.assertEquals(rowSizeWholeStruct, rowSizeWholeStructFromInlineView);
+    Assert.assertEquals(rowSizeOneField, rowSizeOneFieldFromInlineView);
+    Assert.assertEquals(rowSizeTwoFields, rowSizeTwoFieldsFromInlineView);
+
+    Assert.assertTrue(rowSizeOneField < rowSizeTwoFields);
+    Assert.assertTrue(rowSizeTwoFields < rowSizeWholeStruct);
+  }
+
+  @Test
+  public void testStructFieldSlotSharedWithStruct() throws ImpalaException {
+    // Tests that in the case where both a struct and some of its fields are present in
+    // the select list, no extra slots are generated in the row for the struct fields but
+    // the memory of the struct is reused, i.e. the row size is the same as when only the
+    // struct is queried.
+    TQueryOptions queryOpts = defaultQueryOptions();
+    String queryTemplate =
+        "select %s from functional_orc_def.complextypes_nested_structs";
+
+    // The base case is when the top-level struct is selected.
+    String queryWithoutFields =
+        String.format(queryTemplate, "outer_struct");
+    int rowSizeWithoutFields = getRowSize(queryWithoutFields, queryOpts);
+
+    // Try permutations of (nested) fields of the top-level struct.
+    String[] fields = {"outer_struct", "outer_struct.str", "outer_struct.inner_struct3",
+      "outer_struct.inner_struct3.s"};
+    Collection<List<String>> permutations =
+      Collections2.permutations(java.util.Arrays.asList(fields));
+    for (List<String> permutation : permutations) {
+      String query = String.format(queryTemplate, String.join(", ", permutation));
+      int rowSize = getRowSize(query, queryOpts);
+      Assert.assertEquals(rowSizeWithoutFields, rowSize);
+    }
+  }
+
+  @Test
+  public void testStructFieldSlotSharedWithStructFromStarExpansion()
+      throws ImpalaException {
+    // Like testStructFieldSlotSharedWithStruct(), but involving structs that come from a
+    // star expansion.
+
+    TQueryOptions queryOpts = defaultQueryOptions();
+    // Enable star-expandion of complex types.
+    queryOpts.setExpand_complex_types(true);
+
+    String queryTemplate =
+        "select %s from functional_orc_def.complextypes_nested_structs";
+
+    // The base case is when only the star is given in the select list.
+    String queryWithoutFields =
+        String.format(queryTemplate, "*");
+    int rowSizeWithoutFields = getRowSize(queryWithoutFields, queryOpts);
+
+    // Try permutations of (nested) fields of the top-level struct.
+    String[] fields = {"*", "outer_struct", "outer_struct.inner_struct1",
+      "outer_struct.inner_struct1.str"};
+    Collection<List<String>> permutations =
+      Collections2.permutations(java.util.Arrays.asList(fields));
+    for (List<String> permutation : permutations) {
+      String query = String.format(queryTemplate, String.join(", ", permutation));
+      int rowSize = getRowSize(query, queryOpts);
+      Assert.assertEquals(rowSizeWithoutFields, rowSize);
+    }
+  }
+
+  @Test
   public void testResourceRequirements() {
     // Tests the resource requirement computation from the planner.
     TQueryOptions options = defaultQueryOptions();
     options.setNum_scanner_threads(1); // Required so that output doesn't vary by machine
+    options.setMinmax_filter_threshold(0.0);
+    // Required so that output doesn't vary by whether parquet tables are used or not.
     options.setDisable_hdfs_num_rows_estimate(true);
     runPlannerTestFile("resource-requirements", options,
         ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
@@ -727,6 +924,7 @@ public class PlannerTest extends PlannerTestBase {
     TQueryOptions options = defaultQueryOptions();
     options.setExplain_level(TExplainLevel.EXTENDED);
     options.setNum_scanner_threads(1); // Required so that output doesn't vary by machine
+    options.setMinmax_filter_threshold(0.0);
     options.setDisable_hdfs_num_rows_estimate(true);
     runPlannerTestFile("spillable-buffer-sizing", options,
         ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
@@ -741,6 +939,8 @@ public class PlannerTest extends PlannerTestBase {
     TQueryOptions options = defaultQueryOptions();
     options.setExplain_level(TExplainLevel.EXTENDED);
     options.setNum_scanner_threads(1); // Required so that output doesn't vary by machine
+    // Required so that output doesn't vary by the format of the table used.
+    options.setMinmax_filter_threshold(0.0);
     options.setMax_row_size(8L * 1024L * 1024L);
     runPlannerTestFile("max-row-size", options,
         ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
@@ -751,7 +951,11 @@ public class PlannerTest extends PlannerTestBase {
   @Test
   public void testSortExprMaterialization() {
     addTestFunction("TestFn", Lists.newArrayList(Type.DOUBLE), false);
-    runPlannerTestFile("sort-expr-materialization",
+    // Avoid conversion of RANK()/ROW_NUMBER() predicates to Top-N limits, which
+    // would interfere with the purpose of this test.
+    TQueryOptions options = defaultQueryOptions();
+    options.setAnalytic_rank_pushdown_threshold(0);
+    runPlannerTestFile("sort-expr-materialization", options,
         ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN));
   }
 
@@ -759,7 +963,8 @@ public class PlannerTest extends PlannerTestBase {
   public void testTableSample() {
     TQueryOptions options = defaultQueryOptions();
     runPlannerTestFile("tablesample", options,
-        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN));
+        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
+            PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS));
   }
 
   @Test
@@ -819,7 +1024,11 @@ public class PlannerTest extends PlannerTestBase {
     TQueryOptions options = defaultQueryOptions();
     options.setExplain_level(TExplainLevel.EXTENDED);
     options.setDisable_hdfs_num_rows_estimate(false);
-    runPlannerTestFile("min-max-runtime-filters-hdfs-num-rows-est-enabled", options);
+    options.unsetEnabled_runtime_filter_types();
+    options.addToEnabled_runtime_filter_types(TRuntimeFilterType.MIN_MAX);
+    runPlannerTestFile("min-max-runtime-filters-hdfs-num-rows-est-enabled", options,
+        ImmutableSet.of(
+            PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS));
   }
 
   @Test
@@ -827,6 +1036,9 @@ public class PlannerTest extends PlannerTestBase {
     TQueryOptions options = defaultQueryOptions();
     options.setExplain_level(TExplainLevel.EXTENDED);
     options.setDisable_hdfs_num_rows_estimate(true);
+    options.setMinmax_filter_partition_columns(false);
+    options.unsetEnabled_runtime_filter_types();
+    options.addToEnabled_runtime_filter_types(TRuntimeFilterType.MIN_MAX);
     runPlannerTestFile("min-max-runtime-filters", options);
   }
 
@@ -972,6 +1184,9 @@ public class PlannerTest extends PlannerTestBase {
     filter = TestUtils.ROW_SIZE_FILTER;
     assertEquals(" row-size= cardinality=10.3K",
         filter.transform(" row-size=10B cardinality=10.3K"));
+    filter = TestUtils.PARTITIONS_FILTER;
+    assertEquals(" partitions: 0/24 rows=",
+        filter.transform(" partitions: 0/24 rows=10.3K"));
   }
 
   @Test
@@ -1018,4 +1233,159 @@ public class PlannerTest extends PlannerTestBase {
     runPlannerTestFile("broadcast-bytes-limit-large", "tpch_parquet", options);
   }
 
+  /**
+   * Check that planner estimates reflect the preagg bytes limit.
+   */
+  @Test
+  public void testPreaggBytesLimit() {
+    TQueryOptions options = defaultQueryOptions();
+    options.setPreagg_bytes_limit(64 * 1024 * 1024);
+    options.setExplain_level(TExplainLevel.EXTENDED);
+    runPlannerTestFile("preagg-bytes-limit", "tpch_parquet", options);
+  }
+
+  /**
+   * Check conversion of predicates to conjunctive normal form.
+   */
+  @Test
+  public void testConvertToCNF() {
+    TQueryOptions options = defaultQueryOptions();
+    options.setMinmax_filter_threshold(0.0);
+    runPlannerTestFile("convert-to-cnf", "tpch_parquet", options);
+  }
+
+  /**
+   * Check that ACID table scans work as expected.
+   */
+  @Test
+  public void testAcidTableScans() {
+    runPlannerTestFile("acid-scans", "functional_orc_def",
+        ImmutableSet.of(
+            PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS));
+  }
+
+  /**
+   * Checks exercising predicate pushdown with Iceberg tables.
+   */
+  @Test
+  public void testIcebergPredicates() {
+    runPlannerTestFile("iceberg-predicates", "functional_parquet",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
+  }
+
+  /**
+   * Check that Iceberg V2 table scans work as expected.
+   */
+  @Test
+  public void testIcebergV2TableScans() {
+    runPlannerTestFile("iceberg-v2-tables", "functional_parquet",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
+  }
+
+  /**
+   * Check that Iceberg metadata table scan plans are as expected.
+   */
+  @Test
+  public void testIcebergMetadataTableScans() {
+    runPlannerTestFile("iceberg-metadata-table-scan", "functional_parquet",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
+  }
+
+  /**
+   * Test limit pushdown into analytic sort in isolation.
+   */
+  @Test
+  public void testLimitPushdownAnalytic() {
+    // The partitioned top-n optimization interacts with limit pushdown. We run the
+    // basic limit pushdown tests with it disabled.
+    TQueryOptions options = defaultQueryOptions();
+    options.setAnalytic_rank_pushdown_threshold(0);
+    runPlannerTestFile("limit-pushdown-analytic", options);
+  }
+
+  /**
+   * Test limit pushdown into analytic sort with the partitioned top-n transformation
+   * also enabled.
+   */
+  @Test
+  public void testLimitPushdownPartitionedTopN() {
+    TQueryOptions options = defaultQueryOptions();
+    options.setDisable_hdfs_num_rows_estimate(true); // Needed to test IMPALA-11443.
+    runPlannerTestFile("limit-pushdown-partitioned-top-n", options);
+  }
+
+  /**
+   * Test outer join simplification.
+   */
+  @Test
+  public void testSimplifyOuterJoins() {
+    TQueryOptions options = new TQueryOptions();
+    options.setEnable_outer_join_to_inner_transformation(true);
+    runPlannerTestFile("outer-to-inner-joins", options,
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
+  }
+
+  /**
+   * Test simple limit optimization
+   */
+  @Test
+  public void testSimpleLimitOptimization() {
+    TQueryOptions options = new TQueryOptions();
+    options.setOptimize_simple_limit(true);
+    runPlannerTestFile("optimize-simple-limit", options);
+  }
+
+  /**
+   * Test the distribution method for a join
+   */
+  @Test
+  public void testDistributionMethod() {
+    runPlannerTestFile("tpcds-dist-method", "tpcds");
+  }
+
+  /**
+   * Test new hint of 'TABLE_NUM_ROWS'
+   */
+  @Test
+  public void testTableCardinalityHint() {
+    runPlannerTestFile("table-cardinality-hint",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
+  }
+
+  /**
+   * Test EXPLAIN_LEVEL=VERBOSE is displayed properly with MT_DOP>0
+   */
+  @Test
+  public void testExplainVerboseMtDop() {
+    runPlannerTestFile("explain-verbose-mt_dop", "tpcds_parquet",
+        ImmutableSet.of(PlannerTestOption.INCLUDE_RESOURCE_HEADER));
+  }
+
+  /**
+   * Test that processing cost can adjust effective instance count of fragment.
+   */
+  @Test
+  public void testProcessingCost() {
+    TQueryOptions options = new TQueryOptions();
+    options.setCompute_processing_cost(true);
+    options.setProcessing_cost_min_threads(2);
+    options.setMax_fragment_instances_per_node(16);
+    options.setMinmax_filter_threshold(0.5);
+    options.setMinmax_filter_sorted_columns(false);
+    options.setMinmax_filter_partition_columns(false);
+    runPlannerTestFile("tpcds-processing-cost", "tpcds_parquet", options,
+        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
+            PlannerTestOption.INCLUDE_RESOURCE_HEADER,
+            PlannerTestOption.VALIDATE_RESOURCES,
+            PlannerTestOption.VALIDATE_CARDINALITY));
+  }
+
+  /**
+   * Test SELECTIVITY hints
+   */
+  @Test
+  public void testPredicateSelectivityHints() {
+    runPlannerTestFile("predicate-selectivity-hint",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
+  }
 }

@@ -36,6 +36,8 @@ using namespace impala::test;
 
 DECLARE_int32(statestore_max_missed_heartbeats);
 DECLARE_int32(statestore_heartbeat_frequency_ms);
+DECLARE_int32(num_expected_executors);
+DECLARE_string(expected_executor_group_sets);
 
 namespace impala {
 
@@ -61,25 +63,30 @@ class ClusterMembershipMgrTest : public testing::Test {
  protected:
   ClusterMembershipMgrTest() {}
 
-  /// Returns the size of the default executor group of the current membership in 'cmm'.
+  /// Returns the size of the default executor group of the current membership in 'cmm'
+  /// if the default executor group exists, otherwise returns 0.
   int GetDefaultGroupSize(const ClusterMembershipMgr& cmm) const {
     const string& group_name = ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME;
+    if (cmm.GetSnapshot()->executor_groups.find(group_name)
+        == cmm.GetSnapshot()->executor_groups.end()) {
+      return 0;
+    }
     return cmm.GetSnapshot()->executor_groups.find(group_name)->second.NumExecutors();
   }
 
   /// A struct to hold information related to a simulated backend during the test.
   struct Backend {
-    string backend_id;
+    UniqueIdPB backend_id;
     std::unique_ptr<MetricGroup> metric_group;
     std::unique_ptr<ClusterMembershipMgr> cmm;
-    std::shared_ptr<TBackendDescriptor> desc;
+    std::shared_ptr<BackendDescriptorPB> desc;
   };
   /// The list of backends_ that owns all backends.
   vector<unique_ptr<Backend>> backends_;
 
   /// Various lists of pointers that point into elements of 'backends_'. These pointers
   /// will stay valid when backend_ resizes. Backends can be in one of 5 states:
-  /// - "Offline": A TBackendDescriptor has been created but has not been associated with
+  /// - "Offline": A BackendDescriptorPB has been created but has not been associated with
   ///     a ClusterMembershipMgr.
   /// - "Starting": A ClusterMembershipMgr has been created, but the associated backend
   ///     descriptor is not running yet (no callback registered with the
@@ -166,8 +173,8 @@ class ClusterMembershipMgrTest : public testing::Test {
     if (idx == -1) idx = backends_.size();
     backends_.push_back(make_unique<Backend>());
     auto& be = backends_.back();
-    be->desc = make_shared<TBackendDescriptor>(MakeBackendDescriptor(idx));
-    be->backend_id = be->desc->address.hostname;
+    be->desc = make_shared<BackendDescriptorPB>(MakeBackendDescriptor(idx));
+    be->backend_id = be->desc->backend_id();
     offline_.push_back(be.get());
     return be.get();
   }
@@ -179,7 +186,7 @@ class ClusterMembershipMgrTest : public testing::Test {
     ASSERT_TRUE(IsInVector(be, offline_));
     be->metric_group = make_unique<MetricGroup>("test");
     be->cmm = make_unique<ClusterMembershipMgr>(
-        be->backend_id, nullptr, be->metric_group.get());
+        PrintId(be->backend_id), nullptr, be->metric_group.get());
     RemoveFromVector(be, &offline_);
     starting_.push_back(be);
   }
@@ -213,7 +220,7 @@ class ClusterMembershipMgrTest : public testing::Test {
   /// moves the backend from 'running_' to 'quiescing_'.
   void QuiesceBackend(Backend* be) {
     ASSERT_TRUE(IsInVector(be, running_));
-    be->desc->__set_is_quiescing(true);
+    be->desc->set_is_quiescing(true);
     TopicDeltas topic_deltas = Poll(be);
     ASSERT_EQ(1, topic_deltas.size());
     ASSERT_EQ(1, topic_deltas[0].topic_entries.size());
@@ -237,7 +244,7 @@ class ClusterMembershipMgrTest : public testing::Test {
 
     // Create topic item before erasing the backend.
     TTopicItem deletion_item;
-    deletion_item.key = be->backend_id;
+    deletion_item.key = PrintId(be->backend_id);
     deletion_item.deleted = true;
 
     // Delete the backend
@@ -269,13 +276,13 @@ class ClusterMembershipMgrTest : public testing::Test {
 /// It also serves as an example for how to craft statestore messages and pass them to
 /// UpdaUpdateMembership().
 TEST_F(ClusterMembershipMgrTest, TwoInstances) {
-  auto b1 = make_shared<TBackendDescriptor>(MakeBackendDescriptor(1));
-  auto b2 = make_shared<TBackendDescriptor>(MakeBackendDescriptor(2));
+  auto b1 = make_shared<BackendDescriptorPB>(MakeBackendDescriptor(1));
+  auto b2 = make_shared<BackendDescriptorPB>(MakeBackendDescriptor(2));
 
   MetricGroup tmp_metrics1("test-metrics1");
   MetricGroup tmp_metrics2("test-metrics2");
-  ClusterMembershipMgr cmm1(b1->address.hostname, nullptr, &tmp_metrics1);
-  ClusterMembershipMgr cmm2(b2->address.hostname, nullptr, &tmp_metrics2);
+  ClusterMembershipMgr cmm1(b1->address().hostname(), nullptr, &tmp_metrics1);
+  ClusterMembershipMgr cmm2(b2->address().hostname(), nullptr, &tmp_metrics2);
 
   const Statestore::TopicId topic_id = Statestore::IMPALA_MEMBERSHIP_TOPIC;
   StatestoreSubscriber::TopicDeltaMap topic_delta_map = {{topic_id, TTopicDelta()}};
@@ -317,12 +324,12 @@ TEST_F(ClusterMembershipMgrTest, TwoInstances) {
 
   // Both managers now have the same state. Shutdown one of them and step through
   // propagating the update.
-  b1->is_quiescing = true;
+  b1->set_is_quiescing(true);
   // Send an empty update to the 1st one to trigger propagation of the shutdown
   returned_topic_deltas.clear();
   topic_delta_map[topic_id] = empty_delta;
   cmm1.UpdateMembership(topic_delta_map, &returned_topic_deltas);
-  // The mgr will return its changed TBackendDescriptor
+  // The mgr will return its changed BackendDescriptorPB
   ASSERT_EQ(1, returned_topic_deltas.size());
   // It will also remove itself from the executor group (but not the current backends).
   ASSERT_EQ(1, GetDefaultGroupSize(cmm1));
@@ -344,6 +351,25 @@ TEST_F(ClusterMembershipMgrTest, TwoInstances) {
   ASSERT_EQ(0, returned_topic_deltas.size());
   ASSERT_EQ(1, cmm2.GetSnapshot()->current_backends.size());
   ASSERT_EQ(1, GetDefaultGroupSize(cmm2));
+}
+
+TEST_F(ClusterMembershipMgrTest, IsBlacklisted) {
+  const int NUM_BACKENDS = 2;
+  for (int i = 0; i < NUM_BACKENDS; ++i) CreateBackend();
+  EXPECT_EQ(NUM_BACKENDS, backends_.size());
+  EXPECT_EQ(backends_.size(), offline_.size());
+
+  while (!offline_.empty()) CreateCMM(offline_.front());
+  EXPECT_EQ(0, offline_.size());
+  EXPECT_EQ(NUM_BACKENDS, starting_.size());
+
+  while (!starting_.empty()) StartBackend(starting_.front());
+  EXPECT_EQ(0, starting_.size());
+  EXPECT_EQ(NUM_BACKENDS, running_.size());
+
+  backends_[0]->cmm->BlacklistExecutor(backends_[1]->desc->backend_id(), Status("error"));
+  ClusterMembershipMgr::SnapshotPtr snapshot = backends_[0]->cmm->GetSnapshot();
+  EXPECT_TRUE(snapshot->executor_blacklist.IsBlacklisted(*(backends_[1]->desc)));
 }
 
 // This test verifies the interaction between the ExecutorBlacklist and
@@ -376,17 +402,17 @@ TEST_F(ClusterMembershipMgrTest, ExecutorBlacklist) {
   }
 
   // Tell a BE to blacklist itself, should have no effect.
-  backends_[0]->cmm->BlacklistExecutor(*backends_[0]->desc);
+  backends_[0]->cmm->BlacklistExecutor(backends_[0]->desc->backend_id(), Status("error"));
   EXPECT_EQ(NUM_BACKENDS, backends_[0]->cmm->GetSnapshot()->current_backends.size());
   EXPECT_EQ(NUM_BACKENDS, GetDefaultGroupSize(*backends_[0]->cmm));
 
   // Tell a BE to blacklist another BE, should remove it from executor_groups but not
   // current_backends.
-  backends_[0]->cmm->BlacklistExecutor(*backends_[1]->desc);
+  backends_[0]->cmm->BlacklistExecutor(backends_[1]->desc->backend_id(), Status("error"));
   EXPECT_EQ(NUM_BACKENDS, backends_[0]->cmm->GetSnapshot()->current_backends.size());
   EXPECT_EQ(NUM_BACKENDS - 1, GetDefaultGroupSize(*backends_[0]->cmm));
   // Blacklist a BE that is already blacklisted. Should have no effect.
-  backends_[0]->cmm->BlacklistExecutor(*backends_[1]->desc);
+  backends_[0]->cmm->BlacklistExecutor(backends_[1]->desc->backend_id(), Status("error"));
   EXPECT_EQ(NUM_BACKENDS, backends_[0]->cmm->GetSnapshot()->current_backends.size());
   EXPECT_EQ(NUM_BACKENDS - 1, GetDefaultGroupSize(*backends_[0]->cmm));
 
@@ -397,7 +423,7 @@ TEST_F(ClusterMembershipMgrTest, ExecutorBlacklist) {
   EXPECT_EQ(NUM_BACKENDS, GetDefaultGroupSize(*backends_[0]->cmm));
 
   // Blacklist the BE and sleep again.
-  backends_[0]->cmm->BlacklistExecutor(*backends_[1]->desc);
+  backends_[0]->cmm->BlacklistExecutor(backends_[1]->desc->backend_id(), Status("error"));
   EXPECT_EQ(NUM_BACKENDS, backends_[0]->cmm->GetSnapshot()->current_backends.size());
   EXPECT_EQ(NUM_BACKENDS - 1, GetDefaultGroupSize(*backends_[0]->cmm));
   usleep(BLACKLIST_TIMEOUT_SLEEP_US);
@@ -407,12 +433,12 @@ TEST_F(ClusterMembershipMgrTest, ExecutorBlacklist) {
   EXPECT_EQ(NUM_BACKENDS, backends_[0]->cmm->GetSnapshot()->current_backends.size());
   EXPECT_EQ(NUM_BACKENDS - 1, GetDefaultGroupSize(*backends_[0]->cmm));
   // Try blacklisting the quiesced BE, should have no effect.
-  backends_[0]->cmm->BlacklistExecutor(*backends_[1]->desc);
+  backends_[0]->cmm->BlacklistExecutor(backends_[1]->desc->backend_id(), Status("error"));
   EXPECT_EQ(NUM_BACKENDS, backends_[0]->cmm->GetSnapshot()->current_backends.size());
   EXPECT_EQ(NUM_BACKENDS - 1, GetDefaultGroupSize(*backends_[0]->cmm));
 
   // Blacklist another BE and sleep.
-  backends_[0]->cmm->BlacklistExecutor(*backends_[2]->desc);
+  backends_[0]->cmm->BlacklistExecutor(backends_[2]->desc->backend_id(), Status("error"));
   EXPECT_EQ(NUM_BACKENDS, backends_[0]->cmm->GetSnapshot()->current_backends.size());
   EXPECT_EQ(NUM_BACKENDS - 2, GetDefaultGroupSize(*backends_[0]->cmm));
   usleep(BLACKLIST_TIMEOUT_SLEEP_US);
@@ -547,6 +573,223 @@ TEST_F(ClusterMembershipMgrTest, RandomizedMembershipUpdates) {
   }
   std::cout << "Added: " << num_added << ", shutdown: " << num_shutdown << ", deleted: "
       << num_deleted << ", killed: " << num_killed << endl;
+}
+
+/// This tests various valid and invalid cases that the parsing logic in
+/// PopulateExpectedExecGroupSets can encounter.
+TEST(ClusterMembershipMgrUnitTest, TestPopulateExpectedExecGroupSets) {
+  gflags::FlagSaver saver;
+  vector<TExecutorGroupSet> expected_exec_group_sets;
+  // Case 1: Empty string
+  FLAGS_expected_executor_group_sets = "";
+  expected_exec_group_sets.clear();
+  Status status =
+      ClusterMembershipMgr::PopulateExpectedExecGroupSets(expected_exec_group_sets);
+  EXPECT_TRUE(status.ok());
+  EXPECT_TRUE(expected_exec_group_sets.empty());
+
+  // Case 2: Single valid group set
+  FLAGS_expected_executor_group_sets = "group-prefix1:2";
+  expected_exec_group_sets.clear();
+  status = ClusterMembershipMgr::PopulateExpectedExecGroupSets(expected_exec_group_sets);
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(expected_exec_group_sets.size(), 1);
+  EXPECT_EQ(expected_exec_group_sets[0].exec_group_name_prefix, "group-prefix1");
+  EXPECT_EQ(expected_exec_group_sets[0].expected_num_executors, 2);
+
+  // Case 3: Multiple valid group sets
+  FLAGS_expected_executor_group_sets = "group-prefix1:2,group-prefix2:10";
+  expected_exec_group_sets.clear();
+  status = ClusterMembershipMgr::PopulateExpectedExecGroupSets(expected_exec_group_sets);
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(expected_exec_group_sets.size(), 2);
+  EXPECT_EQ(expected_exec_group_sets[0].exec_group_name_prefix, "group-prefix1");
+  EXPECT_EQ(expected_exec_group_sets[0].expected_num_executors, 2);
+  EXPECT_EQ(expected_exec_group_sets[1].exec_group_name_prefix, "group-prefix2");
+  EXPECT_EQ(expected_exec_group_sets[1].expected_num_executors, 10);
+
+  // Case 4: Multiple valid group sets but out of order, output is expected to return in
+  // increasing order of expected group size
+  FLAGS_expected_executor_group_sets = "group-prefix1:10,group-prefix2:2";
+  expected_exec_group_sets.clear();
+  status = ClusterMembershipMgr::PopulateExpectedExecGroupSets(expected_exec_group_sets);
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(expected_exec_group_sets.size(), 2);
+  EXPECT_EQ(expected_exec_group_sets[0].exec_group_name_prefix, "group-prefix2");
+  EXPECT_EQ(expected_exec_group_sets[0].expected_num_executors, 2);
+  EXPECT_EQ(expected_exec_group_sets[1].exec_group_name_prefix, "group-prefix1");
+  EXPECT_EQ(expected_exec_group_sets[1].expected_num_executors, 10);
+
+  // Case 5: Invalid input for expected group size
+  FLAGS_expected_executor_group_sets = "group-prefix1:2abc";
+  expected_exec_group_sets.clear();
+  status = ClusterMembershipMgr::PopulateExpectedExecGroupSets(expected_exec_group_sets);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.msg().GetFullMessageDetails(),
+      "Failed to parse expected executor group set size for input: group-prefix1:2abc\n");
+
+  // Case 6: Invalid input with no expected group size
+  FLAGS_expected_executor_group_sets = "group-prefix1:";
+  expected_exec_group_sets.clear();
+  status = ClusterMembershipMgr::PopulateExpectedExecGroupSets(expected_exec_group_sets);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.msg().GetFullMessageDetails(),
+      "Failed to parse expected executor group set size for input: group-prefix1:\n");
+
+  // Case 7: Invalid input with no group prefix
+  FLAGS_expected_executor_group_sets = ":1";
+  expected_exec_group_sets.clear();
+  status = ClusterMembershipMgr::PopulateExpectedExecGroupSets(expected_exec_group_sets);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.msg().GetFullMessageDetails(),
+      "Executor group set prefix cannot be empty for input: :1\n");
+
+  // Case 8: Invalid input with no colon separator
+  FLAGS_expected_executor_group_sets = "group-prefix1";
+  expected_exec_group_sets.clear();
+  status = ClusterMembershipMgr::PopulateExpectedExecGroupSets(expected_exec_group_sets);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.msg().GetFullMessageDetails(),
+      "Invalid executor group set format: group-prefix1\n");
+
+  // Case 9: Invalid input with duplicated group prefix
+  FLAGS_expected_executor_group_sets = "group-prefix1:2,group-prefix1:10";
+  expected_exec_group_sets.clear();
+  status = ClusterMembershipMgr::PopulateExpectedExecGroupSets(expected_exec_group_sets);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.msg().GetFullMessageDetails(),
+      "Executor group set prefix specified multiple times: group-prefix1:10\n");
+}
+
+/// This ensures that all executor group configuration scenarios possible using available
+/// startup flags are handled correctly when populating membership updates that are
+/// sent to the frontend.
+TEST(ClusterMembershipMgrUnitTest, PopulateExecutorMembershipRequest) {
+  gflags::FlagSaver saver;
+  FLAGS_num_expected_executors = 20;
+  auto snapshot_ptr = std::make_shared<ClusterMembershipMgr::Snapshot>();
+  TUpdateExecutorMembershipRequest update_req;
+  vector<TExecutorGroupSet> empty_exec_group_sets;
+  vector<TExecutorGroupSet> populated_exec_group_sets;
+  populated_exec_group_sets.emplace_back();
+  populated_exec_group_sets.back().__set_exec_group_name_prefix("foo");
+  populated_exec_group_sets.back().__set_expected_num_executors(2);
+  populated_exec_group_sets.emplace_back();
+  populated_exec_group_sets.back().__set_exec_group_name_prefix("bar");
+  populated_exec_group_sets.back().__set_expected_num_executors(10);
+
+  // Case 1a: Not using executor groups
+  {
+    ExecutorGroup exec_group(ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME, 1);
+    exec_group.AddExecutor(MakeBackendDescriptor(1, 0));
+    snapshot_ptr->executor_groups.insert({exec_group.name(), exec_group});
+    ClusterMembershipMgr::SnapshotPtr ptr = snapshot_ptr;
+    PopulateExecutorMembershipRequest(ptr, empty_exec_group_sets, update_req);
+    EXPECT_EQ(update_req.exec_group_sets.size(), 1);
+    EXPECT_EQ(update_req.exec_group_sets[0].curr_num_executors, 1);
+    EXPECT_EQ(update_req.exec_group_sets[0].expected_num_executors, 20);
+    EXPECT_EQ(update_req.exec_group_sets[0].exec_group_name_prefix, "");
+    snapshot_ptr->executor_groups.clear();
+  }
+
+  // Case 1b: Not using executor groups but expected_exec_group_sets is non-empty
+  {
+    ExecutorGroup exec_group(ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME, 1);
+    exec_group.AddExecutor(MakeBackendDescriptor(1, 0));
+    snapshot_ptr->executor_groups.insert({exec_group.name(), exec_group});
+    ClusterMembershipMgr::SnapshotPtr ptr = snapshot_ptr;
+    PopulateExecutorMembershipRequest(ptr, populated_exec_group_sets, update_req);
+    EXPECT_EQ(update_req.exec_group_sets.size(), 1);
+    EXPECT_EQ(update_req.exec_group_sets[0].curr_num_executors, 1);
+    EXPECT_EQ(update_req.exec_group_sets[0].expected_num_executors, 20);
+    EXPECT_EQ(update_req.exec_group_sets[0].exec_group_name_prefix, "");
+    snapshot_ptr->executor_groups.clear();
+  }
+
+  // Case 2a: Using executor groups, expected_exec_group_sets is empty
+  {
+    ExecutorGroup exec_group("foo-group1", 1);
+    exec_group.AddExecutor(MakeBackendDescriptor(1, exec_group, 0));
+    snapshot_ptr->executor_groups.insert({exec_group.name(), exec_group});
+    // Adding another exec group with more executors.
+    ExecutorGroup exec_group2("foo-group2", 1);
+    exec_group2.AddExecutor(MakeBackendDescriptor(1, exec_group2, 1));
+    exec_group2.AddExecutor(MakeBackendDescriptor(2, exec_group2, 2));
+    snapshot_ptr->executor_groups.insert({exec_group2.name(), exec_group2});
+    ClusterMembershipMgr::SnapshotPtr ptr = snapshot_ptr;
+    PopulateExecutorMembershipRequest(ptr, empty_exec_group_sets, update_req);
+    EXPECT_EQ(update_req.exec_group_sets.size(), 1);
+    EXPECT_EQ(update_req.exec_group_sets[0].curr_num_executors, 2);
+    EXPECT_EQ(update_req.exec_group_sets[0].expected_num_executors, 20);
+    EXPECT_EQ(update_req.exec_group_sets[0].exec_group_name_prefix, "");
+    snapshot_ptr->executor_groups.clear();
+  }
+
+  // Case 2b: Using executor groups, expected_exec_group_sets is empty, executor groups
+  // with different group prefixes
+  {
+    ExecutorGroup exec_group("foo-group1", 1);
+    exec_group.AddExecutor(MakeBackendDescriptor(1, exec_group, 0));
+    snapshot_ptr->executor_groups.insert({exec_group.name(), exec_group});
+    // Adding another exec group with a different group prefix.
+    ExecutorGroup exec_group2("bar-group1", 1);
+    exec_group2.AddExecutor(MakeBackendDescriptor(1, exec_group2, 1));
+    exec_group2.AddExecutor(MakeBackendDescriptor(2, exec_group2, 2));
+    snapshot_ptr->executor_groups.insert({exec_group2.name(), exec_group2});
+    ClusterMembershipMgr::SnapshotPtr ptr = snapshot_ptr;
+    PopulateExecutorMembershipRequest(ptr, empty_exec_group_sets, update_req);
+    EXPECT_EQ(update_req.exec_group_sets.size(), 1);
+    EXPECT_EQ(update_req.exec_group_sets[0].curr_num_executors, 2);
+    EXPECT_EQ(update_req.exec_group_sets[0].expected_num_executors, 20);
+    EXPECT_EQ(update_req.exec_group_sets[0].exec_group_name_prefix, "");
+    snapshot_ptr->executor_groups.clear();
+  }
+
+  // Case 2c: Using executor groups, expected_exec_group_sets is non-empty
+  {
+    ExecutorGroup exec_group("foo-group1", 1);
+    exec_group.AddExecutor(MakeBackendDescriptor(1, exec_group, 0));
+    snapshot_ptr->executor_groups.insert({exec_group.name(), exec_group});
+    // Adding another exec group with a different group prefix.
+    ExecutorGroup exec_group2("bar-group1", 1);
+    exec_group2.AddExecutor(MakeBackendDescriptor(1, exec_group2, 1));
+    exec_group2.AddExecutor(MakeBackendDescriptor(2, exec_group2, 2));
+    snapshot_ptr->executor_groups.insert({exec_group2.name(), exec_group2});
+    ClusterMembershipMgr::SnapshotPtr ptr = snapshot_ptr;
+    PopulateExecutorMembershipRequest(ptr, populated_exec_group_sets, update_req);
+    EXPECT_EQ(update_req.exec_group_sets.size(), 2);
+    EXPECT_EQ(update_req.exec_group_sets[0].curr_num_executors, 1);
+    EXPECT_EQ(update_req.exec_group_sets[0].expected_num_executors, 2);
+    EXPECT_EQ(update_req.exec_group_sets[0].exec_group_name_prefix, "foo");
+    EXPECT_EQ(update_req.exec_group_sets[1].curr_num_executors, 2);
+    EXPECT_EQ(update_req.exec_group_sets[1].expected_num_executors, 10);
+    EXPECT_EQ(update_req.exec_group_sets[1].exec_group_name_prefix, "bar");
+    snapshot_ptr->executor_groups.clear();
+  }
+
+  // Case 2d: Using executor groups, expected_exec_group_sets is non-empty
+  // and one executor group that does not match to any executor group sets having more
+  // number of executor groups
+  {
+    ExecutorGroup exec_group("foo-group1", 1);
+    exec_group.AddExecutor(MakeBackendDescriptor(1, exec_group, 0));
+    snapshot_ptr->executor_groups.insert({exec_group.name(), exec_group});
+    // Adding another exec group with a different group prefix.
+    ExecutorGroup exec_group2("unmatch-group1", 1);
+    exec_group2.AddExecutor(MakeBackendDescriptor(1, exec_group2, 1));
+    exec_group2.AddExecutor(MakeBackendDescriptor(2, exec_group2, 2));
+    snapshot_ptr->executor_groups.insert({exec_group2.name(), exec_group2});
+    ClusterMembershipMgr::SnapshotPtr ptr = snapshot_ptr;
+    PopulateExecutorMembershipRequest(ptr, populated_exec_group_sets, update_req);
+    EXPECT_EQ(update_req.exec_group_sets.size(), 2);
+    EXPECT_EQ(update_req.exec_group_sets[0].curr_num_executors, 1);
+    EXPECT_EQ(update_req.exec_group_sets[0].expected_num_executors, 2);
+    EXPECT_EQ(update_req.exec_group_sets[0].exec_group_name_prefix, "foo");
+    EXPECT_EQ(update_req.exec_group_sets[1].curr_num_executors, 0);
+    EXPECT_EQ(update_req.exec_group_sets[1].expected_num_executors, 10);
+    EXPECT_EQ(update_req.exec_group_sets[1].exec_group_name_prefix, "bar");
+    snapshot_ptr->executor_groups.clear();
+  }
 }
 
 /// TODO: Write a test that makes a number of random changes to cluster membership while

@@ -17,6 +17,8 @@
 
 #include "exec/buffered-plan-root-sink.h"
 #include "service/query-result-set.h"
+#include "util/debug-util.h"
+#include "util/runtime-profile-counters.h"
 
 #include "common/names.h"
 
@@ -29,10 +31,10 @@ const int BufferedPlanRootSink::MAX_FETCH_SIZE;
 const int FETCH_NUM_BATCHES = 10;
 
 BufferedPlanRootSink::BufferedPlanRootSink(TDataSinkId sink_id,
-    const RowDescriptor* row_desc, RuntimeState* state,
-    const TBackendResourceProfile& resource_profile, const TDebugOptions& debug_options)
-  : PlanRootSink(sink_id, row_desc, state),
-    resource_profile_(resource_profile),
+    const DataSinkConfig& sink_config, RuntimeState* state,
+    const TDebugOptions& debug_options)
+  : PlanRootSink(sink_id, sink_config, state),
+    resource_profile_(sink_config.tsink_->plan_root_sink.resource_profile),
     debug_options_(debug_options) {}
 
 Status BufferedPlanRootSink::Prepare(
@@ -48,9 +50,11 @@ Status BufferedPlanRootSink::Open(RuntimeState* state) {
   RETURN_IF_ERROR(DebugAction(state->query_options(), "BPRS_BEFORE_OPEN"));
   RETURN_IF_ERROR(DataSink::Open(state));
   current_batch_ = make_unique<RowBatch>(row_desc_, state->batch_size(), mem_tracker());
-  batch_queue_.reset(new SpillableRowBatchQueue(name_,
-      state->query_options().max_spilled_result_spooling_mem, state, mem_tracker(),
-      profile(), row_desc_, resource_profile_, debug_options_));
+  int64_t max_spilled_mem = state->query_options().max_spilled_result_spooling_mem;
+  // max_spilled_result_spooling_mem = 0 means unbounded.
+  if (max_spilled_mem <= 0) max_spilled_mem = INT64_MAX;
+  batch_queue_.reset(new SpillableRowBatchQueue(name_, max_spilled_mem, state,
+      mem_tracker(), profile(), row_desc_, resource_profile_, debug_options_));
   RETURN_IF_ERROR(batch_queue_->Open());
   return Status::OK();
 }
@@ -64,7 +68,6 @@ Status BufferedPlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
   // after the sink is closed.
   DCHECK(!closed_);
   DCHECK(batch_queue_->IsOpen());
-  PlanRootSink::ValidateCollectionSlots(*row_desc_, batch);
   RETURN_IF_ERROR(PlanRootSink::UpdateAndCheckRowsProducedLimit(state, batch));
 
   {
@@ -76,6 +79,8 @@ Status BufferedPlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
     while (!state->is_cancelled() && batch_queue_->IsFull()) {
       SCOPED_TIMER(profile()->inactive_timer());
       SCOPED_TIMER(row_batches_send_wait_timer_);
+      // Set this to true means the batch queue is full.
+      discard_result(all_results_spooled_.Set(true));
       batch_queue_has_capacity_.Wait(l);
     }
     RETURN_IF_CANCELLED(state);
@@ -100,11 +105,13 @@ Status BufferedPlanRootSink::FlushFinal(RuntimeState* state) {
   DCHECK(!closed_);
   unique_lock<mutex> l(lock_);
   sender_state_ = SenderState::EOS;
+  discard_result(all_results_spooled_.Set(false));
   // If no batches are ever added, wake up the consumer thread so it can check the
   // SenderState and return appropriately.
   rows_available_.NotifyAll();
-  // Wait until the consumer has read all rows from the batch_queue_.
-  {
+  // Wait until the consumer has read all rows from the batch_queue_ or this has
+  // been cancelled.
+  while (!IsCancelledOrClosed(state) && !IsQueueEmpty(state)) {
     SCOPED_TIMER(profile()->inactive_timer());
     consumer_eos_.Wait(l);
   }
@@ -120,6 +127,7 @@ void BufferedPlanRootSink::Close(RuntimeState* state) {
   if (sender_state_ == SenderState::ROWS_PENDING) {
     sender_state_ = SenderState::CLOSED_NOT_EOS;
   }
+  discard_result(all_results_spooled_.Set(false));
   if (current_batch_row_ != 0) {
     current_batch_->Reset();
   }
@@ -134,6 +142,14 @@ void BufferedPlanRootSink::Close(RuntimeState* state) {
 
 void BufferedPlanRootSink::Cancel(RuntimeState* state) {
   DCHECK(state->is_cancelled());
+  // Get the lock_ to synchronize with FlushFinal(). Either FlushFinal() will be waiting
+  // on the consumer_eos_ condition variable and get signalled below, or it will see
+  // that is_cancelled() is true after it gets the lock. Drop the the lock before
+  // signalling the CV so that a blocked thread can immediately acquire the mutex when
+  // it wakes up.
+  {
+    unique_lock<mutex> l(lock_);
+  }
   // Wake up all sleeping threads so they can check the cancellation state.
   // While it should be safe to call NotifyOne() here, prefer to use NotifyAll() to
   // ensure that all sleeping threads are awoken. The calls to NotifyAll() are not on the
@@ -141,6 +157,7 @@ void BufferedPlanRootSink::Cancel(RuntimeState* state) {
   rows_available_.NotifyAll();
   consumer_eos_.NotifyAll();
   batch_queue_has_capacity_.NotifyAll();
+  discard_result(all_results_spooled_.Set(false));
 }
 
 Status BufferedPlanRootSink::GetNext(RuntimeState* state, QueryResultSet* results,

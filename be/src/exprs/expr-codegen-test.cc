@@ -18,6 +18,8 @@
 // The following is cross-compiled to native code and IR, and used in the test below
 #include "exprs/decimal-operators.h"
 #include "exprs/scalar-expr.h"
+#include "runtime/fragment-state.h"
+#include "runtime/query-state.h"
 #include "udf/udf.h"
 
 #ifdef IR_COMPILE
@@ -88,6 +90,7 @@ class ExprCodegenTest : public ::testing::Test {
  protected:
   scoped_ptr<TestEnv> test_env_;
   RuntimeState* runtime_state_;
+  FragmentState* fragment_state_;
   FunctionContext* fn_ctx_;
   FnAttr fn_type_attr_;
 
@@ -101,8 +104,8 @@ class ExprCodegenTest : public ::testing::Test {
   }
 
   Status CreateFromFile(const string& filename, scoped_ptr<LlvmCodeGen>* codegen) {
-    RETURN_IF_ERROR(LlvmCodeGen::CreateFromFile(runtime_state_,
-        runtime_state_->obj_pool(), NULL, filename, "test", codegen));
+    RETURN_IF_ERROR(LlvmCodeGen::CreateFromFile(fragment_state_,
+        fragment_state_->obj_pool(), NULL, filename, "test", codegen));
     return (*codegen)->MaterializeModule();
   }
 
@@ -113,6 +116,11 @@ class ExprCodegenTest : public ::testing::Test {
     test_env_.reset(new TestEnv());
     ASSERT_OK(test_env_->Init());
     ASSERT_OK(test_env_->CreateQueryState(0, &query_options, &runtime_state_));
+    QueryState* qs = runtime_state_->query_state();
+    TPlanFragment* fragment = qs->obj_pool()->Add(new TPlanFragment());
+    PlanFragmentCtxPB* fragment_ctx = qs->obj_pool()->Add(new PlanFragmentCtxPB());
+    fragment_state_ =
+        qs->obj_pool()->Add(new FragmentState(qs, *fragment, *fragment_ctx));
 
     FunctionContext::TypeDesc return_type;
     return_type.type = FunctionContext::TYPE_DECIMAL;
@@ -145,7 +153,9 @@ class ExprCodegenTest : public ::testing::Test {
   virtual void TearDown() {
     fn_ctx_->impl()->Close();
     delete fn_ctx_;
-    runtime_state_ = NULL;
+    fragment_state_->ReleaseResources();
+    fragment_state_ = nullptr;
+    runtime_state_ = nullptr;
     test_env_.reset();
   }
 
@@ -308,7 +318,7 @@ TEST_F(ExprCodegenTest, TestInlineConstFnAttrs) {
   // Create Expr
   MemTracker tracker;
   ScalarExpr* expr;
-  ASSERT_OK(ScalarExpr::Create(texpr, RowDescriptor(), runtime_state_, &expr));
+  ASSERT_OK(ScalarExpr::Create(texpr, RowDescriptor(), fragment_state_, &expr));
 
   // Get TestGetFnAttrs() IR function
   stringstream test_udf_file;
@@ -332,7 +342,8 @@ TEST_F(ExprCodegenTest, TestInlineConstFnAttrs) {
   // Compile module
   fn = codegen->FinalizeFunction(fn);
   ASSERT_TRUE(fn != NULL);
-  void* fn_ptr;
+  typedef DecimalVal (*TestGetFnAttrs)(FunctionContext*, const DecimalVal&);
+  CodegenFnPtr<TestGetFnAttrs> fn_ptr;
   codegen->AddFunctionToJit(fn, &fn_ptr);
   EXPECT_TRUE(codegen->FinalizeModule().ok()) << LlvmCodeGen::Print(fn);
 
@@ -341,8 +352,7 @@ TEST_F(ExprCodegenTest, TestInlineConstFnAttrs) {
   // and return types are encoded above (ARG0_*, RET_*);
   int64_t v = 1000025;
   DecimalVal arg0_val(v);
-  typedef DecimalVal (*TestGetFnAttrs)(FunctionContext*, const DecimalVal&);
-  DecimalVal result = reinterpret_cast<TestGetFnAttrs>(fn_ptr)(fn_ctx_, arg0_val);
+  DecimalVal result = fn_ptr.load()(fn_ctx_, arg0_val);
   // sanity check result
   EXPECT_EQ(result.is_null, false);
   EXPECT_EQ(result.val8, 100003);

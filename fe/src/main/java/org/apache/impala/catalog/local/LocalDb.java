@@ -35,6 +35,9 @@ import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
 import org.apache.impala.catalog.TableLoadingException;
+import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.thrift.TBriefTableMeta;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TFunctionCategory;
 import org.apache.impala.util.FunctionUtils;
@@ -53,7 +56,7 @@ import com.google.common.collect.Maps;
  * This class is not thread-safe. A new instance is created for
  * each catalog instance.
  */
-class LocalDb implements FeDb {
+public class LocalDb implements FeDb {
   private final LocalCatalog catalog_;
   /** The lower-case name of the database. */
   private final String name_;
@@ -122,14 +125,15 @@ class LocalDb implements FeDb {
     FeTable tbl = getTableIfCached(tblName);
     if (tbl instanceof LocalIncompleteTable) {
       // The table exists but hasn't been loaded yet.
-      try{
+      try {
         tbl = LocalTable.load(this, tblName);
       } catch (TableLoadingException tle) {
         // If the table fails to load (eg a Kudu table that doesn't have
         // a backing table, or some other catalogd-side issue), turn it into
         // an IncompleteTable. This allows statements like DROP TABLE to still
         // analyze.
-        tbl = new FailedLoadLocalTable(this, tblName, tle);
+        tbl = new FailedLoadLocalTable(this, tblName, tbl.getTableType(),
+            tbl.getTableComment(), tle);
       }
       tables_.put(tblName, tbl);
     }
@@ -138,10 +142,10 @@ class LocalDb implements FeDb {
 
   @Override
   public FeKuduTable createKuduCtasTarget(Table msTbl, List<ColumnDef> columnDefs,
-      List<ColumnDef> primaryKeyColumnDefs,
-      List<KuduPartitionParam> kuduPartitionParams) {
-    return LocalKuduTable.createCtasTarget(this, msTbl, columnDefs, primaryKeyColumnDefs,
-        kuduPartitionParams);
+      List<ColumnDef> primaryKeyColumnDefs, boolean isPrimaryKeyUnique,
+      List<KuduPartitionParam> kuduPartitionParams) throws ImpalaRuntimeException {
+    return LocalKuduTable.createCtasTarget(this, msTbl, columnDefs, isPrimaryKeyUnique,
+        primaryKeyColumnDefs, kuduPartitionParams);
   }
 
   @Override
@@ -165,9 +169,9 @@ class LocalDb implements FeDb {
     if (tables_ != null) return;
     Map<String, FeTable> newMap = new HashMap<>();
     try {
-      List<String> names = catalog_.getMetaProvider().loadTableNames(name_);
-      for (String tableName : names) {
-        newMap.put(tableName.toLowerCase(), new LocalIncompleteTable(this, tableName));
+      MetaProvider metaProvider = catalog_.getMetaProvider();
+      for (TBriefTableMeta meta : metaProvider.loadTableList(name_)) {
+        newMap.put(meta.getName(), new LocalIncompleteTable(this, meta));
       }
     } catch (TException e) {
       throw new LocalCatalogException(String.format(

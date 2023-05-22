@@ -14,20 +14,25 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_UTIL_BLOOM_FILTER_H
-#define KUDU_UTIL_BLOOM_FILTER_H
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/hash/city.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/util/bitmap.h"
+#include "kudu/util/hash.pb.h"
+#include "kudu/util/hash_util.h"
 #include "kudu/util/slice.h"
 
 namespace kudu {
+
+// A simple BloomFilter that takes arbitrary datatype as key.
+// For a space and cache efficient block based BloomFilter that takes 32-bit hash as key see
+// BlockBloomFilter in block_bloom_filter.h
 
 // Probe calculated from a given key. This caches the calculated
 // hash values which are necessary for probing into a Bloom Filter,
@@ -52,11 +57,22 @@ class BloomKeyProbe {
   //
   // NOTE: proper operation requires that the referenced memory remain
   // valid for the lifetime of this object.
-  explicit BloomKeyProbe(const Slice &key) : key_(key) {
-    uint64_t h = util_hash::CityHash64(
-      reinterpret_cast<const char *>(key.data()),
-      key.size());
-
+  explicit BloomKeyProbe(const Slice &key, HashAlgorithm hash_algorithm = CITY_HASH)
+      : key_(key) {
+    uint64_t h = 0;
+    switch (hash_algorithm) {
+      case MURMUR_HASH_2:
+        h = HashUtil::MurmurHash2_64(
+                reinterpret_cast<const char *>(key.data()),
+                key.size(),
+                /*seed=*/0);
+        break;
+      case CITY_HASH:
+      default:
+        h = util_hash::CityHash64(
+                reinterpret_cast<const char *>(key.data()),
+                key.size());
+    }
     // Use the top and bottom halves of the 64-bit hash
     // as the two independent hash functions for mixing.
     h_1_ = static_cast<uint32_t>(h);
@@ -158,7 +174,7 @@ class BloomFilterBuilder {
   DISALLOW_COPY_AND_ASSIGN(BloomFilterBuilder);
 
   size_t n_bits_;
-  gscoped_array<uint8_t> bitmap_;
+  std::unique_ptr<uint8_t[]> bitmap_;
 
   // The number of hash functions to compute.
   size_t n_hashes_;
@@ -250,5 +266,3 @@ inline bool BloomFilter::MayContainKey(const BloomKeyProbe &probe) const {
 }
 
 } // namespace kudu
-
-#endif

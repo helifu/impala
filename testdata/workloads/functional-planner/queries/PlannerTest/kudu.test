@@ -143,7 +143,7 @@ and zip > 1 and zip < 50
 PLAN-ROOT SINK
 |
 00:SCAN KUDU [functional_kudu.testtbl]
-   kudu predicates: id <= 20, id >= 10, zip < 50, zip <= 30, zip <= 5, zip > 1, zip >= 0, name = 'foo'
+   kudu predicates: name = 'foo', id <= 20, id >= 10, zip < 50, zip <= 30, zip <= 5, zip > 1, zip >= 0
    row-size=28B cardinality=0
 ---- SCANRANGELOCATIONS
 NODE 0:
@@ -154,7 +154,7 @@ PLAN-ROOT SINK
 01:EXCHANGE [UNPARTITIONED]
 |
 00:SCAN KUDU [functional_kudu.testtbl]
-   kudu predicates: id <= 20, id >= 10, zip < 50, zip <= 30, zip <= 5, zip > 1, zip >= 0, name = 'foo'
+   kudu predicates: name = 'foo', id <= 20, id >= 10, zip < 50, zip <= 30, zip <= 5, zip > 1, zip >= 0
    row-size=28B cardinality=0
 ====
 # Constant propagation works for Kudu
@@ -392,7 +392,7 @@ PLAN-ROOT SINK
 |
 03:HASH JOIN [INNER JOIN]
 |  hash predicates: a.id = b.id
-|  runtime filters: RF001 <- b.id
+|  runtime filters: RF000 <- b.id, RF001 <- b.id
 |  row-size=12B cardinality=1
 |
 |--01:SCAN KUDU [functional_kudu.alltypessmall b]
@@ -403,7 +403,7 @@ PLAN-ROOT SINK
 00:SCAN KUDU [functional_kudu.alltypes a]
    predicates: CAST(a.id AS STRING) > '123'
    kudu predicates: a.id > 10
-   runtime filters: RF001 -> a.id
+   runtime filters: RF000 -> a.id, RF001 -> a.id
    row-size=4B cardinality=730
 ====
 # IMPALA-4662: Kudu analysis failure for NULL literal in IN list
@@ -625,4 +625,158 @@ PLAN-ROOT SINK
 00:SCAN KUDU [functional_kudu.decimal_tbl]
    kudu predicates: d4 = 0.123456789
    row-size=56B cardinality=5
+====
+# Multiple conflicting equality predicates on the Kudu table.
+# EmptySetNode should be created.
+select * from functional_kudu.testtbl where id = 1 and id = 10
+---- PLAN
+PLAN-ROOT SINK
+|
+00:EMPTYSET
+---- SCANRANGELOCATIONS
+
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+00:EMPTYSET
+====
+# Query with "limit 0" on the Kudu table
+# EmptySetNode should be created.
+select * from functional_kudu.testtbl limit 0
+---- PLAN
+PLAN-ROOT SINK
+|
+00:EMPTYSET
+---- SCANRANGELOCATIONS
+
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+00:EMPTYSET
+====
+# Multiple redundant equality predicates on the Kudu table.
+# They should be deduplicated.
+select * from functional_kudu.testtbl where name = 'Smith' and name = 'Smith'
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.testtbl]
+   kudu predicates: name = 'Smith'
+   row-size=28B cardinality=0
+---- SCANRANGELOCATIONS
+NODE 0:
+  ScanToken{table-name=impala::functional_kudu.testtbl, range-partition: [(int64 id=1004), (int64 id=1008))}
+  ScanToken{table-name=impala::functional_kudu.testtbl, range-partition: [(int64 id=1008), <end>)}
+  ScanToken{table-name=impala::functional_kudu.testtbl, range-partition: [<start>, (int64 id=1004))}
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+01:EXCHANGE [UNPARTITIONED]
+|
+00:SCAN KUDU [functional_kudu.testtbl]
+   kudu predicates: name = 'Smith'
+   row-size=28B cardinality=0
+====
+# Redundant = and "is not distinct from" predicates.
+# They are same and should be deduplicated.
+select count(*) from tpch_kudu.lineitem
+where l_orderkey = 1 and l_orderkey is not distinct from 1 and
+l_partkey = 1 and l_suppkey = 1;
+---- PLAN
+PLAN-ROOT SINK
+|
+01:AGGREGATE [FINALIZE]
+|  output: count(*)
+|  row-size=8B cardinality=1
+|
+00:SCAN KUDU [tpch_kudu.lineitem]
+   kudu predicates: l_orderkey = 1, l_partkey = 1, l_suppkey = 1
+   row-size=0B cardinality=1
+---- SCANRANGELOCATIONS
+NODE 0:
+  ScanToken{table-name=impala::tpch_kudu.lineitem, hash-partition-buckets: [3]}
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+03:AGGREGATE [FINALIZE]
+|  output: count:merge(*)
+|  row-size=8B cardinality=1
+|
+02:EXCHANGE [UNPARTITIONED]
+|
+01:AGGREGATE
+|  output: count(*)
+|  row-size=8B cardinality=1
+|
+00:SCAN KUDU [tpch_kudu.lineitem]
+   kudu predicates: l_orderkey = 1, l_partkey = 1, l_suppkey = 1
+   row-size=0B cardinality=1
+====
+# DATE predicate.
+select * from functional_kudu.date_tbl where date_col = DATE "1970-01-01";
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.date_tbl]
+   kudu predicates: date_col = DATE '1970-01-01'
+   row-size=12B cardinality=1
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+01:EXCHANGE [UNPARTITIONED]
+|
+00:SCAN KUDU [functional_kudu.date_tbl]
+   kudu predicates: date_col = DATE '1970-01-01'
+   row-size=12B cardinality=1
+====
+# BIGINT predicate.
+select * from functional_kudu.alltypes where bigint_col = 1;
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: bigint_col = 1
+   row-size=97B cardinality=730
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+01:EXCHANGE [UNPARTITIONED]
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: bigint_col = 1
+   row-size=97B cardinality=730
+====
+# FLOAT predicate.
+select * from functional_kudu.alltypes where float_col = 1.0;
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: float_col = 1.0
+   row-size=97B cardinality=730
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+01:EXCHANGE [UNPARTITIONED]
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: float_col = 1.0
+   row-size=97B cardinality=730
+====
+# DOUBLE predicate.
+select * from functional_kudu.alltypes where double_col = 1.0;
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: double_col = 1.0
+   row-size=97B cardinality=730
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+01:EXCHANGE [UNPARTITIONED]
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: double_col = 1.0
+   row-size=97B cardinality=730
 ====

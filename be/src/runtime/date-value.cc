@@ -21,6 +21,7 @@
 #include <iomanip>
 #include "cctz/civil_time.h"
 #include "runtime/date-parse-util.h"
+#include "runtime/datetime-simple-date-format-parser.h"
 
 #include "common/names.h"
 
@@ -29,6 +30,7 @@ namespace impala {
 using datetime_parse_util::DateTimeFormatContext;
 using datetime_parse_util::GetMonthAndDayFromDaysSinceJan1;
 using datetime_parse_util::IsLeapYear;
+using datetime_parse_util::SimpleDateFormatTokenizer;
 
 const int EPOCH_YEAR = 1970;
 const int MIN_YEAR = 1;
@@ -366,6 +368,24 @@ DateValue DateValue::AddYears(int64_t years) const {
   return DateValue(result_year, today.month(), today.day());
 }
 
+DateValue DateValue::SubtractDays(int64_t days) const {
+  if (UNLIKELY(!IsValid())) {
+    return DateValue();
+  }
+  int64_t delta = days_since_epoch_ - days;
+  if (delta < MIN_DAYS_SINCE_EPOCH || delta > MAX_DAYS_SINCE_EPOCH) {
+    return DateValue();
+  }
+  return DateValue(delta);
+}
+
+DateValue DateValue::FindMiddleDate(const DateValue& min, const DateValue& max) {
+  if (UNLIKELY(!min.IsValid() || !max.IsValid())) {
+    return DateValue();
+  }
+  return DateValue((min.days_since_epoch_ + max.days_since_epoch_) / 2);
+}
+
 bool DateValue::ToDaysSinceEpoch(int32_t* days) const {
   DCHECK(days != nullptr);
   if (UNLIKELY(!IsValid())) return false;
@@ -409,17 +429,23 @@ bool DateValue::MonthsBetween(const DateValue& other, double* months_between) co
 }
 
 string DateValue::ToString() const {
-  stringstream ss;
-  int year, month, day;
-  if (ToYearMonthDay(&year, &month, &day)) {
-    ss << std::setfill('0') << setw(4) << year << "-" << setw(2) << month << "-"
-       << setw(2) << day;
+  string s;
+  s.resize(SimpleDateFormatTokenizer::DEFAULT_DATE_FMT_LEN);
+  const int out_len = DateParser::FormatDefault(*this, s.data());
+  if (UNLIKELY(out_len != SimpleDateFormatTokenizer::DEFAULT_DATE_FMT_LEN)) {
+    s.clear();
   }
-  return ss.str();
+  return s;
 }
 
 ostream& operator<<(ostream& os, const DateValue& date_value) {
-  return os << date_value.ToString();
+  char dst[SimpleDateFormatTokenizer::DEFAULT_DATE_FMT_LEN + 1];
+  const int out_len = DateParser::FormatDefault(date_value, dst);
+  if (LIKELY(out_len >= 0)) {
+    dst[out_len] = '\0';
+    os << dst;
+  }
+  return os;
 }
 
 }

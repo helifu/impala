@@ -139,6 +139,10 @@ class RequestContext {
   /// on the IoMgr disk queue.
   Status AddWriteRange(WriteRange* write_range) WARN_UNUSED_RESULT;
 
+  /// Add a RemoteOperRange for the writer. This is non-blocking and schedules the context
+  /// on the IoMgr disk queue.
+  Status AddRemoteOperRange(RemoteOperRange* write_range) WARN_UNUSED_RESULT;
+
   /// Cancel the context asynchronously. All outstanding requests are cancelled
   /// asynchronously. This does not need to be called if the context finishes normally.
   /// Calling GetNext() on any scan ranges belonging to this RequestContext will return
@@ -147,13 +151,15 @@ class RequestContext {
   void Cancel();
 
   bool IsCancelled() {
-    boost::unique_lock<boost::mutex> lock(lock_);
+    std::unique_lock<std::mutex> lock(lock_);
     return state_ == Cancelled;
   }
 
   int64_t bytes_read_local() const { return bytes_read_local_.Load(); }
   int64_t bytes_read_short_circuit() const { return bytes_read_short_circuit_.Load(); }
   int64_t bytes_read_dn_cache() const { return bytes_read_dn_cache_.Load(); }
+  int64_t bytes_read_encrypted() const { return bytes_read_encrypted_.Load(); }
+  int64_t bytes_read_ec() const { return bytes_read_ec_.Load(); }
   int num_remote_ranges() const { return num_remote_ranges_.Load(); }
   int64_t unexpected_remote_bytes() const { return unexpected_remote_bytes_.Load(); }
 
@@ -167,6 +173,25 @@ class RequestContext {
 
   void set_bytes_read_counter(RuntimeProfile::Counter* bytes_read_counter) {
     bytes_read_counter_ = bytes_read_counter;
+  }
+
+  void set_read_use_mem_counter(RuntimeProfile::Counter* read_use_mem_counter) {
+    read_use_mem_counter_ = read_use_mem_counter;
+  }
+
+  void set_bytes_read_use_mem_counter(
+      RuntimeProfile::Counter* bytes_read_use_mem_counter) {
+    bytes_read_use_mem_counter_ = bytes_read_use_mem_counter;
+  }
+
+  void set_read_use_local_disk_counter(
+      RuntimeProfile::Counter* read_use_local_disk_counter) {
+    read_use_local_disk_counter_ = read_use_local_disk_counter;
+  }
+
+  void set_bytes_read_use_local_disk_counter(
+      RuntimeProfile::Counter* bytes_read_use_local_disk_counter) {
+    bytes_read_use_local_disk_counter_ = bytes_read_use_local_disk_counter;
   }
 
   void set_read_timer(RuntimeProfile::Counter* read_timer) { read_timer_ = read_timer; }
@@ -223,6 +248,9 @@ class RequestContext {
   friend class DiskIoMgr;
   friend class ScanRange;
   friend class HdfsFileReader;
+  friend class WriteRange;
+  friend class RemoteOperRange;
+  friend class LocalFileWriter;
 
   enum State {
     /// Reader is initialized and maps to a client
@@ -253,7 +281,7 @@ class RequestContext {
   /// Decrements the number of active disks for this reader.  If the disk count
   /// goes to 0, the disk complete condition variable is signaled.
   /// 'lock_' must be held via 'lock'.
-  void DecrementDiskRefCount(const boost::unique_lock<boost::mutex>& lock);
+  void DecrementDiskRefCount(const std::unique_lock<std::mutex>& lock);
 
   /// Reader & Disk Scheduling: Readers that currently can't do work are not on
   /// the disk's queue. These readers are ones that don't have any ranges in the
@@ -265,7 +293,7 @@ class RequestContext {
   /// Adds range to in_flight_ranges, scheduling this reader on the disk threads
   /// if necessary.
   /// 'lock_' must be held via 'lock'. Only valid to call if this context is active.
-  void ScheduleScanRange(const boost::unique_lock<boost::mutex>& lock, ScanRange* range);
+  void ScheduleScanRange(const std::unique_lock<std::mutex>& lock, ScanRange* range);
 
   // Called from the disk thread for 'disk_id' to get the next request range to process
   // for this context for the disk. Returns nullptr if there are no ranges currently
@@ -279,11 +307,11 @@ class RequestContext {
   /// Caller must not hold 'lock_'.
   void ReadDone(int disk_id, ReadOutcome outcome, ScanRange* range);
 
-  /// Invokes write_range->callback() after the range has been written and
-  /// updates per-disk state and handle state. The status of the write OK/RUNTIME_ERROR
-  /// etc. is passed via write_status and to the callback. A write error does not cancel
-  /// the writer context - that decision is left to the callback handler.
-  void WriteDone(WriteRange* write_range, const Status& write_status);
+  /// Invokes write_range->callback() or oper_range->callback() after the range has been
+  /// executed, and updates per-disk state and handle state. The status of the operation
+  /// OK/RUNTIME_ERROR etc. is passed via status and to the callback. An error status
+  /// does not cancel the request context - that decision is left to the callback handler.
+  void OperDone(RequestRange* range, const Status& status);
 
   /// Cancel the context if not already cancelled, wait for all scan ranges to finish
   /// and mark the context as inactive, after which it cannot be used.
@@ -304,32 +332,44 @@ class RequestContext {
   /// client by GetNextUnstartedRange(). If BY_CALLER, the scan range is not added to
   /// any queues. The range will be scheduled later as a separate step, e.g. when it is
   /// unblocked by adding buffers to it. Caller must hold 'lock_' via 'lock'.
-  void AddRangeToDisk(const boost::unique_lock<boost::mutex>& lock, RequestRange* range,
+  void AddRangeToDisk(const std::unique_lock<std::mutex>& lock, RequestRange* range,
       ScheduleMode schedule_mode);
 
   /// Adds an active range to 'active_scan_ranges_'
   void AddActiveScanRangeLocked(
-      const boost::unique_lock<boost::mutex>& lock, ScanRange* range);
+      const std::unique_lock<std::mutex>& lock, ScanRange* range);
 
   /// Removes the range from 'active_scan_ranges_'. Called by ScanRange after eos or
   /// cancellation. If calling the Locked version, the caller must hold
   /// 'lock_'. Otherwise the function will acquire 'lock_'.
   void RemoveActiveScanRange(ScanRange* range);
   void RemoveActiveScanRangeLocked(
-      const boost::unique_lock<boost::mutex>& lock, ScanRange* range);
+      const std::unique_lock<std::mutex>& lock, ScanRange* range);
 
   /// Try to read the scan range from the cache. '*read_succeeded' is set to true if the
   /// scan range can be found in the cache, otherwise false.
   /// If '*needs_buffers' is returned as true, the caller must call
   /// AllocateBuffersForRange() to add buffers for the data to be read into before the
   /// range can be scheduled.
-  Status TryReadFromCache(const boost::unique_lock<boost::mutex>& lock, ScanRange* range,
+  Status TryReadFromCache(const std::unique_lock<std::mutex>& lock, ScanRange* range,
       bool* read_succeeded, bool* needs_buffers);
 
   // Counters are updated by other classes - expose to other io:: classes for convenience.
 
   /// Total bytes read for this reader
   RuntimeProfile::Counter* bytes_read_counter_ = nullptr;
+
+  /// Total read from mem buffer for this reader
+  RuntimeProfile::Counter* read_use_mem_counter_ = nullptr;
+
+  /// Total bytes read from mem buffer for this reader
+  RuntimeProfile::Counter* bytes_read_use_mem_counter_ = nullptr;
+
+  /// Total read from local disk buffer for this reader
+  RuntimeProfile::Counter* read_use_local_disk_counter_ = nullptr;
+
+  /// Total bytes read from local disk buffer for this reader
+  RuntimeProfile::Counter* bytes_read_use_local_disk_counter_ = nullptr;
 
   /// Total time spent in hdfs reading
   RuntimeProfile::Counter* read_timer_ = nullptr;
@@ -360,6 +400,12 @@ class RequestContext {
 
   /// Total number of bytes read from date node cache, updated at end of each range scan
   AtomicInt64 bytes_read_dn_cache_{0};
+
+  /// Total number of encrypted bytes read
+  AtomicInt64 bytes_read_encrypted_{0};
+
+  /// Total number of erasure-coded bytes read
+  AtomicInt64 bytes_read_ec_{0};
 
   /// Total number of bytes from remote reads that were expected to be local.
   AtomicInt64 unexpected_remote_bytes_{0};
@@ -392,7 +438,7 @@ class RequestContext {
   /// All fields below are accessed by multiple threads and the lock needs to be
   /// taken before accessing them. Must be acquired before ScanRange::lock_ if both
   /// are held simultaneously.
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// Current state of the reader
   State state_ = Active;

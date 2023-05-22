@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_SERVICE_CHILD_QUERY_H
-#define IMPALA_SERVICE_CHILD_QUERY_H
+#pragma once
 
+#include <mutex>
 #include <string>
-#include <boost/thread/mutex.hpp>
 
 #include "common/status.h"
 #include "impala-server.h"
@@ -64,7 +63,7 @@ class ChildQuery {
   }
 
   /// Allow child queries to be added to std collections.
-  /// (boost::mutex's operator= and copy c'tor are private)
+  /// (std::mutex's operator= and copy c'tor are private)
   ChildQuery(const ChildQuery& other)
     : query_(other.query_),
       parent_request_state_(other.parent_request_state_),
@@ -75,7 +74,7 @@ class ChildQuery {
       is_cancelled_(other.is_cancelled_) {}
 
   /// Allow child queries to be added to std collections.
-  /// (boost::mutex's operator= and copy c'tor are private)
+  /// (std::mutex's operator= and copy c'tor are private)
   ChildQuery& operator=(const ChildQuery& other) {
     query_ = other.query_;
     parent_request_state_ = other.parent_request_state_;
@@ -111,7 +110,7 @@ class ChildQuery {
  private:
   /// Sets the query options from the parent query in child's HS2 request.
   /// TODO: Consider moving this function into a more appropriate place.
-  void SetQueryOptions(const TQueryOptions& parent_options,
+  void SetQueryOptions(
       apache::hive::service::cli::thrift::TExecuteStatementReq* exec_stmt_req);
 
   /// Returns Status::Cancelled if this child query has been cancelled, otherwise OK.
@@ -140,7 +139,7 @@ class ChildQuery {
   apache::hive::service::cli::thrift::TOperationHandle hs2_handle_;
 
   /// Protects is_running_ and is_cancelled_ to ensure idempotent cancellations.
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// Indicates whether this query is running. False if the query has not started yet
   /// or if the query has finished either successfully or because of an error.
@@ -217,5 +216,3 @@ class ChildQueryExecutor {
   Status child_queries_status_;
 };
 }
-
-#endif

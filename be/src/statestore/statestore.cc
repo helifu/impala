@@ -22,7 +22,6 @@
 #include <utility>
 
 #include <boost/lexical_cast.hpp>
-#include <boost/thread.hpp>
 #include <thrift/Thrift.h>
 #include <gutil/strings/substitute.h>
 #include <gutil/strings/util.h>
@@ -107,6 +106,7 @@ DEFINE_int32(statestore_update_tcp_timeout_seconds, 300, "(Advanced) The time af
     "badly hung machines that are not able to respond to the update RPC in short "
     "order.");
 
+DECLARE_string(debug_actions);
 DECLARE_string(ssl_server_certificate);
 DECLARE_string(ssl_private_key);
 DECLARE_string(ssl_private_key_password_cmd);
@@ -135,8 +135,8 @@ const Statestore::TopicEntry::Version Statestore::Subscriber::TOPIC_INITIAL_VERS
 // Updates or heartbeats that miss their deadline by this much are logged.
 const uint32_t DEADLINE_MISS_THRESHOLD_MS = 2000;
 
-const string Statestore::IMPALA_MEMBERSHIP_TOPIC("impala-membership");
-const string Statestore::IMPALA_REQUEST_QUEUE_TOPIC("impala-request-queue");
+const char* Statestore::IMPALA_MEMBERSHIP_TOPIC = "impala-membership";
+const char* Statestore::IMPALA_REQUEST_QUEUE_TOPIC = "impala-request-queue";
 
 typedef ClientConnection<StatestoreSubscriberClientWrapper> StatestoreSubscriberConn;
 
@@ -392,7 +392,11 @@ void Statestore::Subscriber::SetLastTopicVersionProcessed(const TopicId& topic_i
   // modified.
   Topics* subscribed_topics = GetTopicsMapForId(topic_id);
   Topics::iterator topic_it = subscribed_topics->find(topic_id);
-  DCHECK(topic_it != subscribed_topics->end());
+  // IMPALA-7714: log warning to aid debugging in release builds without DCHECK.
+  if (UNLIKELY(topic_it == subscribed_topics->end())) {
+    LOG(ERROR) << "Couldn't find subscribed topic " << topic_id;
+  }
+  DCHECK(topic_it != subscribed_topics->end()) << topic_id;
   topic_it->second.last_version.Store(version);
 }
 
@@ -453,12 +457,12 @@ Statestore::Statestore(MetricGroup* metrics)
 }
 
 Statestore::~Statestore() {
-  CHECK(initialized_) << "Cannot shutdown Statestore once initialized.";
+  CHECK(service_started_) << "Cannot shutdown Statestore once initialized and started.";
 }
 
 Status Statestore::Init(int32_t state_store_port) {
-  boost::shared_ptr<TProcessor> processor(new StatestoreServiceProcessor(thrift_iface()));
-  boost::shared_ptr<TProcessorEventHandler> event_handler(
+  std::shared_ptr<TProcessor> processor(new StatestoreServiceProcessor(thrift_iface()));
+  std::shared_ptr<TProcessorEventHandler> event_handler(
       new RpcEventHandler("statestore", metrics_));
   processor->setEventHandler(event_handler);
   ThriftServerBuilder builder("StatestoreService", processor, state_store_port);
@@ -482,12 +486,20 @@ Status Statestore::Init(int32_t state_store_port) {
   RETURN_IF_ERROR(subscriber_heartbeat_threadpool_.Init());
   RETURN_IF_ERROR(Thread::Create("statestore-heartbeat", "heartbeat-monitoring-thread",
       &Statestore::MonitorSubscriberHeartbeat, this, &heartbeat_monitoring_thread_));
-  initialized_ = true;
+  service_started_ = true;
 
   return Status::OK();
 }
 
-void Statestore::RegisterWebpages(Webserver* webserver) {
+void Statestore::RegisterWebpages(Webserver* webserver, bool metrics_only) {
+  Webserver::RawUrlCallback healthz_callback =
+      [this](const auto& req, auto* data, auto* response) {
+        return this->HealthzHandler(req, data, response);
+      };
+  webserver->RegisterUrlCallback("/healthz", healthz_callback);
+
+  if (metrics_only) return;
+
   Webserver::UrlCallback topics_callback =
       bind<void>(mem_fn(&Statestore::TopicsHandler), this, _1, _2);
   webserver->RegisterUrlCallback("/topics", "statestore_topics.tmpl",
@@ -920,6 +932,8 @@ void Statestore::DoSubscriberUpdate(UpdateKind update_kind, int thread_id,
     VLOG(3) << "Initial " << update_kind_str << " message for: " << update.subscriber_id;
   }
 
+  DebugActionNoFail(FLAGS_debug_actions, "DO_SUBSCRIBER_UPDATE");
+
   // Send the right message type, and compute the next deadline
   int64_t deadline_ms = 0;
   Status status;
@@ -1072,4 +1086,15 @@ void Statestore::ShutdownForTesting() {
 
 int64_t Statestore::FailedExecutorDetectionTimeMs() {
   return FLAGS_statestore_max_missed_heartbeats * FLAGS_statestore_heartbeat_frequency_ms;
+}
+
+void Statestore::HealthzHandler(
+    const Webserver::WebRequest& req, std::stringstream* data, HttpStatusCode* response) {
+  if (service_started_) {
+    (*data) << "OK";
+    *response = HttpStatusCode::Ok;
+    return;
+  }
+  *(data) << "Not Available";
+  *response = HttpStatusCode::ServiceUnavailable;
 }

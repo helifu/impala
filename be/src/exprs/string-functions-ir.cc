@@ -28,10 +28,13 @@
 #include "exprs/anyval-util.h"
 #include "exprs/scalar-expr.h"
 #include "gutil/strings/charset.h"
+#include "gutil/strings/substitute.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/tuple-row.h"
 #include "util/bit-util.h"
 #include "util/coding-util.h"
+#include "util/pretty-printer.h"
+#include "util/string-util.h"
 #include "util/ubsan.h"
 #include "util/url-parser.h"
 
@@ -43,6 +46,11 @@ using std::bitset;
 // NOTE: be careful not to use string::append.  It is not performant.
 namespace impala {
 
+const char* ERROR_CHARACTER_LIMIT_EXCEEDED =
+  "$0 is larger than allowed limit of $1 character data.";
+
+uint64_t StringFunctions::re2_mem_limit_ = 8 << 20;
+
 // This behaves identically to the mysql implementation, namely:
 //  - 1-indexed positions
 //  - supported negative positions (count from the end of the string)
@@ -50,6 +58,9 @@ namespace impala {
 StringVal StringFunctions::Substring(FunctionContext* context,
     const StringVal& str, const BigIntVal& pos, const BigIntVal& len) {
   if (str.is_null || pos.is_null || len.is_null) return StringVal::null();
+  if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE)) {
+    return Utf8Substring(context, str, pos, len);
+  }
   int fixed_pos = pos.val;
   if (fixed_pos < 0) fixed_pos = str.len + fixed_pos + 1;
   int max_len = str.len - fixed_pos + 1;
@@ -65,6 +76,60 @@ StringVal StringFunctions::Substring(FunctionContext* context,
     const StringVal& str, const BigIntVal& pos) {
   // StringVal.len is an int => INT32_MAX
   return Substring(context, str, pos, BigIntVal(INT32_MAX));
+}
+
+StringVal StringFunctions::Utf8Substring(FunctionContext* context, const StringVal& str,
+    const BigIntVal& pos) {
+  return Utf8Substring(context, str, pos, BigIntVal(INT32_MAX));
+}
+
+StringVal StringFunctions::Utf8Substring(FunctionContext* context, const StringVal& str,
+    const BigIntVal& pos, const BigIntVal& len) {
+  if (str.is_null || pos.is_null || len.is_null) return StringVal::null();
+  if (str.len == 0 || pos.val == 0 || len.val <= 0) return StringVal();
+
+  int byte_pos;
+  int utf8_cnt = 0;
+  // pos.val starts at 1 (1-indexed positions).
+  if (pos.val > 0) {
+    // Seek to the start byte of the pos-th UTF-8 character.
+    for (byte_pos = 0; utf8_cnt < pos.val && byte_pos < str.len; ++byte_pos) {
+      if (BitUtil::IsUtf8StartByte(str.ptr[byte_pos])) ++utf8_cnt;
+    }
+    // Not enough UTF-8 characters.
+    if (utf8_cnt < pos.val) return StringVal();
+    // Back to the start byte of the pos-th UTF-8 character.
+    --byte_pos;
+    int byte_start = byte_pos;
+    // Seek to the end until we get enough UTF-8 characters.
+    for (utf8_cnt = 0; utf8_cnt < len.val && byte_pos < str.len; ++byte_pos) {
+      if (BitUtil::IsUtf8StartByte(str.ptr[byte_pos])) ++utf8_cnt;
+    }
+    if (utf8_cnt == len.val) {
+      // We are now at the middle byte of the last UTF-8 character. Seek to the end of it.
+      while (byte_pos < str.len && !BitUtil::IsUtf8StartByte(str.ptr[byte_pos])) {
+        ++byte_pos;
+      }
+    }
+    return StringVal(str.ptr + byte_start, byte_pos - byte_start);
+  }
+  // pos.val is negative. Seek from the end of the string.
+  int byte_end = str.len;
+  utf8_cnt = 0;
+  byte_pos = str.len - 1;
+  while (utf8_cnt < -pos.val && byte_pos >= 0) {
+    if (BitUtil::IsUtf8StartByte(str.ptr[byte_pos])) {
+      ++utf8_cnt;
+      // Remember the end of the substring's last UTF-8 character.
+      if (utf8_cnt > 0 && utf8_cnt == -pos.val - len.val) byte_end = byte_pos;
+    }
+    --byte_pos;
+  }
+  // Not enough UTF-8 characters.
+  if (utf8_cnt < -pos.val) return StringVal();
+  // Back to the start byte of the substring's first UTF-8 character.
+  ++byte_pos;
+  return StringVal(str.ptr + byte_pos, byte_end - byte_pos);
 }
 
 // This behaves identically to the mysql implementation.
@@ -84,6 +149,12 @@ StringVal StringFunctions::Right(
 StringVal StringFunctions::Space(FunctionContext* context, const BigIntVal& len) {
   if (len.is_null) return StringVal::null();
   if (len.val <= 0) return StringVal();
+  if (len.val > StringVal::MAX_LENGTH) {
+    context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
+         "space() result",
+         PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
+    return StringVal::null();
+  }
   StringVal result(context, len.val);
   if (UNLIKELY(result.is_null)) return StringVal::null();
   memset(result.ptr, ' ', len.val);
@@ -95,8 +166,9 @@ StringVal StringFunctions::Repeat(
   if (str.is_null || n.is_null) return StringVal::null();
   if (str.len == 0 || n.val <= 0) return StringVal();
   if (n.val > StringVal::MAX_LENGTH) {
-    context->SetError("Number of repeats in repeat() call is larger than allowed limit "
-        "of 1 GB character data.");
+    context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
+        "Number of repeats in repeat() call",
+        PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
     return StringVal::null();
   }
   static_assert(numeric_limits<int64_t>::max() / numeric_limits<int>::max()
@@ -104,8 +176,9 @@ StringVal StringFunctions::Repeat(
       "multiplying StringVal::len with positive int fits in int64_t");
   int64_t out_len = str.len * n.val;
   if (out_len > StringVal::MAX_LENGTH) {
-    context->SetError(
-        "repeat() result is larger than allowed limit of 1 GB character data.");
+    context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
+        "repeat() result",
+        PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
     return StringVal::null();
   }
   StringVal result(context, static_cast<int>(out_len));
@@ -125,7 +198,12 @@ StringVal StringFunctions::Lpad(FunctionContext* context, const StringVal& str,
   // TODO: Hive seems to go into an infinite loop if pad.len == 0,
   // so we should pay attention to Hive's future solution to be compatible.
   if (len.val <= str.len || pad.len == 0) return StringVal(str.ptr, len.val);
-
+  if (len.val > StringVal::MAX_LENGTH) {
+    context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
+        "lpad() result",
+        PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
+    return StringVal::null();
+  }
   StringVal result(context, len.val);
   if (UNLIKELY(result.is_null)) return StringVal::null();
   int padded_prefix_len = len.val - str.len;
@@ -153,6 +231,12 @@ StringVal StringFunctions::Rpad(FunctionContext* context, const StringVal& str,
   if (len.val <= str.len || pad.len == 0) {
     return StringVal(str.ptr, len.val);
   }
+  if (len.val > StringVal::MAX_LENGTH) {
+    context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
+        "rpad() result",
+        PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
+    return StringVal::null();
+  }
 
   StringVal result(context, len.val);
   if (UNLIKELY(result.is_null)) return StringVal::null();
@@ -171,6 +255,13 @@ StringVal StringFunctions::Rpad(FunctionContext* context, const StringVal& str,
 
 IntVal StringFunctions::Length(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return IntVal::null();
+  if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE, 0)) {
+    return Utf8Length(context, str);
+  }
+  return IntVal(str.len);
+}
+IntVal StringFunctions::Bytes(FunctionContext* context,const StringVal& str){
+  if(str.is_null) return IntVal::null();
   return IntVal(str.len);
 }
 
@@ -181,8 +272,30 @@ IntVal StringFunctions::CharLength(FunctionContext* context, const StringVal& st
   return StringValue::UnpaddedCharLength(reinterpret_cast<char*>(str.ptr), t->len);
 }
 
+static int CountUtf8Chars(uint8_t* ptr, int len) {
+  if (ptr == nullptr) return 0;
+  int cnt = 0;
+  for (int i = 0; i < len; ++i) {
+    if (BitUtil::IsUtf8StartByte(ptr[i])) ++cnt;
+  }
+  return cnt;
+}
+
+IntVal StringFunctions::Utf8Length(FunctionContext* context, const StringVal& str) {
+  if (str.is_null) return IntVal::null();
+  return IntVal(CountUtf8Chars(str.ptr, str.len));
+}
+
 StringVal StringFunctions::Lower(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
+  if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE)) {
+    return LowerUtf8(context, str);
+  }
+  return LowerAscii(context, str);
+}
+
+StringVal StringFunctions::LowerAscii(FunctionContext* context, const StringVal& str) {
+  // Not in UTF-8 mode, only English alphabetic characters will be converted.
   StringVal result(context, str.len);
   if (UNLIKELY(result.is_null)) return StringVal::null();
   for (int i = 0; i < str.len; ++i) {
@@ -193,6 +306,14 @@ StringVal StringFunctions::Lower(FunctionContext* context, const StringVal& str)
 
 StringVal StringFunctions::Upper(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
+  if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE)) {
+    return UpperUtf8(context, str);
+  }
+  return UpperAscii(context, str);
+}
+
+StringVal StringFunctions::UpperAscii(FunctionContext* context, const StringVal& str) {
+  // Not in UTF-8 mode, only English alphabetic characters will be converted.
   StringVal result(context, str.len);
   if (UNLIKELY(result.is_null)) return StringVal::null();
   for (int i = 0; i < str.len; ++i) {
@@ -207,6 +328,13 @@ StringVal StringFunctions::Upper(FunctionContext* context, const StringVal& str)
 // will return NULL
 StringVal StringFunctions::InitCap(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
+  if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE)) {
+    return InitCapUtf8(context, str);
+  }
+  return InitCapAscii(context, str);
+}
+
+StringVal StringFunctions::InitCapAscii(FunctionContext* context, const StringVal& str) {
   StringVal result(context, str.len);
   if (UNLIKELY(result.is_null)) return StringVal::null();
   uint8_t* result_ptr = result.ptr;
@@ -221,6 +349,115 @@ StringVal StringFunctions::InitCap(FunctionContext* context, const StringVal& st
     }
   }
   return result;
+}
+
+/// Reports the error in parsing multibyte characters with leading bytes and current
+/// locale. Used in Utf8CaseConversion().
+static void ReportErrorBytes(FunctionContext* context, const StringVal& str,
+    int current_idx) {
+  DCHECK_LT(current_idx, str.len);
+  stringstream ss;
+  ss << "[0x" << std::hex << (int)DCHECK_NOTNULL(str.ptr)[current_idx];
+  for (int k = 1; k < 4 && current_idx + k < str.len; ++k) {
+    ss << ", 0x" << std::hex << (int)str.ptr[current_idx + k];
+  }
+  ss << "]";
+  context->AddWarning(Substitute(
+      "Illegal multi-byte character in string. Leading bytes: $0. Current locale: $1",
+      ss.str(), std::locale("").name()).c_str());
+}
+
+/// Converts string based on the transform function 'fn'. The unit of the conversion is
+/// a wchar_t (i.e. uint32_t) which is parsed from multi bytes using std::mbtowc().
+/// The transform function 'fn' accepts two parameters: the original wchar_t and a flag
+/// indicating whether it's the first character of a word.
+/// After the transformation, the wchar_t is converted back to bytes.
+static StringVal Utf8CaseConversion(FunctionContext* context, const StringVal& str,
+    uint32_t (*fn)(uint32_t, bool*)) {
+  // Usually the upper/lower cases have the same size in bytes. Here we add 4 bytes
+  // buffer in case of illegal Unicodes.
+  int max_result_bytes = str.len + 4;
+  StringVal result(context, max_result_bytes);
+  if (UNLIKELY(result.is_null)) return StringVal::null();
+  wchar_t wc;
+  int wc_bytes;
+  bool word_start = true;
+  uint8_t* result_ptr = result.ptr;
+  std::mbstate_t wc_state{};
+  std::mbstate_t mb_state{};
+  for (int i = 0; i < str.len; i += wc_bytes) {
+    // std::mbtowc converts a multibyte sequence to a wide character. It's not
+    // thread safe. Here we use std::mbrtowc instead.
+    wc_bytes = std::mbrtowc(&wc, reinterpret_cast<char*>(str.ptr + i), str.len - i,
+        &wc_state);
+    bool needs_conversion = true;
+    if (wc_bytes == 0) {
+      // std::mbtowc returns 0 when hitting '\0'.
+      wc = 0;
+      wc_bytes = 1;
+    } else if (wc_bytes < 0) {
+      ReportErrorBytes(context, str, i);
+      // Replace it to the replacement character (U+FFFD)
+      wc = 0xFFFD;
+      needs_conversion = false;
+      // Jump to the next legal UTF-8 start byte.
+      wc_bytes = 1;
+      while (i + wc_bytes < str.len && !BitUtil::IsUtf8StartByte(str.ptr[i + wc_bytes])) {
+        wc_bytes++;
+      }
+    }
+    if (needs_conversion) wc = fn(wc, &word_start);
+    // std::wctomb converts a wide character to a multibyte sequence. It's not
+    // thread safe. Here we use std::wcrtomb instead.
+    int res_bytes = std::wcrtomb(reinterpret_cast<char*>(result_ptr), wc, &mb_state);
+    if (res_bytes <= 0) {
+      if (needs_conversion) {
+        context->AddWarning(Substitute(
+            "Ignored illegal wide character in results: $0. Current locale: $1",
+            wc, std::locale("").name()).c_str());
+      }
+      continue;
+    }
+    result_ptr += res_bytes;
+    if (result_ptr - result.ptr > max_result_bytes - 4) {
+      // Double the result buffer for overflow
+      max_result_bytes *= 2;
+      max_result_bytes = min<int>(StringVal::MAX_LENGTH,
+          static_cast<int>(BitUtil::RoundUpToPowerOfTwo(max_result_bytes)));
+      int offset = result_ptr - result.ptr;
+      if (UNLIKELY(!result.Resize(context, max_result_bytes))) return StringVal::null();
+      result_ptr = result.ptr + offset;
+    }
+  }
+  result.len = result_ptr - result.ptr;
+  return result;
+}
+
+StringVal StringFunctions::LowerUtf8(FunctionContext* context, const StringVal& str) {
+  return Utf8CaseConversion(context, str,
+      [](uint32_t wide_char, bool* word_start) {
+        return std::towlower(wide_char);
+      });
+}
+
+StringVal StringFunctions::UpperUtf8(FunctionContext* context, const StringVal& str) {
+  return Utf8CaseConversion(context, str,
+      [](uint32_t wide_char, bool* word_start) {
+        return std::towupper(wide_char);
+      });
+}
+
+StringVal StringFunctions::InitCapUtf8(FunctionContext* context, const StringVal& str) {
+  return Utf8CaseConversion(context, str,
+      [](uint32_t wide_char, bool* word_start) {
+        if (UNLIKELY(iswspace(wide_char))) {
+          *word_start = true;
+          return wide_char;
+        }
+        uint32_t res = *word_start ? std::towupper(wide_char) : std::towlower(wide_char);
+        *word_start = false;
+        return res;
+      });
 }
 
 struct ReplaceContext {
@@ -351,8 +588,9 @@ StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& st
       if (UNLIKELY(space_needed > buffer_space)) {
         // Check to see if we can allocate a large enough buffer.
         if (space_needed > StringVal::MAX_LENGTH) {
-          context->SetError(
-              "String length larger than allowed limit of 1 GB character data.");
+          context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
+              "replace() result",
+              PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
           return StringVal::null();
         }
         // Double the buffer size whenever it fills up to amortise cost of resizing.
@@ -382,9 +620,43 @@ StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& st
 
 StringVal StringFunctions::Reverse(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
+  if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE)) {
+    return Utf8Reverse(context, str);
+  }
   StringVal result(context, str.len);
   if (UNLIKELY(result.is_null)) return StringVal::null();
   BitUtil::ByteSwap(result.ptr, str.ptr, str.len);
+  return result;
+}
+
+static inline void InPlaceReverse(uint8_t* ptr, int len) {
+  for (int i = 0, j = len - 1; i < j; ++i, --j) {
+    uint8_t tmp = ptr[i];
+    ptr[i] = ptr[j];
+    ptr[j] = tmp;
+  }
+}
+
+// Returns a string with the UTF-8 characters (code points) in revrese order. Note that
+// this function operates on Unicode code points and not user visible characters (or
+// grapheme clusters). This is consistent with other systems, e.g. Hive, SparkSQL.
+StringVal StringFunctions::Utf8Reverse(FunctionContext* context, const StringVal& str) {
+  if (str.is_null) return StringVal::null();
+  if (str.len == 0) return StringVal();
+  StringVal result(context, str.len);
+  if (UNLIKELY(result.is_null)) return StringVal::null();
+  // First make a copy of the reversed string.
+  BitUtil::ByteSwap(result.ptr, str.ptr, str.len);
+  // Then reverse bytes inside each UTF-8 character.
+  int last = result.len;
+  for (int i = result.len - 1; i >= 0; --i) {
+    if (BitUtil::IsUtf8StartByte(result.ptr[i])) {
+      // Only reverse bytes of a UTF-8 character
+      if (last - i > 1) InPlaceReverse(result.ptr + i + 1, last - i);
+      last = i;
+    }
+  }
+  if (last > 0) InPlaceReverse(result.ptr, last + 1);
   return result;
 }
 
@@ -529,14 +801,18 @@ IntVal StringFunctions::Instr(FunctionContext* context, const StringVal& str,
   }
   if (start_position.val == 0) return IntVal(0);
 
+  bool utf8_mode = context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE);
   StringValue haystack = StringValue::FromStringVal(str);
   StringValue needle = StringValue::FromStringVal(substr);
   StringSearch search(&needle);
+  int match_pos = -1;
   if (start_position.val > 0) {
     // A positive starting position indicates regular searching from the left.
     int search_start_pos = start_position.val - 1;
+    if (utf8_mode) {
+      search_start_pos = FindUtf8PosForward(str.ptr, str.len, search_start_pos);
+    }
     if (search_start_pos >= haystack.len) return IntVal(0);
-    int match_pos = -1;
     for (int match_num = 0; match_num < occurrence.val; ++match_num) {
       DCHECK_LE(search_start_pos, haystack.len);
       StringValue haystack_substring = haystack.Substring(search_start_pos);
@@ -545,17 +821,16 @@ IntVal StringFunctions::Instr(FunctionContext* context, const StringVal& str,
       match_pos = search_start_pos + match_pos_in_substring;
       search_start_pos = match_pos + 1;
     }
-    // Return positions starting from 1 at the leftmost position.
-    return IntVal(match_pos + 1);
   } else {
     // A negative starting position indicates searching from the right.
-    int search_start_pos = haystack.len + start_position.val;
+    int search_start_pos = utf8_mode ?
+        FindUtf8PosBackward(str.ptr, str.len, -start_position.val - 1) :
+        haystack.len + start_position.val;
     // The needle must fit between search_start_pos and the end of the string
     if (search_start_pos + needle.len > haystack.len) {
       search_start_pos = haystack.len - needle.len;
     }
     if (search_start_pos < 0) return IntVal(0);
-    int match_pos = -1;
     for (int match_num = 0; match_num < occurrence.val; ++match_num) {
       DCHECK_GE(search_start_pos + needle.len, 0);
       DCHECK_LE(search_start_pos + needle.len, haystack.len);
@@ -565,9 +840,11 @@ IntVal StringFunctions::Instr(FunctionContext* context, const StringVal& str,
       if (match_pos < 0) return IntVal(0);
       search_start_pos = match_pos - 1;
     }
-    // Return positions starting from 1 at the leftmost position.
-    return IntVal(match_pos + 1);
   }
+  // In UTF8 mode, positions are counted by Unicode characters in UTF8 encoding.
+  // If not in UTF8 mode, return positions starting from 1 at the leftmost position.
+  return utf8_mode ? IntVal(CountUtf8Chars(str.ptr, match_pos) + 1) :
+      IntVal(match_pos + 1);
 }
 
 IntVal StringFunctions::Instr(FunctionContext* context, const StringVal& str,
@@ -592,18 +869,7 @@ IntVal StringFunctions::LocatePos(FunctionContext* context, const StringVal& sub
   // but throws an exception for *start_pos > str->len.
   // Since returning 0 seems to be Hive's error condition, return 0.
   if (start_pos.val <= 0 || start_pos.val > str.len) return IntVal(0);
-  StringValue substr_sv = StringValue::FromStringVal(substr);
-  StringSearch search(&substr_sv);
-  // Input start_pos.val starts from 1.
-  StringValue adjusted_str(reinterpret_cast<char*>(str.ptr) + start_pos.val - 1,
-       str.len - start_pos.val + 1);
-  int32_t match_pos = search.Search(&adjusted_str);
-  if (match_pos >= 0) {
-    // Hive returns the position in the original string starting from 1.
-    return IntVal(start_pos.val + match_pos);
-  } else {
-    return IntVal(0);
-  }
+  return Instr(context, str, substr, start_pos);
 }
 
 // The caller owns the returned regex. Returns NULL if the pattern could not be compiled.
@@ -616,6 +882,8 @@ re2::RE2* CompileRegex(const StringVal& pattern, string* error_str,
   options.set_log_errors(false);
   // Return the leftmost longest match (rather than the first match).
   options.set_longest_match(true);
+  // Set the maximum memory used by re2's regex engine for storage
+  StringFunctions::SetRE2MemOpt(&options);
   if (!match_parameter.is_null &&
       !StringFunctions::SetRE2Options(match_parameter, error_str, &options)) {
     return NULL;
@@ -660,6 +928,19 @@ bool StringFunctions::SetRE2Options(const StringVal& match_parameter,
     }
   }
   return true;
+}
+
+void StringFunctions::SetRE2MemLimit(int64_t re2_mem_limit) {
+  // TODO: include the memory requirement for re2 in the memory planner estimates
+  DCHECK(re2_mem_limit > 0);
+  StringFunctions::re2_mem_limit_ = re2_mem_limit;
+}
+
+// Set the maximum memory used by re2's regex engine for a compiled regex expression's
+// storage. By default, it uses 8 MiB. This can be used to avoid DFA state cache flush
+// resulting in slower execution
+void StringFunctions::SetRE2MemOpt(re2::RE2::Options* opts) {
+  opts->set_max_mem(StringFunctions::re2_mem_limit_);
 }
 
 void StringFunctions::RegexpPrepare(
@@ -865,11 +1146,19 @@ StringVal StringFunctions::Concat(
   if (num_children == 1) return strs[0];
 
   // Loop once to compute the final size and reserve space.
-  int32_t total_size = 0;
+  int64_t total_size = 0;
   for (int32_t i = 0; i < num_children; ++i) {
     if (strs[i].is_null) return StringVal::null();
     total_size += strs[i].len;
   }
+
+  if (total_size > StringVal::MAX_LENGTH) {
+    context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
+         "Concatenated string length",
+         PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
+    return StringVal::null();
+  }
+
   // If total_size is zero, directly returns empty string
   if (total_size <= 0) return StringVal();
 
@@ -895,7 +1184,7 @@ StringVal StringFunctions::ConcatWs(FunctionContext* context, const StringVal& s
   // count.
   int32_t valid_num_children = 0;
   int32_t valid_start_index = -1;
-  int32_t total_size = 0;
+  int64_t total_size = 0;
   for (int32_t i = 0; i < num_children; ++i) {
     if (strs[i].is_null) continue;
 
@@ -909,6 +1198,13 @@ StringVal StringFunctions::ConcatWs(FunctionContext* context, const StringVal& s
     }
     // Record the count of valid string object.
     valid_num_children++;
+  }
+
+  if (total_size > StringVal::MAX_LENGTH) {
+    context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
+         "Concatenated string length",
+         PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
+    return StringVal::null();
   }
 
   // If all data are invalid, or data size is zero, return empty string.

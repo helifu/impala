@@ -19,35 +19,35 @@ package org.apache.impala.planner;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.Map;
 import java.util.Set;
 
-import org.apache.impala.analysis.AggregateInfo;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.BoolLiteral;
+import org.apache.impala.analysis.DateLiteral;
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.analysis.ExprSubstitutionMap;
-import org.apache.impala.analysis.FunctionCallExpr;
-import org.apache.impala.analysis.FunctionName;
-import org.apache.impala.analysis.FunctionParams;
 import org.apache.impala.analysis.InPredicate;
 import org.apache.impala.analysis.IsNullPredicate;
 import org.apache.impala.analysis.LiteralExpr;
+import org.apache.impala.analysis.MultiAggregateInfo;
 import org.apache.impala.analysis.NumericLiteral;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.StringLiteral;
+import org.apache.impala.analysis.TableRef;
 import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.catalog.FeKuduTable;
-import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TExplainLevel;
+import org.apache.impala.thrift.TKuduReplicaSelection;
 import org.apache.impala.thrift.TKuduScanNode;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TPlanNode;
@@ -57,7 +57,9 @@ import org.apache.impala.thrift.TScanRange;
 import org.apache.impala.thrift.TScanRangeLocation;
 import org.apache.impala.thrift.TScanRangeLocationList;
 import org.apache.impala.thrift.TScanRangeSpec;
+import org.apache.impala.util.ExprUtil;
 import org.apache.impala.util.KuduUtil;
+import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
 import org.apache.kudu.client.KuduClient;
@@ -66,6 +68,7 @@ import org.apache.kudu.client.KuduPredicate.ComparisonOp;
 import org.apache.kudu.client.KuduScanToken;
 import org.apache.kudu.client.KuduScanToken.KuduScanTokenBuilder;
 import org.apache.kudu.client.LocatedTablet;
+import org.apache.kudu.consensus.Metadata.RaftPeerPB.Role;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -99,6 +102,9 @@ public class KuduScanNode extends ScanNode {
   // Set in computeNodeResourceProfile().
   private boolean useMtScanNode_;
 
+  // True if the query option of replica selection is set as leader-only.
+  private boolean replicaSelectionLeaderOnly_ = false;
+
   // Indexes for the set of hosts that will be used for the query.
   // From analyzer.getHostIndex().getIndex(address)
   private final Set<Integer> hostIndexSet_ = new HashSet<>();
@@ -114,15 +120,22 @@ public class KuduScanNode extends ScanNode {
   // this scan node has the count(*) optimization enabled.
   private SlotDescriptor countStarSlot_ = null;
 
+  // It is used to indicate if the input query returns not more than one row
+  // from Kudu. It is set as TRUE in extractKuduConjuncts() if the number of
+  // primary key columns in equivalence predicates pushed down to Kudu equals
+  // the total number of primary key columns of the Kudu table.
+  // It is used to adjust the cardinality estimation to speed up point lookup
+  // for Kudu primary keys by enabling small query optimization.
+  boolean isPointLookupQuery_ = false;
+
   public KuduScanNode(PlanNodeId id, TupleDescriptor desc, List<Expr> conjuncts,
-      AggregateInfo aggInfo) {
+      MultiAggregateInfo aggInfo, TableRef kuduTblRef) {
     super(id, desc, "SCAN KUDU");
     kuduTable_ = (FeKuduTable) desc_.getTable();
     conjuncts_ = conjuncts;
     aggInfo_ = aggInfo;
+    tableNumRowsHint_ = kuduTblRef.getTableNumRowsHint();
   }
-
-  public ExprSubstitutionMap getOptimizedAggSmap() { return optimizedAggSmap_; }
 
   @Override
   public void init(Analyzer analyzer) throws ImpalaRuntimeException {
@@ -130,8 +143,10 @@ public class KuduScanNode extends ScanNode {
 
     KuduClient client = KuduUtil.getKuduClient(kuduTable_.getKuduMasterHosts());
     try {
+      // Get the KuduTable from the analyzer to retrieve the cached KuduTable
+      // for this query and prevent multiple openTable calls for a single query.
       org.apache.kudu.client.KuduTable rpcTable =
-          client.openTable(kuduTable_.getKuduTableName());
+          analyzer.getKuduTable(kuduTable_);
       validateSchema(rpcTable);
 
       if (canApplyCountStarOptimization(analyzer)) {
@@ -210,7 +225,9 @@ public class KuduScanNode extends ScanNode {
       throws ImpalaRuntimeException {
     scanRangeSpecs_ = new TScanRangeSpec();
 
-    List<KuduScanToken> scanTokens = createScanTokens(client, rpcTable);
+    replicaSelectionLeaderOnly_ = (analyzer.getQueryOptions().getKudu_replica_selection()
+        == TKuduReplicaSelection.LEADER_ONLY);
+    List<KuduScanToken> scanTokens = createScanTokens(analyzer, client, rpcTable);
     for (KuduScanToken token: scanTokens) {
       LocatedTablet tablet = token.getTablet();
       List<TScanRangeLocation> locations = new ArrayList<>();
@@ -221,10 +238,17 @@ public class KuduScanNode extends ScanNode {
       }
 
       for (LocatedTablet.Replica replica: tablet.getReplicas()) {
+        // Skip non-leader replicas if query option KUDU_REPLICA_SELECTION is set as
+        // LEADER_ONLY.
+        if (replicaSelectionLeaderOnly_
+            && !replica.getRole().equals(Role.LEADER.toString())) {
+          continue;
+        }
+
         TNetworkAddress address =
             new TNetworkAddress(replica.getRpcHost(), replica.getRpcPort());
         // Use the network address to look up the host in the global list
-        Integer hostIndex = analyzer.getHostIndex().getIndex(address);
+        Integer hostIndex = analyzer.getHostIndex().getOrAddIndex(address);
         locations.add(new TScanRangeLocation(hostIndex));
         hostIndexSet_.add(hostIndex);
       }
@@ -249,7 +273,7 @@ public class KuduScanNode extends ScanNode {
    * will be pushed to Kudu. The projected Kudu columns are ordered by offset in an
    * Impala tuple to make the Impala and Kudu tuple layouts identical.
    */
-  private List<KuduScanToken> createScanTokens(KuduClient client,
+  private List<KuduScanToken> createScanTokens(Analyzer analyzer, KuduClient client,
       org.apache.kudu.client.KuduTable rpcTable) {
     List<String> projectedCols = new ArrayList<>();
     for (SlotDescriptor desc: getTupleDesc().getSlotsOrderedByOffset()) {
@@ -259,6 +283,9 @@ public class KuduScanNode extends ScanNode {
     }
     KuduScanTokenBuilder tokenBuilder = client.newScanTokenBuilder(rpcTable);
     tokenBuilder.setProjectedColumnNames(projectedCols);
+    long split_size_hint = analyzer.getQueryOptions()
+        .getTargeted_kudu_scan_range_length();
+    if (split_size_hint > 0) tokenBuilder.setSplitSizeBytes(split_size_hint);
     for (KuduPredicate predicate: kuduPredicates_) tokenBuilder.addPredicate(predicate);
     return tokenBuilder.build();
   }
@@ -270,19 +297,109 @@ public class KuduScanNode extends ScanNode {
     return computeCombinedSelectivity(allConjuncts);
   }
 
-  @Override
-  protected void computeStats(Analyzer analyzer) {
-    super.computeStats(analyzer);
-    // Update the number of nodes to reflect the hosts that have relevant data.
-    numNodes_ = Math.max(1, hostIndexSet_.size());
+  /**
+   * Estimate the number of impalad nodes that this scan node will execute on (which is
+   * ultimately determined by the scheduling done by the backend's Scheduler).
+   * Assume that scan ranges that can be scheduled locally will be, and that scan
+   * ranges that cannot will be round-robined across the cluster.
+   */
+  protected void computeNumNodes(Analyzer analyzer) {
+    ExecutorMembershipSnapshot cluster = ExecutorMembershipSnapshot.getCluster();
+    final int maxInstancesPerNode = getMaxInstancesPerNode(analyzer);
+    final int maxPossibleInstances =
+        analyzer.numExecutorsForPlanning() * maxInstancesPerNode;
+    int totalNodes = 0;
+    int totalInstances = 0;
+    int numLocalRanges = 0;
+    int numRemoteRanges = 0;
+    // Counts the number of local ranges, capped at maxInstancesPerNode.
+    Map<TNetworkAddress, Integer> localRangeCounts = new HashMap<>();
+    // Sum of the counter values in localRangeCounts.
+    int totalLocalParallelism = 0;
+    if (scanRangeSpecs_.isSetConcrete_ranges()) {
+      for (TScanRangeLocationList range : scanRangeSpecs_.concrete_ranges) {
+        boolean anyLocal = false;
+        if (range.isSetLocations()) {
+          for (TScanRangeLocation loc : range.locations) {
+            TNetworkAddress address =
+                analyzer.getHostIndex().getEntry(loc.getHost_idx());
+            if (cluster.contains(address)) {
+              anyLocal = true;
+              // Use the full tserver address (including port) to account for the test
+              // minicluster where there are multiple tservers and impalads on a single
+              // host.  This assumes that when an impalad is colocated with a tserver,
+              // there are the same number of impalads as tservers on this host in this
+              // cluster.
+              int count = localRangeCounts.getOrDefault(address, 0);
+              if (count < maxInstancesPerNode) {
+                ++totalLocalParallelism;
+                localRangeCounts.put(address, count + 1);
+              }
+            }
+          }
+        }
+        // This range has at least one replica with a colocated impalad, so assume it
+        // will be scheduled on one of those nodes.
+        if (anyLocal) {
+          ++numLocalRanges;
+        } else {
+          ++numRemoteRanges;
+        }
+        // Approximate the number of nodes that will execute locally assigned ranges to
+        // be the smaller of the number of locally assigned ranges and the number of
+        // hosts that hold replica for those ranges.
+        int numLocalNodes = Math.min(numLocalRanges, localRangeCounts.size());
+        // The remote ranges are round-robined across all the impalads.
+        int numRemoteNodes =
+            Math.min(numRemoteRanges, analyzer.numExecutorsForPlanning());
+        // The local and remote assignments may overlap, but we don't know by how much
+        // so conservatively assume no overlap.
+        totalNodes =
+            Math.min(numLocalNodes + numRemoteNodes, analyzer.numExecutorsForPlanning());
 
-    // Update the cardinality
-    inputCardinality_ = cardinality_ = kuduTable_.getNumRows();
-    cardinality_ = applyConjunctsSelectivity(cardinality_);
-    cardinality_ = capCardinalityAtLimit(cardinality_);
+        int numLocalInstances = Math.min(numLocalRanges, totalLocalParallelism);
+        totalInstances = Math.min(numLocalInstances + numRemoteRanges,
+            totalNodes * maxInstancesPerNode);
+
+        // Exit early if we have maxed out our estimate of hosts/instances, to avoid
+        // extraneous work in case the number of scan ranges dominates the number of
+        // nodes.
+        if (totalInstances == maxPossibleInstances) break;
+      }
+    }
+    numNodes_ = Math.max(totalNodes, 1);
+    numInstances_ = Math.max(totalInstances, 1);
+  }
+
+  @Override
+  public void computeStats(Analyzer analyzer) {
+    super.computeStats(analyzer);
+    computeNumNodes(analyzer);
+
+    // Update the cardinality, hint value will be used when table has no stats.
+    inputCardinality_ = cardinality_ =
+        kuduTable_.getNumRows() == -1 ? tableNumRowsHint_ : kuduTable_.getNumRows();
+    if (isPointLookupQuery_) {
+      // Adjust input and output cardinality for point lookup.
+      // Planner don't create KuduScanNode for query with closure "limit 0" so
+      // we can assume "limit" is not less than 1 here and don't need to call
+      // capCardinalityAtLimit().
+      if (cardinality_ != 0) cardinality_ = 1;
+      inputCardinality_ = cardinality_;
+    } else {
+      cardinality_ = applyConjunctsSelectivity(cardinality_);
+      cardinality_ = capCardinalityAtLimit(cardinality_);
+    }
     if (LOG.isTraceEnabled()) {
       LOG.trace("computeStats KuduScan: cardinality=" + Long.toString(cardinality_));
     }
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    Preconditions.checkNotNull(scanRangeSpecs_);
+    processingCost_ =
+        computeScanProcessingCost(queryOptions, scanRangeSpecs_.getConcrete_rangesSize());
   }
 
   @Override
@@ -299,14 +416,13 @@ public class KuduScanNode extends ScanNode {
     int perHostScanRanges = estimatePerHostScanRanges(numOfScanRanges);
     int maxScannerThreads = computeMaxNumberOfScannerThreads(queryOptions,
         perHostScanRanges);
-    int num_cols = desc_.getSlots().size();
     long estimated_bytes_per_column_per_thread = BackendConfig.INSTANCE.getBackendCfg().
         kudu_scanner_thread_estimated_bytes_per_column;
     long max_estimated_bytes_per_thread = BackendConfig.INSTANCE.getBackendCfg().
         kudu_scanner_thread_max_estimated_bytes;
-    long mem_estimate_per_thread = Math.min(num_cols *
+    long mem_estimate_per_thread = Math.min(getNumMaterializedSlots(desc_) *
         estimated_bytes_per_column_per_thread, max_estimated_bytes_per_thread);
-    useMtScanNode_ = queryOptions.mt_dop > 0;
+    useMtScanNode_ = Planner.useMTFragment(queryOptions);
     nodeResourceProfile_ = new ResourceProfileBuilder()
         .setMemEstimateBytes(mem_estimate_per_thread * maxScannerThreads)
         .setThreadReservation(useMtScanNode_ ? 0 : 1).build();
@@ -318,8 +434,10 @@ public class KuduScanNode extends ScanNode {
     StringBuilder result = new StringBuilder();
 
     String aliasStr = desc_.hasExplicitAlias() ? " " + desc_.getAlias() : "";
-    result.append(String.format("%s%s:%s [%s%s]\n", prefix, id_.toString(), displayName_,
-        kuduTable_.getFullName(), aliasStr));
+    result.append(
+        String.format(replicaSelectionLeaderOnly_ ? "%s%s:%s [%s%s, LEADER-only]\n" :
+                                                    "%s%s:%s [%s%s]\n",
+            prefix, id_.toString(), displayName_, kuduTable_.getFullName(), aliasStr));
 
     switch (detailLevel) {
       case MINIMAL: break;
@@ -366,14 +484,23 @@ public class KuduScanNode extends ScanNode {
    */
   private void extractKuduConjuncts(Analyzer analyzer,
       KuduClient client, org.apache.kudu.client.KuduTable rpcTable) {
+    // The set of primary key column index which are in equality predicates where
+    // it's compared to a constant, and will be pushed down to Kudu.
+    Set<Integer> primaryKeyColsInEqualPred = new HashSet<>();
     ListIterator<Expr> it = conjuncts_.listIterator();
     while (it.hasNext()) {
       Expr predicate = it.next();
-      if (tryConvertBinaryKuduPredicate(analyzer, rpcTable, predicate) ||
+      if (tryConvertBinaryKuduPredicate(analyzer, rpcTable, predicate,
+              primaryKeyColsInEqualPred) ||
           tryConvertInListKuduPredicate(analyzer, rpcTable, predicate) ||
           tryConvertIsNullKuduPredicate(analyzer, rpcTable, predicate)) {
         it.remove();
       }
+    }
+    if (primaryKeyColsInEqualPred.size() >= 1 &&
+        primaryKeyColsInEqualPred.size() ==
+            rpcTable.getSchema().getPrimaryKeyColumnCount()) {
+      isPointLookupQuery_ = true;
     }
   }
 
@@ -382,7 +509,8 @@ public class KuduScanNode extends ScanNode {
    * kuduPredicates_ and kuduConjuncts_.
    */
   private boolean tryConvertBinaryKuduPredicate(Analyzer analyzer,
-      org.apache.kudu.client.KuduTable table, Expr expr) {
+      org.apache.kudu.client.KuduTable table, Expr expr,
+      Set<Integer> primaryKeyColsInEqualPred) {
     if (!(expr instanceof BinaryPredicate)) return false;
     BinaryPredicate predicate = (BinaryPredicate) expr;
 
@@ -442,24 +570,36 @@ public class KuduScanNode extends ScanNode {
         try {
           // TODO: Simplify when Impala supports a 64-bit TIMESTAMP type.
           kuduPredicate = KuduPredicate.newComparisonPredicate(column, op,
-              KuduUtil.timestampToUnixTimeMicros(analyzer, literal));
+              ExprUtil.utcTimestampToUnixTimeMicros(analyzer, literal));
         } catch (Exception e) {
           LOG.info("Exception converting Kudu timestamp predicate: " + expr.toSql(), e);
           return false;
         }
         break;
       }
+      case DATE:
+        kuduPredicate = KuduPredicate.newComparisonPredicate(column, op,
+            ((DateLiteral)literal).getValue());
+        break;
       case DECIMAL: {
         kuduPredicate = KuduPredicate.newComparisonPredicate(column, op,
             ((NumericLiteral)literal).getValue());
         break;
       }
-      default: break;
+      default:
+        //All supported types are covered, should not reach default case
+        Preconditions.checkState(false);
     }
-    if (kuduPredicate == null) return false;
+    Preconditions.checkState(kuduPredicate != null);
 
     kuduConjuncts_.add(predicate);
     kuduPredicates_.add(kuduPredicate);
+
+    if (predicate.getOp().isEquivalence() && column.isKey()) {
+      Integer colIndex = table.getSchema().getColumnIndex(colName);
+      primaryKeyColsInEqualPred.add(colIndex);
+    }
+
     return true;
   }
 
@@ -547,7 +687,7 @@ public class KuduScanNode extends ScanNode {
       case TIMESTAMP: {
         try {
           // TODO: Simplify when Impala supports a 64-bit TIMESTAMP type.
-          return KuduUtil.timestampToUnixTimeMicros(analyzer, e);
+          return ExprUtil.utcTimestampToUnixTimeMicros(analyzer, e);
         } catch (Exception ex) {
           LOG.info("Exception converting Kudu timestamp expr: " + e.toSql(), ex);
         }

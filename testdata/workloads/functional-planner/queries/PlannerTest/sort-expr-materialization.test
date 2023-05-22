@@ -2,10 +2,10 @@
 select * from functional.alltypes order by random()
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=12.03MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=16.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SORT
 |  order by: random() ASC
@@ -29,10 +29,10 @@ PLAN-ROOT SINK
 select * from functional.alltypes order by abs(id) + abs(id)
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=12.03MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=16.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SORT
 |  order by: abs(id) + abs(id) ASC
@@ -56,10 +56,10 @@ PLAN-ROOT SINK
 select * from functional.alltypes order by tinyint_col + 1
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=12.03MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=16.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SORT
 |  order by: tinyint_col + 1 ASC
@@ -83,10 +83,10 @@ select * from functional.alltypes
 order by dayofweek(timestamp_col), true, id + 1, string_col = date_string_col, id = tinyint_col
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=12.03MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=16.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SORT
 |  order by: dayofweek(timestamp_col) ASC, TRUE ASC, id + 1 ASC, string_col = date_string_col ASC, id = tinyint_col ASC
@@ -111,10 +111,10 @@ select last_value(id) over (order by to_date(timestamp_col), bool_col is null)
 from functional.alltypes
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=144.00MB mem-reservation=16.03MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=144.00MB mem-reservation=20.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: last_value(id)
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 02:ANALYTIC
 |  functions: last_value(id)
@@ -147,10 +147,10 @@ select id from functional.alltypes order by string_col like 'a.*b', id * bigint_
 regexp_replace(string_col, 'a.*b', 'c') limit 10
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=128.00MB mem-reservation=32.00KB thread-reservation=2
+|  Per-Host Resources: mem-estimate=128.00MB mem-reservation=4.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:TOP-N [LIMIT=10]
 |  order by: string_col LIKE 'a.*b' ASC, id * bigint_col ASC, regexp_replace(string_col, 'a.*b', 'c') ASC
@@ -174,14 +174,14 @@ PLAN-ROOT SINK
 select * from functional.alltypes order by TestFn(double_col)
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=12.03MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=16.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SORT
-|  order by: default.testfn(double_col) ASC
-|  materialized: default.testfn(double_col)
+|  order by: default.testfn(double_col) /* NATIVE UDF */ ASC
+|  materialized: default.testfn(double_col) /* NATIVE UDF */
 |  mem-estimate=12.00MB mem-reservation=12.00MB spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=93B cardinality=7.30K
 |  in pipelines: 01(GETNEXT), 00(OPEN)
@@ -201,10 +201,10 @@ PLAN-ROOT SINK
 select concat(date_string_col, string_col) c from functional.alltypes order by c
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=12.03MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=140.00MB mem-reservation=16.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: concat(date_string_col, string_col)
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SORT
 |  order by: concat(date_string_col, string_col) ASC
@@ -235,7 +235,7 @@ F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=42.00MB mem-reservation=16.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id, row_number()
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 03:SORT
 |  order by: id ASC
@@ -253,8 +253,8 @@ PLAN-ROOT SINK
 |  in pipelines: 01(GETNEXT)
 |
 01:SORT
-|  order by: default.testfn(double_col) ASC NULLS FIRST, random() ASC
-|  materialized: default.testfn(double_col), random()
+|  order by: default.testfn(double_col) /* NATIVE UDF */ ASC NULLS LAST, random() ASC
+|  materialized: default.testfn(double_col) /* NATIVE UDF */, random()
 |  mem-estimate=6.00MB mem-reservation=6.00MB spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=6 row-size=24B cardinality=8
 |  in pipelines: 01(GETNEXT), 00(OPEN)
@@ -268,5 +268,192 @@ PLAN-ROOT SINK
    extrapolated-rows=disabled max-scan-range-rows=2
    mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=1
    tuple-ids=0 row-size=12B cardinality=8
+   in pipelines: 00(GETNEXT)
+====
+# IMPALA-7020: CAST expressions are expensive enough that they should be materialized for
+# ORDER BY.
+select *
+FROM
+  (
+    SELECT
+      o.*,
+      ROW_NUMBER() OVER(ORDER BY evt_ts DESC) AS rn
+    FROM
+      (
+        SELECT
+          l_orderkey,l_partkey,l_linenumber,l_quantity, cast (l_shipdate as date) evt_ts
+        FROM
+          tpch_parquet.lineitem
+      ) o
+  ) r
+WHERE
+  rn BETWEEN 1 AND 101
+ORDER BY rn
+---- PLAN
+F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=713.05MB mem-reservation=32.00MB thread-reservation=2
+PLAN-ROOT SINK
+|  output exprs: l_orderkey, l_partkey, l_linenumber, l_quantity, evt_ts, rn
+|  mem-estimate=22.89MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+04:SORT
+|  order by: rn ASC
+|  mem-estimate=22.89MB mem-reservation=6.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=4 row-size=40B cardinality=600.12K
+|  in pipelines: 04(GETNEXT), 01(OPEN)
+|
+03:SELECT
+|  predicates: row_number() <= CAST(101 AS BIGINT), row_number() >= CAST(1 AS BIGINT)
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  tuple-ids=7,6 row-size=62B cardinality=600.12K
+|  in pipelines: 01(GETNEXT)
+|
+02:ANALYTIC
+|  functions: row_number()
+|  order by: CAST(l_shipdate AS DATE) DESC
+|  window: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=7,6 row-size=62B cardinality=6.00M
+|  in pipelines: 01(GETNEXT)
+|
+01:SORT
+|  order by: CAST(l_shipdate AS DATE) DESC
+|  materialized: CAST(l_shipdate AS DATE)
+|  mem-estimate=309.05MB mem-reservation=12.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=7 row-size=54B cardinality=6.00M
+|  in pipelines: 01(GETNEXT), 00(OPEN)
+|
+00:SCAN HDFS [tpch_parquet.lineitem]
+   HDFS partitions=1/1 files=3 size=193.98MB
+   stored statistics:
+     table: rows=6.00M size=193.98MB
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=2.14M
+   mem-estimate=400.00MB mem-reservation=16.00MB thread-reservation=1
+   tuple-ids=0 row-size=50B cardinality=6.00M
+   in pipelines: 00(GETNEXT)
+====
+# IMPALA-7020: negative test - casts between primitive numeric types are cheap enough to
+# not require materialization.
+select *
+FROM
+  (
+    SELECT
+      o.*,
+      ROW_NUMBER() OVER(ORDER BY lno_f DESC) AS rn
+    FROM
+      (
+        SELECT
+          l_orderkey,l_partkey, cast(l_linenumber as float) lno_f, l_quantity, cast (l_shipdate as date) evt_ts
+        FROM
+          tpch_parquet.lineitem
+      ) o
+  ) r
+WHERE
+  rn BETWEEN 1 AND 101
+ORDER BY rn
+---- PLAN
+F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=690.16MB mem-reservation=32.00MB thread-reservation=2
+PLAN-ROOT SINK
+|  output exprs: l_orderkey, l_partkey, lno_f, l_quantity, evt_ts, rn
+|  mem-estimate=22.89MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+04:SORT
+|  order by: rn ASC
+|  mem-estimate=22.89MB mem-reservation=6.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=4 row-size=40B cardinality=600.12K
+|  in pipelines: 04(GETNEXT), 01(OPEN)
+|
+03:SELECT
+|  predicates: row_number() <= CAST(101 AS BIGINT), row_number() >= CAST(1 AS BIGINT)
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  tuple-ids=7,6 row-size=58B cardinality=600.12K
+|  in pipelines: 01(GETNEXT)
+|
+02:ANALYTIC
+|  functions: row_number()
+|  order by: CAST(l_linenumber AS FLOAT) DESC
+|  window: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=7,6 row-size=58B cardinality=6.00M
+|  in pipelines: 01(GETNEXT)
+|
+01:SORT
+|  order by: CAST(l_linenumber AS FLOAT) DESC
+|  mem-estimate=286.16MB mem-reservation=12.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=7 row-size=50B cardinality=6.00M
+|  in pipelines: 01(GETNEXT), 00(OPEN)
+|
+00:SCAN HDFS [tpch_parquet.lineitem]
+   HDFS partitions=1/1 files=3 size=193.98MB
+   stored statistics:
+     table: rows=6.00M size=193.98MB
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=2.14M
+   mem-estimate=400.00MB mem-reservation=16.00MB thread-reservation=1
+   tuple-ids=0 row-size=50B cardinality=6.00M
+   in pipelines: 00(GETNEXT)
+====
+# IMPALA-7020: negative test - casts between string and varchar are cheap enough to
+# not require materialisation
+select *
+FROM
+  (
+    SELECT
+      o.*,
+      ROW_NUMBER() OVER(ORDER BY evt_ts DESC) AS rn
+    FROM
+      (
+        SELECT
+          l_orderkey,l_partkey, l_linenumber, l_quantity, cast (l_shipdate as varchar(20)) evt_ts
+        FROM
+          tpch_parquet.lineitem
+      ) o
+  ) r
+WHERE
+  rn BETWEEN 1 AND 101
+ORDER BY rn
+---- PLAN
+F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=690.16MB mem-reservation=32.00MB thread-reservation=2
+PLAN-ROOT SINK
+|  output exprs: l_orderkey, l_partkey, l_linenumber, l_quantity, evt_ts, rn
+|  mem-estimate=33.19MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+04:SORT
+|  order by: rn ASC
+|  mem-estimate=33.19MB mem-reservation=12.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=4 row-size=58B cardinality=600.12K
+|  in pipelines: 04(GETNEXT), 01(OPEN)
+|
+03:SELECT
+|  predicates: row_number() <= CAST(101 AS BIGINT), row_number() >= CAST(1 AS BIGINT)
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  tuple-ids=7,6 row-size=58B cardinality=600.12K
+|  in pipelines: 01(GETNEXT)
+|
+02:ANALYTIC
+|  functions: row_number()
+|  order by: CAST(l_shipdate AS VARCHAR(20)) DESC
+|  window: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=7,6 row-size=58B cardinality=6.00M
+|  in pipelines: 01(GETNEXT)
+|
+01:SORT
+|  order by: CAST(l_shipdate AS VARCHAR(20)) DESC
+|  mem-estimate=286.16MB mem-reservation=12.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=7 row-size=50B cardinality=6.00M
+|  in pipelines: 01(GETNEXT), 00(OPEN)
+|
+00:SCAN HDFS [tpch_parquet.lineitem]
+   HDFS partitions=1/1 files=3 size=193.98MB
+   stored statistics:
+     table: rows=6.00M size=193.98MB
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=2.14M
+   mem-estimate=400.00MB mem-reservation=16.00MB thread-reservation=1
+   tuple-ids=0 row-size=50B cardinality=6.00M
    in pipelines: 00(GETNEXT)
 ====

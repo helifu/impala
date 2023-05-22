@@ -34,7 +34,8 @@ class ScalarExprEvaluator;
 
 class AnalyticEvalPlanNode : public PlanNode {
  public:
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status Init(const TPlanNode& tnode, FragmentState* state) override;
+  virtual void Close() override;
   virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
 
   ~AnalyticEvalPlanNode(){}
@@ -261,7 +262,7 @@ class AnalyticEvalNode : public ExecNode {
 
   /// Analytic functions and their evaluators. 'analytic_fns_' live in the query-state's
   /// objpool while the evaluators live in the exec node's objpool.
-  std::vector<AggFn*> analytic_fns_;
+  const std::vector<AggFn*>& analytic_fns_;
   std::vector<AggFnEvaluator*> analytic_fn_evals_;
 
   /// Indicates if each evaluator is the lead() fn. Used by ResetLeadFnSlots() to

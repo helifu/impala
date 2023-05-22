@@ -22,10 +22,13 @@
 #include <unordered_map>
 
 #include <boost/scoped_ptr.hpp>
+#include <kudu/client/client.h>
 
 // NOTE: try not to add more headers here: exec-env.h is included in many many files.
+#include "common/global-types.h"
 #include "common/status.h"
 #include "runtime/client-cache-types.h"
+#include "testutil/gtest-util.h"
 #include "util/hdfs-bulk-ops-defs.h" // For declaration of HdfsOpThreadPool
 #include "util/network-util.h"
 #include "util/spinlock.h"
@@ -66,6 +69,7 @@ class SystemStateInfo;
 class ThreadResourceMgr;
 class TmpFileMgr;
 class Webserver;
+class CodeGenCache;
 
 namespace io {
   class DiskIoMgr;
@@ -79,11 +83,13 @@ namespace io {
 /// ExecEnv::GetInstance().
 class ExecEnv {
  public:
-  ExecEnv();
+  /// If external_fe = true, some members (i.e. frontend_) are not used and will
+  /// be initialized to null.
+  /// TODO: Split out common logic into base class and eliminate null pointers.
+  ExecEnv(bool external_fe = false);
 
-  ExecEnv(int backend_port, int krpc_port,
-      int subscriber_port, int webserver_port, const std::string& statestore_host,
-      int statestore_port);
+  ExecEnv(int krpc_port, int subscriber_port, int webserver_port,
+      const std::string& statestore_host, int statestore_port, bool external_fe = false);
 
   /// Returns the most recently created exec env instance. In a normal impalad, this is
   /// the only instance. In test setups with multiple ExecEnv's per process,
@@ -109,30 +115,28 @@ class ExecEnv {
   /// once.
   void SetImpalaServer(ImpalaServer* server);
 
-  /// Get the address of the thrift backend service. Only valid to call if
-  /// StartServices() was successful.
-  TNetworkAddress GetThriftBackendAddress() const;
+  const BackendIdPB& backend_id() const { return backend_id_; }
 
   KrpcDataStreamMgr* stream_mgr() { return stream_mgr_.get(); }
 
-  ImpalaBackendClientCache* impalad_client_cache() {
-    return impalad_client_cache_.get();
-  }
   CatalogServiceClientCache* catalogd_client_cache() {
     return catalogd_client_cache_.get();
   }
   HBaseTableFactory* htable_factory() { return htable_factory_.get(); }
   io::DiskIoMgr* disk_io_mgr() { return disk_io_mgr_.get(); }
   Webserver* webserver() { return webserver_.get(); }
+  Webserver* metrics_webserver() { return metrics_webserver_.get(); }
   MetricGroup* metrics() { return metrics_.get(); }
   MetricGroup* rpc_metrics() { return rpc_metrics_; }
   MemTracker* process_mem_tracker() { return mem_tracker_.get(); }
   ThreadResourceMgr* thread_mgr() { return thread_mgr_.get(); }
   HdfsOpThreadPool* hdfs_op_thread_pool() { return hdfs_op_thread_pool_.get(); }
   TmpFileMgr* tmp_file_mgr() { return tmp_file_mgr_.get(); }
-  CallableThreadPool* exec_rpc_thread_pool() { return exec_rpc_thread_pool_.get(); }
   ImpalaServer* impala_server() { return impala_server_; }
-  Frontend* frontend() { return frontend_.get(); }
+  Frontend* frontend() {
+    DCHECK(frontend_.get() != nullptr);
+    return frontend_.get();
+  }
   RequestPoolService* request_pool_service() { return request_pool_service_.get(); }
   CallableThreadPool* rpc_pool() { return async_rpc_pool_.get(); }
   QueryExecMgr* query_exec_mgr() { return query_exec_mgr_.get(); }
@@ -142,19 +146,25 @@ class ExecEnv {
   BufferPool* buffer_pool() { return buffer_pool_.get(); }
   SystemStateInfo* system_state_info() { return system_state_info_.get(); }
 
-  void set_enable_webserver(bool enable) { enable_webserver_ = enable; }
+  bool get_enable_webserver() const { return enable_webserver_; }
 
   ClusterMembershipMgr* cluster_membership_mgr() { return cluster_membership_mgr_.get(); }
   Scheduler* scheduler() { return scheduler_.get(); }
   AdmissionController* admission_controller() { return admission_controller_.get(); }
   StatestoreSubscriber* subscriber() { return statestore_subscriber_.get(); }
+  CodeGenCache* codegen_cache() const { return codegen_cache_.get(); }
+  bool codegen_cache_enabled() const { return codegen_cache_ != nullptr; }
+
+  const TNetworkAddress& configured_backend_address() const {
+    return configured_backend_address_;
+  }
 
   const IpAddr& ip_address() const { return ip_address_; }
 
-  const TNetworkAddress& krpc_address() const { return krpc_address_; }
+  const NetworkAddressPB& krpc_address() const { return krpc_address_; }
 
   /// Initializes the exec env for running FE tests.
-  Status InitForFeTests() WARN_UNUSED_RESULT;
+  Status InitForFeSupport() WARN_UNUSED_RESULT;
 
   /// Returns true if this environment was created from the FE tests. This makes the
   /// environment special since the JVM is started first and libraries are loaded
@@ -166,15 +176,26 @@ class ExecEnv {
 
   /// Gets a KuduClient for this list of master addresses. It will look up and share
   /// an existing KuduClient if possible. Otherwise, it will create a new KuduClient
-  /// internally and return a pointer to it. All KuduClients accessed through this
-  /// interface are owned by the ExecEnv. Thread safe.
+  /// internally and return a shared pointer to it. All KuduClients accessed through this
+  /// interface are shared among ExecEnv and other actors which hold the returned handle.
+  /// Thread safe.
   Status GetKuduClient(const std::vector<std::string>& master_addrs,
-      kudu::client::KuduClient** client) WARN_UNUSED_RESULT;
+      kudu::client::sp::shared_ptr<kudu::client::KuduClient>* client) WARN_UNUSED_RESULT;
 
   int64_t admit_mem_limit() const { return admit_mem_limit_; }
   int64_t admission_slots() const { return admission_slots_; }
 
+  /// Gets the resolved IP address and port where the admission control service is
+  /// running, if enabled.
+  Status GetAdmissionServiceAddress(NetworkAddressPB& address) const;
+
+  /// Returns true if the admission control service is enabled.
+  bool AdmissionServiceEnabled() const;
+
  private:
+  // Used to uniquely identify this impalad.
+  BackendIdPB backend_id_;
+
   boost::scoped_ptr<ObjectPool> obj_pool_;
   boost::scoped_ptr<MetricGroup> metrics_;
   boost::scoped_ptr<KrpcDataStreamMgr> stream_mgr_;
@@ -182,11 +203,11 @@ class ExecEnv {
   boost::scoped_ptr<Scheduler> scheduler_;
   boost::scoped_ptr<AdmissionController> admission_controller_;
   boost::scoped_ptr<StatestoreSubscriber> statestore_subscriber_;
-  boost::scoped_ptr<ImpalaBackendClientCache> impalad_client_cache_;
   boost::scoped_ptr<CatalogServiceClientCache> catalogd_client_cache_;
   boost::scoped_ptr<HBaseTableFactory> htable_factory_;
   boost::scoped_ptr<io::DiskIoMgr> disk_io_mgr_;
   boost::scoped_ptr<Webserver> webserver_;
+  boost::scoped_ptr<Webserver> metrics_webserver_;
   boost::scoped_ptr<MemTracker> mem_tracker_;
   boost::scoped_ptr<PoolMemTrackerRegistry> pool_mem_trackers_;
   boost::scoped_ptr<ThreadResourceMgr> thread_mgr_;
@@ -198,10 +219,6 @@ class ExecEnv {
   boost::scoped_ptr<TmpFileMgr> tmp_file_mgr_;
   boost::scoped_ptr<RequestPoolService> request_pool_service_;
   boost::scoped_ptr<Frontend> frontend_;
-
-  // Thread pool for the ExecQueryFInstances RPC. Only used by the coordinator, so it's
-  // only started if FLAGS_is_coordinator is 'true'.
-  boost::scoped_ptr<CallableThreadPool> exec_rpc_thread_pool_;
 
   boost::scoped_ptr<CallableThreadPool> async_rpc_pool_;
   boost::scoped_ptr<QueryExecMgr> query_exec_mgr_;
@@ -218,42 +235,47 @@ class ExecEnv {
   /// Tracks system resource usage which we then include in profiles.
   boost::scoped_ptr<SystemStateInfo> system_state_info_;
 
+  /// Singleton cache for codegen functions.
+  boost::scoped_ptr<CodeGenCache> codegen_cache_;
+
   /// Not owned by this class
   ImpalaServer* impala_server_ = nullptr;
   MetricGroup* rpc_metrics_ = nullptr;
 
   bool enable_webserver_;
+  bool external_fe_;
 
  private:
   friend class TestEnv;
   friend class DataStreamTest;
 
+  // For access to InitHadoopConfig().
+  FRIEND_TEST(HdfsUtilTest, CheckFilesystemsAndBucketsMatch);
+
   static ExecEnv* exec_env_;
   bool is_fe_tests_ = false;
 
-  /// Address of the thrift based ImpalaInternalService. In backend tests we allow
-  /// wildcard port 0, so this may not be the actual backend address.
+  /// The network address that the backend KRPC service is listening on:
+  /// hostname + krpc_port.
   TNetworkAddress configured_backend_address_;
 
   /// Resolved IP address of the host name.
   IpAddr ip_address_;
 
-  /// Address of the KRPC-based ImpalaInternalService
-  TNetworkAddress krpc_address_;
+  /// Address of the KRPC backend service: ip_address + krpc_port and UDS address.
+  NetworkAddressPB krpc_address_;
 
   /// fs.defaultFs value set in core-site.xml
   std::string default_fs_;
 
   SpinLock kudu_client_map_lock_; // protects kudu_client_map_
 
-  /// Opaque type for storing the pointer to the KuduClient. This allows us
-  /// to avoid including Kudu header files.
-  struct KuduClientPtr;
-
-  /// Map from the master addresses string for a Kudu table to the KuduClientPtr for
+  /// Map from the master addresses string for a Kudu table to the KuduClient for
   /// accessing that table. The master address string is constructed by joining
   /// the sorted master address list entries with a comma separator.
-  typedef std::unordered_map<std::string, std::unique_ptr<KuduClientPtr>> KuduClientMap;
+  typedef std::unordered_map<std::string,
+      kudu::client::sp::shared_ptr<kudu::client::KuduClient>>
+      KuduClientMap;
 
   /// Map for sharing KuduClients across the ExecEnv. This map requires that the master
   /// address lists be identical in order to share a KuduClient.
@@ -274,11 +296,8 @@ class ExecEnv {
   /// this backend. Queries take up multiple slots only when mt_dop > 1.
   int64_t admission_slots_;
 
-  /// Choose a memory limit (returned in *bytes_limit) based on the --mem_limit flag and
-  /// the memory available to the daemon process. Returns an error if the memory limit is
-  /// invalid or another error is encountered that should prevent starting up the daemon.
-  /// Logs the memory limit chosen and any relevant diagnostics related to that choice.
-  Status ChooseProcessMemLimit(int64_t* bytes_limit);
+  /// Initialize ExecEnv based on Hadoop config from frontend.
+  Status InitHadoopConfig();
 
   /// Initialise 'buffer_pool_' and 'buffer_reservation_' with given capacity.
   void InitBufferPool(int64_t min_page_len, int64_t capacity, int64_t clean_pages_limit);

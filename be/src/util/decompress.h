@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_UTIL_DECOMPRESS_H
-#define IMPALA_UTIL_DECOMPRESS_H
+#include <cstdint>
+#include <string>
 
 // We need zlib.h here to declare stream_ below.
-#include <zlib.h>
 #include <bzlib.h>
+#include <zlib.h>
+#include <zstd.h>
 
+#include "common/status.h"
 #include "util/codec.h"
 
 namespace impala {
@@ -132,17 +135,30 @@ class SnappyBlockDecompressor : public Codec {
   virtual std::string file_extension() const override { return "snappy"; }
 };
 
+/// Zstandard is a real-time compression algorithm, providing high compression ratios.
+/// It offers a very wide range of compression/speed trade-off. This decompressor
+/// supports both block and streaming, while block decompress requires output buffer be
+/// pre-allocated.
 class ZstandardDecompressor : public Codec {
  public:
   ZstandardDecompressor(MemPool* mem_pool, bool reuse_buffer);
-  virtual ~ZstandardDecompressor() {}
+  virtual ~ZstandardDecompressor();
 
   virtual int64_t MaxOutputLen(
       int64_t input_len, const uint8_t* input = nullptr) override;
   virtual Status ProcessBlock(bool output_preallocated, int64_t input_length,
       const uint8_t* input, int64_t* output_length,
       uint8_t** output) override WARN_UNUSED_RESULT;
-  virtual std::string file_extension() const override { return "zstd"; }
+  /// File extension to use for this compression codec.
+  /// Except parquet which uses ".parq" as the file extension.
+  virtual std::string file_extension() const override { return "zst"; }
+  virtual Status ProcessBlockStreaming(int64_t input_length, const uint8_t* input,
+      int64_t* input_bytes_read, int64_t* output_length, uint8_t** output,
+      bool* stream_end) override WARN_UNUSED_RESULT;
+
+ private:
+  /// Allocate one context per thread, and re-use for many time decompression.
+  ZSTD_DCtx* stream_ = NULL;
 };
 
 /// Hadoop's block compression scheme on top of LZ4.
@@ -159,4 +175,3 @@ class Lz4BlockDecompressor : public Codec {
   virtual std::string file_extension() const override { return "lz4"; }
 };
 }
-#endif

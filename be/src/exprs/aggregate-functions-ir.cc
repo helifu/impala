@@ -23,32 +23,45 @@
 #include <utility>
 #include <cmath>
 
-#include <boost/random/ranlux.hpp>
+#include <boost/random/mersenne_twister.hpp>
 #include <boost/random/uniform_int.hpp>
 
 #include "codegen/impala-ir.h"
 #include "common/logging.h"
 #include "exprs/anyval-util.h"
+#include "exprs/datasketches-common.h"
 #include "exprs/hll-bias.h"
+#include "gutil/strings/substitute.h"
 #include "runtime/date-value.h"
 #include "runtime/decimal-value.inline.h"
+#include "runtime/multi-precision.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
+#include "thirdparty/datasketches/hll.hpp"
+#include "thirdparty/datasketches/cpc_sketch.hpp"
+#include "thirdparty/datasketches/cpc_union.hpp"
+#include "thirdparty/datasketches/theta_sketch.hpp"
+#include "thirdparty/datasketches/theta_union.hpp"
+#include "thirdparty/datasketches/theta_intersection.hpp"
+#include "thirdparty/datasketches/kll_sketch.hpp"
 #include "util/arithmetic-util.h"
 #include "util/mpfit-util.h"
+#include "util/pretty-printer.h"
 
 #include "common/names.h"
 
 using boost::uniform_int;
-using boost::ranlux64_3;
+using boost::mt19937_64;
 using std::make_pair;
 using std::map;
 using std::min_element;
 using std::nth_element;
 using std::pop_heap;
 using std::push_heap;
+using std::string;
+using std::stringstream;
 
 namespace {
 // Threshold for each precision where it's better to use linear counting instead
@@ -91,19 +104,19 @@ static float HllThreshold(int p) {
 
 // Implements k nearest neighbor interpolation for k=6,
 // we choose 6 bassed on the HLL++ paper
-int64_t HllEstimateBias(int64_t estimate) {
+int64_t HllEstimateBias(int64_t estimate, int precision) {
   const size_t K = 6;
 
   // Precision index into data arrays
   // We don't have data for precisions less than 4
-  DCHECK(impala::AggregateFunctions::HLL_PRECISION >= 4);
-  static constexpr size_t idx = impala::AggregateFunctions::HLL_PRECISION - 4;
+  DCHECK_IN_RANGE(precision, impala::AggregateFunctions::MIN_HLL_PRECISION,
+      impala::AggregateFunctions::MAX_HLL_PRECISION);
+  size_t idx = precision - 4;
 
   // Calculate the square of the difference of this estimate to all
   // precalculated estimates for a particular precision
   map<double, size_t> distances;
-  for (size_t i = 0;
-      i < impala::HLL_DATA_SIZES[idx] / sizeof(double); ++i) {
+  for (size_t i = 0; i < impala::HLL_DATA_SIZES[idx] / sizeof(double); ++i) {
     double val = estimate - impala::HLL_RAW_ESTIMATE_DATA[idx][i];
     distances.insert(make_pair(val * val, i));
   }
@@ -128,6 +141,9 @@ int64_t HllEstimateBias(int64_t estimate) {
 }
 
 namespace impala {
+
+const char* ERROR_CONCATENATED_STRING_MAX_SIZE_REACHED =
+  "Concatenated string length is larger than allowed limit of $0 character data.";
 
 // This function initializes StringVal 'dst' with a newly allocated buffer of
 // 'buf_len' bytes. The new buffer will be filled with zero. If allocation fails,
@@ -174,8 +190,13 @@ StringVal ToStringVal(FunctionContext* context, T val) {
       context, reinterpret_cast<const uint8_t*>(str.c_str()), str.size());
 }
 
-constexpr int AggregateFunctions::HLL_PRECISION;
-constexpr int AggregateFunctions::HLL_LEN;
+constexpr int AggregateFunctions::DEFAULT_HLL_PRECISION;
+constexpr int AggregateFunctions::MIN_HLL_PRECISION;
+constexpr int AggregateFunctions::MAX_HLL_PRECISION;
+
+constexpr int AggregateFunctions::DEFAULT_HLL_LEN;
+constexpr int AggregateFunctions::MIN_HLL_LEN;
+constexpr int AggregateFunctions::MAX_HLL_LEN;
 
 void AggregateFunctions::InitNull(FunctionContext*, AnyVal* dst) {
   dst->is_null = true;
@@ -267,6 +288,362 @@ void AggregateFunctions::CountMerge(FunctionContext*, const BigIntVal& src,
   dst->val += src.val;
 }
 
+// Implementation of CORR() function which takes two arguments of numeric type
+// and returns the Pearson's correlation coefficient between them using the Welford's
+// online algorithm. This is calculated using a stable one-pass algorithm, based on
+// work by Philippe Pébay and Donald Knuth.
+// Implementation of CORR() is independent of the implementation of COVAR_SAMP() and
+// COVAR_POP() so changes in one would probably need to be reflected in the other as well.
+// Few useful links :
+// https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online
+// https://www.osti.gov/biblio/1028931
+// Correlation coefficient formula used:
+// r = covar / (√(xvar * yvar)
+struct CorrState {
+  int64_t count; // number of elements
+  double xavg; // average of x elements
+  double yavg; // average of y elements
+  double xvar; // n times the variance of x elements
+  double yvar; // n times the variance of y elements
+  double covar; // n times the covariance
+};
+
+void AggregateFunctions::CorrInit(FunctionContext* ctx, StringVal* dst) {
+  dst->is_null = false;
+  dst->len = sizeof(CorrState);
+  dst->ptr = ctx->Allocate(dst->len);
+  memset(dst->ptr, 0, dst->len);
+}
+
+static inline void CorrUpdateState(double x, double y, CorrState* state) {
+  double deltaX = x - state->xavg;
+  double deltaY = y - state->yavg;
+  ++state->count;
+  // mx_n = mx_(n - 1) + [x_n - mx_(n - 1)] / n
+  state->xavg += deltaX / state->count;
+  // my_n = my_(n - 1) + [y_n - my_(n - 1)] / n
+  state->yavg += deltaY / state->count;
+  if (state->count > 1) {
+    // c_n = c_(n - 1) + (x_n - mx_n) * (y_n - my_(n - 1)) OR
+    // c_n = c_(n - 1) + (x_n - mx_(n - 1)) * (y_n - my_n)
+    // The apparent asymmetry in the equations is due to the fact that,
+    // x_n - mx_n = (n - 1) * (x_n - mx_(n - 1)) / n, so both update terms are equal to
+    // (n - 1) * (x_n - mx_(n - 1)) * (y_n - my_(n - 1)) / n
+    state->covar += deltaX * (y - state->yavg);
+    // vx_n = vx_(n - 1) + (x_n - mx_(n - 1)) * (x_n - mx_n)
+    state->xvar += deltaX * (x - state->xavg);
+    // vy_n = vy_(n - 1) + (y_n - my_(n - 1)) * (y_n - my_n)
+    state->yvar += deltaY * (y - state->yavg);
+  }
+}
+
+static inline void CorrRemoveState(double x, double y, CorrState* state) {
+  double deltaX = x - state->xavg;
+  double deltaY = y - state->yavg;
+  if (state->count <= 1) {
+    memset(state, 0, sizeof(CorrState));
+  } else {
+    --state->count;
+    // mx_(n - 1) = mx_n - (x_n - mx_n) / (n - 1)
+    state->xavg -= deltaX / state->count;
+    // my_(n - 1) = my_n - (y_n - my_n) / (n - 1)
+    state->yavg -= deltaY / state->count;
+    // c_(n - 1) = c_n - (x_n - mx_n) * (y_n - my_(n -1))
+    state->covar -= deltaX * (y - state->yavg);
+    // vx_(n - 1) = vx_n - (x_n - mx_n) * (x_n - mx_(n - 1))
+    state->xvar -= deltaX * (x - state->xavg);
+    // vy_(n - 1) = vy_n - (y_n - my_n) * (y_n - my_(n - 1))
+    state->yvar -= deltaY * (y - state->yavg);
+  }
+}
+
+void AggregateFunctions::CorrUpdate(FunctionContext* ctx,
+    const DoubleVal& src1, const DoubleVal& src2, StringVal* dst) {
+  if (src1.is_null || src2.is_null) return;
+  DCHECK(dst->ptr != nullptr);
+  DCHECK_EQ(sizeof(CorrState), dst->len);
+  CorrState* state = reinterpret_cast<CorrState*>(dst->ptr);
+  CorrUpdateState(src1.val, src2.val, state);
+}
+
+void AggregateFunctions::CorrRemove(FunctionContext* ctx,
+    const DoubleVal& src1, const DoubleVal& src2, StringVal* dst) {
+  // Remove doesn't need to explicitly check the number of calls to Update() or Remove()
+  // because Finalize() returns NULL if count is 0. In other words, it's not needed to
+  // check if num_removes() >= num_updates() as it's accounted for in Finalize().
+  if (src1.is_null || src2.is_null) return;
+  DCHECK(dst->ptr != nullptr);
+  DCHECK_EQ(sizeof(CorrState), dst->len);
+  CorrState* state = reinterpret_cast<CorrState*>(dst->ptr);
+  CorrRemoveState(src1.val, src2.val, state);
+}
+
+void AggregateFunctions::TimestampCorrUpdate(FunctionContext* ctx,
+    const TimestampVal& src1, const TimestampVal& src2, StringVal* dst) {
+  if (src1.is_null || src2.is_null) return;
+  CorrState* state = reinterpret_cast<CorrState*>(dst->ptr);
+  const TimestampValue& tm_src1 = TimestampValue::FromTimestampVal(src1);
+  const TimestampValue& tm_src2 = TimestampValue::FromTimestampVal(src2);
+  double val1, val2;
+  if (tm_src1.ToSubsecondUnixTime(UTCPTR, &val1) &&
+      tm_src2.ToSubsecondUnixTime(UTCPTR, &val2)) {
+    CorrUpdateState(val1, val2, state);
+  }
+}
+
+void AggregateFunctions::TimestampCorrRemove(FunctionContext* ctx,
+    const TimestampVal& src1, const TimestampVal& src2, StringVal* dst) {
+  // Remove doesn't need to explicitly check the number of calls to Update() or Remove()
+  // because Finalize() returns NULL if count is 0. In other words, it's not needed to
+  // check if num_removes() >= num_updates() as it's accounted for in Finalize().
+  if (src1.is_null || src2.is_null) return;
+  CorrState* state = reinterpret_cast<CorrState*>(dst->ptr);
+  const TimestampValue& tm_src1 = TimestampValue::FromTimestampVal(src1);
+  const TimestampValue& tm_src2 = TimestampValue::FromTimestampVal(src2);
+  double val1, val2;
+  if (tm_src1.ToSubsecondUnixTime(UTCPTR, &val1) &&
+      tm_src2.ToSubsecondUnixTime(UTCPTR, &val2)) {
+    CorrRemoveState(val1, val2, state);
+  }
+}
+
+void AggregateFunctions::CorrMerge(FunctionContext* ctx,
+    const StringVal& src, StringVal* dst) {
+  CorrState* src_state = reinterpret_cast<CorrState*>(src.ptr);
+  DCHECK(dst->ptr != nullptr);
+  DCHECK_EQ(sizeof(CorrState), dst->len);
+  CorrState* dst_state = reinterpret_cast<CorrState*>(dst->ptr);
+  if (src.ptr != nullptr) {
+    int64_t nA = dst_state->count;
+    int64_t nB = src_state->count;
+    if (nA == 0) {
+      memcpy(dst_state, src_state, sizeof(CorrState));
+      return;
+    }
+    if (nA != 0 && nB != 0) {
+      double xavgA = dst_state->xavg;
+      double yavgA = dst_state->yavg;
+      double xavgB = src_state->xavg;
+      double yavgB = src_state->yavg;
+      double xvarB = src_state->xvar;
+      double yvarB = src_state->yvar;
+      double covarB = src_state->covar;
+
+      dst_state->count += nB;
+      dst_state->xavg = (xavgA * nA + xavgB * nB) / dst_state->count;
+      dst_state->yavg = (yavgA * nA + yavgB * nB) / dst_state->count;
+      // vx_(A,B) = vx_A + vx_B + (mx_A - mx_B) * (mx_A - mx_B) * n_A * n_B / (n_A + n_B)
+      dst_state->xvar +=
+          xvarB + (xavgA - xavgB) * (xavgA - xavgB) * nA * nB / dst_state->count;
+      // vy_(A,B) = vy_A + vy_B + (my_A - my_B) * (my_A - my_B) * n_A * n_B / (n_A + n_B)
+      dst_state->yvar +=
+          yvarB + (yavgA - yavgB) * (yavgA - yavgB) * nA * nB / dst_state->count;
+      // c_(A,B) = c_A + c_B + (mx_A - mx_B) * (my_A - my_B) * n_A * n_B / (n_A + n_B)
+      dst_state->covar += covarB
+          + (xavgA - xavgB) * (yavgA - yavgB) * ((double)(nA * nB)) / (dst_state->count);
+    }
+  }
+}
+
+DoubleVal AggregateFunctions::CorrGetValue(FunctionContext* ctx, const StringVal& src) {
+  CorrState* state = reinterpret_cast<CorrState*>(src.ptr);
+  // Calculating Pearson's correlation coefficient
+  // xvar and yvar become negative in certain cases due to floating point rounding error.
+  // Since these values are very small, they can be ignored and rounded to 0.
+  DCHECK(state->xvar >= -1E-8);
+  DCHECK(state->yvar >= -1E-8);
+  if (state->count == 0 || state->count == 1 || state->xvar <= 0.0 ||
+      state->yvar <= 0.0) {
+    return DoubleVal::null();
+  }
+  double r = sqrt(state->xvar * state->yvar);
+  if (r == 0.0) return DoubleVal::null();
+  double corr = state->covar / r;
+  return DoubleVal(corr);
+}
+
+DoubleVal AggregateFunctions::CorrFinalize(FunctionContext* ctx, const StringVal& src) {
+  CorrState* state = reinterpret_cast<CorrState*>(src.ptr);
+  if (UNLIKELY(src.is_null) || state->count == 0 || state->count == 1) {
+    ctx->Free(src.ptr);
+    return DoubleVal::null();
+  }
+  DoubleVal r = CorrGetValue(ctx, src);
+  ctx->Free(src.ptr);
+  return r;
+}
+
+// Implementation of COVAR_SAMP() and COVAR_POP() which calculates sample and
+// population covariance between two columns of numeric types respectively using
+// the Welford's online algorithm.
+// Sample covariance:
+// r = covar / (n-1)
+// Population covariance:
+// r = covar / (n)
+struct CovarState {
+  int64_t count; // number of elements
+  double xavg; // average of x elements
+  double yavg; // average of y elements
+  double covar; // n times the covariance
+};
+
+void AggregateFunctions::CovarInit(FunctionContext* ctx, StringVal* dst) {
+  dst->is_null = false;
+  dst->len = sizeof(CovarState);
+  dst->ptr = ctx->Allocate(dst->len);
+  memset(dst->ptr, 0, dst->len);
+}
+
+static inline void CovarUpdateState(double x, double y, CovarState* state) {
+  ++state->count;
+  // my_n = my_(n - 1) + [y_n - my_(n - 1)] / n
+  state->yavg += (y - state->yavg) / state->count;
+  // c_n = c_(n - 1) + (x_n - mx_(n - 1)) * (y_n - my_n) OR
+  // c_n = c_(n - 1) + (x_n - mx_n) * (y_n - my_(n - 1))
+  // The apparent asymmetry in the equations is due to the fact that,
+  // x_n - mx_n = (n - 1) * (x_n - mx_(n - 1)) / n, so both terms are equal to
+  // (n - 1) * (x_n - mx_(n - 1)) * (y_n - my_(n - 1)) / n
+  if (state->count > 1) state->covar += (x - state->xavg) * (y - state->yavg);
+  // mx_n = mx_(n - 1) + [x_n - mx_(n - 1)] / n
+  state->xavg += (x - state->xavg) / state->count;
+}
+
+static inline void CovarRemoveState(double x, double y, CovarState* state){
+  if (state->count <= 1) {
+    memset(state, 0, sizeof(CovarState));
+  } else {
+    --state->count;
+    // my_(n - 1) = my_n - (y_n - my_n) / (n - 1)
+    state->yavg -= (y - state->yavg) / state->count;
+    // c_(n - 1) = c_n - (x_n - mx_(n - 1)) * (y_n - my_n)
+    state->covar -= (x - state->xavg) * (y - state->yavg);
+    // mx_(n - 1) = mx_n - (x_n - mx_n) / (n - 1)
+    state->xavg -= (x - state->xavg) / state->count;
+  }
+}
+
+void AggregateFunctions::CovarUpdate(FunctionContext* ctx,
+    const DoubleVal& src1, const DoubleVal& src2, StringVal* dst) {
+  if (src1.is_null || src2.is_null) return;
+  DCHECK(dst->ptr != nullptr);
+  DCHECK_EQ(sizeof(CovarState), dst->len);
+  CovarState* state = reinterpret_cast<CovarState*>(dst->ptr);
+  CovarUpdateState(src1.val, src2.val, state);
+}
+
+void AggregateFunctions::CovarRemove(FunctionContext* ctx,
+    const DoubleVal& src1, const DoubleVal& src2, StringVal* dst) {
+  // Remove doesn't need to explicitly check the number of calls to Update() or Remove()
+  // because Finalize() returns NULL if count is 0. In other words, it's not needed to
+  // check if num_removes() >= num_updates() as it's accounted for in Finalize().
+  if (src1.is_null || src2.is_null) return;
+  DCHECK(dst->ptr != nullptr);
+  DCHECK_EQ(sizeof(CovarState), dst->len);
+  CovarState* state = reinterpret_cast<CovarState*>(dst->ptr);
+  CovarRemoveState(src1.val, src2.val, state);
+}
+
+void AggregateFunctions::TimestampCovarUpdate(FunctionContext* ctx,
+    const TimestampVal& src1, const TimestampVal& src2, StringVal* dst) {
+  if (src1.is_null || src2.is_null) return;
+  CovarState* state = reinterpret_cast<CovarState*>(dst->ptr);
+  const TimestampValue& tm_src1 = TimestampValue::FromTimestampVal(src1);
+  const TimestampValue& tm_src2 = TimestampValue::FromTimestampVal(src2);
+  double val1, val2;
+  if (tm_src1.ToSubsecondUnixTime(UTCPTR, &val1) &&
+      tm_src2.ToSubsecondUnixTime(UTCPTR, &val2)) {
+    CovarUpdateState(val1, val2, state);
+  }
+}
+
+void AggregateFunctions::TimestampCovarRemove(FunctionContext* ctx,
+    const TimestampVal& src1, const TimestampVal& src2, StringVal* dst) {
+  // Remove doesn't need to explicitly check the number of calls to Update() or Remove()
+  // because Finalize() returns NULL if count is 0. In other words, it's not needed to
+  // check if num_removes() >= num_updates() as it's accounted for in Finalize().
+  if (src1.is_null || src2.is_null) return;
+  CovarState* state = reinterpret_cast<CovarState*>(dst->ptr);
+  const TimestampValue& tm_src1 = TimestampValue::FromTimestampVal(src1);
+  const TimestampValue& tm_src2 = TimestampValue::FromTimestampVal(src2);
+  double val1, val2;
+  if (tm_src1.ToSubsecondUnixTime(UTCPTR, &val1) &&
+      tm_src2.ToSubsecondUnixTime(UTCPTR, &val2)) {
+    CovarRemoveState(val1, val2, state);
+  }
+}
+
+void AggregateFunctions::CovarMerge(FunctionContext* ctx,
+    const StringVal& src, StringVal* dst) {
+  CovarState* src_state = reinterpret_cast<CovarState*>(src.ptr);
+  DCHECK(dst->ptr != nullptr);
+  DCHECK_EQ(sizeof(CovarState), dst->len);
+  CovarState* dst_state = reinterpret_cast<CovarState*>(dst->ptr);
+  if (src.ptr != nullptr) {
+    int64_t nA = dst_state->count;
+    int64_t nB = src_state->count;
+    if (nA == 0) {
+      memcpy(dst_state, src_state, sizeof(CovarState));
+      return;
+    }
+    if (nA != 0 && nB != 0) {
+      double xavgA = dst_state->xavg;
+      double yavgA = dst_state->yavg;
+      double xavgB = src_state->xavg;
+      double yavgB = src_state->yavg;
+      double covarB = src_state->covar;
+
+      dst_state->count += nB;
+      dst_state->xavg = (xavgA * nA + xavgB * nB) / dst_state->count;
+      dst_state->yavg = (yavgA * nA + yavgB * nB) / dst_state->count;
+      // c_(A,B) = c_A + c_B + (mx_A - mx_B) * (my_A - my_B) * n_A * n_B / (n_A + n_B)
+      dst_state->covar += covarB
+          + (xavgA - xavgB) * (yavgA - yavgB) * ((double)(nA * nB)) / (dst_state->count);
+    }
+  }
+}
+
+DoubleVal AggregateFunctions::CovarSampleGetValue(FunctionContext* ctx,
+    const StringVal& src) {
+  // Calculating sample covariance
+  CovarState* state = reinterpret_cast<CovarState*>(src.ptr);
+  if (state->count == 0 || state->count == 1) return DoubleVal::null();
+  double covar_samp = state->covar / (state->count - 1);
+  return DoubleVal(covar_samp);
+}
+
+DoubleVal AggregateFunctions::CovarPopulationGetValue(FunctionContext* ctx,
+    const StringVal& src) {
+  // Calculating population covariance
+  CovarState* state = reinterpret_cast<CovarState*>(src.ptr);
+  if (state->count == 0) return DoubleVal::null();
+  double covar_pop = state->covar / (state->count);
+  return DoubleVal(covar_pop);
+}
+
+DoubleVal AggregateFunctions::CovarSampleFinalize(FunctionContext* ctx,
+    const StringVal& src) {
+  CovarState* state = reinterpret_cast<CovarState*>(src.ptr);
+  if (UNLIKELY(src.is_null) || state->count == 0 || state->count == 1) {
+    ctx->Free(src.ptr);
+    return DoubleVal::null();
+  }
+  DoubleVal r = CovarSampleGetValue(ctx, src);
+  ctx->Free(src.ptr);
+  return r;
+}
+
+DoubleVal AggregateFunctions::CovarPopulationFinalize(FunctionContext* ctx,
+    const StringVal& src) {
+  CovarState* state = reinterpret_cast<CovarState*>(src.ptr);
+  if (UNLIKELY(src.is_null) || state->count == 0) {
+    ctx->Free(src.ptr);
+    return DoubleVal::null();
+  }
+  DoubleVal r = CovarPopulationGetValue(ctx, src);
+  ctx->Free(src.ptr);
+  return r;
+}
+
 struct AvgState {
   double sum;
   int64_t count;
@@ -333,7 +710,7 @@ void AggregateFunctions::TimestampAvgUpdate(FunctionContext* ctx,
   AvgState* avg = reinterpret_cast<AvgState*>(dst->ptr);
   const TimestampValue& tm_src = TimestampValue::FromTimestampVal(src);
   double val;
-  if (tm_src.ToSubsecondUnixTime(ctx->impl()->state()->local_time_zone(), &val)) {
+  if (tm_src.ToSubsecondUnixTime(UTCPTR, &val)) {
     avg->sum += val;
     ++avg->count;
   }
@@ -347,7 +724,7 @@ void AggregateFunctions::TimestampAvgRemove(FunctionContext* ctx,
   AvgState* avg = reinterpret_cast<AvgState*>(dst->ptr);
   const TimestampValue& tm_src = TimestampValue::FromTimestampVal(src);
   double val;
-  if (tm_src.ToSubsecondUnixTime(ctx->impl()->state()->local_time_zone(), &val)) {
+  if (tm_src.ToSubsecondUnixTime(UTCPTR, &val)) {
     avg->sum -= val;
     --avg->count;
     DCHECK_GE(avg->count, 0);
@@ -359,7 +736,7 @@ TimestampVal AggregateFunctions::TimestampAvgGetValue(FunctionContext* ctx,
   AvgState* val_struct = reinterpret_cast<AvgState*>(src.ptr);
   if (val_struct->count == 0) return TimestampVal::null();
   const TimestampValue& tv = TimestampValue::FromSubsecondUnixTime(
-      val_struct->sum / val_struct->count, ctx->impl()->state()->local_time_zone());
+      val_struct->sum / val_struct->count, UTCPTR);
   if (tv.HasDate()) {
     TimestampVal result;
     tv.ToTimestampVal(&result);
@@ -419,20 +796,20 @@ IR_ALWAYS_INLINE void AggregateFunctions::DecimalAvgAddOrRemove(FunctionContext*
     case 4:
       avg->sum_val16 += m * src.val4;
       if (UNLIKELY(decimal_v2 &&
-          abs(avg->sum_val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+          abs(avg->sum_val16) > MAX_UNSCALED_DECIMAL16)) {
         ctx->SetError("Avg computation overflowed");
       }
       break;
     case 8:
       avg->sum_val16 += m * src.val8;
       if (UNLIKELY(decimal_v2 &&
-          abs(avg->sum_val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+          abs(avg->sum_val16) > MAX_UNSCALED_DECIMAL16)) {
         ctx->SetError("Avg computation overflowed");
       }
       break;
     case 16:
       if (UNLIKELY(decimal_v2 && (avg->sum_val16 >= 0) == (src.val16 >= 0) &&
-          abs(avg->sum_val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src.val16))) {
+          abs(avg->sum_val16) > MAX_UNSCALED_DECIMAL16 - abs(src.val16))) {
         // We can't check for overflow after performing the addition like in the other
         // cases because the result may not fit into int128.
         ctx->SetError("Avg computation overflowed");
@@ -460,7 +837,7 @@ void AggregateFunctions::DecimalAvgMerge(FunctionContext* ctx,
   bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
   bool overflow = decimal_v2 &&
       abs(dst_struct->sum_val16) >
-      DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src_struct->sum_val16);
+      MAX_UNSCALED_DECIMAL16 - abs(src_struct->sum_val16);
   if (UNLIKELY(overflow)) ctx->SetError("Avg computation overflowed");
   dst_struct->sum_val16 =
       ArithmeticUtil::AsUnsigned<std::plus>(dst_struct->sum_val16, src_struct->sum_val16);
@@ -556,18 +933,18 @@ IR_ALWAYS_INLINE void AggregateFunctions::SumDecimalAddOrSubtract(FunctionContex
   if (precision <= 9) {
     dst->val16 += m * src.val4;
     if (UNLIKELY(decimal_v2 &&
-        abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+        abs(dst->val16) > MAX_UNSCALED_DECIMAL16)) {
       ctx->SetError("Sum computation overflowed");
     }
   } else if (precision <= 19) {
     dst->val16 += m * src.val8;
     if (UNLIKELY(decimal_v2 &&
-        abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+        abs(dst->val16) > MAX_UNSCALED_DECIMAL16)) {
       ctx->SetError("Sum computation overflowed");
     }
   } else {
     if (UNLIKELY(decimal_v2 && (dst->val16 >= 0) == (src.val16 >= 0) &&
-        abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src.val16))) {
+        abs(dst->val16) > MAX_UNSCALED_DECIMAL16 - abs(src.val16))) {
       // We can't check for overflow after performing the addition like in the other
       // cases because the result may not fit into int128.
       ctx->SetError("Sum computation overflowed");
@@ -582,7 +959,7 @@ void AggregateFunctions::SumDecimalMerge(FunctionContext* ctx,
   if (dst->is_null) InitZero<DecimalVal>(ctx, dst);
   bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
   bool overflow = decimal_v2 &&
-      abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src.val16);
+      abs(dst->val16) > MAX_UNSCALED_DECIMAL16 - abs(src.val16);
   if (UNLIKELY(overflow)) ctx->SetError("Sum computation overflowed");
   dst->val16 = ArithmeticUtil::AsUnsigned<std::plus>(dst->val16, src.val16);
 }
@@ -750,8 +1127,8 @@ void AggregateFunctions::StringConcatUpdate(FunctionContext* ctx, const StringVa
       DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
     }
   } else {
-    ctx->SetError("Concatenated string length larger than allowed limit of "
-        "1 GB character data.");
+    ctx->SetError(Substitute(ERROR_CONCATENATED_STRING_MAX_SIZE_REACHED,
+      PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
   }
 }
 
@@ -782,8 +1159,8 @@ void AggregateFunctions::StringConcatMerge(FunctionContext* ctx,
       DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
     }
   } else {
-    ctx->SetError("Concatenated string length larger than allowed limit of "
-        "1 GB character data.");
+    ctx->SetError(Substitute(ERROR_CONCATENATED_STRING_MAX_SIZE_REACHED,
+      PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
   }
 }
 
@@ -1256,8 +1633,9 @@ class ReservoirSampleState {
   int64_t source_size_;
 
   // Random number generator for generating 64-bit integers
-  // TODO: Replace with mt19937_64 when upgrading boost
-  ranlux64_3 rng_;
+  // Replace ranlux64_3 with mt19937_64 for better performance. See boost benchmark at
+  // https://www.boost.org/doc/libs/1_74_0/doc/html/boost_random/performance.html
+  mt19937_64 rng_;
 
   // True if the array of samples is in the same memory allocation as this object. If
   // false, this object is responsible for freeing the memory.
@@ -1363,7 +1741,7 @@ void PrintSample(const ReservoirSample<DecimalVal>& v, ostream* os) {
 
 template <>
 void PrintSample(const ReservoirSample<TimestampVal>& v, ostream* os) {
-  *os << TimestampValue::FromTimestampVal(v.val).ToString();
+  *os << TimestampValue::FromTimestampVal(v.val);
 }
 
 template <>
@@ -1424,98 +1802,1011 @@ T AggregateFunctions::AppxMedianFinalize(FunctionContext* ctx, const StringVal& 
   return result;
 }
 
-void AggregateFunctions::HllInit(FunctionContext* ctx, StringVal* dst) {
-  // The HLL functions use a preallocated FIXED_UDA_INTERMEDIATE intermediate value.
-  DCHECK_EQ(dst->len, HLL_LEN);
-  memset(dst->ptr, 0, HLL_LEN);
+// Compute the precision from a scale value.
+static inline int ComputePrecisionFromScale(int scale) {
+  return scale + 8;
 }
 
+// Compute the precision from a scale value. This method must be identical
+// to function ComputeHllLengthFromScale() defined in FunctionCallExpr.java.
+static inline int ComputeHllLengthFromScale(int scale) {
+  return 1 << ComputePrecisionFromScale(scale);
+}
+
+// Compute the precision from a hll length as log2(len) or # of trailing
+// zeros in length. For example, when len is 1024 = 2^10 = 0b10000000000,
+// precision = 10.
+static inline int ComputePrecisionFromHllLength(int hll_len) {
+  return BitUtil::CountTrailingZeros((unsigned int)hll_len, sizeof(hll_len) * CHAR_BIT);
+}
+
+// Verify that the length of the intermediate data type is computable from
+// the precision as represented in the 2nd argument.
+static inline bool CheckHllArgs(FunctionContext* ctx, StringVal* dst) {
+  if (ctx->GetNumArgs() == 2) {
+    IntVal* int_val = reinterpret_cast<IntVal*>(ctx->GetConstantArg(1));
+
+    // In parallel plan, the merge() function takes only one argument which
+    // is the intermediate data. Avoid check in such cases.
+    if (int_val) {
+      return dst->len == ComputeHllLengthFromScale(int_val->val);
+    }
+  }
+  return true;
+}
+
+void AggregateFunctions::HllInit(FunctionContext* ctx, StringVal* dst) {
+  // The HLL functions use a preallocated FIXED_UDA_INTERMEDIATE intermediate value.
+  DCHECK_IN_RANGE(dst->len, MIN_HLL_LEN, MAX_HLL_LEN);
+  memset(dst->ptr, 0, dst->len);
+  DCHECK(CheckHllArgs(ctx, dst));
+}
+
+// Implementation for update functions. It accepts a precision.
+// Always inline in IR so that constants can be replaced.
 template <typename T>
-void AggregateFunctions::HllUpdate(FunctionContext* ctx, const T& src, StringVal* dst) {
+IR_ALWAYS_INLINE void AggregateFunctions::HllUpdate(
+    FunctionContext* ctx, const T& src, StringVal* dst, int precision) {
   if (src.is_null) return;
   DCHECK(!dst->is_null);
-  DCHECK_EQ(dst->len, HLL_LEN);
+
+  const int& hll_len = dst->len;
+  DCHECK_IN_RANGE(hll_len, MIN_HLL_LEN, MAX_HLL_LEN);
+
   uint64_t hash_value =
       AnyValUtil::Hash64(src, *ctx->GetArgType(0), HashUtil::FNV64_SEED);
   // Use the lower bits to index into the number of streams and then find the first 1 bit
   // after the index bits.
-  int idx = hash_value & (HLL_LEN - 1);
-  const uint8_t first_one_bit =
-      1 + BitUtil::CountTrailingZeros(
-              hash_value >> HLL_PRECISION, sizeof(hash_value) * CHAR_BIT - HLL_PRECISION);
+  int idx = hash_value & (hll_len - 1);
+  const uint8_t first_one_bit = 1
+      + BitUtil::CountTrailingZeros(
+            hash_value >> precision, sizeof(hash_value) * CHAR_BIT - precision);
   dst->ptr[idx] = ::max(dst->ptr[idx], first_one_bit);
 }
 
-// Specialize for DecimalVal to allow substituting decimal size.
-template <>
+// Update function for NDV() that accepts an expression only.
+template <typename T>
+void AggregateFunctions::HllUpdate(FunctionContext* ctx, const T& src, StringVal* dst) {
+  HllUpdate(ctx, src, dst, DEFAULT_HLL_PRECISION);
+}
+
+// Update function for NDV() that accepts an expression and a scale value.
+template <typename T>
 void AggregateFunctions::HllUpdate(
-    FunctionContext* ctx, const DecimalVal& src, StringVal* dst) {
+    FunctionContext* ctx, const T& src1, const IntVal& src2, StringVal* dst) {
+  HllUpdate(ctx, src1, dst, ComputePrecisionFromScale(src2.val));
+}
+
+// Implementation for update functions for DecimalVal to allow substituting decimal
+// size. It accepts a precision. Always inline in IR so that constants can be replaced.
+template <>
+IR_ALWAYS_INLINE void AggregateFunctions::HllUpdate(
+    FunctionContext* ctx, const DecimalVal& src, StringVal* dst, int precision) {
   if (src.is_null) return;
   DCHECK(!dst->is_null);
-  DCHECK_EQ(dst->len, HLL_LEN);
+
+  const int& hll_len = dst->len;
+  DCHECK_IN_RANGE(hll_len, MIN_HLL_LEN, MAX_HLL_LEN);
+
   int byte_size = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SIZE, 0);
   uint64_t hash_value = AnyValUtil::HashDecimal64(src, byte_size, HashUtil::FNV64_SEED);
   if (hash_value != 0) {
     // Use the lower bits to index into the number of streams and then
     // find the first 1 bit after the index bits.
-    int idx = hash_value & (HLL_LEN - 1);
-    uint8_t first_one_bit = __builtin_ctzl(hash_value >> HLL_PRECISION) + 1;
+    int idx = hash_value & (hll_len - 1);
+    uint8_t first_one_bit = __builtin_ctzl(hash_value >> precision) + 1;
     dst->ptr[idx] = ::max(dst->ptr[idx], first_one_bit);
   }
+}
+
+// Specialized update function for NDV() that accepts a decimal typed expression.
+template <>
+void AggregateFunctions::HllUpdate(
+    FunctionContext* ctx, const DecimalVal& src, StringVal* dst) {
+  HllUpdate(ctx, src, dst, DEFAULT_HLL_PRECISION);
+}
+
+// Specialized update function for NDV() that accepts a decimal typed expression
+// and a scale value.
+template <>
+void AggregateFunctions::HllUpdate(
+    FunctionContext* ctx, const DecimalVal& src1, const IntVal& src2, StringVal* dst) {
+  HllUpdate(ctx, src1, dst, ComputePrecisionFromScale(src2.val));
 }
 
 void AggregateFunctions::HllMerge(
     FunctionContext* ctx, const StringVal& src, StringVal* dst) {
   DCHECK(!dst->is_null);
   DCHECK(!src.is_null);
-  DCHECK_EQ(dst->len, HLL_LEN);
-  DCHECK_EQ(src.len, HLL_LEN);
+  DCHECK_IN_RANGE(src.len, MIN_HLL_LEN, MAX_HLL_LEN);
+  DCHECK_EQ(src.len, dst->len);
+
   for (int i = 0; i < src.len; ++i) {
     dst->ptr[i] = ::max(dst->ptr[i], src.ptr[i]);
   }
 }
 
-uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets) {
+uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets, int hll_len) {
   DCHECK(buckets != NULL);
 
   // Empirical constants for the algorithm.
-  float alpha = 0;
-  if (HLL_LEN == 16) {
-    alpha = 0.673f;
-  } else if (HLL_LEN == 32) {
-    alpha = 0.697f;
-  } else if (HLL_LEN == 64) {
-    alpha = 0.709f;
+  double alpha = 0;
+  DCHECK_IN_RANGE(hll_len, MIN_HLL_LEN, MAX_HLL_LEN);
+  int precision = ComputePrecisionFromHllLength(hll_len);
+
+  if (hll_len == 16) {
+    alpha = 0.673;
+  } else if (hll_len == 32) {
+    alpha = 0.697;
+  } else if (hll_len == 64) {
+    alpha = 0.709;
   } else {
-    alpha = 0.7213f / (1 + 1.079f / HLL_LEN);
+    alpha = 0.7213 / (1 + 1.079 / hll_len);
   }
 
-  float harmonic_mean = 0;
+  double harmonic_mean = 0;
   int num_zero_registers = 0;
-  for (int i = 0; i < HLL_LEN; ++i) {
-    harmonic_mean += ldexp(1.0f, -buckets[i]);
+  for (int i = 0; i < hll_len; ++i) {
+    harmonic_mean += ldexp(1.0, -buckets[i]);
     if (buckets[i] == 0) ++num_zero_registers;
   }
-  harmonic_mean = 1.0f / harmonic_mean;
-  int64_t estimate = alpha * HLL_LEN * HLL_LEN * harmonic_mean;
+  harmonic_mean = 1.0 / harmonic_mean;
+
+  // The actual harmonic mean is hll_len * harmonic_mean.
+  int64_t estimate = alpha * hll_len * hll_len * harmonic_mean;
   // Adjust for Hll bias based on Hll++ algorithm
-  if (estimate <= 5 * HLL_LEN) {
-    estimate -= HllEstimateBias(estimate);
+  if (estimate <= 5 * hll_len) {
+    estimate -= HllEstimateBias(estimate, precision);
   }
 
   if (num_zero_registers == 0) return estimate;
 
   // Estimated cardinality is too low. Hll is too inaccurate here, instead use
   // linear counting.
-  int64_t h = HLL_LEN * log(static_cast<float>(HLL_LEN) / num_zero_registers);
+  int64_t h = hll_len * log(static_cast<double>(hll_len) / num_zero_registers);
 
-  return (h <= HllThreshold(HLL_PRECISION)) ? h : estimate;
+  return (h <= HllThreshold(precision)) ? h : estimate;
 }
 
 BigIntVal AggregateFunctions::HllFinalize(FunctionContext* ctx, const StringVal& src) {
   if (UNLIKELY(src.is_null)) return BigIntVal::null();
-  uint64_t estimate = HllFinalEstimate(src.ptr);
+  uint64_t estimate = HllFinalEstimate(src.ptr, src.len);
   return estimate;
+}
+
+/// Auxiliary function that receives a hll_sketch and returns the serialized version of
+/// it wrapped into a StringVal.
+/// Introducing this function in the .cc to avoid including the whole DataSketches HLL
+/// functionality into the header.
+StringVal SerializeCompactDsHllSketch(FunctionContext* ctx,
+    const datasketches::hll_sketch& sketch) {
+  auto bytes = sketch.serialize_compact();
+  StringVal result(ctx, bytes.size());
+  memcpy(result.ptr, bytes.data(), bytes.size());
+  return result;
+}
+
+/// Auxiliary function that receives a hll_union, gets the underlying HLL sketch from the
+/// union object and returns the serialized, compacted HLL sketch wrapped into StringVal.
+/// Introducing this function in the .cc to avoid including the whole DataSketches HLL
+/// functionality into the header.
+StringVal SerializeDsHllUnion(FunctionContext* ctx,
+    const datasketches::hll_union& ds_union) {
+  datasketches::hll_sketch sketch = ds_union.get_result(DS_HLL_TYPE);
+  return SerializeCompactDsHllSketch(ctx, sketch);
+}
+
+/// Auxiliary function that receives a cpc_union, gets the underlying CPC sketch from the
+/// union object and returns the serialized, CPC sketch wrapped into StringVal.
+/// Introducing this function in the .cc to avoid including the whole DataSketches CPC
+/// functionality into the header.
+StringVal SerializeDsCpcUnion(
+    FunctionContext* ctx, const datasketches::cpc_union& ds_union) {
+  datasketches::cpc_sketch sketch = ds_union.get_result();
+  return SerializeDsSketch(ctx, sketch);
+}
+
+/// Auxiliary function that receives a theta_union, gets the underlying Theta sketch from
+/// the union object and returns the serialized, Theta sketch wrapped into StringVal.
+/// Introducing this function in the .cc to avoid including the whole DataSketches Theta
+/// functionality into the header.
+StringVal SerializeDsThetaUnion(
+    FunctionContext* ctx, const datasketches::theta_union& ds_union) {
+  datasketches::compact_theta_sketch sketch = ds_union.get_result();
+  return SerializeDsSketch(ctx, sketch);
+}
+
+/// Auxiliary function that receives a theta_intersection, gets the underlying Theta
+/// sketch from the intersection object and returns the serialized, compacted Theta sketch
+/// wrapped into StringVal (may be null).
+/// Introducing this function in the .cc to avoid including the whole DataSketches Theta
+/// functionality into the header.
+StringVal SerializeDsThetaIntersection(
+    FunctionContext* ctx, const datasketches::theta_intersection& ds_intersection) {
+  // Calling get_result() before calling update() is undefined, so you need to check.
+  if (ds_intersection.has_result()) {
+    datasketches::compact_theta_sketch sketch = ds_intersection.get_result();
+    return SerializeDsSketch(ctx, sketch);
+  }
+  return StringVal::null();
+}
+
+// This is for functions with different state during update and merge.
+enum agg_phase { UPDATE, MERGE };
+using agg_state = std::pair<agg_phase, void*>;
+
+void AggregateFunctions::DsHllInit(FunctionContext* ctx, StringVal* dst) {
+  AllocBuffer(ctx, dst, sizeof(agg_state));
+  if (UNLIKELY(dst->is_null)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return;
+  }
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  agg_state_ptr->first = agg_phase::UPDATE;
+  agg_state_ptr->second = new (ctx->Allocate<datasketches::hll_sketch>())
+      datasketches::hll_sketch(DS_SKETCH_CONFIG, DS_HLL_TYPE);
+}
+
+template <typename T>
+void AggregateFunctions::DsHllUpdate(FunctionContext* ctx, const T& src,
+    StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(agg_state));
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  DCHECK_EQ(agg_state_ptr->first, agg_phase::UPDATE);
+  auto sketch_ptr = reinterpret_cast<datasketches::hll_sketch*>(agg_state_ptr->second);
+  sketch_ptr->update(src.val);
+}
+
+// Specialize for StringVal
+template <>
+void AggregateFunctions::DsHllUpdate(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  if (src.is_null || src.len == 0) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(agg_state));
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  DCHECK_EQ(agg_state_ptr->first, agg_phase::UPDATE);
+  auto sketch_ptr = reinterpret_cast<datasketches::hll_sketch*>(agg_state_ptr->second);
+  sketch_ptr->update(reinterpret_cast<char*>(src.ptr), src.len);
+}
+
+StringVal AggregateFunctions::DsHllSerialize(FunctionContext* ctx,
+    const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(agg_state));
+  StringVal dst;
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(src.ptr);
+  if (agg_state_ptr->first == agg_phase::UPDATE) { // the agg state is a sketch
+    auto sketch_ptr = reinterpret_cast<datasketches::hll_sketch*>(agg_state_ptr->second);
+    dst = SerializeCompactDsHllSketch(ctx, *sketch_ptr);
+    sketch_ptr->~hll_sketch_alloc();
+  } else { // the agg state is a union
+    auto union_ptr = reinterpret_cast<datasketches::hll_union*>(agg_state_ptr->second);
+    dst = SerializeDsHllUnion(ctx, *union_ptr);
+    union_ptr->~hll_union_alloc();
+  }
+  ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+  ctx->Free(src.ptr);
+  return dst;
+}
+
+void AggregateFunctions::DsHllMerge(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  DCHECK(!src.is_null);
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(agg_state));
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  if (agg_state_ptr->first == agg_phase::MERGE) { // was already switched to union
+    auto dst_union_ptr =
+        reinterpret_cast<datasketches::hll_union*>(agg_state_ptr->second);
+    dst_union_ptr->update(datasketches::hll_sketch::deserialize(src.ptr, src.len));
+  } else { // must be the first call. the state is still a sketch
+    auto dst_sketch_ptr =
+        reinterpret_cast<datasketches::hll_sketch*>(agg_state_ptr->second);
+
+    datasketches::hll_union u(DS_SKETCH_CONFIG);
+    u.update(*dst_sketch_ptr);
+    u.update(datasketches::hll_sketch::deserialize(src.ptr, src.len));
+
+    // swich to union
+    dst_sketch_ptr->~hll_sketch_alloc();
+    ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+    agg_state_ptr->second = new (ctx->Allocate<datasketches::hll_union>())
+        datasketches::hll_union(std::move(u));
+    agg_state_ptr->first = agg_phase::MERGE;
+  }
+}
+
+BigIntVal AggregateFunctions::DsHllFinalize(FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(agg_state));
+  BigIntVal estimate;
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(src.ptr);
+  if (agg_state_ptr->first == agg_phase::UPDATE) { // the agg state is a sketch
+    auto sketch_ptr = reinterpret_cast<datasketches::hll_sketch*>(agg_state_ptr->second);
+    estimate = sketch_ptr->get_estimate();
+    sketch_ptr->~hll_sketch_alloc();
+  } else { // the agg state is a union
+    auto union_ptr = reinterpret_cast<datasketches::hll_union*>(agg_state_ptr->second);
+    estimate = union_ptr->get_result().get_estimate();
+    union_ptr->~hll_union_alloc();
+  }
+  ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+  ctx->Free(src.ptr);
+  return (estimate == 0) ? BigIntVal::null() : estimate;
+}
+
+StringVal AggregateFunctions::DsHllFinalizeSketch(FunctionContext* ctx,
+    const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(agg_state));
+  StringVal result = StringVal::null();
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(src.ptr);
+  if (agg_state_ptr->first == agg_phase::UPDATE) { // the agg state is a sketch
+    auto sketch_ptr = reinterpret_cast<datasketches::hll_sketch*>(agg_state_ptr->second);
+    if (!sketch_ptr->is_empty()) {
+      result = SerializeCompactDsHllSketch(ctx, *sketch_ptr);
+    }
+    sketch_ptr->~hll_sketch_alloc();
+  } else { // the agg state is a union
+    auto union_ptr = reinterpret_cast<datasketches::hll_union*>(agg_state_ptr->second);
+    auto sketch = union_ptr->get_result(DS_HLL_TYPE);
+    if (!sketch.is_empty()) {
+      result = SerializeCompactDsHllSketch(ctx, sketch);
+    }
+    union_ptr->~hll_union_alloc();
+  }
+  ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+  ctx->Free(src.ptr);
+  return result;
+}
+
+void AggregateFunctions::DsHllUnionInit(FunctionContext* ctx, StringVal* slot) {
+  AllocBuffer(ctx, slot, sizeof(datasketches::hll_union));
+  if (UNLIKELY(slot->is_null)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return;
+  }
+  auto union_ptr = reinterpret_cast<datasketches::hll_union*>(slot->ptr);
+  new (union_ptr) datasketches::hll_union(DS_SKETCH_CONFIG);
+}
+
+void AggregateFunctions::DsHllUnionUpdate(FunctionContext* ctx, const StringVal& src,
+    StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::hll_union));
+  try {
+    reinterpret_cast<datasketches::hll_union*>(dst->ptr)
+        ->update(datasketches::hll_sketch::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    LogSketchDeserializationError(ctx, e);
+  }
+}
+
+StringVal AggregateFunctions::DsHllUnionSerialize(FunctionContext* ctx,
+    const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::hll_union));
+  datasketches::hll_union* union_ptr =
+      reinterpret_cast<datasketches::hll_union*>(src.ptr);
+  StringVal dst = SerializeDsHllUnion(ctx, *union_ptr);
+  union_ptr->~hll_union_alloc();
+  ctx->Free(src.ptr);
+  return dst;
+}
+
+void AggregateFunctions::DsHllUnionMerge(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  DCHECK(!src.is_null);
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::hll_union));
+  // Note, 'src' is a serialized hll_sketch and not a serialized hll_union.
+  try {
+    reinterpret_cast<datasketches::hll_union*>(dst->ptr)
+        ->update(datasketches::hll_sketch::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    LogSketchDeserializationError(ctx, e);
+  }
+}
+
+StringVal AggregateFunctions::DsHllUnionFinalize(FunctionContext* ctx,
+    const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::hll_union));
+  auto union_ptr = reinterpret_cast<datasketches::hll_union*>(src.ptr);
+  auto sketch = union_ptr->get_result(DS_HLL_TYPE);
+  StringVal result = StringVal::null();
+  if (!sketch.is_empty()) {
+    result = SerializeCompactDsHllSketch(ctx, sketch);
+  }
+  union_ptr->~hll_union_alloc();
+  ctx->Free(src.ptr);
+  return result;
+}
+
+void AggregateFunctions::DsCpcInit(FunctionContext* ctx, StringVal* dst) {
+  AllocBuffer(ctx, dst, sizeof(agg_state));
+  if (UNLIKELY(dst->is_null)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return;
+  }
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  agg_state_ptr->first = agg_phase::UPDATE;
+  agg_state_ptr->second = new (ctx->Allocate<datasketches::cpc_sketch>())
+      datasketches::cpc_sketch(DS_CPC_SKETCH_CONFIG);
+}
+
+template <typename T>
+void AggregateFunctions::DsCpcUpdate(FunctionContext* ctx, const T& src, StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(agg_state));
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  DCHECK_EQ(agg_state_ptr->first, agg_phase::UPDATE);
+  auto sketch_ptr = reinterpret_cast<datasketches::cpc_sketch*>(agg_state_ptr->second);
+  sketch_ptr->update(src.val);
+}
+
+// Specialize for StringVal
+template <>
+void AggregateFunctions::DsCpcUpdate(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  if (src.is_null || src.len == 0) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(agg_state));
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  DCHECK(agg_state_ptr->first == agg_phase::UPDATE);
+  auto sketch_ptr = reinterpret_cast<datasketches::cpc_sketch*>(agg_state_ptr->second);
+  sketch_ptr->update(reinterpret_cast<char*>(src.ptr), src.len);
+}
+
+StringVal AggregateFunctions::DsCpcSerialize(FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(agg_state));
+  StringVal dst;
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(src.ptr);
+  if (agg_state_ptr->first == agg_phase::UPDATE) { // the agg state is a sketch
+    auto sketch_ptr = reinterpret_cast<datasketches::cpc_sketch*>(agg_state_ptr->second);
+    dst = SerializeDsSketch(ctx, *sketch_ptr);
+    sketch_ptr->~cpc_sketch_alloc();
+  } else { // the agg state is a union
+    auto union_ptr = reinterpret_cast<datasketches::cpc_union*>(agg_state_ptr->second);
+    dst = SerializeDsCpcUnion(ctx, *union_ptr);
+    union_ptr->~cpc_union_alloc();
+  }
+  ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+  ctx->Free(src.ptr);
+  return dst;
+}
+
+void AggregateFunctions::DsCpcMerge(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  DCHECK(!src.is_null);
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(agg_state));
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  if (agg_state_ptr->first == agg_phase::MERGE) { // was already switched to union
+    auto dst_union_ptr =
+        reinterpret_cast<datasketches::cpc_union*>(agg_state_ptr->second);
+    dst_union_ptr->update(datasketches::cpc_sketch::deserialize(src.ptr, src.len));
+  } else { // must be the first call. the state is still a sketch
+    auto dst_sketch_ptr =
+        reinterpret_cast<datasketches::cpc_sketch*>(agg_state_ptr->second);
+
+    datasketches::cpc_union u(DS_CPC_SKETCH_CONFIG);
+    u.update(*dst_sketch_ptr);
+    try {
+      u.update(datasketches::cpc_sketch::deserialize(src.ptr, src.len));
+    } catch (const std::exception& e) {
+      LogSketchDeserializationError(ctx, e);
+      return;
+    }
+
+    // switch to union
+    dst_sketch_ptr->~cpc_sketch_alloc();
+    ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+    agg_state_ptr->second = new (ctx->Allocate<datasketches::cpc_union>())
+        datasketches::cpc_union(std::move(u));
+    agg_state_ptr->first = agg_phase::MERGE;
+  }
+}
+
+BigIntVal AggregateFunctions::DsCpcFinalize(FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(agg_state));
+  BigIntVal estimate;
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(src.ptr);
+  if (agg_state_ptr->first == agg_phase::UPDATE) { // the agg state is a sketch
+    auto sketch_ptr = reinterpret_cast<datasketches::cpc_sketch*>(agg_state_ptr->second);
+    estimate = sketch_ptr->get_estimate();
+    sketch_ptr->~cpc_sketch_alloc();
+  } else { // the agg state is a union
+    auto union_ptr = reinterpret_cast<datasketches::cpc_union*>(agg_state_ptr->second);
+    estimate = union_ptr->get_result().get_estimate();
+    union_ptr->~cpc_union_alloc();
+  }
+  ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+  ctx->Free(src.ptr);
+  return (estimate == 0) ? BigIntVal::null() : estimate;
+}
+
+StringVal AggregateFunctions::DsCpcFinalizeSketch(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(agg_state));
+  StringVal result = StringVal::null();
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(src.ptr);
+  if (agg_state_ptr->first == agg_phase::UPDATE) { // the agg state is a sketch
+    auto sketch_ptr = reinterpret_cast<datasketches::cpc_sketch*>(agg_state_ptr->second);
+    if (!sketch_ptr->is_empty()) {
+      result = SerializeDsSketch(ctx, *sketch_ptr);
+    }
+    sketch_ptr->~cpc_sketch_alloc();
+  } else { // the agg state is a union
+    auto union_ptr = reinterpret_cast<datasketches::cpc_union*>(agg_state_ptr->second);
+    auto sketch = union_ptr->get_result();
+    if (!sketch.is_empty()) {
+      result = SerializeDsSketch(ctx, sketch);
+    }
+    union_ptr->~cpc_union_alloc();
+  }
+  ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+  ctx->Free(src.ptr);
+  return result;
+}
+
+void AggregateFunctions::DsCpcUnionInit(FunctionContext* ctx, StringVal* slot) {
+  AllocBuffer(ctx, slot, sizeof(datasketches::cpc_union));
+  if (UNLIKELY(slot->is_null)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return;
+  }
+  auto union_ptr = reinterpret_cast<datasketches::cpc_union*>(slot->ptr);
+  new (union_ptr) datasketches::cpc_union(DS_CPC_SKETCH_CONFIG);
+}
+
+void AggregateFunctions::DsCpcUnionUpdate(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::cpc_union));
+  try {
+    reinterpret_cast<datasketches::cpc_union*>(dst->ptr)
+        ->update(datasketches::cpc_sketch::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    LogSketchDeserializationError(ctx, e);
+  }
+}
+
+StringVal AggregateFunctions::DsCpcUnionSerialize(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::cpc_union));
+  auto union_ptr = reinterpret_cast<datasketches::cpc_union*>(src.ptr);
+  StringVal dst = SerializeDsCpcUnion(ctx, *union_ptr);
+  union_ptr->~cpc_union_alloc();
+  ctx->Free(src.ptr);
+  return dst;
+}
+
+void AggregateFunctions::DsCpcUnionMerge(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  DCHECK(!src.is_null);
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::cpc_union));
+  // Note, 'src' is a serialized Cpc_sketch and not a serialized Cpc_union.
+  try {
+    reinterpret_cast<datasketches::cpc_union*>(dst->ptr)
+        ->update(datasketches::cpc_sketch::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    LogSketchDeserializationError(ctx, e);
+  }
+}
+
+StringVal AggregateFunctions::DsCpcUnionFinalize(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::cpc_union));
+  auto union_ptr = reinterpret_cast<datasketches::cpc_union*>(src.ptr);
+  auto sketch = union_ptr->get_result();
+  StringVal result = StringVal::null();
+  if (!sketch.is_empty()) {
+    result = SerializeDsSketch(ctx, sketch);
+  }
+  union_ptr->~cpc_union_alloc();
+  ctx->Free(src.ptr);
+  return result;
+}
+
+void AggregateFunctions::DsThetaInit(FunctionContext* ctx, StringVal* dst) {
+  AllocBuffer(ctx, dst, sizeof(agg_state));
+  if (UNLIKELY(dst->is_null)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return;
+  }
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  agg_state_ptr->first = agg_phase::UPDATE;
+  agg_state_ptr->second = new (ctx->Allocate<datasketches::update_theta_sketch>())
+      datasketches::update_theta_sketch(
+          datasketches::update_theta_sketch::builder().build());
+}
+
+template <typename T>
+void AggregateFunctions::DsThetaUpdate(
+    FunctionContext* ctx, const T& src, StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(agg_state));
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  DCHECK_EQ(agg_state_ptr->first, agg_phase::UPDATE);
+  auto sketch_ptr =
+      reinterpret_cast<datasketches::update_theta_sketch*>(agg_state_ptr->second);
+  sketch_ptr->update(src.val);
+}
+
+// Specialize for StringVal
+template <>
+void AggregateFunctions::DsThetaUpdate(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  if (src.is_null || src.len == 0) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(agg_state));
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+  DCHECK_EQ(agg_state_ptr->first, agg_phase::UPDATE);
+  auto sketch_ptr =
+      reinterpret_cast<datasketches::update_theta_sketch*>(agg_state_ptr->second);
+  sketch_ptr->update(reinterpret_cast<char*>(src.ptr), src.len);
+}
+
+StringVal AggregateFunctions::DsThetaSerialize(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(agg_state));
+  StringVal dst;
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(src.ptr);
+  if (agg_state_ptr->first == agg_phase::UPDATE) { // the agg state is a sketch
+    auto sketch_ptr =
+        reinterpret_cast<datasketches::update_theta_sketch*>(agg_state_ptr->second);
+    dst = SerializeDsSketch(ctx, sketch_ptr->compact());
+    sketch_ptr->~update_theta_sketch_alloc();
+  } else { // the agg state is a union
+    auto union_ptr = reinterpret_cast<datasketches::theta_union*>(agg_state_ptr->second);
+    dst = SerializeDsThetaUnion(ctx, *union_ptr);
+    union_ptr->~theta_union_alloc();
+  }
+  ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+  ctx->Free(src.ptr);
+  return dst;
+}
+
+void AggregateFunctions::DsThetaMerge(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  DCHECK(!src.is_null);
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(agg_state));
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(dst->ptr);
+
+  // Note, 'src' is a serialized compact_theta_sketch.
+  if (agg_state_ptr->first == agg_phase::MERGE) { // was already switched to union
+    auto dst_union_ptr =
+        reinterpret_cast<datasketches::theta_union*>(agg_state_ptr->second);
+    try {
+      dst_union_ptr->update(datasketches::compact_theta_sketch::deserialize(src.ptr,
+          src.len));
+    } catch (const std::exception& e) {
+      LogSketchDeserializationError(ctx, e);
+      return;
+    }
+  } else { // must be the first call. the state is still a sketch
+    auto dst_sketch_ptr =
+        reinterpret_cast<datasketches::update_theta_sketch*>(agg_state_ptr->second);
+
+    auto u = datasketches::theta_union::builder().build();
+    u.update(*dst_sketch_ptr);
+    try {
+      u.update(datasketches::compact_theta_sketch::deserialize(src.ptr, src.len));
+    } catch (const std::exception& e) {
+      LogSketchDeserializationError(ctx, e);
+      return;
+    }
+
+    // switch to union
+    dst_sketch_ptr->~update_theta_sketch_alloc();
+    ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+    agg_state_ptr->second = new (ctx->Allocate<datasketches::theta_union>())
+        datasketches::theta_union(std::move(u));
+    agg_state_ptr->first = agg_phase::MERGE;
+  }
+}
+
+BigIntVal AggregateFunctions::DsThetaFinalize(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(agg_state));
+  BigIntVal estimate;
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(src.ptr);
+  if (agg_state_ptr->first == agg_phase::UPDATE) { // the agg state is a sketch
+    auto sketch_ptr =
+        reinterpret_cast<datasketches::update_theta_sketch*>(agg_state_ptr->second);
+    estimate = sketch_ptr->get_estimate();
+    sketch_ptr->~update_theta_sketch_alloc();
+  } else { // the agg state is a union
+    auto union_ptr = reinterpret_cast<datasketches::theta_union*>(agg_state_ptr->second);
+    estimate = union_ptr->get_result().get_estimate();
+    union_ptr->~theta_union_alloc();
+  }
+  ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+  ctx->Free(src.ptr);
+  return estimate;
+}
+
+StringVal AggregateFunctions::DsThetaFinalizeSketch(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(agg_state));
+  StringVal result;
+  auto agg_state_ptr = reinterpret_cast<agg_state*>(src.ptr);
+  if (agg_state_ptr->first == agg_phase::UPDATE) { // the agg state is a sketch
+    auto sketch_ptr =
+        reinterpret_cast<datasketches::update_theta_sketch*>(agg_state_ptr->second);
+    result = SerializeDsSketch(ctx, sketch_ptr->compact());
+    sketch_ptr->~update_theta_sketch_alloc();
+  } else { // the agg state is a union
+    auto union_ptr = reinterpret_cast<datasketches::theta_union*>(agg_state_ptr->second);
+    result = SerializeDsThetaUnion(ctx, *union_ptr);
+    union_ptr->~theta_union_alloc();
+  }
+  ctx->Free(reinterpret_cast<uint8_t*>(agg_state_ptr->second));
+  ctx->Free(src.ptr);
+  return result;
+}
+
+void AggregateFunctions::DsThetaUnionInit(FunctionContext* ctx, StringVal* dst) {
+  AllocBuffer(ctx, dst, sizeof(datasketches::theta_union));
+  if (UNLIKELY(dst->is_null)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return;
+  }
+  auto union_ptr = reinterpret_cast<datasketches::theta_union*>(dst->ptr);
+  new (union_ptr) datasketches::theta_union(datasketches::theta_union::builder().build());
+}
+
+void AggregateFunctions::DsThetaUnionUpdate(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::theta_union));
+  try {
+    reinterpret_cast<datasketches::theta_union*>(dst->ptr)
+        ->update(datasketches::compact_theta_sketch::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    LogSketchDeserializationError(ctx, e);
+  }
+}
+
+StringVal AggregateFunctions::DsThetaUnionSerialize(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::theta_union));
+  auto union_ptr = reinterpret_cast<datasketches::theta_union*>(src.ptr);
+  StringVal dst = SerializeDsThetaUnion(ctx, *union_ptr);
+  union_ptr->~theta_union_alloc();
+  ctx->Free(src.ptr);
+  return dst;
+}
+
+void AggregateFunctions::DsThetaUnionMerge(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  DCHECK(!src.is_null);
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::theta_union));
+  // Note, 'src' is a serialized compact_theta_sketch and not a serialized theta_union.
+  try {
+    reinterpret_cast<datasketches::theta_union*>(dst->ptr)
+        ->update(datasketches::compact_theta_sketch::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    LogSketchDeserializationError(ctx, e);
+  }
+}
+
+StringVal AggregateFunctions::DsThetaUnionFinalize(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::theta_union));
+  auto union_ptr = reinterpret_cast<datasketches::theta_union*>(src.ptr);
+  auto sketch = union_ptr->get_result();
+  StringVal result = StringVal::null();
+  if (!sketch.is_empty()) {
+    result = SerializeDsSketch(ctx, sketch);
+  }
+  union_ptr->~theta_union_alloc();
+  ctx->Free(src.ptr);
+  return result;
+}
+
+void AggregateFunctions::DsThetaIntersectInit(FunctionContext* ctx, StringVal* slot) {
+  AllocBuffer(ctx, slot, sizeof(datasketches::theta_intersection));
+  if (UNLIKELY(slot->is_null)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return;
+  }
+  auto intersection_ptr = reinterpret_cast<datasketches::theta_intersection*>(slot->ptr);
+  new (intersection_ptr) datasketches::theta_intersection();
+}
+
+void AggregateFunctions::DsThetaIntersectUpdate(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::theta_intersection));
+  try {
+    reinterpret_cast<datasketches::theta_intersection*>(dst->ptr)
+        ->update(datasketches::compact_theta_sketch::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    LogSketchDeserializationError(ctx, e);
+  }
+}
+
+StringVal AggregateFunctions::DsThetaIntersectSerialize(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::theta_intersection));
+  auto intersection_ptr = reinterpret_cast<datasketches::theta_intersection*>(src.ptr);
+  StringVal dst = SerializeDsThetaIntersection(ctx, *intersection_ptr);
+  intersection_ptr->~theta_intersection_alloc();
+  ctx->Free(src.ptr);
+  return dst;
+}
+
+void AggregateFunctions::DsThetaIntersectMerge(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::theta_intersection));
+  // Note, 'src' is a serialized compact_theta_sketch and not a serialized
+  // theta_intersection.
+  try {
+    reinterpret_cast<datasketches::theta_intersection*>(dst->ptr)
+        ->update(datasketches::compact_theta_sketch::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    LogSketchDeserializationError(ctx, e);
+  }
+}
+
+StringVal AggregateFunctions::DsThetaIntersectFinalize(
+    FunctionContext* ctx, const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::theta_intersection));
+  auto intersection_ptr = reinterpret_cast<datasketches::theta_intersection*>(src.ptr);
+  StringVal result = StringVal::null();
+  if (intersection_ptr->has_result()) {
+    result = SerializeDsSketch(ctx, intersection_ptr->get_result());
+  }
+  intersection_ptr->~theta_intersection_alloc();
+  ctx->Free(src.ptr);
+  return result;
+}
+
+void AggregateFunctions::DsKllInitHelper(FunctionContext* ctx, StringVal* slot) {
+  AllocBuffer(ctx, slot, sizeof(datasketches::kll_sketch<float>));
+  if (UNLIKELY(slot->is_null)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return;
+  }
+  // Note, that kll_sketch will always have the same size regardless of the amount of
+  // data it keeps track of. This is because it's a wrapper class that holds all the
+  // inserted data on heap. Here, we put only the wrapper class into a StringVal.
+  auto sketch_ptr = reinterpret_cast<datasketches::kll_sketch<float>*>(slot->ptr);
+  new (sketch_ptr) datasketches::kll_sketch<float>();
+}
+
+StringVal AggregateFunctions::DsKllSerializeHelper(FunctionContext* ctx,
+    const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::kll_sketch<float>));
+  auto sketch_ptr = reinterpret_cast<datasketches::kll_sketch<float>*>(src.ptr);
+  StringVal dst = SerializeDsSketch(ctx, *sketch_ptr);
+  sketch_ptr->~kll_sketch();
+  ctx->Free(src.ptr);
+  return dst;
+}
+
+void AggregateFunctions::DsKllMergeHelper(FunctionContext* ctx, const StringVal& src,
+      StringVal* dst) {
+  DCHECK(!src.is_null);
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::kll_sketch<float>));
+
+  auto dst_sketch_ptr = reinterpret_cast<datasketches::kll_sketch<float>*>(dst->ptr);
+  try {
+    dst_sketch_ptr->merge(datasketches::kll_sketch<float>::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    ctx->SetError(Substitute("Error while merging DataSketches KLL sketches. "
+        "Message: $0", e.what()).c_str());
+    return;
+  }
+}
+
+StringVal AggregateFunctions::DsKllFinalizeHelper(FunctionContext* ctx,
+    const StringVal& src) {
+  DCHECK(!src.is_null);
+  DCHECK_EQ(src.len, sizeof(datasketches::kll_sketch<float>));
+  auto sketch_ptr = reinterpret_cast<datasketches::kll_sketch<float>*>(src.ptr);
+  StringVal dst = StringVal::null();
+  if (!sketch_ptr->is_empty()) {
+    dst = SerializeDsSketch(ctx, *sketch_ptr);
+  }
+  sketch_ptr->~kll_sketch();
+  ctx->Free(src.ptr);
+  return dst;
+}
+
+void AggregateFunctions::DsKllInit(FunctionContext* ctx, StringVal* dst) {
+  DsKllInitHelper(ctx, dst);
+}
+
+void AggregateFunctions::DsKllUpdate(FunctionContext* ctx, const FloatVal& src,
+    StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::kll_sketch<float>));
+  auto sketch_ptr = reinterpret_cast<datasketches::kll_sketch<float>*>(dst->ptr);
+  sketch_ptr->update(src.val);
+}
+
+StringVal AggregateFunctions::DsKllSerialize(FunctionContext* ctx,
+    const StringVal& src) {
+  return DsKllSerializeHelper(ctx, src);
+}
+
+void AggregateFunctions::DsKllMerge(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
+  DsKllMergeHelper(ctx, src, dst);
+}
+
+StringVal AggregateFunctions::DsKllFinalizeSketch(FunctionContext* ctx,
+    const StringVal& src) {
+  return DsKllFinalizeHelper(ctx, src);
+}
+
+void AggregateFunctions::DsKllUnionInit(FunctionContext* ctx, StringVal* slot) {
+  // Note, comparing to HLL Union with hll_union type, for KLL Union there is no such
+  // type as kll_union. As a result kll_sketch is used here to store intermediate results
+  // of the union operation.
+  DsKllInitHelper(ctx, slot);
+}
+
+void AggregateFunctions::DsKllUnionUpdate(FunctionContext* ctx, const StringVal& src,
+    StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, sizeof(datasketches::kll_sketch<float>));
+  auto dst_sketch = reinterpret_cast<datasketches::kll_sketch<float>*>(dst->ptr);
+  try {
+    dst_sketch->merge(datasketches::kll_sketch<float>::deserialize(src.ptr, src.len));
+  } catch (const std::exception& e) {
+    ctx->SetError(Substitute("Error while merging DataSketches KLL sketches. "
+        "Message: $0", e.what()).c_str());
+    return;
+  }
+}
+
+StringVal AggregateFunctions::DsKllUnionSerialize(FunctionContext* ctx,
+    const StringVal& src) {
+  return DsKllSerializeHelper(ctx, src);
+}
+
+void AggregateFunctions::DsKllUnionMerge(FunctionContext* ctx, const StringVal& src,
+    StringVal* dst) {
+  DsKllMergeHelper(ctx, src, dst);
+}
+
+StringVal AggregateFunctions::DsKllUnionFinalize(FunctionContext* ctx,
+    const StringVal& src) {
+  return DsKllFinalizeHelper(ctx, src);
 }
 
 /// Intermediate aggregation state for the SampledNdv() function.
@@ -1529,7 +2820,8 @@ class SampledNdvState {
   static const uint32_t NUM_HLL_BUCKETS = 32;
 
   /// A bucket contains an update count and an HLL intermediate state.
-  static constexpr int64_t BUCKET_SIZE = sizeof(int64_t) + AggregateFunctions::HLL_LEN;
+  static constexpr int64_t BUCKET_SIZE =
+      sizeof(int64_t) + AggregateFunctions::DEFAULT_HLL_LEN;
 
   /// Sampling percent which was given as the second argument to SampledNdv().
   /// Stored here to avoid existing issues with passing constant arguments to all
@@ -1543,7 +2835,7 @@ class SampledNdvState {
   /// Array of buckets.
   struct {
     int64_t row_count;
-    uint8_t hll[AggregateFunctions::HLL_LEN];
+    uint8_t hll[AggregateFunctions::DEFAULT_HLL_LEN];
   } buckets[NUM_HLL_BUCKETS];
 };
 
@@ -1569,7 +2861,7 @@ void AggregateFunctions::SampledNdvUpdate(FunctionContext* ctx, const T& src,
     const DoubleVal& sample_perc, StringVal* dst) {
   SampledNdvState* state = reinterpret_cast<SampledNdvState*>(dst->ptr);
   int64_t bucket_idx = state->total_row_count % SampledNdvState::NUM_HLL_BUCKETS;
-  StringVal hll_dst = StringVal(state->buckets[bucket_idx].hll, HLL_LEN);
+  StringVal hll_dst = StringVal(state->buckets[bucket_idx].hll, DEFAULT_HLL_LEN);
   HllUpdate(ctx, src, &hll_dst);
   ++state->buckets[bucket_idx].row_count;
   ++state->total_row_count;
@@ -1580,8 +2872,8 @@ void AggregateFunctions::SampledNdvMerge(FunctionContext* ctx, const StringVal& 
   SampledNdvState* src_state = reinterpret_cast<SampledNdvState*>(src.ptr);
   SampledNdvState* dst_state = reinterpret_cast<SampledNdvState*>(dst->ptr);
   for (int i = 0; i < SampledNdvState::NUM_HLL_BUCKETS; ++i) {
-    StringVal src_hll = StringVal(src_state->buckets[i].hll, HLL_LEN);
-    StringVal dst_hll = StringVal(dst_state->buckets[i].hll, HLL_LEN);
+    StringVal src_hll = StringVal(src_state->buckets[i].hll, DEFAULT_HLL_LEN);
+    StringVal dst_hll = StringVal(dst_state->buckets[i].hll, DEFAULT_HLL_LEN);
     HllMerge(ctx, src_hll, &dst_hll);
     dst_state->buckets[i].row_count += src_state->buckets[i].row_count;
   }
@@ -1615,15 +2907,15 @@ BigIntVal AggregateFunctions::SampledNdvFinalize(FunctionContext* ctx,
   // are sufficient for reasonable accuracy.
   int pidx = 0;
   for (int i = 0; i < SampledNdvState::NUM_HLL_BUCKETS; ++i) {
-    uint8_t merged_hll_data[HLL_LEN];
-    memset(merged_hll_data, 0, HLL_LEN);
-    StringVal merged_hll(merged_hll_data, HLL_LEN);
+    uint8_t merged_hll_data[DEFAULT_HLL_LEN];
+    memset(merged_hll_data, 0, DEFAULT_HLL_LEN);
+    StringVal merged_hll(merged_hll_data, DEFAULT_HLL_LEN);
     int64_t merged_count = 0;
     for (int j = 0; j < SampledNdvState::NUM_HLL_BUCKETS; ++j) {
       int bucket_idx = (i + j) % SampledNdvState::NUM_HLL_BUCKETS;
       merged_count += state->buckets[bucket_idx].row_count;
       counts[pidx] = merged_count;
-      StringVal hll = StringVal(state->buckets[bucket_idx].hll, HLL_LEN);
+      StringVal hll = StringVal(state->buckets[bucket_idx].hll, DEFAULT_HLL_LEN);
       HllMerge(ctx, hll, &merged_hll);
       ndvs[pidx] = HllFinalEstimate(merged_hll.ptr);
       ++pidx;
@@ -2384,6 +3676,31 @@ template DecimalVal AggregateFunctions::AppxMedianFinalize<DecimalVal>(
 template DateVal AggregateFunctions::AppxMedianFinalize<DateVal>(
     FunctionContext*, const StringVal&);
 
+// Method instantiation for the implementation of the Update
+// functions.
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const BooleanVal&, StringVal*, int precision);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const TinyIntVal&, StringVal*, int precision);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const SmallIntVal&, StringVal*, int precision);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const IntVal&, StringVal*, int precision);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const BigIntVal&, StringVal*, int precision);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const FloatVal&, StringVal*, int precision);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const DoubleVal&, StringVal*, int precision);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const StringVal&, StringVal*, int precision);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const TimestampVal&, StringVal*, int precision);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const DateVal&, StringVal*, int precision);
+
+// Method instantiation for NDV() that accepts a single argument. The
+// NDV() is computed with a precision of 10.
 template void AggregateFunctions::HllUpdate(
     FunctionContext*, const BooleanVal&, StringVal*);
 template void AggregateFunctions::HllUpdate(
@@ -2403,6 +3720,81 @@ template void AggregateFunctions::HllUpdate(
 template void AggregateFunctions::HllUpdate(
     FunctionContext*, const TimestampVal&, StringVal*);
 template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const DateVal&, StringVal*);
+
+// Method instantiation for NDV() that accepts two arguments. The
+// NDV() is computed with a precision indirectly specified through
+// the 2nd argument.
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const BooleanVal&, const IntVal&, StringVal*);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const TinyIntVal&, const IntVal&, StringVal*);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const SmallIntVal&, const IntVal&, StringVal*);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const IntVal&, const IntVal&, StringVal*);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const BigIntVal&, const IntVal&, StringVal*);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const FloatVal&, const IntVal&, StringVal*);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const DoubleVal&, const IntVal&, StringVal*);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const StringVal&, const IntVal&, StringVal*);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const TimestampVal&, const IntVal&, StringVal*);
+template void AggregateFunctions::HllUpdate(
+    FunctionContext*, const DateVal&, const IntVal&, StringVal*);
+
+template void AggregateFunctions::DsHllUpdate(
+    FunctionContext*, const BooleanVal&, StringVal*);
+template void AggregateFunctions::DsHllUpdate(
+    FunctionContext*, const TinyIntVal&, StringVal*);
+template void AggregateFunctions::DsHllUpdate(
+    FunctionContext*, const SmallIntVal&, StringVal*);
+template void AggregateFunctions::DsHllUpdate(
+    FunctionContext*, const IntVal&, StringVal*);
+template void AggregateFunctions::DsHllUpdate(
+    FunctionContext*, const BigIntVal&, StringVal*);
+template void AggregateFunctions::DsHllUpdate(
+    FunctionContext*, const FloatVal&, StringVal*);
+template void AggregateFunctions::DsHllUpdate(
+    FunctionContext*, const DoubleVal&, StringVal*);
+template void AggregateFunctions::DsHllUpdate(
+    FunctionContext*, const DateVal&, StringVal*);
+
+template void AggregateFunctions::DsCpcUpdate(
+    FunctionContext*, const BooleanVal&, StringVal*);
+template void AggregateFunctions::DsCpcUpdate(
+    FunctionContext*, const TinyIntVal&, StringVal*);
+template void AggregateFunctions::DsCpcUpdate(
+    FunctionContext*, const SmallIntVal&, StringVal*);
+template void AggregateFunctions::DsCpcUpdate(
+    FunctionContext*, const IntVal&, StringVal*);
+template void AggregateFunctions::DsCpcUpdate(
+    FunctionContext*, const BigIntVal&, StringVal*);
+template void AggregateFunctions::DsCpcUpdate(
+    FunctionContext*, const FloatVal&, StringVal*);
+template void AggregateFunctions::DsCpcUpdate(
+    FunctionContext*, const DoubleVal&, StringVal*);
+template void AggregateFunctions::DsCpcUpdate(
+    FunctionContext*, const DateVal&, StringVal*);
+
+template void AggregateFunctions::DsThetaUpdate(
+    FunctionContext*, const BooleanVal&, StringVal*);
+template void AggregateFunctions::DsThetaUpdate(
+    FunctionContext*, const TinyIntVal&, StringVal*);
+template void AggregateFunctions::DsThetaUpdate(
+    FunctionContext*, const SmallIntVal&, StringVal*);
+template void AggregateFunctions::DsThetaUpdate(
+    FunctionContext*, const IntVal&, StringVal*);
+template void AggregateFunctions::DsThetaUpdate(
+    FunctionContext*, const BigIntVal&, StringVal*);
+template void AggregateFunctions::DsThetaUpdate(
+    FunctionContext*, const FloatVal&, StringVal*);
+template void AggregateFunctions::DsThetaUpdate(
+    FunctionContext*, const DoubleVal&, StringVal*);
+template void AggregateFunctions::DsThetaUpdate(
     FunctionContext*, const DateVal&, StringVal*);
 
 template void AggregateFunctions::SampledNdvUpdate(

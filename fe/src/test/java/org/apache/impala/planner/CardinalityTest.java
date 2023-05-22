@@ -67,10 +67,8 @@ public class CardinalityTest extends PlannerTestBase {
     verifyCardinality(
         "SELECT id FROM functional.alltypes WHERE int_col = 1", 7300/10);
 
-    // Assume classic 0.1 selectivity for other operators
-    // IMPALA-7560 says this should be revised.
     verifyCardinality(
-        "SELECT id FROM functional.alltypes WHERE int_col != 1", 730);
+        "SELECT id FROM functional.alltypes WHERE int_col != 1", 6570);
 
     // IMPALA-7601 says the following should be revised.
     verifyCardinality(
@@ -90,6 +88,12 @@ public class CardinalityTest extends PlannerTestBase {
     verifyCardinality(
         "select id from functional.alltypesagg where tinyint_col IS NOT NULL", 9000);
 
+    verifyCardinality(
+        "select id from functional.alltypesaggnonulls where int_col IS NULL", 1);
+    verifyCardinality(
+        "select id from functional.alltypesaggnonulls where int_col IS NOT NULL",
+        10000);
+
     // Grouping should reduce cardinality
     verifyCardinality(
         "SELECT COUNT(*) FROM functional.alltypes GROUP BY int_col", 10);
@@ -97,6 +101,10 @@ public class CardinalityTest extends PlannerTestBase {
         "SELECT COUNT(*) FROM functional.alltypes GROUP BY id", 7300);
     verifyCardinality(
         "SELECT COUNT(*) FROM functional.alltypes GROUP BY bool_col", 2);
+
+    // Regression test for IMPALA-11301.
+    verifyCardinality(
+        "SELECT * FROM tpcds_parquet.date_dim WHERE d_current_day != 'a'", 36525);
   }
 
   /**
@@ -111,13 +119,11 @@ public class CardinalityTest extends PlannerTestBase {
     // f repeats for 5 rows, so NDV=7, 26/7 =~ 4
     verifyCardinality("SELECT null_int FROM functional.nullrows WHERE group_str = 'x'",
         4);
-    // Revised use of nulls per IMPALA-7310
-    // null_str is all nulls, NDV = 1, selectivity = 1/1, cardinality = 26
-    // BUG: At present selectivity is assumed to be 0.1
-    //verifyCardinality(
-    //      "SELECT null_int FROM functional.nullrows WHERE null_str = 'x'", 26);
-    verifyCardinality("SELECT null_int FROM functional.nullrows WHERE null_str = 'x'",
-        3);
+    // null_str is all nulls, NDV = 1, selectivity =0, cardinality = 0
+    // PlanNode#applySelectivity, If cardinality is 0, set cardinality to 1
+    // IMPALA-8647: don't round cardinality down to zero for safety.
+    verifyCardinality(
+          "SELECT null_int FROM functional.nullrows WHERE null_str = 'x'", 1);
   }
 
   @Test
@@ -125,23 +131,17 @@ public class CardinalityTest extends PlannerTestBase {
     String baseStmt = "SELECT COUNT(*) " +
                       "FROM functional.nullrows " +
                       "GROUP BY ";
-    // NDV(a) = 26
+    // NDV(id) = 26
     verifyCardinality(baseStmt + "id", 26);
-    // f has NDV=3
+    // group_str has NDV=3
     verifyCardinality(baseStmt + "group_str", 6);
-    // b has NDV=1 (plus 1 for nulls)
-    // Bug: Nulls not counted in NDV
-    //verifyCardinality(baseStmt + "blank", 2);
+    // blank has NDV=1 (and no nulls)
     verifyCardinality(baseStmt + "blank", 1);
-    // c is all nulls
-    // Bug: Nulls not counted in NDV
-    //verifyCardinality(baseStmt + "null_str", 1);
-    verifyCardinality(baseStmt + "null_str", 0);
-    // NDV(a) * ndv(c) = 26 * 1 = 26
-    // Bug: Nulls not counted in NDV
-    //verifyCardinality(baseStmt + "id, null_str", 26);
-    verifyCardinality(baseStmt + "id, null_str", 0);
-    // NDV(a) * ndv(f) = 26 * 3 = 78, capped at row count = 26
+    // null_str is all nulls
+    verifyCardinality(baseStmt + "null_str", 1);
+    // NDV(id) * ndv(null_str) = 26 * 1 = 26
+    verifyCardinality(baseStmt + "id, null_str", 26);
+    // NDV(id) * ndv(group_str) = 26 * 3 = 78, capped at row count = 26
     verifyCardinality(baseStmt + "id, group_str", 26);
   }
 
@@ -182,14 +182,9 @@ public class CardinalityTest extends PlannerTestBase {
     // group_str has NDV=6
     verifyCardinality(baseStmt + "group_str", 6);
     // null_str is all nulls
-    // Bug: Nulls not counted in NDV
-    //verifyCardinality(baseStmt + "null_str", 1);
-    verifyCardinality(baseStmt + "null_str", 0);
-    // NDV(id) = 26 * ndv(null_str) = 1
-    // Bug: Nulls not counted in NDV
-    // Here and for similar bugs: see IMPALA-7310 and IMPALA-8094
-    //verifyCardinality(baseStmt + "id, null_str", 26);
-    verifyCardinality(baseStmt + "nullrows.id, null_str", 0);
+    verifyCardinality(baseStmt + "null_str", 1);
+    // NDV(id) = 26 * ndv(null_str) = 1 ; 26 * 1 = 26
+    verifyCardinality(baseStmt + "nullrows.id, null_str", 26);
     // NDV(id) = 26 * ndv(group_str) = 156
     // Planner does not know that id determines group_str
     verifyCardinality(baseStmt + "nullrows.id, group_str", 156);
@@ -375,11 +370,11 @@ public class CardinalityTest extends PlannerTestBase {
     // The estimated number of rows caps the output cardinality.
     verifyApproxCardinality(
         "select distinct id, int_col from functional_parquet.alltypes",
-        12760, true, ImmutableSet.of(),
+        12400, true, ImmutableSet.of(),
         pathToFirstAggregationNode, AggregationNode.class);
     verifyApproxCardinality(
         "select distinct id, int_col from functional_parquet.alltypes",
-        12760, true, ImmutableSet.of(),
+        12400, true, ImmutableSet.of(),
         pathToSecondAggregationNode, AggregationNode.class);
     // No column stats available and row estimation disabled - no estimate is possible.
     verifyCardinality(
@@ -405,6 +400,12 @@ public class CardinalityTest extends PlannerTestBase {
     verifyApproxCardinality("SELECT SUM(int_col) OVER() int_col "
         + "FROM functional_parquet.alltypestiny", 742, true,
         ImmutableSet.of(), path, AnalyticEvalNode.class);
+
+    // Regression test for IMPALA-11301. row_number() is (incorrectly) assumed to have
+    // NDV=1, which was leading to selectivity=0.0 in rn != 5. Will break if someone
+    // implements correct ndv estimates for analytic functions.
+    verifyCardinality("SELECT * FROM (SELECT *, row_number() OVER(order by id) "
+        + "as rn FROM functional.alltypestiny) v where rn != 5", 4);
   }
 
   @Test
@@ -613,6 +614,29 @@ public class CardinalityTest extends PlannerTestBase {
         path, HdfsScanNode.class);
   }
 
+  /**
+   * Test that cardinality estimates for partition key scans reflect the
+   * number of scan ranges, not the number of rows in the files.
+   */
+  @Test
+  public void testHdfsScanNodePartitionKeyScan() {
+    // Non-distinct, partition key scan optimisation is disabled.
+    verifyCardinality("SELECT year FROM functional.alltypes", 7300, true,
+        ImmutableSet.of(), Arrays.asList(0), HdfsScanNode.class);
+
+    // Distinct, partition key scan optimisation is enabled.
+    verifyCardinality("SELECT distinct year FROM functional.alltypes", 24, true,
+        ImmutableSet.of(), Arrays.asList(0, 0, 0, 0), HdfsScanNode.class);
+
+    // Distinct, partition key scan optimisation is enabled but no stats. We should still
+    // estimate based on the number of files.
+    verifyCardinality("SELECT distinct year FROM functional_parquet.alltypes", 24,
+        true, ImmutableSet.of(), Arrays.asList(0, 0, 0, 0), HdfsScanNode.class);
+    verifyCardinality("SELECT distinct year FROM functional_parquet.alltypes", 24,
+        true, ImmutableSet.of(PlannerTestOption.DISABLE_HDFS_NUM_ROWS_ESTIMATE),
+        Arrays.asList(0, 0, 0, 0), HdfsScanNode.class);
+  }
+
   @Test
   public void testSelectNode() {
     // Create the path to the SelectNode of interest
@@ -721,6 +745,46 @@ public class CardinalityTest extends PlannerTestBase {
   }
 
   @Test
+  public void testPartitionedTopNNode() {
+    // Create the path to the SortNode and SelectNode of interest in a distributed plan.
+    List<Integer> selectPath = Arrays.asList(0);
+    List<Integer> sortPath = Arrays.asList(0, 0, 0);
+
+    // NDV(smallint_col) = 97, NDV(bool_col) = 2
+    // 5 rows per top-N partition
+    // 97 * 2 * 5 = 970
+    String lessThanQuery = "select * from (" +
+            "  select *, row_number() over " +
+            "  (partition by smallint_col, bool_col order by id) as rn" +
+            "  from functional.alltypesagg where id % 777 = 0 or id % 10 = 7) v" +
+            " where rn <= 5";
+    final int EXPECTED_CARDINALITY = 970;
+    // Both TOP-N node and the upper Select  node are expected to return the same number
+    // of nodes - the predicate in the Select is effectively pushed to the top-n, so
+    // its selectivity should be 1.
+    verifyApproxCardinality(lessThanQuery, EXPECTED_CARDINALITY, true, ImmutableSet.of(),
+            sortPath, SortNode.class);
+    verifyApproxCardinality(lessThanQuery, EXPECTED_CARDINALITY, true, ImmutableSet.of(),
+            selectPath, SelectNode.class);
+
+
+    // Any equality predicate results in the same cardinality estimate for the top-n.
+    // It also results in the same estimate for the Select node, but for a different
+    // reason: the NDV of row_number() is estimated as 1, so the equality predicate
+    // has a selectivity estimate of 1.0.
+    String eqQuery = "select * from (" +
+            "  select *, row_number() over " +
+            "  (partition by smallint_col, bool_col order by id) as rn" +
+            "  from functional.alltypesagg where id % 777 = 0 or id % 10 = 7) v" +
+            " where rn = 5";
+    verifyApproxCardinality(eqQuery, EXPECTED_CARDINALITY, true, ImmutableSet.of(),
+            sortPath, SortNode.class);
+    verifyApproxCardinality(eqQuery, EXPECTED_CARDINALITY, true, ImmutableSet.of(),
+            selectPath, SelectNode.class);
+  }
+
+
+  @Test
   public void testSubPlanNode() {
     // Create the path to the SubplanNode of interest
     // in a distributed plan.
@@ -806,6 +870,147 @@ public class CardinalityTest extends PlannerTestBase {
         + "FROM tpch_nested_parquet.customer c, c.c_orders", 10, true,
         ImmutableSet.of(PlannerTestOption.DISABLE_HDFS_NUM_ROWS_ESTIMATE),
         path, UnnestNode.class);
+  }
+
+  @Test
+  public void testAggregationNodeMemoryEstimate() {
+    // Create the paths to the AggregationNode's of interest
+    // in a distributed plan involving GROUP BY.
+    // Since there are two resulting AggregationNode's, we create two paths.
+    List<Integer> pathToFirstAggregationNode = Arrays.asList(0);
+    List<Integer> pathToSecondAggregationNode = Arrays.asList(0, 0, 0);
+    // Single node execution plan, there is only one AggregationNode
+    List<Integer> pathToAggregationNode = Arrays.asList();
+
+    // There is available statistics in functional.alltypes.
+    // True cardinality of functional.alltypes is 7300.
+    // Ndv of int_col is 10;
+    // MIN_HASH_TBL_MEM is 10M
+    verifyApproxMemoryEstimate("SELECT COUNT(int_col) FROM functional.alltypes "
+        + "GROUP BY int_col", AggregationNode.MIN_HASH_TBL_MEM, true, false,
+        ImmutableSet.of(), pathToFirstAggregationNode, AggregationNode.class);
+    // create a single node plan.
+    verifyApproxMemoryEstimate("SELECT COUNT(int_col) FROM functional.alltypes "
+        + "GROUP BY int_col", AggregationNode.MIN_HASH_TBL_MEM, false, false,
+        ImmutableSet.of(), pathToAggregationNode, AggregationNode.class);
+
+    // FUNCTIONAL.ALLTYPES.ID's Ndv is 7300 and avgRowSize is 4
+    // FUNCTIONAL.ALLTYPESSMALL.TIMESTAMP_COL's Ndv is 100 and avgRowSize is 16
+    // FUNCTIONAL.NULLROWS.BOOL_NULLS's Ndv is 3 and avgRowSize is 1
+    // COUNT(*)'s avgRowSize is 8 and MAX(B.BIGINT_COL) avgRowSize is 8
+    // 2190000 = 7300*100*3
+    verifyApproxMemoryEstimate("SELECT COUNT(*),MAX(B.BIGINT_COL) FROM " +
+        "FUNCTIONAL.ALLTYPES A , FUNCTIONAL.ALLTYPESSMALL B, " +
+        "FUNCTIONAL.NULLROWS C GROUP BY A.ID, B.TIMESTAMP_COL,C.BOOL_NULLS",
+        2190000*(4+16+1+8+8+12), true, true, ImmutableSet.of(),
+        pathToFirstAggregationNode, AggregationNode.class);
+    verifyApproxMemoryEstimate("SELECT COUNT(*),MAX(B.BIGINT_COL) FROM " +
+        "FUNCTIONAL.ALLTYPES A , FUNCTIONAL.ALLTYPESSMALL B, " +
+        "FUNCTIONAL.NULLROWS C GROUP BY A.ID, B.TIMESTAMP_COL,C.BOOL_NULLS",
+        2190000*(4+16+1+8+8+12), true, false, ImmutableSet.of(),
+        pathToSecondAggregationNode, AggregationNode.class);
+    // create a single node plan.
+    verifyApproxMemoryEstimate("SELECT COUNT(*),MAX(B.BIGINT_COL) FROM " +
+        "FUNCTIONAL.ALLTYPES A , FUNCTIONAL.ALLTYPESSMALL B, " +
+        "FUNCTIONAL.NULLROWS C GROUP BY A.ID, B.TIMESTAMP_COL,C.BOOL_NULLS",
+        2190000*(4+16+1+8+8+12), false, false, ImmutableSet.of(),
+        pathToAggregationNode, AggregationNode.class);
+
+    List<Integer> countFirstAggregationNode = Arrays.asList();
+    List<Integer> countSecondAggregationNode = Arrays.asList();
+    // Query has no Group by Clause
+    verifyApproxMemoryEstimate("SELECT COUNT(*) FROM FUNCTIONAL.ALLTYPES A ",
+        AggregationNode.MIN_PLAIN_AGG_MEM, true, false, ImmutableSet.of(),
+        countFirstAggregationNode, AggregationNode.class);
+    verifyApproxMemoryEstimate("SELECT COUNT(*) FROM FUNCTIONAL.ALLTYPES A ",
+        AggregationNode.MIN_PLAIN_AGG_MEM, true, false, ImmutableSet.of(),
+        countSecondAggregationNode, AggregationNode.class);
+    // create a single node plan.
+    verifyApproxMemoryEstimate("SELECT COUNT(*) FROM FUNCTIONAL.ALLTYPES A ",
+        AggregationNode.MIN_PLAIN_AGG_MEM, false, false, ImmutableSet.of(),
+        pathToAggregationNode, AggregationNode.class);
+  }
+
+  @Test
+  public void testSortNodeMemoryEstimate() {
+    List<Integer> pathToSortNode = Arrays.asList(0);
+
+    List<Integer> pathToSortNodeSg = Arrays.asList();
+
+    // FUNCTIONAL.ALLTYPES.ID's Ndv is 7300 and avgRowSize is 4
+    // FUNCTIONAL.ALLTYPESSMALL.TIMESTAMP_COL's Ndv is 100 and avgRowSize is 16
+    verifyApproxMemoryEstimate("SELECT A.TIMESTAMP_COL,B.TIMESTAMP_COL FROM " +
+        "FUNCTIONAL.ALLTYPES A , FUNCTIONAL.ALLTYPESSMALL B " +
+        "ORDER BY A.TIMESTAMP_COL,B.TIMESTAMP_COL",
+        7300*100*(16+16), true, true, ImmutableSet.of(),
+        pathToSortNode, SortNode.class);
+    // create a single node plan.
+    verifyApproxMemoryEstimate("SELECT A.TIMESTAMP_COL,B.TIMESTAMP_COL FROM " +
+        "FUNCTIONAL.ALLTYPES A , FUNCTIONAL.ALLTYPESSMALL B " +
+        "ORDER BY A.TIMESTAMP_COL,B.TIMESTAMP_COL",
+        7300*100*(16+16), false, false, ImmutableSet.of(),
+        pathToSortNodeSg, SortNode.class);
+  }
+
+  @Test
+  public void testHashJoinNodeMemoryEstimate() {
+    List<Integer> pathToJoinNode = Arrays.asList(0);
+    List<Integer> pathToJoinNodeSg = Arrays.asList();
+
+    // FUNCTIONAL.ALLTYPES.ID's Ndv is 7300 and avgRowSize is 4
+    // FUNCTIONAL.ALLTYPES.DATE_STRING_COL's Ndv is 736 and avgRowSize is 8
+    // Cardinality estimate of subquery is 5372800
+    // BitUtil.roundUpToPowerOf2((long) Math.ceil(3 * Cardinality / 2)) is 8388608
+    // Size of Bucket is 12.
+    verifyApproxMemoryEstimate("SELECT A.ID FROM (SELECT A1.ID,B1.DATE_STRING_COL " +
+        "IDB FROM FUNCTIONAL.ALLTYPES A1 , FUNCTIONAL.ALLTYPES B1 GROUP BY A1.ID," +
+        "B1.DATE_STRING_COL) A JOIN (SELECT A1.ID,B1.DATE_STRING_COL IDB FROM " +
+        "FUNCTIONAL.ALLTYPES A1,FUNCTIONAL.ALLTYPES B1 GROUP BY " +
+        "A1.ID,B1.DATE_STRING_COL) B ON A.ID = B.ID AND A.IDB=B.IDB",
+        5372800*(4+8+4+8) + 8388608*12, true, true, ImmutableSet.of(),
+        pathToJoinNode, HashJoinNode.class);
+    // create a single node plan.
+    verifyApproxMemoryEstimate("SELECT A.ID FROM (SELECT A1.ID,B1.DATE_STRING_COL " +
+        "IDB FROM FUNCTIONAL.ALLTYPES A1 , FUNCTIONAL.ALLTYPES B1 GROUP BY A1.ID," +
+        "B1.DATE_STRING_COL) A JOIN (SELECT A1.ID,B1.DATE_STRING_COL IDB FROM " +
+        "FUNCTIONAL.ALLTYPES A1,FUNCTIONAL.ALLTYPES B1 GROUP BY " +
+        "A1.ID,B1.DATE_STRING_COL) B ON A.ID = B.ID AND A.IDB=B.IDB",
+        5372800*(4+8+4+8) + 8388608*12, false, false, ImmutableSet.of(),
+        pathToJoinNodeSg, HashJoinNode.class);
+
+    // FUNCTIONAL.ALLTYPES.ID's Ndv is 7300 and avgRowSize is 4
+    // FUNCTIONAL.ALLTYPES.DATE_STRING_COL's Ndv is 736 and avgRowSize is 8
+    // Cardinality estimate of subquery is 53290000
+    // BitUtil.roundUpToPowerOf2((long) Math.ceil(3 * Cardinality / 2)) is 134217728
+    // Size of Bucket is 12. Size of Duplicatenode is 16
+    // Ndv estimate of subquery is 5372800
+    verifyApproxMemoryEstimate("SELECT A.ID FROM (SELECT A1.ID,B1.DATE_STRING_COL " +
+        "IDB FROM FUNCTIONAL.ALLTYPES A1 , FUNCTIONAL.ALLTYPES B1) A JOIN " +
+        "(SELECT A1.ID,B1.DATE_STRING_COL IDB FROM FUNCTIONAL.ALLTYPES A1," +
+        "FUNCTIONAL.ALLTYPES B1) B ON A.ID = B.ID AND A.IDB=B.IDB",
+        53290000L*(4L+8L+4L+8L)+134217728L*12L+(53290000L-5372800L)*16L, true, true,
+        ImmutableSet.of(), pathToJoinNode, HashJoinNode.class);
+    // create a single node plan.
+    verifyApproxMemoryEstimate("SELECT A.ID FROM (SELECT A1.ID,B1.DATE_STRING_COL " +
+        "IDB FROM FUNCTIONAL.ALLTYPES A1 , FUNCTIONAL.ALLTYPES B1) A JOIN " +
+        "(SELECT A1.ID,B1.DATE_STRING_COL IDB FROM FUNCTIONAL.ALLTYPES A1," +
+        "FUNCTIONAL.ALLTYPES B1) B ON A.ID = B.ID AND A.IDB=B.IDB",
+        53290000L*(4L+8L+4L+8L)+134217728L*12L+(53290000L-5372800L)*16L, false, false,
+        ImmutableSet.of(), pathToJoinNodeSg, HashJoinNode.class);
+  }
+
+  @Test
+  public void testKuduScanNodeMemoryEstimate() {
+    List<Integer> pathToKuduScanNode = Arrays.asList(0);
+    List<Integer> pathToKuduScanNodeSg = Arrays.asList();
+    // Scan 1 column.
+    verifyApproxMemoryEstimate("SELECT ID FROM FUNCTIONAL_KUDU.ALLTYPESSMALL",
+        393216*1*2, true, false,
+        ImmutableSet.of(), pathToKuduScanNode, KuduScanNode.class);
+    // create a single node plan.
+    verifyApproxMemoryEstimate("SELECT ID FROM FUNCTIONAL_KUDU.ALLTYPESSMALL",
+        393216*1*2, false, false,
+        ImmutableSet.of(), pathToKuduScanNodeSg, KuduScanNode.class);
   }
 
   /**
@@ -979,6 +1184,61 @@ public class CardinalityTest extends PlannerTestBase {
       fail(e.getMessage());
     }
     return planCtx.getPlan();
+  }
+
+  /**
+  * This method allows us to get a PlanNode located by
+  * path with respect to the root of the retrieved query plan. The class of
+  * the located PlanNode by path will also be checked against cl, the class of
+  * the PlanNode of interest.
+  *
+  * @param query query to test
+  * @param isDistributedPlan set to true if we would like to generate
+  * a distributed plan
+  * @param testOptions specified test options
+  * @param path path to the PlanNode of interest
+  * @param cl class of the PlanNode of interest
+  */
+  protected PlanNode getPlanNode(String query, boolean isDistributedPlan,
+      Set<PlannerTestOption> testOptions, List<Integer> path, Class<?> cl) {
+    List<PlanFragment> plan = getPlan(query, isDistributedPlan, testOptions);
+    // We use the last element on the List of PlanFragment
+    // because this PlanFragment encloses all the PlanNode's
+    // in the query plan (either the single node plan or
+    // the distributed plan).
+    PlanNode currentNode = plan.get(plan.size() - 1).getPlanRoot();
+    for (Integer currentChildIndex: path) {
+      currentNode = currentNode.getChild(currentChildIndex);
+    }
+    assertEquals("PlanNode class not matched: ", cl.getName(),
+        currentNode.getClass().getName());
+    return currentNode;
+  }
+
+  /**
+  * This method allows us to inspect the Memory Estimate of a PlanNode located by
+  * path with respect to the root of the retrieved query plan. The class of
+  * the located PlanNode by path will also be checked against cl, the class of
+  * the PlanNode of interest.
+  *
+  * @param query query to test
+  * @param expected expected Memory at the PlanNode of interest
+  * @param isDistributedPlan set to true if we would like to generate
+  * a distributed plan
+  * @param testOptions specified test options
+  * @param path path to the PlanNode of interest
+  * @param cl class of the PlanNode of interest
+  */
+  protected void verifyApproxMemoryEstimate(String query, long expected,
+      boolean isDistributedPlan, boolean isMultiNodes,
+      Set<PlannerTestOption> testOptions, List<Integer> path, Class<?> cl) {
+    PlanNode pNode = getPlanNode(query, isDistributedPlan, testOptions, path, cl);
+    long result = pNode.getNodeResourceProfile().getMemEstimateBytes();
+    if (isMultiNodes) {
+      result = (long)Math.ceil(result * pNode.getFragment().getNumInstances());
+    }
+    assertEquals("Memory Estimate error for: " + query, expected, result,
+        expected * CARDINALITY_TOLERANCE);
   }
 
 }

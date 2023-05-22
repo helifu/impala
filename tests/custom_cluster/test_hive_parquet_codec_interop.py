@@ -17,10 +17,13 @@
 #
 # Tests for Hive-IMPALA parquet compression codec interoperability
 
+from __future__ import absolute_import, division, print_function
 import pytest
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfS3
+from tests.util.event_processor_utils import EventProcessorUtils
+from tests.common.environ import HIVE_MAJOR_VERSION
+from tests.common.skip import SkipIfFS
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_result_verifier import verify_query_result_is_equal
 from tests.util.filesystem_utils import get_fs_path
@@ -50,18 +53,16 @@ class TestParquetInterop(CustomClusterTestSuite):
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').file_format == 'parquet')
 
-  @SkipIfS3.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("-convert_legacy_hive_parquet_utc_timestamps=true "
       "-hdfs_zone_info_zip=%s" % get_fs_path("/test-warehouse/tzdb/2017c.zip"))
   def test_hive_impala_interop(self, vector, unique_database, cluster_properties):
     # Setup source table.
     source_table = "{0}.{1}".format(unique_database, "t1_source")
-    # TODO: Once IMPALA-8721 is fixed add coverage for TimeStamp data type.
     self.execute_query_expect_success(self.client,
-        "create table {0} as select id, bool_col, tinyint_col, smallint_col, int_col, "
-        "bigint_col, float_col, double_col, date_string_col, string_col, year, month "
-        "from functional_parquet.alltypes".format(source_table))
+        "create table {0} as select * from functional_parquet.alltypes"
+        .format(source_table))
     self.execute_query_expect_success(self.client,
         "insert into {0}(id) values (7777), (8888), (9999), (11111), (22222), (33333)"
         .format(source_table))
@@ -82,13 +83,24 @@ class TestParquetInterop(CustomClusterTestSuite):
       elif (codec == 'zstd:7'): codec = 'zstd'
       hive_table = "{0}.{1}".format(unique_database, "t1_hive")
       self.run_stmt_in_hive("drop table if exists {0}".format(hive_table))
+      # For Hive 3+, workaround for HIVE-22371 (CTAS puts files in the wrong place) by
+      # explicitly creating an external table so that files are in the external warehouse
+      # directory. Use external.table.purge=true so that it is equivalent to a Hive 2
+      # managed table. Hive 2 stays the same.
+      external = ""
+      tblproperties = ""
+      if HIVE_MAJOR_VERSION >= 3:
+        external = "external"
+        tblproperties = "TBLPROPERTIES('external.table.purge'='TRUE')"
       self.run_stmt_in_hive("set parquet.compression={0};\
-          create table {1} stored as parquet as select * from {2}"
-          .format(codec, hive_table, impala_table))
+          create {1} table {2} stored as parquet {3} as select * from {4}"
+          .format(codec, external, hive_table, tblproperties, impala_table))
 
       # Make sure Impala's metadata is in sync.
-      if cluster_properties.is_catalog_v2_cluster():
-        self.wait_for_table_to_appear(unique_database, hive_table, timeout_s=10)
+      if cluster_properties.is_event_polling_enabled():
+        assert EventProcessorUtils.get_event_processor_status() == "ACTIVE"
+        EventProcessorUtils.wait_for_event_processing(self)
+        self.confirm_table_exists(unique_database, "t1_hive")
       else:
         self.client.execute("invalidate metadata {0}".format(hive_table))
 

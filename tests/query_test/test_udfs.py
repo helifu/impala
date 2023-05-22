@@ -15,8 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from copy import copy
 import os
+import re
 import pytest
 import tempfile
 from subprocess import call, check_call
@@ -30,7 +32,7 @@ from tests.common.test_dimensions import (
     create_exec_option_dimension_from_dict,
     create_uncompressed_text_dimension)
 from tests.util.calculation_util import get_random_id
-from tests.util.filesystem_utils import get_fs_path, IS_S3
+from tests.util.filesystem_utils import get_fs_path, WAREHOUSE
 from tests.verifiers.metric_verifier import MetricVerifier
 
 class TestUdfBase(ImpalaTestSuite):
@@ -112,6 +114,11 @@ returns decimal(20,0) intermediate string location '{location}'
 init_fn='AggStringIntermediateInit' update_fn='AggStringIntermediateUpdate'
 merge_fn='AggStringIntermediateMerge' finalize_fn='AggStringIntermediateFinalize';
 
+create aggregate function {database}.agg_binary_intermediate(decimal(20,10), bigint, binary)
+returns decimal(20,0) intermediate binary location '{location}'
+init_fn='AggStringIntermediateInit' update_fn='AggStringIntermediateUpdate'
+merge_fn='AggStringIntermediateMerge' finalize_fn='AggStringIntermediateFinalize';
+
 create aggregate function {database}.char_intermediate_sum(int) returns int
 intermediate char(10) LOCATION '{location}' update_fn='AggCharIntermediateUpdate'
 init_fn='AggCharIntermediateInit' merge_fn='AggCharIntermediateMerge'
@@ -145,6 +152,10 @@ create function {database}.identity(string) returns string
 location '{location}'
 symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_9StringValE';
 
+create function {database}.identity(binary) returns binary
+location '{location}'
+symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_9StringValE';
+
 create function {database}.identity(timestamp) returns timestamp
 location '{location}'
 symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_12TimestampValE';
@@ -166,7 +177,8 @@ location '{location}'
 symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_10DecimalValE';
 
 create function {database}.all_types_fn(
-    string, boolean, tinyint, smallint, int, bigint, float, double, decimal(2,0), date)
+    string, boolean, tinyint, smallint, int, bigint, float, double, decimal(2,0), date,
+    binary)
 returns int
 location '{location}' symbol='AllTypes';
 
@@ -325,8 +337,23 @@ class TestUdfExecution(TestUdfBase):
       self.run_test_case('QueryTest/udf-no-expr-rewrite', vector, use_db=unique_database)
 
   def test_java_udfs(self, vector, unique_database):
+    vector = copy(vector)
+    vector.get_value('exec_option')['abort_java_udf_on_exception'] = True
     self.run_test_case('QueryTest/load-java-udfs', vector, use_db=unique_database)
+    self.run_test_case('QueryTest/load-java-udfs-fail', vector, use_db=unique_database)
     self.run_test_case('QueryTest/java-udf', vector, use_db=unique_database)
+    vector.get_value('exec_option')['abort_java_udf_on_exception'] = False
+    self.run_test_case('QueryTest/java-udf-no-abort-on-exception', vector,
+        use_db=unique_database)
+
+  def test_generic_java_udfs(self, vector, unique_database):
+    vector = copy(vector)
+    vector.get_value('exec_option')['abort_java_udf_on_exception'] = True
+    self.run_test_case('QueryTest/load-generic-java-udfs', vector, use_db=unique_database)
+    self.run_test_case('QueryTest/generic-java-udf', vector, use_db=unique_database)
+    vector.get_value('exec_option')['abort_java_udf_on_exception'] = False
+    self.run_test_case('QueryTest/generic-java-udf-no-abort-on-exception', vector,
+        use_db=unique_database)
 
   def test_udf_errors(self, vector, unique_database):
     # Only run with codegen disabled to force interpretation path to be taken.
@@ -355,17 +382,17 @@ class TestUdfExecution(TestUdfBase):
     # admission control and a simple scan can run.
     vector = copy(vector)
     vector.get_value('exec_option')['mem_limit'] = '1mb'
-    vector.get_value('exec_option')['buffer_pool_limit'] = '32kb'
+    vector.get_value('exec_option')['buffer_pool_limit'] = '4.04mb'
     try:
       self.run_test_case('QueryTest/udf-mem-limit', vector, use_db=unique_database)
       assert False, "Query was expected to fail"
-    except ImpalaBeeswaxException, e:
+    except ImpalaBeeswaxException as e:
       self._check_mem_limit_exception(e)
 
     try:
       self.run_test_case('QueryTest/uda-mem-limit', vector, use_db=unique_database)
       assert False, "Query was expected to fail"
-    except ImpalaBeeswaxException, e:
+    except ImpalaBeeswaxException as e:
       self._check_mem_limit_exception(e)
 
     # It takes a long time for Impala to free up memory after this test, especially if
@@ -423,7 +450,7 @@ class TestUdfTargeted(TestUdfBase):
 
   def test_udf_invalid_symbol(self, vector, unique_database):
     """ IMPALA-1642: Impala crashes if the symbol for a Hive UDF doesn't exist
-        Crashing is non-deterministic so we run the UDF several times."""
+        Invalid symbols are checked at UDF creation time."""
     src_udf_path = os.path.join(
         os.environ['IMPALA_HOME'], 'testdata/udfs/impala-hive-udfs.jar')
     tgt_udf_path = get_fs_path(
@@ -434,15 +461,11 @@ class TestUdfTargeted(TestUdfBase):
         "create function `{0}`.fn_invalid_symbol(STRING) returns "
         "STRING LOCATION '{1}' SYMBOL='not.a.Symbol'".format(
             unique_database, tgt_udf_path))
-    query = "select `{0}`.fn_invalid_symbol('test')".format(unique_database)
 
     self.filesystem_client.copy_from_local(src_udf_path, tgt_udf_path)
     self.client.execute(drop_fn_stmt)
-    self.client.execute(create_fn_stmt)
-    for _ in xrange(5):
-      ex = self.execute_query_expect_failure(self.client, query)
-      assert "Unable to find class" in str(ex)
-    self.client.execute(drop_fn_stmt)
+    ex = self.execute_query_expect_failure(self.client, create_fn_stmt)
+    assert "ClassNotFoundException" in str(ex)
 
   def test_hidden_symbol(self, vector, unique_database):
     """Test that symbols in the test UDFs are hidden by default and that therefore
@@ -501,7 +524,7 @@ class TestUdfTargeted(TestUdfBase):
       self.execute_query_using_client(
           client, "select `{0}`.`pi_missing_jar`()".format(unique_database), vector)
       assert False, "Query expected to fail"
-    except ImpalaBeeswaxException, e:
+    except ImpalaBeeswaxException as e:
       assert "Failed to get file info" in str(e)
 
   def test_libs_with_same_filenames(self, vector, unique_database):
@@ -516,7 +539,7 @@ class TestUdfTargeted(TestUdfBase):
     old_udf = os.path.join(
         os.environ['IMPALA_HOME'], 'testdata/udfs/impala-hive-udfs.jar')
     new_udf = os.path.join(
-        os.environ['IMPALA_HOME'], 'tests/test-hive-udfs/target/test-hive-udfs-1.0.jar')
+        os.environ['IMPALA_HOME'], 'testdata/udfs/impala-hive-udfs-modified.jar')
     udf_dst = get_fs_path(
         '/test-warehouse/{0}.db/impala-hive-udfs.jar'.format(unique_database))
 
@@ -549,7 +572,7 @@ class TestUdfTargeted(TestUdfBase):
     old_udf = os.path.join(
         os.environ['IMPALA_HOME'], 'testdata/udfs/impala-hive-udfs.jar')
     new_udf = os.path.join(
-        os.environ['IMPALA_HOME'], 'tests/test-hive-udfs/target/test-hive-udfs-1.0.jar')
+        os.environ['IMPALA_HOME'], 'testdata/udfs/impala-hive-udfs-modified.jar')
     udf_dst = get_fs_path(
         '/test-warehouse/{0}.db/impala-hive-udfs.jar'.format(unique_database))
     old_function_name = "udf_update_test_create1"
@@ -614,3 +637,57 @@ class TestUdfTargeted(TestUdfBase):
     results = self.client.fetch(query, handle, -1)
     assert results.success
     assert len(results.data) == 9999
+
+  def test_udf_profile(self, vector, unique_database):
+    """Test to validate that explain plans and runtime profiles contain information about
+    any custom UDFs used in an Impala query."""
+    self.client.execute(
+        "create function {0}.hive_substring(string, int) returns string location '{1}' "
+        "symbol='org.apache.hadoop.hive.ql.udf.UDFSubstr'".format(
+            unique_database, get_fs_path('/test-warehouse/hive-exec.jar')))
+    profile = self.execute_query_expect_success(self.client,
+        "select {0}.hive_substring(string_col, 1), {0}.hive_substring(string_col, 2) "
+        "from functional.alltypes limit 10".format(unique_database)).runtime_profile
+
+    assert re.search("output exprs.*hive_substring.*/\* JAVA UDF \*/", profile)
+    # Ensure that hive_substring only shows up once in the list of UDFs.
+    assert re.search(
+        "User Defined Functions \(UDFs\): {0}\.hive_substring\s*[\r\n]".format(
+            unique_database), profile)
+
+  def test_set_fallback_db_for_functions(self, vector, unique_database):
+    """IMPALA-11728: Set fallback database for functions."""
+    create_function_stmt = "create function `{0}`.fn() returns int "\
+          "location '{1}/libTestUdfs.so' symbol='NoArgs'".format(unique_database,
+          WAREHOUSE)
+    self.client.execute(create_function_stmt)
+
+    # case 1: When the function name is fully qualified then this query option
+    # has no effect.
+    assert '6' == self.execute_scalar("select {0}.fn() from functional.alltypes "
+          "limit 1".format(unique_database))
+
+    # case 2: Throw an exception without specifying the database.
+    query_stmt = "select fn() from functional.alltypes limit 1"
+    result = self.execute_query_expect_failure(self.client, query_stmt)
+    assert "default.fn() unknown for database default" in str(result)
+
+    # case 3: Use fn() in fallback db after setting FALLBACK_DB_FOR_FUNCTIONS
+    assert '6' == self.execute_scalar(query_stmt, query_options={
+        'fallback_db_for_functions': unique_database})
+
+    # case 4: Test a function name that also exists as builtin function.
+    # Use function in _impala_builtins.
+    create_function_stmt = "create function `{0}`.abs(int) returns int "\
+          "location '{1}/libTestUdfs.so' symbol='Identity'".format(unique_database,
+          WAREHOUSE)
+    self.client.execute(create_function_stmt)
+
+    assert '1' == self.execute_scalar("select abs(-1)", query_options={
+        'fallback_db_for_functions': unique_database})
+
+    # case 5: It should return empty result for show function, even when
+    # FALLBACK_DB_FOR_FUNCTIONS is set.
+    result = self.execute_scalar("show functions", query_options={
+        'fallback_db_for_functions': unique_database})
+    assert result is None

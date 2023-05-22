@@ -28,10 +28,12 @@
 # be an int (2). The following line changes this behavior so that float will be returned
 # if necessary (2.5).
 
-from __future__ import division
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import difflib
 import json
 import logging
+import math
 import os
 import prettytable
 import re
@@ -218,7 +220,7 @@ def get_dict_from_json(filename):
     cur[RESULT_LIST].append(query_result)
 
   with open(filename, "r") as f:
-    data = json.load(f)
+    data = json.loads(f.read().decode("utf-8", "ignore"))
     grouped = defaultdict( lambda: defaultdict(
         lambda: defaultdict(lambda: defaultdict(list))))
     for workload_name, workload in data.items():
@@ -236,12 +238,15 @@ def all_query_results(grouped):
 
 
 def get_commit_date(commit_sha):
-  import urllib2
+  try:
+    from urllib.request import Request, urlopen
+  except ImportError:
+    from urllib2 import Request, urlopen
 
   url = 'https://api.github.com/repos/apache/impala/commits/' + commit_sha
   try:
-    request = urllib2.Request(url)
-    response = urllib2.urlopen(request).read()
+    request = Request(url)
+    response = urlopen(request).read()
     data = json.loads(response.decode('utf8'))
     return data['commit']['committer']['date'][:10]
   except:
@@ -249,7 +254,7 @@ def get_commit_date(commit_sha):
 
 def get_impala_version(grouped):
   """Figure out Impala version by looking at query profile."""
-  first_result = all_query_results(grouped).next()
+  first_result = next(all_query_results(grouped))
   profile = first_result['result_list'][0]['runtime_profile']
   match = re.search('Impala Version:\s(.*)\s\(build\s(.*)\)', profile)
   version = match.group(1)
@@ -296,6 +301,7 @@ def calculate_time_stats(grouped):
 class Report(object):
 
   significant_perf_change = False
+  invalid_t_tests = False
 
   class FileFormatComparisonRow(object):
     """Represents a row in the overview table, where queries are grouped together and
@@ -344,7 +350,7 @@ class Report(object):
       self.query_name = results[RESULT_LIST][0][QUERY][NAME]
       self.file_format = '{0} / {1} / {2}'.format(
           results[RESULT_LIST][0][QUERY][TEST_VECTOR][FILE_FORMAT],
-          results[RESULT_LIST][0][QUERY][TEST_VECTOR][COMPRESSION_TYPE],
+          results[RESULT_LIST][0][QUERY][TEST_VECTOR][COMPRESSION_CODEC],
           results[RESULT_LIST][0][QUERY][TEST_VECTOR][COMPRESSION_TYPE])
       self.avg = results[AVG]
       self.rsd = results[STDDEV] / self.avg if self.avg > 0 else 0.0
@@ -386,8 +392,13 @@ class Report(object):
 
     def __check_perf_change_significance(self, stat, ref_stat):
       zval = calculate_mwu(stat[SORTED], ref_stat[SORTED])
-      tval = calculate_tval(stat[AVG], stat[STDDEV], stat[ITERATIONS],
-                            ref_stat[AVG], ref_stat[STDDEV], ref_stat[ITERATIONS])
+      try:
+        tval = calculate_tval(stat[AVG], stat[STDDEV], stat[ITERATIONS],
+                              ref_stat[AVG], ref_stat[STDDEV], ref_stat[ITERATIONS])
+      except ZeroDivisionError:
+        # t-test cannot be performed if both standard deviations are 0
+        tval = float('nan')
+        Report.invalid_t_tests = True
       try:
         percent_difference = abs(ref_stat[AVG] - stat[AVG]) * 100 / ref_stat[AVG]
       except ZeroDivisionError:
@@ -408,6 +419,7 @@ class Report(object):
       """
       perf_change_type = ("(R) Regression" if zval >= 0 and tval >= 0
                           else "(I) Improvement" if zval <= 0 and tval <= 0
+                          else "(N/A) Invalid t-test" if math.isnan(tval)
                           else "(?) Anomoly")
       query = result[RESULT_LIST][0][QUERY]
 
@@ -588,7 +600,11 @@ class Report(object):
     output += variability_analysis_str
 
     if Report.significant_perf_change:
-      output += 'Significant perf change detected'
+      output += 'Significant perf change detected.\n'
+
+    if Report.invalid_t_tests:
+      output += 'Invalid t-tests detected. It is not possible to perform t-test with ' \
+                '0 standard deviation. Try increasing the number of iterations.\n'
 
     return output
 
@@ -902,7 +918,7 @@ class ExecSummaryComparison(object):
     table.align = 'l'
     table.float_format = '.2'
     table_contains_at_least_one_row = False
-    for row in filter(lambda row: is_significant(row), self.rows):
+    for row in [r for r in self.rows if is_significant(r)]:
       table_row = [row[OPERATOR],
           '{0:.2%}'.format(row[PERCENT_OF_QUERY]),
           '{0:.2%}'.format(row[RSTD]),
@@ -1138,5 +1154,5 @@ if __name__ == "__main__":
     if ref_grouped:
       ref_impala_version = get_impala_version(ref_grouped)
 
-  print build_summary_header(current_impala_version, ref_impala_version)
-  print report
+  print(build_summary_header(current_impala_version, ref_impala_version))
+  print(report)

@@ -19,6 +19,7 @@
 # A collection of useful Python GDB modules and commands for
 # debugging Impala core dumps.
 #
+from __future__ import absolute_import, division, print_function
 import gdb
 from collections import defaultdict
 
@@ -48,8 +49,8 @@ def get_fragment_instances():
                 # No valid thread_debug_info
                 if not tdi:
                     break
-                hi = long(tdi['instance_id_']['hi'])
-                lo = long(tdi['instance_id_']['lo'])
+                hi = int(tdi['instance_id_']['hi'])
+                lo = int(tdi['instance_id_']['lo'])
                 fi = "%lx:%lx" % (hi, lo)
                 if fi != "0:0":
                     fragment_instances[fi.strip('"')].append(thread.num)

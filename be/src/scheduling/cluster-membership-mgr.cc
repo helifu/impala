@@ -17,10 +17,20 @@
 
 #include "scheduling/cluster-membership-mgr.h"
 
+#include <boost/algorithm/string/join.hpp>
+#include <gutil/strings/split.h>
+#include <gutil/strings/stringpiece.h>
+
 #include "common/logging.h"
 #include "common/names.h"
+#include "runtime/exec-env.h"
+#include "service/impala-server.h"
 #include "util/metrics.h"
+#include "util/string-parser.h"
 #include "util/test-info.h"
+
+DECLARE_int32(num_expected_executors);
+DECLARE_string(expected_executor_group_sets);
 
 namespace {
 using namespace impala;
@@ -28,42 +38,87 @@ using namespace impala;
 /// Looks for an executor group with name 'name' in 'executor_groups' and returns it. If
 /// the group doesn't exist yet, it creates a new one and inserts it into
 /// 'executor_groups'.
-ExecutorGroup* FindOrInsertExecutorGroup(const TExecutorGroupDesc& group,
+ExecutorGroup* FindOrInsertExecutorGroup(const ExecutorGroupDescPB& group,
     ClusterMembershipMgr::ExecutorGroups* executor_groups) {
-  auto it = executor_groups->find(group.name);
+  auto it = executor_groups->find(group.name());
   if (it != executor_groups->end()) {
-    DCHECK_EQ(group.name, it->second.name());
+    DCHECK_EQ(group.name(), it->second.name());
     return &it->second;
   }
   bool inserted;
-  tie(it, inserted) = executor_groups->emplace(group.name, ExecutorGroup(group));
+  tie(it, inserted) = executor_groups->emplace(group.name(), ExecutorGroup(group));
   DCHECK(inserted);
   return &it->second;
 }
 
+/// Removes the executor 'be_desc' from the group 'group' if it exists and removes
+/// the group from the cluster if the group become empty after the executor removed.
+void RemoveExecutorAndGroup(const BackendDescriptorPB& be_desc,
+    const ExecutorGroupDescPB& group,
+    ClusterMembershipMgr::ExecutorGroups* executor_groups) {
+  auto it = executor_groups->find(group.name());
+  DCHECK(it != executor_groups->end());
+  DCHECK_EQ(group.name(), it->second.name());
+  it->second.RemoveExecutor(be_desc);
+  if (it->second.NumExecutors() == 0) {
+    VLOG(1) << "Removing empty group " << group.DebugString();
+    executor_groups->erase(it);
+  }
+}
 }
 
 namespace impala {
+
+static const string EMPTY_GROUP_NAME("empty group (using coordinator only)");
 
 static const string LIVE_EXEC_GROUP_KEY("cluster-membership.executor-groups.total");
 static const string HEALTHY_EXEC_GROUP_KEY(
     "cluster-membership.executor-groups.total-healthy");
 static const string TOTAL_BACKENDS_KEY("cluster-membership.backends.total");
+// Per group set metrics
+static const string LIVE_EXEC_GROUP_KEY_FORMAT(
+    "cluster-membership.group-set.executor-groups.total.$0");
+static const string HEALTHY_EXEC_GROUP_KEY_FORMAT(
+    "cluster-membership.group-set.executor-groups.total-healthy.$0");
+static const string TOTAL_BACKENDS_KEY_FORMAT(
+    "cluster-membership.group-set.backends.total.$0");
 
 ClusterMembershipMgr::ClusterMembershipMgr(
     string local_backend_id, StatestoreSubscriber* subscriber, MetricGroup* metrics)
-  : current_membership_(std::make_shared<const Snapshot>()),
+  : empty_exec_group_(EMPTY_GROUP_NAME),
+    current_membership_(std::make_shared<const Snapshot>()),
     statestore_subscriber_(subscriber),
-    thrift_serializer_(/* compact= */ false),
     local_backend_id_(move(local_backend_id)) {
-  DCHECK(metrics != nullptr);
-  MetricGroup* metric_grp = metrics->GetOrCreateChildGroup("cluster-membership");
-  total_live_executor_groups_ = metric_grp->AddCounter(LIVE_EXEC_GROUP_KEY, 0);
-  total_healthy_executor_groups_ = metric_grp->AddCounter(HEALTHY_EXEC_GROUP_KEY, 0);
-  total_backends_ = metric_grp->AddCounter(TOTAL_BACKENDS_KEY, 0);
+  Status status = PopulateExpectedExecGroupSets(expected_exec_group_sets_);
+  if(!status.ok()) {
+    LOG(FATAL) << "Error populating expected executor group sets: " << status;
+  }
+  InitMetrics(metrics);
   // Register the metric update function as a callback.
   RegisterUpdateCallbackFn([this](
       ClusterMembershipMgr::SnapshotPtr snapshot) { this->UpdateMetrics(snapshot); });
+}
+
+void ClusterMembershipMgr::InitMetrics(MetricGroup* metrics) {
+  DCHECK(metrics != nullptr);
+  MetricGroup* metric_grp = metrics->GetOrCreateChildGroup("cluster-membership");
+  aggregated_group_set_metrics_.total_live_executor_groups_ =
+      metric_grp->AddCounter(LIVE_EXEC_GROUP_KEY, 0);
+  aggregated_group_set_metrics_.total_healthy_executor_groups_ =
+      metric_grp->AddCounter(HEALTHY_EXEC_GROUP_KEY, 0);
+  aggregated_group_set_metrics_.total_backends_ =
+      metric_grp->AddCounter(TOTAL_BACKENDS_KEY, 0);
+
+  for (auto& set : expected_exec_group_sets_) {
+    GroupSetMetrics grp_set_metrics;
+    grp_set_metrics.total_live_executor_groups_ =
+        metric_grp->AddCounter(LIVE_EXEC_GROUP_KEY_FORMAT, 0, set.exec_group_name_prefix);
+    grp_set_metrics.total_healthy_executor_groups_ = metric_grp->AddCounter(
+        HEALTHY_EXEC_GROUP_KEY_FORMAT, 0, set.exec_group_name_prefix);
+    grp_set_metrics.total_backends_ =
+        metric_grp->AddCounter(TOTAL_BACKENDS_KEY_FORMAT, 0, set.exec_group_name_prefix);
+    per_group_set_metrics_.insert({set.exec_group_name_prefix, grp_set_metrics});
+  }
 }
 
 Status ClusterMembershipMgr::Init() {
@@ -190,17 +245,20 @@ void ClusterMembershipMgr::UpdateMembership(
     // Deleted item
     if (item.deleted) {
       if (new_backend_map->find(item.key) != new_backend_map->end()) {
-        const TBackendDescriptor& be_desc = (*new_backend_map)[item.key];
+        const BackendDescriptorPB& be_desc = (*new_backend_map)[item.key];
         bool blacklisted = new_blacklist->FindAndRemove(be_desc)
             == ExecutorBlacklist::State::BLACKLISTED;
+        if (blacklisted) {
+          VLOG(1) << "Removing backend " << item.key << " from blacklist (deleted)";
+          DCHECK(!IsBackendInExecutorGroups(be_desc, *new_executor_groups));
+        }
         // If the backend was quiescing or was previously blacklisted, it will already
         // have been removed from 'executor_groups'.
-        if (be_desc.is_executor && !be_desc.is_quiescing && !blacklisted) {
-          for (const auto& group : be_desc.executor_groups) {
-            VLOG(1) << "Removing backend " << item.key << " from group " << group
-                    << " (deleted)";
-            FindOrInsertExecutorGroup(
-                group, new_executor_groups)->RemoveExecutor(be_desc);
+        if (be_desc.is_executor() && !be_desc.is_quiescing() && !blacklisted) {
+          for (const auto& group : be_desc.executor_groups()) {
+            VLOG(1) << "Removing backend " << item.key << " from group "
+                    << group.DebugString() << " (deleted)";
+            RemoveExecutorAndGroup(be_desc, group, new_executor_groups);
           }
         }
         new_backend_map->erase(item.key);
@@ -209,38 +267,33 @@ void ClusterMembershipMgr::UpdateMembership(
     }
 
     // New or existing item
-    TBackendDescriptor be_desc;
-    // Benchmarks have suggested that this method can deserialize ~10m messages per
-    // second, so no immediate need to consider optimization.
-    uint32_t len = item.value.size();
-    Status status = DeserializeThriftMsg(
-        reinterpret_cast<const uint8_t*>(item.value.data()), &len, false, &be_desc);
-    if (!status.ok()) {
+    BackendDescriptorPB be_desc;
+    bool success = be_desc.ParseFromString(item.value);
+    if (!success) {
       LOG_EVERY_N(WARNING, 30) << "Error deserializing membership topic item with key: "
           << item.key;
       continue;
     }
-    if (be_desc.ip_address.empty()) {
+    if (be_desc.ip_address().empty()) {
       // Each backend resolves its own IP address and transmits it inside its backend
       // descriptor as part of the statestore update. If it is empty, then either that
       // code has been changed, or someone else is sending malformed packets.
       LOG_EVERY_N(WARNING, 30) << "Ignoring subscription request with empty IP address "
-          "from subscriber: " << TNetworkAddressToString(be_desc.address);
+          << "from subscriber: " << be_desc.address();
       continue;
     }
     if (item.key == local_backend_id_) {
       if (local_be_desc.get() == nullptr) {
         LOG_EVERY_N(WARNING, 30) << "Another host registered itself with the local "
-            << "backend id (" << item.key << "), but the local backend has not started "
-            "yet. The offending address is: " << TNetworkAddressToString(be_desc.address);
-      } else if (be_desc.address != local_be_desc->address) {
+             << "backend id (" << item.key << "), but the local backend has not started "
+             << "yet. The offending address is: " << be_desc.address();
+      } else if (be_desc.address() != local_be_desc->address()) {
         // Someone else has registered this subscriber ID with a different address. We
         // will try to re-register (i.e. overwrite their subscription), but there is
         // likely a configuration problem.
         LOG_EVERY_N(WARNING, 30) << "Duplicate subscriber registration from address: "
-            << TNetworkAddressToString(be_desc.address) << " (we are: "
-            << TNetworkAddressToString(local_be_desc->address) << ", backend id: "
-            << item.key << ")";
+            << be_desc.address() << " (we are: " << local_be_desc->address()
+            << ", backend id: " << item.key << ")";
       }
       // We will always set the local backend explicitly below, so we ignore it here.
       continue;
@@ -249,25 +302,39 @@ void ClusterMembershipMgr::UpdateMembership(
     auto it = new_backend_map->find(item.key);
     if (it != new_backend_map->end()) {
       // Update
-      TBackendDescriptor& existing = it->second;
-      bool blacklisted =
-          new_blacklist->FindAndRemove(be_desc) == ExecutorBlacklist::State::BLACKLISTED;
-      if (be_desc.is_quiescing && !existing.is_quiescing && existing.is_executor
-          && !blacklisted) {
-        // Executor needs to be removed from its groups
-        for (const auto& group : be_desc.executor_groups) {
-          VLOG(1) << "Removing backend " << item.key << " from group " << group
-                  << " (quiescing)";
-          FindOrInsertExecutorGroup(group, new_executor_groups)->RemoveExecutor(be_desc);
+      BackendDescriptorPB& existing = it->second;
+
+      // Once a backend starts quiescing, it must stay in the quiescing state until it
+      // has been deleted from the cluster membership. Once a node starts quiescing, it
+      // can never transfer back to a running state.
+      if (existing.is_quiescing()) DCHECK(be_desc.is_quiescing());
+
+      // If the node starts quiescing
+      if (be_desc.is_quiescing() && !existing.is_quiescing() && existing.is_executor()) {
+        // If the backend starts quiescing and it is present in the blacklist, remove it
+        // from the blacklist. If the backend is present in the blacklist, there is no
+        // need to remove it from the executor group because it has already been removed
+        bool blacklisted = new_blacklist->FindAndRemove(be_desc)
+            == ExecutorBlacklist::State::BLACKLISTED;
+        if (blacklisted) {
+          VLOG(1) << "Removing backend " << item.key << " from blacklist (quiescing)";
+          DCHECK(!IsBackendInExecutorGroups(be_desc, *new_executor_groups));
+        } else {
+          // Executor needs to be removed from its groups
+          for (const auto& group : be_desc.executor_groups()) {
+            VLOG(1) << "Removing backend " << item.key << " from group "
+                    << group.DebugString() << " (quiescing)";
+            RemoveExecutorAndGroup(be_desc, group, new_executor_groups);
+          }
         }
       }
       existing = be_desc;
     } else {
       // Create
       new_backend_map->insert(make_pair(item.key, be_desc));
-      if (!be_desc.is_quiescing && be_desc.is_executor) {
-        for (const auto& group : be_desc.executor_groups) {
-          VLOG(1) << "Adding backend " << item.key << " to group " << group;
+      if (!be_desc.is_quiescing() && be_desc.is_executor()) {
+        for (const auto& group : be_desc.executor_groups()) {
+          VLOG(1) << "Adding backend " << item.key << " to group " << group.DebugString();
           FindOrInsertExecutorGroup(group, new_executor_groups)->AddExecutor(be_desc);
         }
       }
@@ -281,12 +348,12 @@ void ClusterMembershipMgr::UpdateMembership(
   if (needs_blacklist_maintenance) {
     // Add any backends that were removed from the blacklist and put on probation back
     // into 'executor_groups'.
-    std::list<TBackendDescriptor> probation_list;
+    std::list<BackendDescriptorPB> probation_list;
     new_blacklist->Maintenance(&probation_list);
-    for (const TBackendDescriptor& be_desc : probation_list) {
-      for (const auto& group : be_desc.executor_groups) {
-        VLOG(1) << "Adding backend " << TNetworkAddressToString(be_desc.address)
-                << " to group " << group << " (passed blacklist timeout)";
+    for (const BackendDescriptorPB& be_desc : probation_list) {
+      for (const auto& group : be_desc.executor_groups()) {
+        VLOG(1) << "Adding backend " << be_desc.address() << " to group "
+                << group.DebugString() << " (passed blacklist timeout)";
         FindOrInsertExecutorGroup(group, new_executor_groups)->AddExecutor(be_desc);
       }
     }
@@ -298,13 +365,12 @@ void ClusterMembershipMgr::UpdateMembership(
   if (NeedsLocalBackendUpdate(*new_state, local_be_desc)) {
     // We need to update both the new membership state and the statestore
     (*new_backend_map)[local_backend_id_] = *local_be_desc;
-    for (const auto& group : local_be_desc->executor_groups) {
-      if (local_be_desc->is_quiescing) {
-        VLOG(1) << "Removing local backend from group " << group;
-        FindOrInsertExecutorGroup(
-            group, new_executor_groups)->RemoveExecutor(*local_be_desc);
-      } else if (local_be_desc->is_executor) {
-        VLOG(1) << "Adding local backend to group " << group;
+    for (const auto& group : local_be_desc->executor_groups()) {
+      if (local_be_desc->is_quiescing()) {
+        VLOG(1) << "Removing local backend from group " << group.DebugString();
+        RemoveExecutorAndGroup(*local_be_desc, group, new_executor_groups);
+      } else if (local_be_desc->is_executor()) {
+        VLOG(1) << "Adding local backend to group " << group.DebugString();
         FindOrInsertExecutorGroup(
             group, new_executor_groups)->AddExecutor(*local_be_desc);
       }
@@ -327,13 +393,26 @@ void ClusterMembershipMgr::UpdateMembership(
   recovering_membership_.reset();
 }
 
-void ClusterMembershipMgr::BlacklistExecutor(const TBackendDescriptor& be_desc) {
+void ClusterMembershipMgr::BlacklistExecutor(
+    const UniqueIdPB& backend_id, const Status& cause) {
+  DCHECK(!cause.ok());
   if (!ExecutorBlacklist::BlacklistingEnabled()) return;
   lock_guard<mutex> l(update_membership_lock_);
+
+  // Look up the descriptor in the current snapshot.
+  auto it = current_membership_->current_backends.find(PrintId(backend_id));
+  if (it == current_membership_->current_backends.end()) {
+    LOG(INFO) << "Did not blacklist " << PrintId(backend_id)
+              << " because it was already removed from the cluster membership.";
+    return;
+  }
+  const BackendDescriptorPB& be_desc = it->second;
+
   // Don't blacklist the local executor. Some queries may have root fragments that must be
   // scheduled on the coordinator and will always fail if its blacklisted.
-  if (be_desc.ip_address == current_membership_->local_be_desc->ip_address
-      && be_desc.address.port == current_membership_->local_be_desc->address.port) {
+  if (be_desc.ip_address() == current_membership_->local_be_desc->ip_address()
+      && be_desc.address().port()
+          == current_membership_->local_be_desc->address().port()) {
     return;
   }
 
@@ -348,10 +427,10 @@ void ClusterMembershipMgr::BlacklistExecutor(const TBackendDescriptor& be_desc) 
   // Check the Snapshot that we'll be updating to see if the backend is present, to avoid
   // copying the Snapshot if it isn't.
   bool exists = false;
-  for (const auto& group : be_desc.executor_groups) {
-    auto it = base_snapshot->executor_groups.find(group.name);
+  for (const auto& group : be_desc.executor_groups()) {
+    auto it = base_snapshot->executor_groups.find(group.name());
     if (it != base_snapshot->executor_groups.end()
-        && it->second.LookUpBackendDesc(be_desc.address) != nullptr) {
+        && it->second.LookUpBackendDesc(be_desc.address()) != nullptr) {
       exists = true;
       break;
     }
@@ -363,6 +442,8 @@ void ClusterMembershipMgr::BlacklistExecutor(const TBackendDescriptor& be_desc) 
     return;
   }
 
+  LOG(INFO) << "Blacklisting " << be_desc.address() << ": " << cause;
+
   std::shared_ptr<Snapshot> new_state;
   if (recovering) {
     // If the statestore is currently recovering, we can apply the blacklisting to
@@ -373,14 +454,14 @@ void ClusterMembershipMgr::BlacklistExecutor(const TBackendDescriptor& be_desc) 
   }
   ExecutorGroups* new_executor_groups = &(new_state->executor_groups);
 
-  for (const auto& group : be_desc.executor_groups) {
-    VLOG(1) << "Removing backend " << TNetworkAddressToString(be_desc.address)
-            << " from group " << group << " (blacklisted)";
-    FindOrInsertExecutorGroup(group, new_executor_groups)->RemoveExecutor(be_desc);
+  for (const auto& group : be_desc.executor_groups()) {
+    VLOG(1) << "Removing backend " << be_desc.address() << " from group "
+            << group.DebugString() << " (blacklisted)";
+    RemoveExecutorAndGroup(be_desc, group, new_executor_groups);
   }
 
   ExecutorBlacklist* new_blacklist = &(new_state->executor_blacklist);
-  new_blacklist->Blacklist(be_desc);
+  new_blacklist->Blacklist(be_desc, cause);
 
   // We'll call SetState() with 'recovering_membership_' once the statestore is no longer
   // in recovery.
@@ -407,7 +488,7 @@ void ClusterMembershipMgr::BlacklistExecutor(const TBackendDescriptor& be_desc) 
 }
 
 void ClusterMembershipMgr::AddLocalBackendToStatestore(
-    const TBackendDescriptor& local_be_desc,
+    const BackendDescriptorPB& local_be_desc,
     vector<TTopicDelta>* subscriber_topic_updates) {
   VLOG(1) << "Sending local backend to statestore";
 
@@ -421,10 +502,9 @@ void ClusterMembershipMgr::AddLocalBackendToStatestore(
 
   TTopicItem& item = update.topic_entries.back();
   item.key = local_backend_id_;
-  Status status = thrift_serializer_.SerializeToString(&local_be_desc, &item.value);
-  if (!status.ok()) {
-    LOG(FATAL) << "Failed to serialize Impala backend descriptor for statestore topic:"
-                << " " << status.GetDetail();
+  bool success = local_be_desc.SerializeToString(&item.value);
+  if (!success) {
+    LOG(FATAL) << "Failed to serialize Impala backend descriptor for statestore topic.";
     subscriber_topic_updates->pop_back();
     return;
   }
@@ -452,15 +532,15 @@ bool ClusterMembershipMgr::NeedsLocalBackendUpdate(const Snapshot& state,
   if (state.local_be_desc.get() == nullptr) return true;
   auto it = state.current_backends.find(local_backend_id_);
   if (it == state.current_backends.end()) return true;
-  return it->second.is_quiescing != local_be_desc->is_quiescing;
+  return it->second.is_quiescing() != local_be_desc->is_quiescing();
 }
 
 bool ClusterMembershipMgr::CheckConsistency(const BackendIdMap& current_backends,
     const ExecutorGroups& executor_groups, const ExecutorBlacklist& executor_blacklist) {
   // Build a map of all backend descriptors
-  std::unordered_map<TNetworkAddress, TBackendDescriptor> address_to_backend;
+  std::unordered_map<NetworkAddressPB, BackendDescriptorPB> address_to_backend;
   for (const auto& it : current_backends) {
-    address_to_backend.emplace(it.second.address, it.second);
+    address_to_backend.emplace(it.second.address(), it.second);
   }
 
   // Check groups against the map
@@ -468,38 +548,39 @@ bool ClusterMembershipMgr::CheckConsistency(const BackendIdMap& current_backends
     const string& group_name = group_it.first;
     const ExecutorGroup& group = group_it.second;
     ExecutorGroup::Executors backends = group.GetAllExecutorDescriptors();
-    for (const TBackendDescriptor& group_be : backends) {
-      if (!group_be.is_executor) {
-        LOG(WARNING) << "Backend " << group_be.address << " in group " << group_name
+    for (const BackendDescriptorPB& group_be : backends) {
+      if (!group_be.is_executor()) {
+        LOG(WARNING) << "Backend " << group_be.DebugString() << " in group " << group_name
             << " is not an executor";
         return false;
       }
-      if (group_be.is_quiescing) {
-        LOG(WARNING) << "Backend " << group_be.address << " in group " << group_name
+      if (group_be.is_quiescing()) {
+        LOG(WARNING) << "Backend " << group_be.DebugString() << " in group " << group_name
             << " is quiescing";
         return false;
       }
-      auto current_be_it = address_to_backend.find(group_be.address);
+      auto current_be_it = address_to_backend.find(group_be.address());
       if (current_be_it == address_to_backend.end()) {
-        LOG(WARNING) << "Backend " << group_be.address << " is in group " << group_name
-            << " but not in current set of backends";
+        LOG(WARNING) << "Backend " << group_be.DebugString() << " is in group "
+            << group_name << " but not in current set of backends";
         return false;
       }
-      if (current_be_it->second.is_quiescing != group_be.is_quiescing) {
-        LOG(WARNING) << "Backend " << group_be.address << " in group " << group_name
+      if (current_be_it->second.is_quiescing() != group_be.is_quiescing()) {
+        LOG(WARNING) << "Backend " << group_be.DebugString() << " in group " << group_name
             << " differs from backend in current set of backends: is_quiescing ("
-            << current_be_it->second.is_quiescing << " != " << group_be.is_quiescing
+            << current_be_it->second.is_quiescing() << " != " << group_be.is_quiescing()
             << ")";
         return false;
       }
-      if (current_be_it->second.is_executor != group_be.is_executor) {
-        LOG(WARNING) << "Backend " << group_be.address << " in group " << group_name
+      if (current_be_it->second.is_executor() != group_be.is_executor()) {
+        LOG(WARNING) << "Backend " << group_be.DebugString() << " in group " << group_name
             << " differs from backend in current set of backends: is_executor ("
-            << current_be_it->second.is_executor << " != " << group_be.is_executor << ")";
+            << current_be_it->second.is_executor() << " != " << group_be.is_executor()
+            << ")";
         return false;
       }
       if (executor_blacklist.IsBlacklisted(group_be)) {
-        LOG(WARNING) << "Backend " << group_be.address << " in group " << group_name
+        LOG(WARNING) << "Backend " << group_be.DebugString() << " in group " << group_name
                      << " is blacklisted.";
         return false;
       }
@@ -521,9 +602,160 @@ void ClusterMembershipMgr::UpdateMetrics(const SnapshotPtr& new_state){
     }
   }
   DCHECK_GE(total_live_executor_groups, healthy_executor_groups);
-  total_live_executor_groups_->SetValue(total_live_executor_groups);
-  total_healthy_executor_groups_->SetValue(healthy_executor_groups);
-  total_backends_->SetValue(new_state->current_backends.size());
+  aggregated_group_set_metrics_.total_live_executor_groups_->SetValue(
+      total_live_executor_groups);
+  aggregated_group_set_metrics_.total_healthy_executor_groups_->SetValue(
+      healthy_executor_groups);
+  aggregated_group_set_metrics_.total_backends_->SetValue(
+      new_state->current_backends.size());
+
+  for (auto& set : expected_exec_group_sets_) {
+    int total_backends = 0;
+    int64_t total_live_exec_groups = 0;
+    int64_t healthy_exec_groups = 0;
+    StringPiece prefix(set.exec_group_name_prefix);
+    for (const auto& group_it : new_state->executor_groups) {
+      StringPiece name(group_it.first);
+      if (!name.starts_with(prefix)) continue;
+      const ExecutorGroup& group = group_it.second;
+      if (group.IsHealthy()) {
+        ++healthy_exec_groups;
+      }
+      if (group.NumHosts() > 0) {
+        ++total_live_exec_groups;
+        total_backends += group.NumExecutors();
+      }
+    }
+    auto& grp_metrics = per_group_set_metrics_[set.exec_group_name_prefix];
+    grp_metrics.total_live_executor_groups_->SetValue(total_live_exec_groups);
+    grp_metrics.total_healthy_executor_groups_->SetValue(healthy_exec_groups);
+    grp_metrics.total_backends_->SetValue(total_backends);
+  }
+}
+
+bool ClusterMembershipMgr::IsBackendInExecutorGroups(
+    const BackendDescriptorPB& be_desc, const ExecutorGroups& executor_groups) {
+  for (const auto& executor_group : executor_groups) {
+    if (executor_group.second.LookUpBackendDesc(be_desc.address()) != nullptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// For the default executor group, we assume that local reads are preferred and will
+/// include the hostnames and IP addresses in the update to the frontend. For non-default
+/// executor groups, we assume that we will read data remotely and will only send the
+/// number of executors in the largest healthy group. When expected exec group sets are
+/// specified we apply the aforementioned steps for each group set.
+void PopulateExecutorMembershipRequest(ClusterMembershipMgr::SnapshotPtr& snapshot,
+    const vector<TExecutorGroupSet>& expected_exec_group_sets,
+    TUpdateExecutorMembershipRequest& update_req) {
+  vector<TExecutorGroupSet> exec_group_sets;
+  auto default_it =
+      snapshot->executor_groups.find(ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME);
+  if (default_it != snapshot->executor_groups.end()) {
+    exec_group_sets.emplace_back();
+    exec_group_sets.back().__set_expected_num_executors(FLAGS_num_expected_executors);
+    const ExecutorGroup* group = &(default_it->second);
+    for (const auto& backend : group->GetAllExecutorDescriptors()) {
+      if (backend.is_executor()) {
+        update_req.hostnames.insert(backend.address().hostname());
+        update_req.ip_addresses.insert(backend.ip_address());
+        exec_group_sets.back().curr_num_executors++;
+      }
+    }
+  } else {
+    if (expected_exec_group_sets.empty()) {
+      // Add a default exec group set if no expected group sets were specified.
+      exec_group_sets.emplace_back();
+      exec_group_sets.back().__set_expected_num_executors(FLAGS_num_expected_executors);
+    } else {
+      exec_group_sets.insert(exec_group_sets.begin(), expected_exec_group_sets.begin(),
+          expected_exec_group_sets.end());
+    }
+    int matching_exec_groups_found = 0;
+    for (auto& set : exec_group_sets) {
+      int max_num_executors = -1;
+      StringPiece prefix(set.exec_group_name_prefix);
+      DCHECK(!prefix.empty() || exec_group_sets.size() == 1)
+          << "An empty group set prefix can only exist if no executor group sets are "
+             "specified";
+      for (const auto& it : snapshot->executor_groups) {
+        StringPiece name(it.first);
+        if (!prefix.empty() && !name.starts_with(prefix)) continue;
+        matching_exec_groups_found++;
+        if (!it.second.IsHealthy()) continue;
+        int num_executors = it.second.NumExecutors();
+        if (num_executors > max_num_executors) {
+          max_num_executors = num_executors;
+          set.curr_num_executors = num_executors;
+        }
+      }
+    }
+    if (matching_exec_groups_found != snapshot->executor_groups.size()) {
+      vector<string> group_sets;
+      for (const auto& set : exec_group_sets) {
+        group_sets.push_back(set.exec_group_name_prefix);
+      }
+      vector<string> group_names;
+      for (const auto& it : snapshot->executor_groups) {
+        group_names.push_back(it.first);
+      }
+      LOG(WARNING) << "Some executor groups either do not match expected group sets or "
+                   "match to more than one set. Expected group sets: "
+                << boost::algorithm::join(group_sets, ",") << " Current executor groups: "
+                << boost::algorithm::join(group_names, ",");
+    }
+  }
+  update_req.__set_exec_group_sets(exec_group_sets);
+}
+
+Status ClusterMembershipMgr::PopulateExpectedExecGroupSets(
+    std::vector<TExecutorGroupSet>& expected_exec_group_sets) {
+  expected_exec_group_sets.clear();
+  std::unordered_set<string> parsed_group_prefixes;
+  vector<StringPiece> groups;
+  groups = strings::Split(FLAGS_expected_executor_group_sets, ",", strings::SkipEmpty());
+  if (groups.empty()) return Status::OK();
+
+  // Name and expected group size are separated by ':'.
+  for (const StringPiece& group : groups) {
+    int colon_idx = group.find_first_of(':');
+    string group_prefix = group.substr(0, colon_idx).as_string();
+    if (group_prefix.empty()) {
+      return Status(Substitute(
+          "Executor group set prefix cannot be empty for input: $0", group.ToString()));
+    }
+    if (parsed_group_prefixes.find(group_prefix) != parsed_group_prefixes.end()) {
+      return Status(Substitute(
+          "Executor group set prefix specified multiple times: $0", group.ToString()));
+    }
+    if (colon_idx != StringPiece::npos) {
+      StringParser::ParseResult result;
+      int64_t expected_num_executors = StringParser::StringToInt<int64_t>(
+          group.data() + colon_idx + 1, group.length() - colon_idx - 1, &result);
+      if (result != StringParser::PARSE_SUCCESS) {
+        return Status(
+            Substitute("Failed to parse expected executor group set size for input: $0",
+                group.ToString()));
+      }
+      expected_exec_group_sets.emplace_back();
+      expected_exec_group_sets.back().__set_exec_group_name_prefix(group_prefix);
+      expected_exec_group_sets.back().__set_expected_num_executors(
+          expected_num_executors);
+      parsed_group_prefixes.insert(group_prefix);
+    } else {
+      return Status(
+          Substitute("Invalid executor group set format: $0", group.ToString()));
+    }
+  }
+  // sort by increasing order expected group size.
+  sort(expected_exec_group_sets.begin(), expected_exec_group_sets.end(),
+      [](const TExecutorGroupSet& first, const TExecutorGroupSet& second) {
+        return first.expected_num_executors < second.expected_num_executors;
+      });
+  return Status::OK();
 }
 
 } // end namespace impala

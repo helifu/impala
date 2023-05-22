@@ -29,6 +29,9 @@
 #include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
 
+#include <openssl/crypto.h>
+#include <openssl/sha.h>
+
 #include "codegen/llvm-codegen.h"
 #include "common/init.h"
 #include "common/object-pool.h"
@@ -50,6 +53,7 @@
 #include "runtime/date-value.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/multi-precision.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.h"
@@ -65,6 +69,7 @@
 #include "udf/udf-test-harness.h"
 #include "util/asan.h"
 #include "util/debug-util.h"
+#include "util/decimal-util.h"
 #include "util/metrics.h"
 #include "util/string-parser.h"
 #include "util/string-util.h"
@@ -75,7 +80,6 @@
 
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disable_optimization_passes);
-DECLARE_bool(use_utc_for_unix_timestamp_conversions);
 DECLARE_string(hdfs_zone_info_zip);
 
 namespace posix_time = boost::posix_time;
@@ -175,17 +179,16 @@ class ScopedTimeZoneOverride {
   const Timezone* new_tz_;
 };
 
-// Enable FLAGS_use_local_tz_for_unix_timestamp_conversions for the duration of the scope.
-class ScopedLocalUnixTimestampConversionOverride {
- bool original_;
+class ScopedExecOption {
+ ImpaladQueryExecutor* executor_;
  public:
-  ScopedLocalUnixTimestampConversionOverride() {
-    original_ = FLAGS_use_local_tz_for_unix_timestamp_conversions;
-    FLAGS_use_local_tz_for_unix_timestamp_conversions = true;
+  ScopedExecOption(ImpaladQueryExecutor* executor, string option_string)
+      : executor_(executor) {
+    executor->PushExecOption(option_string);
   }
 
-  ~ScopedLocalUnixTimestampConversionOverride() {
-    FLAGS_use_local_tz_for_unix_timestamp_conversions = original_;
+  ~ScopedExecOption() {
+    executor_->PopExecOption();
   }
 };
 
@@ -310,8 +313,7 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     default_date_str_ = "cast('2011-01-01' as date)";
     default_bool_val_ = false;
     default_string_val_ = "abc";
-    default_timestamp_val_ = TimestampValue::FromUnixTime(1293872461,
-        TimezoneDatabase::GetUtcTimezone());
+    default_timestamp_val_ = TimestampValue::FromUnixTime(1293872461, UTCPTR);
     default_date_val_ = DateValue(2011, 1, 1);
     default_type_strs_[TYPE_TINYINT] =
         lexical_cast<string>(min_int_values_[TYPE_TINYINT]);
@@ -356,7 +358,11 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
       return "";
     }
     EXPECT_TRUE(status.ok()) << "stmt: " << stmt << "\nerror: " << status.GetDetail();
-    EXPECT_EQ(TypeToOdbcString(expr_type.type), result_types[0].type) << expr;
+    string odbcType = TypeToOdbcString(expr_type.ToThrift());
+    // ColumnType cannot be BINARY, so STRING is used instead.
+    string expectedType =
+        result_types[0].type == "binary" ? "string" : result_types[0].type;
+    EXPECT_EQ(odbcType, expectedType) << expr;
     return result_row;
   }
 
@@ -364,7 +370,7 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
   T ConvertValue(const string& value);
 
   void TestStringValue(const string& expr, const string& expected_result) {
-    EXPECT_EQ(expected_result, GetValue(expr, TYPE_STRING)) << expr;
+    EXPECT_EQ(expected_result, GetValue(expr, ColumnType(TYPE_STRING))) << expr;
   }
 
   // Tests that DST of the given timezone ends at 3am
@@ -377,7 +383,7 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
   }
 
   string TestStringValueRegex(const string& expr, const string& regex) {
-    const string results = GetValue(expr, TYPE_STRING);
+    const string results = GetValue(expr, ColumnType(TYPE_STRING));
     static const boost::regex e(regex);
     const bool is_regex_match = regex_match(results, e);
     EXPECT_TRUE(is_regex_match);
@@ -590,7 +596,7 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     } else {
       typeof_query = "typeof(" + query + ")";
     }
-    const string typeof_result = GetValue(typeof_query, TYPE_STRING);
+    const string typeof_result = GetValue(typeof_query, ColumnType(TYPE_STRING));
     EXPECT_EQ(expected_type.DebugString(), typeof_result) << typeof_query;
   }
 
@@ -626,6 +632,11 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     EXPECT_EQ(result, StringParser::PARSE_SUCCESS);
   }
 
+  template <class T> void TestValue(const string& expr, PrimitiveType expr_type,
+                                    const T& expected_result) {
+    return TestValue(expr, ColumnType(expr_type), expected_result);
+  }
+
   template <class T> void TestValue(const string& expr, const ColumnType& expr_type,
                                     const T& expected_result) {
     const string result = GetValue(expr, expr_type);
@@ -654,7 +665,7 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
         float expected_float;
         expected_float = static_cast<float>(expected_result);
         RawValue::PrintValue(reinterpret_cast<const void*>(&expected_float),
-                             TYPE_FLOAT, -1, &expected_str);
+                             ColumnType(TYPE_FLOAT), -1, &expected_str);
         EXPECT_EQ(expected_str, result) << expr;
         break;
       }
@@ -663,7 +674,7 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
         double expected_double;
         expected_double = static_cast<double>(expected_result);
         RawValue::PrintValue(reinterpret_cast<const void*>(&expected_double),
-                             TYPE_DOUBLE, -1, &expected_str);
+                             ColumnType(TYPE_DOUBLE), -1, &expected_str);
         EXPECT_EQ(expected_str, result) << expr;
         break;
       }
@@ -672,8 +683,26 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     }
   }
 
+  void TestIsNull(const string& expr, PrimitiveType expr_type) {
+    return TestIsNull(expr, ColumnType(expr_type));
+  }
+
   void TestIsNull(const string& expr, const ColumnType& expr_type) {
     EXPECT_TRUE(GetValue(expr, expr_type) == "NULL") << expr;
+  }
+
+  template <class T>
+  void TestValueOrError(const string& expr, PrimitiveType expr_type,
+      const T& expected_result, bool expect_error) {
+    if (expect_error) {
+      TestError(expr);
+    } else {
+      TestValue(expr, expr_type, expected_result);
+    }
+  }
+
+  void TestIsNotNull(const string& expr, PrimitiveType expr_type) {
+    return TestIsNotNull(expr, ColumnType(expr_type));
   }
 
   void TestIsNotNull(const string& expr, const ColumnType& expr_type) {
@@ -681,7 +710,7 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
   }
 
   void TestError(const string& expr) {
-    GetValue(expr, INVALID_TYPE, /* expect_error */ true);
+    GetValue(expr, ColumnType(INVALID_TYPE), /* expect_error */ true);
   }
 
   void TestNonOkStatus(const string& expr) {
@@ -755,28 +784,32 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     TestValue("0/0 < 1/0", TYPE_BOOLEAN, false);
   }
 
-  void TestStringComparisons() {
-    TestValue<bool>("'abc' = 'abc'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abc' = 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abc' != 'abcd'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abc' != 'abc'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abc' < 'abcd'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abcd' < 'abc'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abcd' < 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abc' > 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abcd' > 'abc'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abcd' > 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abc' <= 'abcd'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abcd' <= 'abc'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abcd' <= 'abcd'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abc' >= 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abcd' >= 'abc'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abcd' >= 'abcd'", TYPE_BOOLEAN, true);
+  void TestStringComparisons(string string_type) {
+    string abc = "cast('abc' as " + string_type + ")";
+    string abcd = "cast('abcd' as " + string_type + ")";
+    string empty = "cast('' as " + string_type + ")";
+
+    TestValue<bool>(abc + " = " + abc, TYPE_BOOLEAN, true);
+    TestValue<bool>(abc + " = " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abc + " != " + abcd, TYPE_BOOLEAN, true);
+    TestValue<bool>(abc + " != " + abc, TYPE_BOOLEAN, false);
+    TestValue<bool>(abc + " < " + abcd, TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " < " + abc, TYPE_BOOLEAN, false);
+    TestValue<bool>(abcd + " < " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abc + " > " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abcd + " > " + abc, TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " > " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abc + " <= " + abcd, TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " <= " + abc, TYPE_BOOLEAN, false);
+    TestValue<bool>(abcd + " <= " + abcd, TYPE_BOOLEAN, true);
+    TestValue<bool>(abc + " >= " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abcd + " >= " + abc, TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " >= " + abcd, TYPE_BOOLEAN, true);
 
     // Test some empty strings
-    TestValue<bool>("'abcd' >= ''", TYPE_BOOLEAN, true);
-    TestValue<bool>("'' > ''", TYPE_BOOLEAN, false);
-    TestValue<bool>("'' = ''", TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " >= " + empty, TYPE_BOOLEAN, true);
+    TestValue<bool>(empty + " > " + empty, TYPE_BOOLEAN, false);
+    TestValue<bool>(empty + " = " + empty, TYPE_BOOLEAN, true);
   }
 
   void TestDecimalComparisons() {
@@ -1151,26 +1184,41 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
 
   // Create a Literal expression out of 'str'. Adds the returned literal to pool_.
   Literal* CreateLiteral(const ColumnType& type, const string& str);
+  Literal* CreateLiteral(PrimitiveType type, const string& str);
 
   // Helper function for LiteralConstruction test. Creates a Literal expression
   // of 'type' from 'str' and verifies it compares equally to 'value'.
   template <typename T>
   void TestSingleLiteralConstruction(
       const ColumnType& type, const T& value, const string& string_val);
+  template <typename T>
+  void TestSingleLiteralConstruction(
+      PrimitiveType type, const T& value, const string& string_val);
 
-  // Test casting stmt to all types.  Expected result is val.
+  // Test casting stmt to all types. 'min_integer_size' is the byte size of the smallest
+  // signed integer expected to be able to hold the value. 'float_out_of_range' should be
+  // set to true if the value does not fit in a single precision float. The expected
+  // result is 'val' for the types that can hold the value and error for other types.
   template<typename T>
-  void TestCast(const string& stmt, T val, bool timestamp_out_of_range = false) {
+  void TestCast(const string& stmt, T val, int min_integer_size = 1,
+      bool float_out_of_range = false, bool timestamp_out_of_range = false) {
     TestValue("cast(" + stmt + " as boolean)", TYPE_BOOLEAN, static_cast<bool>(val));
-    TestValue("cast(" + stmt + " as tinyint)", TYPE_TINYINT, static_cast<int8_t>(val));
-    TestValue("cast(" + stmt + " as smallint)", TYPE_SMALLINT, static_cast<int16_t>(val));
-    TestValue("cast(" + stmt + " as int)", TYPE_INT, static_cast<int32_t>(val));
-    TestValue("cast(" + stmt + " as integer)", TYPE_INT, static_cast<int32_t>(val));
-    TestValue("cast(" + stmt + " as bigint)", TYPE_BIGINT, static_cast<int64_t>(val));
-    TestValue("cast(" + stmt + " as float)", TYPE_FLOAT, static_cast<float>(val));
     TestValue("cast(" + stmt + " as double)", TYPE_DOUBLE, static_cast<double>(val));
     TestValue("cast(" + stmt + " as real)", TYPE_DOUBLE, static_cast<double>(val));
     TestStringValue("cast(" + stmt + " as string)", lexical_cast<string>(val));
+
+    TestValueOrError("cast(" + stmt + " as tinyint)", TYPE_TINYINT,
+        static_cast<int8_t>(val), min_integer_size > sizeof(int8_t));
+    TestValueOrError("cast(" + stmt + " as smallint)", TYPE_SMALLINT,
+        static_cast<int16_t>(val), min_integer_size > sizeof(int16_t));
+    TestValueOrError("cast(" + stmt + " as int)", TYPE_INT,
+        static_cast<int32_t>(val), min_integer_size > sizeof(int32_t));
+    TestValueOrError("cast(" + stmt + " as integer)", TYPE_INT,
+        static_cast<int32_t>(val), min_integer_size > sizeof(int32_t));
+    TestValueOrError("cast(" + stmt + " as bigint)", TYPE_BIGINT,
+        static_cast<int64_t>(val), min_integer_size > sizeof(int64_t));
+    TestValueOrError("cast(" + stmt + " as float)", TYPE_FLOAT,
+        static_cast<float>(val), float_out_of_range);
     if (!timestamp_out_of_range) {
       TestTimestampValue("cast(" + stmt + " as timestamp)", CreateTestTimestamp(val));
     } else {
@@ -1186,6 +1234,8 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     return pool_.Add(
         UdfTestHarness::CreateTestContext(return_type, arg_types, state, pool));
   }
+
+  void TestBytes();
 };
 
 template<>
@@ -1195,41 +1245,50 @@ TimestampValue ExprTest::CreateTestTimestamp(const string& val) {
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(float val) {
-  return TimestampValue::FromSubsecondUnixTime(val, TimezoneDatabase::GetUtcTimezone());
+  return TimestampValue::FromSubsecondUnixTime(val, UTCPTR);
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(double val) {
-  return TimestampValue::FromSubsecondUnixTime(val, TimezoneDatabase::GetUtcTimezone());
+  return TimestampValue::FromSubsecondUnixTime(val, UTCPTR);
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(int val) {
-  return TimestampValue::FromUnixTime(val, TimezoneDatabase::GetUtcTimezone());
+  return TimestampValue::FromUnixTime(val, UTCPTR);
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(int64_t val) {
-  return TimestampValue::FromUnixTime(val, TimezoneDatabase::GetUtcTimezone());
+  return TimestampValue::FromUnixTime(val, UTCPTR);
 }
 
-// Test casting 'stmt' to each of the native types.  The result should be 'val'
-// 'stmt' is a partial stmt that could be of any valid type.
+// Test casting 'stmt' to each of the native types. See the general template definition
+// for more information.
 template<>
-void ExprTest::TestCast(const string& stmt, const char* val,
-    bool timestamp_out_of_range) {
+void ExprTest::TestCast(const string& stmt, const char* val, int min_integer_size,
+    bool float_out_of_range, bool timestamp_out_of_range) {
   try {
     int8_t val8 = static_cast<int8_t>(lexical_cast<int16_t>(val));
 #if 0
     // Hive has weird semantics.  What do we want to do?
     TestValue(stmt + " as boolean)", TYPE_BOOLEAN, lexical_cast<bool>(val));
 #endif
-    TestValue("cast(" + stmt + " as tinyint)", TYPE_TINYINT, val8);
-    TestValue("cast(" + stmt + " as smallint)", TYPE_SMALLINT, lexical_cast<int16_t>(val));
-    TestValue("cast(" + stmt + " as int)", TYPE_INT, lexical_cast<int32_t>(val));
-    TestValue("cast(" + stmt + " as bigint)", TYPE_BIGINT, lexical_cast<int64_t>(val));
-    TestValue("cast(" + stmt + " as float)", TYPE_FLOAT, lexical_cast<float>(val));
+    TestValueOrError("cast(" + stmt + " as tinyint)", TYPE_TINYINT,
+        val8, min_integer_size > sizeof(int8_t));
+    TestValueOrError("cast(" + stmt + " as smallint)", TYPE_SMALLINT,
+        lexical_cast<int16_t>(val), min_integer_size > sizeof(int16_t));
+    TestValueOrError("cast(" + stmt + " as int)", TYPE_INT,
+        lexical_cast<int32_t>(val), min_integer_size > sizeof(int32_t));
+    TestValueOrError("cast(" + stmt + " as integer)", TYPE_INT,
+        lexical_cast<int32_t>(val), min_integer_size > sizeof(int32_t));
+    TestValueOrError("cast(" + stmt + " as bigint)", TYPE_BIGINT,
+        lexical_cast<int64_t>(val), min_integer_size > sizeof(int64_t));
+    TestValueOrError("cast(" + stmt + " as float)", TYPE_FLOAT,
+        lexical_cast<float>(val), float_out_of_range);
+
     TestValue("cast(" + stmt + " as double)", TYPE_DOUBLE, lexical_cast<double>(val));
+    TestValue("cast(" + stmt + " as real)", TYPE_DOUBLE, lexical_cast<double>(val));
     TestStringValue("cast(" + stmt + " as string)", lexical_cast<string>(val));
   } catch (bad_lexical_cast& e) {
     EXPECT_TRUE(false) << e.what();
@@ -1290,20 +1349,21 @@ DateValue ExprTest::ConvertValue<DateValue>(const string& value) {
 // the ambiguity in TimestampValue::operator==, even with the appropriate casts.
 void ExprTest::TestTimestampValue(const string& expr, const TimestampValue& expected_result) {
   EXPECT_EQ(expected_result,
-      ConvertValue<TimestampValue>(GetValue(expr, TYPE_TIMESTAMP)));
+      ConvertValue<TimestampValue>(GetValue(expr, ColumnType(TYPE_TIMESTAMP))));
 }
 
 // Tests whether the returned TimestampValue is valid.
 // We use this function for tests where the expected value is unknown, e.g., now().
 void ExprTest::TestValidTimestampValue(const string& expr) {
   EXPECT_TRUE(
-      ConvertValue<TimestampValue>(GetValue(expr, TYPE_TIMESTAMP)).HasDateOrTime());
+      ConvertValue<TimestampValue>(GetValue(expr, ColumnType(TYPE_TIMESTAMP))).HasDate());
 }
 
 // We can't put this into TestValue() because GTest can't resolve
 // the ambiguity in DateValue::operator==, even with the appropriate casts.
 void ExprTest::TestDateValue(const string& expr, const DateValue& expected_result) {
-  EXPECT_EQ(expected_result, ConvertValue<DateValue>(GetValue(expr, TYPE_DATE)));
+  EXPECT_EQ(expected_result,
+      ConvertValue<DateValue>(GetValue(expr, ColumnType(TYPE_DATE))));
 }
 
 template<class T>
@@ -1390,6 +1450,9 @@ Literal* ExprTest::CreateLiteral(const ColumnType& type, const string& str) {
       return nullptr;
   }
 }
+Literal* ExprTest::CreateLiteral(PrimitiveType type, const string& str) {
+  return CreateLiteral(ColumnType(type), str);
+}
 
 template <typename T>
 void ExprTest::TestSingleLiteralConstruction(
@@ -1410,6 +1473,12 @@ void ExprTest::TestSingleLiteralConstruction(
   eval->Close(&state);
   expr->Close();
   state.ReleaseResources();
+}
+
+template <typename T>
+void ExprTest::TestSingleLiteralConstruction(
+    PrimitiveType type, const T& value, const string& string_val) {
+  return TestSingleLiteralConstruction(ColumnType(type), value, string_val);
 }
 
 TEST_P(ExprTest, NullLiteral) {
@@ -1489,14 +1558,14 @@ TEST_P(ExprTest, LiteralConstruction) {
 
 
 TEST_P(ExprTest, LiteralExprs) {
-  TestFixedPointLimits<int8_t>(TYPE_TINYINT);
-  TestFixedPointLimits<int16_t>(TYPE_SMALLINT);
-  TestFixedPointLimits<int32_t>(TYPE_INT);
-  TestFixedPointLimits<int64_t>(TYPE_BIGINT);
+  TestFixedPointLimits<int8_t>(ColumnType(TYPE_TINYINT));
+  TestFixedPointLimits<int16_t>(ColumnType(TYPE_SMALLINT));
+  TestFixedPointLimits<int32_t>(ColumnType(TYPE_INT));
+  TestFixedPointLimits<int64_t>(ColumnType(TYPE_BIGINT));
   // The value is not an exact FLOAT so it gets compared as a DOUBLE
   // and fails.  This needs to be researched.
   // TestFloatingPointLimits<float>(TYPE_FLOAT);
-  TestFloatingPointLimits<double>(TYPE_DOUBLE);
+  TestFloatingPointLimits<double>(ColumnType(TYPE_DOUBLE));
 
   TestValue("true", TYPE_BOOLEAN, true);
   TestValue("false", TYPE_BOOLEAN, false);
@@ -1543,104 +1612,104 @@ TEST_P(ExprTest, EscapeStringLiteral) {
 TEST_P(ExprTest, ArithmeticExprs) {
   // Test float ops.
   TestFixedResultTypeOps<float, float, double>(min_float_values_[TYPE_FLOAT],
-      min_float_values_[TYPE_FLOAT], TYPE_DOUBLE);
+      min_float_values_[TYPE_FLOAT], ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<float, double, double>(min_float_values_[TYPE_FLOAT],
-      min_float_values_[TYPE_DOUBLE], TYPE_DOUBLE);
+      min_float_values_[TYPE_DOUBLE], ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<double, double, double>(min_float_values_[TYPE_DOUBLE],
-      min_float_values_[TYPE_DOUBLE], TYPE_DOUBLE);
+      min_float_values_[TYPE_DOUBLE], ColumnType(TYPE_DOUBLE));
 
   // Test behavior of float ops at max/min value boundaries.
   // The tests with float type should trivially pass, since their results are double.
   TestFixedResultTypeOps<float, float, double>(numeric_limits<float>::min(),
-      numeric_limits<float>::min(), TYPE_DOUBLE);
+      numeric_limits<float>::min(), ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<float, float, double>(numeric_limits<float>::max(),
-      numeric_limits<float>::max(), TYPE_DOUBLE);
+      numeric_limits<float>::max(), ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<float, float, double>(numeric_limits<float>::min(),
-      numeric_limits<float>::max(), TYPE_DOUBLE);
+      numeric_limits<float>::max(), ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<float, float, double>(numeric_limits<float>::max(),
-      numeric_limits<float>::min(), TYPE_DOUBLE);
+      numeric_limits<float>::min(), ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<double, double, double>(numeric_limits<double>::min(),
-      numeric_limits<double>::min(), TYPE_DOUBLE);
+      numeric_limits<double>::min(), ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<double, double, double>(numeric_limits<double>::max(),
-      numeric_limits<double>::max(), TYPE_DOUBLE);
+      numeric_limits<double>::max(), ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<double, double, double>(numeric_limits<double>::min(),
-      numeric_limits<double>::max(), TYPE_DOUBLE);
+      numeric_limits<double>::max(), ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<double, double, double>(numeric_limits<double>::max(),
-      numeric_limits<double>::min(), TYPE_DOUBLE);
+      numeric_limits<double>::min(), ColumnType(TYPE_DOUBLE));
 
   // Test behavior with zero (especially for division by zero).
   TestFixedResultTypeOps<float, float, double>(min_float_values_[TYPE_FLOAT],
-      0.0f, TYPE_DOUBLE);
+      0.0f, ColumnType(TYPE_DOUBLE));
   TestFixedResultTypeOps<double, double, double>(min_float_values_[TYPE_DOUBLE],
-      0.0, TYPE_DOUBLE);
+      0.0, ColumnType(TYPE_DOUBLE));
 
   // Test ops that always promote to fixed type (e.g., next higher resolution type).
   TestFixedResultTypeOps<int8_t, int8_t, int16_t>(min_int_values_[TYPE_TINYINT],
-      min_int_values_[TYPE_TINYINT], TYPE_SMALLINT);
+      min_int_values_[TYPE_TINYINT], ColumnType(TYPE_SMALLINT));
   TestFixedResultTypeOps<int8_t, int16_t, int32_t>(min_int_values_[TYPE_TINYINT],
-      min_int_values_[TYPE_SMALLINT], TYPE_INT);
+      min_int_values_[TYPE_SMALLINT], ColumnType(TYPE_INT));
   TestFixedResultTypeOps<int8_t, int32_t, int64_t>(min_int_values_[TYPE_TINYINT],
-      min_int_values_[TYPE_INT], TYPE_BIGINT);
+      min_int_values_[TYPE_INT], ColumnType(TYPE_BIGINT));
   TestFixedResultTypeOps<int8_t, int64_t, int64_t>(min_int_values_[TYPE_TINYINT],
-      min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
+      min_int_values_[TYPE_BIGINT], ColumnType(TYPE_BIGINT));
   TestFixedResultTypeOps<int16_t, int16_t, int32_t>(min_int_values_[TYPE_SMALLINT],
-      min_int_values_[TYPE_SMALLINT], TYPE_INT);
+      min_int_values_[TYPE_SMALLINT], ColumnType(TYPE_INT));
   TestFixedResultTypeOps<int16_t, int32_t, int64_t>(min_int_values_[TYPE_SMALLINT],
-      min_int_values_[TYPE_INT], TYPE_BIGINT);
+      min_int_values_[TYPE_INT], ColumnType(TYPE_BIGINT));
   TestFixedResultTypeOps<int16_t, int64_t, int64_t>(min_int_values_[TYPE_SMALLINT],
-      min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
+      min_int_values_[TYPE_BIGINT], ColumnType(TYPE_BIGINT));
   TestFixedResultTypeOps<int32_t, int32_t, int64_t>(min_int_values_[TYPE_INT],
-      min_int_values_[TYPE_INT], TYPE_BIGINT);
+      min_int_values_[TYPE_INT], ColumnType(TYPE_BIGINT));
   TestFixedResultTypeOps<int32_t, int64_t, int64_t>(min_int_values_[TYPE_INT],
-      min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
+      min_int_values_[TYPE_BIGINT], ColumnType(TYPE_BIGINT));
   TestFixedResultTypeOps<int64_t, int64_t, int64_t>(min_int_values_[TYPE_BIGINT],
-      min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
+      min_int_values_[TYPE_BIGINT], ColumnType(TYPE_BIGINT));
 
   // Test behavior on overflow/underflow.
   TestFixedResultTypeOps<int64_t, int64_t, int64_t>(numeric_limits<int64_t>::min()+1,
-      numeric_limits<int64_t>::min()+1, TYPE_BIGINT);
+      numeric_limits<int64_t>::min()+1, ColumnType(TYPE_BIGINT));
   TestFixedResultTypeOps<int64_t, int64_t, int64_t>(numeric_limits<int64_t>::max(),
-      numeric_limits<int64_t>::max(), TYPE_BIGINT);
+      numeric_limits<int64_t>::max(), ColumnType(TYPE_BIGINT));
   TestFixedResultTypeOps<int64_t, int64_t, int64_t>(numeric_limits<int64_t>::min()+1,
-      numeric_limits<int64_t>::max(), TYPE_BIGINT);
+      numeric_limits<int64_t>::max(), ColumnType(TYPE_BIGINT));
   TestFixedResultTypeOps<int64_t, int64_t, int64_t>(numeric_limits<int64_t>::max(),
-      numeric_limits<int64_t>::min()+1, TYPE_BIGINT);
+      numeric_limits<int64_t>::min()+1, ColumnType(TYPE_BIGINT));
 
   // Test behavior with NULLs.
   TestNullOperandFixedResultTypeOps<float, double>(min_float_values_[TYPE_FLOAT],
-      TYPE_DOUBLE);
+      ColumnType(TYPE_DOUBLE));
   TestNullOperandFixedResultTypeOps<double, double>(min_float_values_[TYPE_DOUBLE],
-      TYPE_DOUBLE);
+      ColumnType(TYPE_DOUBLE));
   TestNullOperandFixedResultTypeOps<int8_t, int64_t>(min_int_values_[TYPE_TINYINT],
-      TYPE_SMALLINT);
+      ColumnType(TYPE_SMALLINT));
   TestNullOperandFixedResultTypeOps<int16_t, int64_t>(min_int_values_[TYPE_SMALLINT],
-      TYPE_INT);
+      ColumnType(TYPE_INT));
   TestNullOperandFixedResultTypeOps<int32_t, int64_t>(min_int_values_[TYPE_INT],
-      TYPE_BIGINT);
+      ColumnType(TYPE_BIGINT));
   TestNullOperandFixedResultTypeOps<int64_t, int64_t>(min_int_values_[TYPE_BIGINT],
-      TYPE_BIGINT);
+      ColumnType(TYPE_BIGINT));
 
   // Test int ops that promote to assignment compatible type.
   TestVariableResultTypeIntOps<int8_t, int8_t>(min_int_values_[TYPE_TINYINT],
-      min_int_values_[TYPE_TINYINT], TYPE_TINYINT);
+      min_int_values_[TYPE_TINYINT], ColumnType(TYPE_TINYINT));
   TestVariableResultTypeIntOps<int8_t, int16_t>(min_int_values_[TYPE_TINYINT],
-      min_int_values_[TYPE_SMALLINT], TYPE_SMALLINT);
+      min_int_values_[TYPE_SMALLINT], ColumnType(TYPE_SMALLINT));
   TestVariableResultTypeIntOps<int8_t, int32_t>(min_int_values_[TYPE_TINYINT],
-      min_int_values_[TYPE_INT], TYPE_INT);
+      min_int_values_[TYPE_INT], ColumnType(TYPE_INT));
   TestVariableResultTypeIntOps<int8_t, int64_t>(min_int_values_[TYPE_TINYINT],
-      min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
+      min_int_values_[TYPE_BIGINT], ColumnType(TYPE_BIGINT));
   TestVariableResultTypeIntOps<int16_t, int16_t>(min_int_values_[TYPE_SMALLINT],
-      min_int_values_[TYPE_SMALLINT], TYPE_SMALLINT);
+      min_int_values_[TYPE_SMALLINT], ColumnType(TYPE_SMALLINT));
   TestVariableResultTypeIntOps<int16_t, int32_t>(min_int_values_[TYPE_SMALLINT],
-      min_int_values_[TYPE_INT],TYPE_INT);
+      min_int_values_[TYPE_INT],ColumnType(TYPE_INT));
   TestVariableResultTypeIntOps<int16_t, int64_t>(min_int_values_[TYPE_SMALLINT],
-      min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
+      min_int_values_[TYPE_BIGINT], ColumnType(TYPE_BIGINT));
   TestVariableResultTypeIntOps<int32_t, int32_t>(min_int_values_[TYPE_INT],
-      min_int_values_[TYPE_INT], TYPE_INT);
+      min_int_values_[TYPE_INT], ColumnType(TYPE_INT));
   TestVariableResultTypeIntOps<int32_t, int64_t>(min_int_values_[TYPE_INT],
-      min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
+      min_int_values_[TYPE_BIGINT], ColumnType(TYPE_BIGINT));
   TestVariableResultTypeIntOps<int64_t, int64_t>(min_int_values_[TYPE_BIGINT],
-      min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
+      min_int_values_[TYPE_BIGINT], ColumnType(TYPE_BIGINT));
 
   // Test behavior of INT_DIVIDE and MOD with zero as second argument.
   IntValMap::iterator int_iter;
@@ -1653,13 +1722,13 @@ TEST_P(ExprTest, ArithmeticExprs) {
 
   // Test behavior with NULLs.
   TestNullOperandVariableResultTypeIntOps<int8_t>(min_int_values_[TYPE_TINYINT],
-      TYPE_TINYINT);
+      ColumnType(TYPE_TINYINT));
   TestNullOperandVariableResultTypeIntOps<int16_t>(min_int_values_[TYPE_SMALLINT],
-      TYPE_SMALLINT);
+      ColumnType(TYPE_SMALLINT));
   TestNullOperandVariableResultTypeIntOps<int32_t>(min_int_values_[TYPE_INT],
-      TYPE_INT);
+      ColumnType(TYPE_INT));
   TestNullOperandVariableResultTypeIntOps<int64_t>(min_int_values_[TYPE_BIGINT],
-      TYPE_BIGINT);
+      ColumnType(TYPE_BIGINT));
 
   // Tests for dealing with '-'.
   TestValue("-1", TYPE_TINYINT, -1);
@@ -3034,7 +3103,7 @@ void TestScaleBy() {
           // overflows in all cases.
           EXPECT_TRUE((-scaled_up_dividend) / scale_multiplier ==
               ConvertToInt256(-dividend));
-          int256_t max_divisor = ConvertToInt256(DecimalUtil::MAX_UNSCALED_DECIMAL16);
+          int256_t max_divisor = ConvertToInt256(MAX_UNSCALED_DECIMAL16);
           EXPECT_TRUE(scaled_up_dividend / max_divisor > max_divisor);
           EXPECT_TRUE((-scaled_up_dividend) / max_divisor < -max_divisor);
         } else {
@@ -3135,7 +3204,10 @@ TEST_P(ExprTest, BinaryPredicates) {
   TestFixedPointComparisons<int64_t>(false);
   TestFloatingPointComparisons<float>(true);
   TestFloatingPointComparisons<double>(false);
-  TestStringComparisons();
+  TestStringComparisons("STRING");
+  TestStringComparisons("BINARY");
+  TestStringComparisons("VARCHAR(4)");
+  TestStringComparisons("CHAR(4)");
   TestDecimalComparisons();
   TestNullComparisons();
   TestDistinctFrom();
@@ -3175,36 +3247,47 @@ TEST_P(ExprTest, CastExprs) {
   TestCast("cast(0.1234567890123 as float)", 0.1234567890123f);
   TestCast("cast(0.1234567890123 as float)", 0.123456791f); // same as above
   TestCast("cast(0.00000000001234567890123 as float)", 0.00000000001234567890123f);
-  TestCast("cast(123456 as float)", 123456.0f);
+  TestCast("cast(123456 as float)", 123456.0f, 4, false, false);
 
   // From http://en.wikipedia.org/wiki/Single-precision_floating-point_format
   // Min positive normal value
   TestCast("cast(1.1754944e-38 as float)", 1.1754944e-38f);
   // Max representable value
-  TestCast("cast(3.4028234e38 as float)", 3.4028234e38f, true);
-
+  TestCast("cast(3.4028234e38 as float)", 3.4028234e38f, 32, false, true);
 
   // From Double
   TestCast("cast(0.0 as double)", 0.0);
   TestCast("cast(5.0 as double)", 5.0);
   TestCast("cast(-5.0 as double)", -5.0);
-  TestCast("cast(0.123e10 as double)", 0.123e10);
-  TestCast("cast(123.123e10 as double)", 123.123e10, true);
+  TestCast("cast(0.123e10 as double)", 0.123e10, 4, false, false);
+  TestCast("cast(123.123e10 as double)", 123.123e10, 8, false, true);
   TestCast("cast(1.01234567890123456789 as double)", 1.01234567890123456789);
   TestCast("cast(1.01234567890123456789 as double)", 1.0123456789012346); // same as above
   TestCast("cast(0.01234567890123456789 as double)", 0.01234567890123456789);
   TestCast("cast(0.1234567890123456789 as double)", 0.1234567890123456789);
   TestCast("cast(-2.2250738585072020E-308 as double)", -2.2250738585072020e-308);
+  // casting string to double
+  TestCast("cast('0.43149576573887316' as double)", 0.43149576573887316);
+  TestCast("cast('-0.43149576573887316' as double)", -0.43149576573887316);
+  TestCast("cast('0.123e10' as double)", 0.123e10, 4, false, false);
+  TestCast("cast('123.123e10' as double)", 123.123e10, 8, false, true);
+  TestCast("cast('1.01234567890123456789' as double)", 1.01234567890123456789);
 
   // From http://en.wikipedia.org/wiki/Double-precision_floating-point_format
   // Min subnormal positive double
   TestCast("cast(4.9406564584124654e-324 as double)", 4.9406564584124654e-324);
+  TestCast("cast('4.9406564584124654e-324' as double)", 4.9406564584124654e-324);
   // Max subnormal double
   TestCast("cast(2.2250738585072009e-308 as double)", 2.2250738585072009e-308);
+  TestCast("cast('2.2250738585072009e-308' as double)", 2.2250738585072009e-308);
   // Min normal positive double
   TestCast("cast(2.2250738585072014e-308 as double)", 2.2250738585072014e-308);
+  TestCast("cast('2.2250738585072014e-308' as double)", 2.2250738585072014e-308);
   // Max Double
-  TestCast("cast(1.7976931348623157e+308 as double)", 1.7976931348623157e308, true);
+  TestCast("cast(1.7976931348623157e+308 as double)", 1.7976931348623157e308,
+      128, true, true);
+  TestCast("cast('1.7976931348623157e+308' as double)", 1.7976931348623157e308,
+      128, true, true);
 
   // From String
   TestCast("'0'", "0");
@@ -3236,16 +3319,15 @@ TEST_P(ExprTest, CastExprs) {
       TimestampValue::ParseSimpleDateFormat("2001-01-21 01:05:31.123450000"));
   TestTimestampValue("cast('2001-1-21 1:5:31.12345678910111213' as timestamp)",
       TimestampValue::ParseSimpleDateFormat("2001-01-21 01:05:31.123456789"));
-  TestTimestampValue("cast('1:05:1.12' as timestamp)",
-      TimestampValue::ParseSimpleDateFormat("01:05:01.120000000"));
-  TestTimestampValue("cast('1:05:1' as timestamp)",
-      TimestampValue::ParseSimpleDateFormat("01:05:01"));
   TestTimestampValue("cast('        2001-01-9 1:05:1        ' as timestamp)",
       TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
   TestIsNull("cast('2001-6' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('01-1-21' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2001-1-21 12:5:3 AM' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('1:05:31.123456foo' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1:05:1.12' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1:05:1' as timestamp)", TYPE_TIMESTAMP);
+
   TestIsNull("cast('10/feb/10' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('1909-foo1-2bar' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('1909/1-/2' as timestamp)", TYPE_TIMESTAMP);
@@ -3307,20 +3389,20 @@ TEST_P(ExprTest, CastExprs) {
       TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
   TestTimestampValue("cast('  \t\r\n      2001-01-09   \t\r\n     ' as timestamp)",
       TimestampValue::ParseSimpleDateFormat("2001-01-09"));
-  TestTimestampValue("cast('  \t\r\n      01:05:01   \t\r\n     ' as timestamp)",
-      TimestampValue::ParseSimpleDateFormat("01:05:01"));
-  TestTimestampValue("cast(' \t\r\n 01:05:01.123456789   \t\r\n     ' as timestamp)",
-      TimestampValue::ParseSimpleDateFormat("01:05:01.123456789"));
   TestTimestampValue("cast('  \t\r\n      2001-1-9 1:5:1    \t\r\n    ' as timestamp)",
       TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
   TestTimestampValue("cast('  \t\r\n  2001-1-9 1:5:1.12345678  \t\r\n ' as timestamp)",
       TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01.123456780"));
-  TestTimestampValue("cast('  \t\r\n      1:5:1    \t\r\n    ' as timestamp)",
-      TimestampValue::ParseSimpleDateFormat("01:05:01"));
-  TestTimestampValue("cast('  \t\r\n      1:5:1.12345678    \t\r\n    ' as timestamp)",
-      TimestampValue::ParseSimpleDateFormat("01:05:01.123456780"));
   TestTimestampValue("cast('  \t\r\n      2001-1-9    \t\r\n    ' as timestamp)",
       TimestampValue::ParseSimpleDateFormat("2001-01-09"));
+
+  // IMPALA-9531: Dateless timestamps without format should return NULL
+  TestIsNull(
+      "cast('  \t\r\n      1:5:1.12345678    \t\r\n    ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('  \t\r\n      1:5:1    \t\r\n    ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull(
+      "cast(' \t\r\n 01:05:01.123456789   \t\r\n     ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('  \t\r\n      01:05:01   \t\r\n     ' as timestamp)", TYPE_TIMESTAMP);
 
   // IMPALA-6995: whitespace-only strings should return NULL.
   TestIsNull("cast(' ' as timestamp)", TYPE_TIMESTAMP);
@@ -3464,6 +3546,81 @@ TEST_P(ExprTest, CastExprs) {
   TestValue<int16_t>("cast(10000000 as smallint)", TYPE_SMALLINT, val & 0xffff);
   TestValue<int16_t>("cast(-10000000 as smallint)", TYPE_SMALLINT, -val & 0xffff);
 #endif
+}
+
+// Test overflow and boundaries in case of narrowing conversions: from floating point to
+// integer types or from double to float.
+TEST_P(ExprTest, CastFloatingPointNarrowing) {
+  // TINYINT
+  // Valid values on the boundary.
+  constexpr int64_t int8_max = std::numeric_limits<int8_t>::max();
+  constexpr int64_t int8_min = std::numeric_limits<int8_t>::min();
+  TestValue(Substitute("cast(cast($0 as float) as tinyint)", int8_max),
+      TYPE_TINYINT, int8_max);
+  TestValue(Substitute("cast(cast($0 as float) as tinyint)", -int8_max),
+      TYPE_TINYINT, -int8_max);
+  TestValue(Substitute("cast(cast($0 as float) as tinyint)", int8_min),
+      TYPE_TINYINT, int8_min);
+
+  // Values outside the valid range.
+  TestError(Substitute("cast(cast($0 as float) as tinyint)", int8_max + 1));
+  TestError(Substitute("cast(cast($0 as float) as tinyint)", int8_min - 1));
+
+  // SMALLINT
+  // Valid values on the boundary.
+  constexpr int64_t int16_max = std::numeric_limits<int16_t>::max();
+  constexpr int64_t int16_min = std::numeric_limits<int16_t>::min();
+  TestValue(Substitute("cast(cast($0 as float) as smallint)", int16_max),
+      TYPE_SMALLINT, int16_max);
+  TestValue(Substitute("cast(cast($0 as float) as smallint)", -int16_max),
+      TYPE_SMALLINT, -int16_max);
+  TestValue(Substitute("cast(cast($0 as float) as smallint)", int16_min),
+      TYPE_SMALLINT, int16_min);
+
+  // Values outside the valid range.
+  TestError(Substitute("cast(cast($0 as float) as smallint)", int16_max + 1));
+  TestError(Substitute("cast(cast($0 as float) as smallint)", int16_min - 1));
+
+  // INT
+  // Valid values on the boundary.
+  constexpr int64_t int32_max = std::numeric_limits<int32_t>::max();
+  constexpr int64_t int32_min = std::numeric_limits<int32_t>::min();
+  TestValue(Substitute("cast(cast($0 as double) as int)", int32_max),
+      TYPE_INT, int32_max);
+  TestValue(Substitute("cast(cast($0 as double) as int)", -int32_max),
+      TYPE_INT, -int32_max);
+  TestValue(Substitute("cast(cast($0 as double) as int)", int32_min),
+      TYPE_INT, int32_min);
+
+  // Values outside the valid range.
+  TestError(Substitute("cast(cast($0 as double) as int)", int32_max + 1));
+  TestError(Substitute("cast(cast($0 as double) as int)", int32_min - 1));
+
+  // BIGINT
+  // Values outside the valid range: the limit values of BIGINT cannot be represented
+  // exactly as DOUBLE, and casting them to DOUBLE produces a value that is outside the
+  // range of BIGINT.
+  constexpr int64_t int64_max = std::numeric_limits<int64_t>::max();
+  constexpr int64_t int64_min = std::numeric_limits<int64_t>::min();
+  TestError(Substitute("cast(cast($0 as double) as bigint)", int64_max));
+  TestError(Substitute("cast(cast($0 as double) as bigint)", int64_min));
+
+  // DOUBLE to FLOAT
+  // Valid values on the boundary.
+  constexpr double float_max = std::numeric_limits<float>::max();
+  constexpr double float_min = std::numeric_limits<float>::lowest();
+  TestValue(Substitute("cast(cast($0 as double) as float)", float_max),
+      TYPE_FLOAT, float_max);
+  TestValue(Substitute("cast(cast($0 as double) as float)", float_min),
+      TYPE_FLOAT, float_min);
+
+  // Values outside the valid range.
+  // 'float_max + 1' is not representable as a float or double. We find the next
+  // representable double that is greater than 'float_max'.
+  const double next_double = std::nextafter(
+      float_max, std::numeric_limits<double>::max());
+  TestError(Substitute("cast(cast($0 as double) as float)", next_double));
+  TestError(Substitute("cast(cast($0 as double) as float)", -next_double));
 }
 
 // Test casting from/to Date.
@@ -3878,6 +4035,39 @@ TEST_P(ExprTest, BetweenPredicate) {
   TestIsNull("1 between 0 and NULL", TYPE_BOOLEAN);
   TestIsNull("1 between NULL and NULL", TYPE_BOOLEAN);
   TestIsNull("NULL between NULL and NULL", TYPE_BOOLEAN);
+}
+
+TEST_P(ExprTest, CompoundVerticalBarExpr) {
+  // CompoundVerticalBarExpr is rewritten into a compound predicate
+  // or concat FunctionCallExpr based on the arguments
+  TestValue("5 > 2 || 3 < 6", TYPE_BOOLEAN, true);
+  TestValue("TRUE || NULL", TYPE_BOOLEAN, true);
+  TestIsNull("FALSE || NULL", TYPE_BOOLEAN);
+
+  TestStringValue("'abc' || '5'", "abc5");
+  TestStringValue("cast('foo  ' AS CHAR(5)) || '3'", "foo  3");
+  TestStringValue("cast('foo  ' AS CHAR(5)) || '3'", "foo  3");
+
+  TestIsNull("cast(NULL AS STRING) || 'abc'", TYPE_STRING);
+  TestIsNull("concat (cast(NULL AS STRING), 'abc')", TYPE_STRING);
+
+  TestStringValue("cast(NULL AS CHAR(5)) || 'abc'", "NULL");
+  TestStringValue("cast(NULL AS STRING) || 'abc'", "NULL");
+  TestStringValue("'abc' || cast(NULL AS CHAR(5))", "NULL");
+  TestStringValue("'abc' || cast(NULL AS STRING)", "NULL");
+
+  TestError("NULL || 'abc'");
+  TestError("NULL || cast('abc' AS CHAR(3))");
+  TestError("'xyz' || NULL");
+  TestError("cast('xyz' AS CHAR(3)) || NULL");
+  TestError("TRUE || 'abc'");
+  TestError("'abc' || FALSE");
+  TestError("'abc' || 5");
+  TestError("5 || 6");
+  TestError("5.1 || 6.2");
+  TestError("cast('2011-10-22 09:10:11' as timestamp)"
+            " || cast('2016-10-22 09:10:11' as timestamp)");
+  TestError("cast('2011-01-02' as date) || cast('2020-01-02' as date)");
 }
 
 // Tests with NULLs are in the FE QueryTest.
@@ -4502,9 +4692,9 @@ TEST_P(ExprTest, StringFunctions) {
   TestIsNull("repeat('ab', NULL)", TYPE_STRING);
   TestIsNull("repeat(NULL, NULL)", TYPE_STRING);
   TestErrorString("repeat('x', 1024 * 1024 * 1024 * 10)", "Number of repeats in "
-      "repeat() call is larger than allowed limit of 1 GB character data.\n");
+      "repeat() call is larger than allowed limit of 1.00 GB character data.\n");
   TestErrorString("repeat('xx', 1024 * 1024 * 1024)", "repeat() result is larger than "
-      "allowed limit of 1 GB character data.\n");
+      "allowed limit of 1.00 GB character data.\n");
 
   TestValue("ascii('')", TYPE_INT, 0);
   TestValue("ascii('abcde')", TYPE_INT, 'a');
@@ -4654,6 +4844,26 @@ TEST_P(ExprTest, StringFunctions) {
   TestIsNull("concat('a', 'b', NULL)", TYPE_STRING);
   TestStringValue("concat('', '', '')", "");
 
+  // Concat should work with BINARY the same way as with STRING
+  TestStringValue("concat(cast('a' as binary))", "a");
+  TestStringValue("concat(cast('a' as binary), cast('b' as binary))", "ab");
+  TestStringValue(
+      "concat(cast('a' as binary), cast('b' as binary), cast('cde' as binary))",
+      "abcde");
+  TestStringValue(
+      "concat(cast('a' as binary) , cast('b' as binary), "
+      "cast('cde' as binary), cast('fg' as binary))",
+      "abcdefg");
+  TestStringValue(
+       "concat(cast('a' as binary), cast('b' as binary), cast('cde' as binary), "
+       "cast('' as binary), cast('fg' as binary), cast('' as binary))",
+       "abcdefg");
+  TestIsNull("concat(cast(NULL as binary))", TYPE_STRING);
+  TestIsNull("concat(cast('a' as binary), NULL, cast('b' as binary))", TYPE_STRING);
+  TestIsNull("concat(cast('a' as binary), cast('b' as binary), NULL)", TYPE_STRING);
+  TestStringValue(
+      "concat(cast('' as binary), cast('' as binary), cast('' as binary))", "");
+
   TestStringValue("concat_ws(',', 'a')", "a");
   TestStringValue("concat_ws(',', 'a', 'b')", "a,b");
   TestStringValue("concat_ws(',', 'a', 'b', 'cde')", "a,b,cde");
@@ -4768,7 +4978,11 @@ TEST_P(ExprTest, StringBase64Coding) {
   TestStringValue("base64encode('alpha')","YWxwaGE=");
   TestStringValue("base64decode('YWxwaGE=')","alpha");
   TestIsNull("base64decode('YWxwaGE')", TYPE_STRING);
+#ifndef __aarch64__
   TestIsNull("base64decode('YWxwaGE%')", TYPE_STRING);
+#else
+  TestStringValue("base64decode('YWxwaGE%')", "alpha\377");
+#endif
 
   // Test random short strings.
   srand(0);
@@ -5395,9 +5609,9 @@ TEST_P(ExprTest, UtilityFunctions) {
   TestIsNull("fnv_hash(NULL)", TYPE_BIGINT);
 }
 
-// Test that UtilityFunctions::Coordinator() will return null if coord_address is unset
+// Test that UtilityFunctions::Coordinator() will return null if coord_hostname is unset
 TEST_P(ExprTest, CoordinatorFunction) {
-  // Make a RuntimeState where the query context does not have coord_address set.
+  // Make a RuntimeState where the query context does not have coord_hostname set.
   // Note that this should never happen in a real impalad.
   RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
   MemTracker tracker;
@@ -5423,6 +5637,8 @@ TEST_P(ExprTest, MurmurHashFunction) {
   // changes behavior.
   EXPECT_EQ(-3190198453633110066, expected);
   TestValue("murmur_hash('hello world')", TYPE_BIGINT, expected);
+  // BINARY should return the same hash as STRING
+  TestValue("murmur_hash(cast('hello world' as binary))", TYPE_BIGINT, expected);
   s = string("");
   expected = HashUtil::MurmurHash2_64(s.data(), s.size(), HashUtil::MURMUR_DEFAULT_SEED);
   TestValue("murmur_hash('')", TYPE_BIGINT, expected);
@@ -5465,6 +5681,102 @@ TEST_P(ExprTest, MurmurHashFunction) {
   TestIsNull("murmur_hash(NULL)", TYPE_BIGINT);
 }
 
+/// Convert character array `str` of length `len` to hexadecimal.
+std::string ToHex(const unsigned char * str, int len) {
+  stringstream ss;
+  ss << hex << std::uppercase << setfill('0');
+  for (int i = 0; i < len; ++i) {
+    // setw is not sticky. stringstream only converts integral values,
+    // so a cast to int is required, but only convert the least significant byte to hex.
+    ss << setw(2) << (static_cast<int32_t>(str[i]) & 0xFF);
+  }
+  std::string result = ss.str();
+  boost::to_lower(result);
+  return result;
+}
+
+TEST_P(ExprTest, SHAFunctions) {
+  unsigned char input[] = "compute sha digest";
+  std::string sha1fn = std::string("sha1('compute sha digest')");
+  std::string sha2fn = std::string("sha2('compute sha digest'");
+  std::string expected;
+  unsigned char sha1[SHA_DIGEST_LENGTH];
+  unsigned char sha224[SHA224_DIGEST_LENGTH];
+  unsigned char sha256[SHA256_DIGEST_LENGTH];
+  unsigned char sha384[SHA384_DIGEST_LENGTH];
+  unsigned char sha512[SHA512_DIGEST_LENGTH];
+
+  if (FIPS_mode()) {
+    TestError(sha1fn);
+    TestError(sha2fn + ", 224)");
+    TestError(sha2fn + ", 256)");
+  } else {
+    SHA1(input, 18, sha1);
+    expected = ToHex(sha1, SHA_DIGEST_LENGTH);
+    TestStringValue(sha1fn, expected);
+
+    SHA224(input, 18, sha224);
+    expected = ToHex(sha224, SHA224_DIGEST_LENGTH);
+    TestStringValue(sha2fn + ", 224)", expected);
+
+    SHA256(input, 18, sha256);
+    expected = ToHex(sha256, SHA256_DIGEST_LENGTH);
+    TestStringValue(sha2fn + ", 256)", expected);
+  }
+
+  SHA384(input, 18, sha384);
+  expected = ToHex(sha384, SHA384_DIGEST_LENGTH);
+  TestStringValue(sha2fn + ", 384)", expected);
+
+  SHA512(input, 18, sha512);
+  expected = ToHex(sha512, SHA512_DIGEST_LENGTH);
+  TestStringValue(sha2fn + ", 512)", expected);
+
+  // Test empty strings. Empty string is valid input and produces hash.
+  if (!FIPS_mode()) {
+    SHA1(input, 0, sha1);
+    expected = ToHex(sha1, SHA_DIGEST_LENGTH);
+    TestStringValue("sha1('')", expected);
+
+    SHA224(input, 0, sha224);
+    expected = ToHex(sha224, SHA224_DIGEST_LENGTH);
+    TestStringValue("sha2('', 224)", expected);
+
+    SHA256(input, 0, sha256);
+    expected = ToHex(sha256, SHA256_DIGEST_LENGTH);
+    TestStringValue("sha2('', 256)", expected);
+  }
+
+  SHA384(input, 0, sha384);
+  expected = ToHex(sha384, SHA384_DIGEST_LENGTH);
+  TestStringValue("sha2('', 384)", expected);
+
+  SHA512(input, 0, sha512);
+  expected = ToHex(sha512, SHA512_DIGEST_LENGTH);
+  TestStringValue("sha2('', 512)", expected);
+
+  // Test Invalid Inputs
+  TestIsNull("sha1(NULL)", TYPE_STRING);
+  TestIsNull("sha2(NULL, 512)", TYPE_STRING);
+  TestIsNull("sha2('foo', NULL)", TYPE_STRING);
+  // 300 is invalid bit length
+  TestError(sha2fn + ", 300)");
+}
+
+TEST_P(ExprTest, MD5Function) {
+  if (FIPS_mode()) {
+    TestError("md5('foo')");
+  } else {
+    std::string expected("1fdf956bdad98101171512d18eec3bcf");
+    TestStringValue("md5('compute md5 checksum')", expected);
+    // Test empty string
+    expected = std::string("d41d8cd98f00b204e9800998ecf8427e");
+    TestStringValue("md5('')", expected);
+    // Test null input
+    TestIsNull("md5(NULL)", TYPE_STRING);
+  }
+}
+
 TEST_P(ExprTest, SessionFunctions) {
   enum Session {S1, S2};
   enum Query {Q1, Q2};
@@ -5472,8 +5784,8 @@ TEST_P(ExprTest, SessionFunctions) {
   map<Session, map<Query, string>> results;
   for (Session session: {S1, S2}) {
     ASSERT_OK(executor_->Setup()); // Starts new session
-    results[session][Q1] = GetValue("current_session()", TYPE_STRING);
-    results[session][Q2] = GetValue("current_sid()", TYPE_STRING);
+    results[session][Q1] = GetValue("current_session()", ColumnType(TYPE_STRING));
+    results[session][Q2] = GetValue("current_sid()", ColumnType(TYPE_STRING));
   }
 
   // The sessions IDs from the same session must be the same.
@@ -5684,8 +5996,13 @@ TEST_P(ExprTest, MathConversionFunctions) {
   // Uneven number of chars results in empty string.
   TestStringValue("unhex('30A')", "");
   // IMPALA-8713: stack overflow in unhex().
+  // IMPALA-9404: For unknown reasons, the expression returns 0 when run on a TSAN build.
+  // Given that there is no multi-threading involved here, it is unlikely the test
+  // failure is caused by a data race.
+#ifndef THREAD_SANITIZER
   TestValue("length(unhex(repeat('a', 1024 * 1024 * 1024)))",
       TYPE_INT, 512 * 1024 * 1024);
+#endif
 
   // Run the test suite twice, once with a bigint parameter, and once with
   // string parameters.
@@ -5767,9 +6084,8 @@ TEST_P(ExprTest, MathFunctions) {
   TestValue("abs(-32768)", TYPE_INT, 32768);
   TestValue("abs(32767)", TYPE_INT, 32767);
   TestValue("abs(32768)", TYPE_BIGINT, 32768);
-  TestValue("abs(-1 * cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483648);
-  TestValue("abs(cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483648);
-  TestValue("abs(2147483647)", TYPE_BIGINT, 2147483647);
+  TestError("abs(-1 * cast(pow(2, 31) as int))");
+  TestError("abs(cast(pow(2, 31) as int))");
   TestValue("abs(2147483647)", TYPE_BIGINT, 2147483647);
   TestValue("abs(-9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
   TestValue("abs(9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
@@ -5887,7 +6203,7 @@ TEST_P(ExprTest, MathFunctions) {
     rand << "rand(" << seed << ")";
     random << "random(" << seed << ")";
     const double expected_result = ConvertValue<double>(GetValue(rand.str(),
-      TYPE_DOUBLE));
+      ColumnType(TYPE_DOUBLE)));
     TestValue(rand.str(), TYPE_DOUBLE, expected_result);
     TestValue(random.str(), TYPE_DOUBLE, expected_result); // Test alias
   }
@@ -6687,7 +7003,8 @@ TEST_P(ExprTest, TimestampFunctions) {
   // Test Unix epoch conversions again but now converting into local timestamp values.
   {
     ScopedTimeZoneOverride time_zone("PST8PDT");
-    ScopedLocalUnixTimestampConversionOverride use_local;
+    ScopedExecOption use_local(executor_,
+        "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     // Determine what the local time would have been when it was 1970-01-01 GMT
     ptime local_time_at_epoch = c_local_adjustor<ptime>::utc_to_local(from_time_t(0));
     // ... and as an Impala compatible string.
@@ -6732,6 +7049,8 @@ TEST_P(ExprTest, TimestampFunctions) {
       + 60*60*24), 'yyyy-MM-dd')", "1999-01-02");
   TestStringValue("from_timestamp(to_timestamp(unix_timestamp('1999-01-01 10:10:10') \
       + 10), 'yyyy-MM-dd HH:mm:ss')", "1999-01-01 10:10:20");
+  TestStringValue("from_timestamp(cast('2999-05-05 11:11:11' as timestamp), 'HH:mm:ss')",
+      "11:11:11");
   TestValue("cast('2011-12-22 09:10:11.123456789' as timestamp) > \
       cast('2011-12-22 09:10:11.12345678' as timestamp)", TYPE_BOOLEAN, true);
   TestValue("cast('2011-12-22 08:10:11.123456789' as timestamp) > \
@@ -6767,12 +7086,27 @@ TEST_P(ExprTest, TimestampFunctions) {
   TestValue("dayofweek(cast('2011-12-18' as timestamp))", TYPE_INT, 1);
   TestValue("dayofweek(cast('2011-12-22' as timestamp))", TYPE_INT, 5);
   TestValue("dayofweek(cast('2011-12-24' as timestamp))", TYPE_INT, 7);
-  TestValue("hour(cast('09:10:11.000000' as timestamp))", TYPE_INT, 9);
-  TestValue("minute(cast('09:10:11.000000' as timestamp))", TYPE_INT, 10);
-  TestValue("second(cast('09:10:11.000000' as timestamp))", TYPE_INT, 11);
-  TestValue("millisecond(cast('09:10:11.123456' as timestamp))", TYPE_INT, 123);
   TestStringValue(
       "to_date(cast('2011-12-22 09:10:11.12345678' as timestamp))", "2011-12-22");
+
+  // These expressions directly extract hour/minute/second/millis from STRING type
+  // to support these functions for timestamp strings without a date part (IMPALA-11355).
+  TestValue("hour('09:10:11.000000')", TYPE_INT, 9);
+  TestValue("minute('09:10:11.000000')", TYPE_INT, 10);
+  TestValue("second('09:10:11.000000')", TYPE_INT, 11);
+  TestValue("millisecond('09:10:11.123456')", TYPE_INT, 123);
+  TestValue("millisecond('09:10:11')", TYPE_INT, 0);
+  // Test the functions above with invalid inputs.
+  TestIsNull("hour('09:10:1')", TYPE_INT);
+  TestIsNull("hour('838:59:59')", TYPE_INT);
+  TestIsNull("minute('09-10-11')", TYPE_INT);
+  TestIsNull("second('09:aa:11.000000')", TYPE_INT);
+  TestIsNull("second('09:10:11pm')", TYPE_INT);
+  TestIsNull("millisecond('24:11:11.123')", TYPE_INT);
+  TestIsNull("millisecond('09:61:11.123')", TYPE_INT);
+  TestIsNull("millisecond('09:10:61.123')", TYPE_INT);
+  TestIsNull("millisecond('09:10:11.123aaa')", TYPE_INT);
+  TestIsNull("millisecond('')", TYPE_INT);
 
   // Check that timeofday() does not crash or return incorrect results
   TestIsNotNull("timeofday()", TYPE_STRING);
@@ -6781,7 +7115,6 @@ TEST_P(ExprTest, TimestampFunctions) {
   TestValue("timestamp_cmp('1966-09-04 15:33:45','1966-05-04 15:33:45')", TYPE_INT, 1);
   TestValue("timestamp_cmp('1966-05-04 15:33:45','1966-05-04 15:33:45')", TYPE_INT, 0);
   TestValue("timestamp_cmp('1967-06-05','1966-05-04')", TYPE_INT, 1);
-  TestValue("timestamp_cmp('15:33:45','16:34:45')", TYPE_INT, -1);
   TestValue("timestamp_cmp('1966-05-04','1966-05-04 15:33:45')", TYPE_INT, -1);
 
   TestIsNull("timestamp_cmp('','1966-05-04 15:33:45')", TYPE_INT);
@@ -6796,7 +7129,6 @@ TEST_P(ExprTest, TimestampFunctions) {
   TestValue("int_months_between('1967-07-19','1967-07-19')", TYPE_INT, 0);
   TestValue("int_months_between('2015-07-19','2015-08-18')", TYPE_INT, 0);
 
-  TestIsNull("int_months_between('23:33:45','15:33:45')", TYPE_INT);
   TestIsNull("int_months_between('','1966-06-04')", TYPE_INT);
 
   TestValue("months_between('1967-07-19','1966-06-04')", TYPE_DOUBLE,
@@ -6807,7 +7139,6 @@ TEST_P(ExprTest, TimestampFunctions) {
   TestValue("months_between('2015-02-28','2015-05-31')", TYPE_DOUBLE, -3);
   TestValue("months_between('2012-02-29','2012-01-31')", TYPE_DOUBLE, 1);
 
-  TestIsNull("months_between('23:33:45','15:33:45')", TYPE_DOUBLE);
   TestIsNull("months_between('','1966-06-04')", TYPE_DOUBLE);
 
   TestValue("datediff(cast('2011-12-22 09:10:11.12345678' as timestamp), \
@@ -6815,22 +7146,10 @@ TEST_P(ExprTest, TimestampFunctions) {
   TestValue("datediff(cast('2012-12-22' as timestamp), \
       cast('2011-12-22 09:10:11.12345678' as timestamp))", TYPE_INT, 366);
 
-  TestIsNull("cast('24:59:59' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('2020-05-06 24:59:59' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('10000-12-31' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('10000-12-31 23:59:59' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2000-12-31 24:59:59' as timestamp)", TYPE_TIMESTAMP);
-
-  TestIsNull("year(cast('09:10:11.000000' as timestamp))", TYPE_INT);
-  TestIsNull("quarter(cast('09:10:11.000000' as timestamp))", TYPE_INT);
-  TestIsNull("month(cast('09:10:11.000000' as timestamp))", TYPE_INT);
-  TestIsNull("dayofmonth(cast('09:10:11.000000' as timestamp))", TYPE_INT);
-  TestIsNull("day(cast('09:10:11.000000' as timestamp))", TYPE_INT);
-  TestIsNull("dayofyear(cast('09:10:11.000000' as timestamp))", TYPE_INT);
-  TestIsNull("dayofweek(cast('09:10:11.000000' as timestamp))", TYPE_INT);
-  TestIsNull("weekofyear(cast('09:10:11.000000' as timestamp))", TYPE_INT);
-  TestIsNull("week(cast('09:10:11.000000' as timestamp))", TYPE_INT);
-  TestIsNull("datediff(cast('09:10:11.12345678' as timestamp), "
-      "cast('2012-12-22' as timestamp))", TYPE_INT);
 
   TestIsNull("year(NULL)", TYPE_INT);
   TestIsNull("quarter(NULL)", TYPE_INT);
@@ -6923,7 +7242,8 @@ TEST_P(ExprTest, TimestampFunctions) {
   // Tests from Hive. When casting from timestamp to numeric, timestamps are considered
   // to be local values.
   {
-    ScopedLocalUnixTimestampConversionOverride use_local;
+    ScopedExecOption use_local(executor_,
+        "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     ScopedTimeZoneOverride time_zone("PST8PDT");
     TestValue("cast(cast('2011-01-01 01:01:01' as timestamp) as boolean)", TYPE_BOOLEAN,
         true);
@@ -6990,17 +7310,18 @@ TEST_P(ExprTest, TimestampFunctions) {
     time_t unix_start_time =
         (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
     int64_t unix_timestamp_result = ConvertValue<int64_t>(GetValue("unix_timestamp()",
-        TYPE_BIGINT));
+        ColumnType(TYPE_BIGINT)));
     EXPECT_BETWEEN(unix_start_time, unix_timestamp_result, static_cast<int64_t>(
         (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds()));
 
     // Check again with the flag enabled.
     {
-      ScopedLocalUnixTimestampConversionOverride use_local;
+      ScopedExecOption use_local(executor_,
+          "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
       tm before = to_tm(posix_time::microsec_clock::local_time());
       unix_start_time = mktime(&before);
       unix_timestamp_result = ConvertValue<int64_t>(GetValue("unix_timestamp()",
-          TYPE_BIGINT));
+          ColumnType(TYPE_BIGINT)));
       tm after = to_tm(posix_time::microsec_clock::local_time());
       EXPECT_BETWEEN(unix_start_time, unix_timestamp_result,
           static_cast<int64_t>(mktime(&after)));
@@ -7010,33 +7331,35 @@ TEST_P(ExprTest, TimestampFunctions) {
   // Test that now() and current_timestamp() are reasonable.
   {
     ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
-    ScopedLocalUnixTimestampConversionOverride use_local;
+    ScopedExecOption use_local(executor_,
+        "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     const Timezone& local_tz = time_zone.GetTimezone();
 
     const TimestampValue start_time =
-        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz);
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), &local_tz);
     TimestampValue timestamp_result =
-        ConvertValue<TimestampValue>(GetValue("now()", TYPE_TIMESTAMP));
+        ConvertValue<TimestampValue>(GetValue("now()", ColumnType(TYPE_TIMESTAMP)));
     EXPECT_BETWEEN(start_time, timestamp_result,
-        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz));
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), &local_tz));
     timestamp_result = ConvertValue<TimestampValue>(GetValue("current_timestamp()",
-        TYPE_TIMESTAMP));
+        ColumnType(TYPE_TIMESTAMP)));
     EXPECT_BETWEEN(start_time, timestamp_result,
-        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz));
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), &local_tz));
   }
 
   // Test that utc_timestamp() is reasonable.
   const TimestampValue utc_start_time =
       TimestampValue::UtcFromUnixTimeMicros(UnixMicros());
-  TimestampValue timestamp_result =
-      ConvertValue<TimestampValue>(GetValue("utc_timestamp()", TYPE_TIMESTAMP));
+  TimestampValue timestamp_result = ConvertValue<TimestampValue>(
+      GetValue("utc_timestamp()", ColumnType(TYPE_TIMESTAMP)));
   EXPECT_BETWEEN(utc_start_time, timestamp_result,
       TimestampValue::UtcFromUnixTimeMicros(UnixMicros()));
 
   // Test cast(unix_timestamp() as timestamp).
   {
     ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
-    ScopedLocalUnixTimestampConversionOverride use_local;
+    ScopedExecOption use_local(executor_,
+        "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     const Timezone& local_tz = time_zone.GetTimezone();
 
     // UNIX_TIMESTAMP() has second precision so the comparison start time is shifted back
@@ -7044,10 +7367,10 @@ TEST_P(ExprTest, TimestampFunctions) {
     time_t unix_start_time =
         (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
     TimestampValue timestamp_result = ConvertValue<TimestampValue>(GetValue(
-        "cast(unix_timestamp() as timestamp)", TYPE_TIMESTAMP));
-    EXPECT_BETWEEN(TimestampValue::FromUnixTime(unix_start_time - 1, local_tz),
+        "cast(unix_timestamp() as timestamp)", ColumnType(TYPE_TIMESTAMP)));
+    EXPECT_BETWEEN(TimestampValue::FromUnixTime(unix_start_time - 1, &local_tz),
         timestamp_result,
-        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz));
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), &local_tz));
   }
 
   // Test that UTC and local time represent the same point in time
@@ -7059,9 +7382,9 @@ TEST_P(ExprTest, TimestampFunctions) {
     Status status = executor_->Exec(stmt, &result_types);
     EXPECT_TRUE(status.ok()) << "stmt: " << stmt << "\nerror: " << status.GetDetail();
     DCHECK(result_types.size() == 2);
-    EXPECT_EQ(TypeToOdbcString(TYPE_TIMESTAMP), result_types[0].type)
+    EXPECT_EQ(result_types[0].type, "timestamp")
         << "invalid type returned by now()";
-    EXPECT_EQ(TypeToOdbcString(TYPE_TIMESTAMP), result_types[1].type)
+    EXPECT_EQ(result_types[1].type, "timestamp")
         << "invalid type returned by utc_timestamp()";
     string result_row;
     status = executor_->FetchResult(&result_row);
@@ -7159,9 +7482,6 @@ TEST_P(ExprTest, TimestampFunctions) {
   TestIsNull("cast(trunc('2014-07-22 01:34:55 +0100', 'year') as STRING)", TYPE_STRING);
   TestStringValue("cast(trunc(cast('2014-04-01' as timestamp), 'SYYYY') as string)",
           "2014-01-01 00:00:00");
-  TestIsNull("cast(trunc('01:34:55', 'year') as STRING)", TYPE_STRING);
-  TestStringValue("cast(trunc(cast('07:02:03' as timestamp), 'MI') as string)",
-          "07:02:00");
   // note: no time value in string defaults to 00:00:00
   TestStringValue("cast(trunc(cast('2014-01-01' as timestamp), 'MI') as string)",
           "2014-01-01 00:00:00");
@@ -7359,7 +7679,7 @@ TEST_P(ExprTest, TimestampFunctions) {
         "cast(trunc(cast('2012-09-10 07:59:03' as timestamp), 'MI') as string)",
           "2012-09-10 07:59:00");
   TestStringValue(
-        "cast(trunc(cast('2012-09-10 07:59:59' as timestamp), 'MI') as string)",
+        "cast(trunc(cast('2012-09-10 07:59:59.123' as timestamp), 'MI') as string)",
           "2012-09-10 07:59:00");
   TestNonOkStatus(
       "cast(trunc(cast('2012-09-10 07:59:59' as timestamp), 'MIN') as string)");
@@ -7457,8 +7777,6 @@ TEST_P(ExprTest, TimestampFunctions) {
   TestStringValue(
       "cast(cast('2012-01-01T09:10:11.12345-01:30' as timestamp) as string)",
       "2012-01-01 09:10:11.123450000");
-  TestStringValue("cast(cast('09:10:11+01:30' as timestamp) as string)", "09:10:11");
-  TestStringValue("cast(cast('09:10:11-01:30' as timestamp) as string)", "09:10:11");
 
   TestValue("unix_timestamp('2038-01-19T03:14:08-0100')", TYPE_BIGINT, 2147483648);
   TestValue("unix_timestamp('2038/01/19T03:14:08+01:00', 'yyyy/MM/ddTHH:mm:ss')",
@@ -7471,8 +7789,6 @@ TEST_P(ExprTest, TimestampFunctions) {
 
   TestStringValue("cast(trunc('2014-07-22T01:34:55+0100', 'year') as STRING)",
                   "2014-01-01 00:00:00");
-  TestStringValue("cast(trunc(cast('07:02:03+01:30' as timestamp), 'MI') as string)",
-                  "07:02:00");
 
   // Test timezone offset format
   TestStringValue("from_unixtime(unix_timestamp('2012-01-01 19:10:11+02:30', \
@@ -7550,6 +7866,7 @@ TEST_P(ExprTest, TimestampFunctions) {
   TestError("from_unixtime(unix_timestamp('10:00:00+0530 2010-01-01', \
       'HH:mm:ss+hhmm yyyy-MM-dd'))");
 
+  TestError("to_timestamp('01:01:01', 'HH:mm:ss')");
   TestError("to_timestamp('2012-02-28 11:10:11+0530', 'yyyy-MM-dd HH:mm:ss+hhdd')");
   TestError("to_timestamp('2012-02-28+0530', 'yyyy-MM-dd+hhmm')");
   TestError("to_timestamp('10:00:00+0530 2010-01-01', 'HH:mm:ss+hhmm yyyy-MM-dd')");
@@ -8194,14 +8511,16 @@ TEST_P(ExprTest, DateFunctions) {
   // Test that current_date() is reasonable.
   {
     ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
-    ScopedLocalUnixTimestampConversionOverride use_local;
+    ScopedExecOption use_local(executor_,
+        "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     const Timezone& local_tz = time_zone.GetTimezone();
 
     const boost::gregorian::date start_date =
-        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz).date();
-    DateValue current_dv = ConvertValue<DateValue>(GetValue("current_date()", TYPE_DATE));
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), &local_tz).date();
+    DateValue current_dv =
+        ConvertValue<DateValue>(GetValue("current_date()", ColumnType(TYPE_DATE)));
     const boost::gregorian::date end_date =
-        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz).date();
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), &local_tz).date();
 
     int year, month, day;
     EXPECT_TRUE(current_dv.ToYearMonthDay(&year, &month, &day));
@@ -8221,10 +8540,11 @@ TEST_P(ExprTest, ConditionalFunctions) {
   TestValue("if(FALSE, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
   TestStringValue("if(TRUE, 'abc', 'defgh')", "abc");
   TestStringValue("if(FALSE, 'abc', 'defgh')", "defgh");
-  TimestampValue then_val = TimestampValue::FromUnixTime(1293872461,
-      TimezoneDatabase::GetUtcTimezone());
-  TimestampValue else_val = TimestampValue::FromUnixTime(929387245,
-      TimezoneDatabase::GetUtcTimezone());
+  TestStringValue("if(TRUE, cast('a' as binary), cast('b' as binary))", "a");
+  TestStringValue("if(FALSE, cast('a' as binary), cast('b' as binary))", "b");
+
+  TimestampValue then_val = TimestampValue::FromUnixTime(1293872461, UTCPTR);
+  TimestampValue else_val = TimestampValue::FromUnixTime(929387245, UTCPTR);
   TestTimestampValue("if(TRUE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", then_val);
   TestTimestampValue("if(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
@@ -8245,10 +8565,11 @@ TEST_P(ExprTest, ConditionalFunctions) {
   TestValue("nvl2(NULL, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
   TestStringValue("nvl2('some string', 'abc', 'defgh')", "abc");
   TestStringValue("nvl2(NULL, 'abc', 'defgh')", "defgh");
-  TimestampValue first_val = TimestampValue::FromUnixTime(1293872461,
-      TimezoneDatabase::GetUtcTimezone());
-  TimestampValue second_val = TimestampValue::FromUnixTime(929387245,
-      TimezoneDatabase::GetUtcTimezone());
+  TestStringValue(
+      "nvl2(cast('' as binary), cast('a' as binary), cast('b' as binary))", "a");
+  TestStringValue("nvl2(NULL, cast('a' as binary), cast('b' as binary))", "b");
+  TimestampValue first_val = TimestampValue::FromUnixTime(1293872461, UTCPTR);
+  TimestampValue second_val = TimestampValue::FromUnixTime(929387245, UTCPTR);
   TestTimestampValue("nvl2(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", first_val);
   TestTimestampValue("nvl2(NULL, cast('2011-01-01 09:01:01' as timestamp), "
@@ -8276,10 +8597,13 @@ TEST_P(ExprTest, ConditionalFunctions) {
   TestStringValue("nullif('abc', 'def')", "abc");
   TestIsNull("nullif(NULL, 'abc')", TYPE_STRING);
   TestStringValue("nullif('abc', NULL)", "abc");
+  TestIsNull("nullif(cast('a' as binary), cast('a' as binary))", TYPE_STRING);
+  TestStringValue("nullif(cast('a' as binary), cast('b' as binary))", "a");
+  TestIsNull("nullif(NULL, cast('a' as binary))", TYPE_STRING);
+  TestStringValue("nullif(cast('a' as binary), NULL)", "a");
   TestIsNull("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "cast('2011-01-01 09:01:01' as timestamp))", TYPE_TIMESTAMP);
-  TimestampValue testlhs = TimestampValue::FromUnixTime(1293872461,
-      TimezoneDatabase::GetUtcTimezone());
+  TimestampValue testlhs = TimestampValue::FromUnixTime(1293872461, UTCPTR);
   TestTimestampValue("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", testlhs);
   TestIsNull("nullif(NULL, "
@@ -8313,6 +8637,7 @@ TEST_P(ExprTest, ConditionalFunctions) {
     TestValue(f + "(NULL, cast(10.0 as float))", TYPE_FLOAT, 10.0f);
     TestValue(f + "(NULL, cast(10.0 as double))", TYPE_DOUBLE, 10.0);
     TestStringValue(f + "(NULL, 'abc')", "abc");
+    TestStringValue(f + "(NULL, cast('abc' as binary))", "abc");
     TestTimestampValue(f + "(NULL, " + default_timestamp_str_ + ")",
         default_timestamp_val_);
     TestDateValue(f + "(NULL, " + default_date_str_ + ")", default_date_val_);
@@ -8346,10 +8671,12 @@ TEST_P(ExprTest, ConditionalFunctions) {
   TestStringValue("coalesce(NULL, 'abc', NULL)", "abc");
   TestStringValue("coalesce('defgh', NULL, 'abc', NULL)", "defgh");
   TestStringValue("coalesce(NULL, NULL, NULL, 'abc', NULL, NULL)", "abc");
-  TimestampValue ats = TimestampValue::FromUnixTime(1293872461,
-      TimezoneDatabase::GetUtcTimezone());
-  TimestampValue bts = TimestampValue::FromUnixTime(929387245,
-      TimezoneDatabase::GetUtcTimezone());
+  TestStringValue("coalesce(cast('a' as binary))", "a");
+  TestStringValue("coalesce(NULL, cast('a' as binary), NULL)", "a");
+  TestStringValue("coalesce(cast('a' as binary), NULL, cast('b' as binary), NULL)", "a");
+  TestStringValue("coalesce(NULL, NULL, NULL, cast('a' as binary), NULL, NULL)", "a");
+  TimestampValue ats = TimestampValue::FromUnixTime(1293872461, UTCPTR);
+  TimestampValue bts = TimestampValue::FromUnixTime(929387245, UTCPTR);
   TestTimestampValue("coalesce(cast('2011-01-01 09:01:01' as timestamp))", ats);
   TestTimestampValue("coalesce(NULL, cast('2011-01-01 09:01:01' as timestamp),"
       "NULL)", ats);
@@ -8618,21 +8945,19 @@ TEST_P(ExprTest, ConditionalFunctionIsNotFalse) {
   TestError("isnotfalse(-9999999999999999999999999999999999999.9)");
 }
 
-// Validates that Expr::ComputeResultsLayout() for 'exprs' is correct.
+// Validates that the constructor ScalarExprsResultsRowLayout() for 'exprs' is correct.
 //   - expected_byte_size: total byte size to store all results for exprs
 //   - expected_var_begin: byte offset where variable length types begin
 //   - expected_offsets: mapping of byte sizes to a set valid offsets
 //     exprs that have the same byte size can end up in a number of locations
 void ValidateLayout(const vector<ScalarExpr*>& exprs, int expected_byte_size,
     int expected_var_begin, const map<int, set<int>>& expected_offsets) {
-  vector<int> offsets;
   set<int> offsets_found;
 
-  int var_begin;
-  int byte_size = ScalarExpr::ComputeResultsLayout(exprs, &offsets, &var_begin);
+  ScalarExprsResultsRowLayout row_layout(exprs);
 
-  EXPECT_EQ(expected_byte_size, byte_size);
-  EXPECT_EQ(expected_var_begin, var_begin);
+  EXPECT_EQ(expected_byte_size, row_layout.expr_values_bytes_per_row);
+  EXPECT_EQ(expected_var_begin, row_layout.var_results_begin_offset);
 
   // Walk the computed offsets and make sure the resulting sets match expected_offsets
   for (int i = 0; i < exprs.size(); ++i) {
@@ -8641,7 +8966,7 @@ void ValidateLayout(const vector<ScalarExpr*>& exprs, int expected_byte_size,
     EXPECT_TRUE(iter != expected_offsets.end());
 
     const set<int>& possible_offsets = iter->second;
-    int computed_offset = offsets[i];
+    int computed_offset = row_layout.expr_values_offsets[i];
     // The computed offset has to be one of the possible.  Exprs types with the
     // same size are not ordered wrt each other.
     EXPECT_TRUE(possible_offsets.find(computed_offset) != possible_offsets.end());
@@ -8660,16 +8985,16 @@ TEST_P(ExprTest, ResultsLayoutTest) {
 
   // Test single Expr case
   vector<ColumnType> types;
-  types.push_back(TYPE_BOOLEAN);
-  types.push_back(TYPE_TINYINT);
-  types.push_back(TYPE_SMALLINT);
-  types.push_back(TYPE_INT);
-  types.push_back(TYPE_BIGINT);
-  types.push_back(TYPE_FLOAT);
-  types.push_back(TYPE_DOUBLE);
-  types.push_back(TYPE_TIMESTAMP);
-  types.push_back(TYPE_DATE);
-  types.push_back(TYPE_STRING);
+  types.push_back(ColumnType(TYPE_BOOLEAN));
+  types.push_back(ColumnType(TYPE_TINYINT));
+  types.push_back(ColumnType(TYPE_SMALLINT));
+  types.push_back(ColumnType(TYPE_INT));
+  types.push_back(ColumnType(TYPE_BIGINT));
+  types.push_back(ColumnType(TYPE_FLOAT));
+  types.push_back(ColumnType(TYPE_DOUBLE));
+  types.push_back(ColumnType(TYPE_TIMESTAMP));
+  types.push_back(ColumnType(TYPE_DATE));
+  types.push_back(ColumnType(TYPE_STRING));
 
   types.push_back(ColumnType::CreateDecimalType(1,0));
   types.push_back(ColumnType::CreateDecimalType(8,0));
@@ -9983,6 +10308,7 @@ TEST_P(ExprTest, JsonTest) {
   TestStringValue(
       "get_json_object('{\"a\": {\"aa\": 1}, \"b\": {\"bb\": 2}}', '$.*.*')",
       "[1,2]");
+  TestStringValue("get_json_object('{\"a\":1, \"1\":2, \"c\":3}', '$.1')", "2");
 
   // Tests about NULL
   TestIsNull("get_json_object('{\"a\": 1}', '$.b')", TYPE_STRING);
@@ -10076,6 +10402,695 @@ TEST_P(ExprTest, JsonTest) {
   TestErrorString("get_json_object('[1,2,3]', '   ')",
       "Failed to parse json path '   ': Should start with '$'\n");
 }
+
+TEST_P(ExprTest, MaskShowFirstNTest) {
+  // Test overrides for string value.
+  // Replace upper case with 'X', lower case with 'x', digit chars with '0', other chars
+  // with ':'.
+  TestStringValue("mask_show_first_n('TestString-123', 4, 'X', 'x', '0', ':')",
+      "TestXxxxxx:000");
+  TestStringValue(
+      "mask_show_first_n(cast('TestString-123' as varchar(24)), 4, 'X', 'x', '0', ':')",
+      "TestXxxxxx:000");
+  TestStringValue(
+      "mask_show_first_n(cast('TestString-123' as char(24)), 4, 'X', 'x', '0', ':')",
+      "TestXxxxxx:000::::::::::");
+  TestStringValue("mask_show_first_n('')", "");
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#')", "abcdxXXXXXnnnnn-#");
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#', 0)", "xxxxxXXXXXnnnnn-#");
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#', -1)", "xxxxxXXXXXnnnnn-#");
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#', 2)", "abxxxXXXXXnnnnn-#");
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#', 100)", "abcdeABCDE12345-#");
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#', 3, '*', '*', '*', '*', 1)",
+      "abc**************");  // The last argument 1 is unused since the value is string.
+  // Most importantly, test the override used by Ranger transformer.
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#', 4, 'x', 'x', 'x', -1, '1')",
+      "abcdxxxxxxxxxxx-#");
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#', 0, '*', '*', '*', -1, '9')",
+      "***************-#");
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#', 0, 65, 97, 48, -1, 9)",
+      "aaaaaAAAAA00000-#");
+  TestStringValue("mask_show_first_n('abcdeABCDE12345-#', 4, -1, -1, -1, -1, 9)",
+      "abcdeABCDE12345-#");
+
+  // Test overrides for numeric value.
+  TestValue("mask_show_first_n(0)", TYPE_BIGINT, 0);
+  TestValue("mask_show_first_n(0, 0)", TYPE_BIGINT, 1);
+  TestValue("mask_show_first_n(0, 0, -1, -1, -1, -1, 5)", TYPE_BIGINT, 5);
+  TestValue("mask_show_first_n(cast(123 as tinyint), 2, 'x', 'x', 'x', -1, '5')",
+      TYPE_BIGINT, 125);
+  TestValue("mask_show_first_n(cast(12345 as smallint), 3, 'x', 'x', 'x', -1, '5')",
+      TYPE_BIGINT, 12355);
+  TestValue("mask_show_first_n(cast(12345 as int), 0, 'x', 'x', 'x', 'x', 5)",
+      TYPE_BIGINT, 55555);
+  TestValue("mask_show_first_n(cast(12345 as bigint), 4, -1, -1, -1, -1, -1)",
+      TYPE_BIGINT, 12341);
+  TestValue("mask_show_first_n(123456789)", TYPE_BIGINT, 123411111);
+  TestValue("mask_show_first_n(123456789, 0)", TYPE_BIGINT, 111111111);
+  TestValue("mask_show_first_n(123456789, -1)", TYPE_BIGINT, 111111111);
+  TestValue("mask_show_first_n(123456789, 2)", TYPE_BIGINT, 121111111);
+  TestValue("mask_show_first_n(123456789, 100)", TYPE_BIGINT, 123456789);
+  TestValue("mask_show_first_n(123456789, 3, '*', '*', '*', '*', 2)", TYPE_BIGINT,
+      123222222);  // Only the last mask argument 2 is unused since the value is numeric.
+  // Most importantly, test the override used by Ranger transformer.
+  TestValue("mask_show_first_n(12345678900, 4, 'x', 'x', 'x', -1, '1')", TYPE_BIGINT,
+      12341111111);
+  TestValue("mask_show_first_n(12345678900, 0, '*', '*', '*', -1, '9')", TYPE_BIGINT,
+      99999999999);
+  TestValue("mask_show_first_n(-12345678900, 0, '*', '*', '*', -1, '9')", TYPE_BIGINT,
+      -99999999999);
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestValue("mask_show_first_n(12345678, 0, 65, 97, 48, -1, 9)", TYPE_BIGINT, 99999999);
+  // Illegal masked_number (not in [0, 9]) is converted to default value 1.
+  TestValue("mask_show_first_n(12345678, 4, -1, -1, -1, -1, 10)", TYPE_BIGINT, 12341111);
+  TestValue("mask_show_first_n(12345678, 4, -1, -1, -1, -1, -1)", TYPE_BIGINT, 12341111);
+
+  // Error handling
+  // Empty chars are converted to default values. Pick the first char for long strings.
+  TestStringValue("mask_show_first_n('TestString-123', 4, '', 'bBBBB', '', 'dDDD')",
+      "TestXbbbbbdnnn");
+  TestIsNull("mask_show_first_n(cast(NULL as STRING))", TYPE_STRING);
+  TestIsNull("mask_show_first_n(cast(NULL as BIGINT))", TYPE_BIGINT);
+  TestErrorString("mask_show_first_n(123456789, 4, 'aa', 'bb', 'cc', -1, 'a')",
+      "Can't convert 'a' to a valid masked_number. Valid values: 0-9.\n");
+  TestErrorString("mask_show_first_n(123456789, 4, 'aa', 'bb', 'cc', -1, '10')",
+      "Can't convert '10' to a valid masked_number. Valid values: 0-9.\n");
+}
+
+TEST_P(ExprTest, MaskShowLastNTest) {
+  // Test overrides for string value.
+  // Replace upper case with 'X', lower case with 'x', digit chars with '0', other chars
+  // with ':'.
+  TestStringValue("mask_show_last_n('TestString-123', 4, 'X', 'x', '0', ':')",
+      "XxxxXxxxxx-123");
+  TestStringValue(
+      "mask_show_last_n(cast('TestString-123' as varchar(24)), 4, 'X', 'x', '0', ':')",
+      "XxxxXxxxxx-123");
+  TestStringValue(
+      "mask_show_last_n(cast('TestString-123' as char(24)), 4, 'X', 'x', '0', ':')",
+      "XxxxXxxxxx:000::::::    "); // Remain the last 4 whitespaces
+  TestStringValue("mask_show_last_n('')", "");
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#')", "xxxxxXXXXXnnn45-#");
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#', 0)", "xxxxxXXXXXnnnnn-#");
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#', -1)", "xxxxxXXXXXnnnnn-#");
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#', 2)", "xxxxxXXXXXnnnnn-#");
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#', 100)", "abcdeABCDE12345-#");
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#', 3, '*', '*', '*', '*', 1)",
+      "**************5-#");  // The last argument 1 is unused since the value is string.
+  // Most importantly, test the override used by Ranger transformer.
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#', 4, 'x', 'x', 'x', -1, '1')",
+      "xxxxxxxxxxxxx45-#");
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#', 0, '*', '*', '*', -1, '9')",
+      "***************-#");
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#', 0, 65, 97, 48, -1, 9)",
+      "aaaaaAAAAA00000-#");
+  TestStringValue("mask_show_last_n('abcdeABCDE12345-#', 4, -1, -1, -1, -1, 9)",
+      "abcdeABCDE12345-#");
+
+  // Test overrides for numeric value.
+  TestValue("mask_show_last_n(0)", TYPE_BIGINT, 0);
+  TestValue("mask_show_last_n(0, 0)", TYPE_BIGINT, 1);
+  TestValue("mask_show_last_n(0, 0, -1, -1, -1, -1, 5)", TYPE_BIGINT, 5);
+  TestValue("mask_show_last_n(cast(123 as tinyint), 2, 'x', 'x', 'x', -1, '5')",
+      TYPE_BIGINT, 523);
+  TestValue("mask_show_last_n(cast(12345 as smallint), 3, 'x', 'x', 'x', -1, '5')",
+      TYPE_BIGINT, 55345);
+  TestValue("mask_show_last_n(cast(12345 as int), 0, 'x', 'x', 'x', 'x', 5)",
+      TYPE_BIGINT, 55555);
+  TestValue("mask_show_last_n(cast(12345 as bigint), 4, -1, -1, -1, -1, -1)",
+      TYPE_BIGINT, 12345);
+  TestValue("mask_show_last_n(123456789)", TYPE_BIGINT, 111116789);
+  TestValue("mask_show_last_n(123456789, 0)", TYPE_BIGINT, 111111111);
+  TestValue("mask_show_last_n(123456789, -1)", TYPE_BIGINT, 111111111);
+  TestValue("mask_show_last_n(123456789, 2)", TYPE_BIGINT, 111111189);
+  TestValue("mask_show_last_n(123456789, 100)", TYPE_BIGINT, 123456789);
+  TestValue("mask_show_last_n(123456789, 3, '*', '*', '*', '*', 2)", TYPE_BIGINT,
+      222222789);  // Only the last mask argument 2 is unused since the value is numeric.
+  // Most importantly, test the override used by Ranger transformer.
+  TestValue("mask_show_last_n(12345678900, 4, 'x', 'x', 'x', -1, '1')", TYPE_BIGINT,
+      11111118900);
+  TestValue("mask_show_last_n(12345678900, 0, '*', '*', '*', -1, '9')", TYPE_BIGINT,
+      99999999999);
+  TestValue("mask_show_last_n(-12345678900, 0, '*', '*', '*', -1, '9')", TYPE_BIGINT,
+      -99999999999);
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestValue("mask_show_last_n(12345678, 0, 65, 97, 48, -1, 9)", TYPE_BIGINT, 99999999);
+  // Illegal masked_number (not in [0, 9]) is converted to default value 1.
+  TestValue("mask_show_last_n(12345678, 4, -1, -1, -1, -1, 10)", TYPE_BIGINT, 11115678);
+  TestValue("mask_show_last_n(12345678, 4, -1, -1, -1, -1, -1)", TYPE_BIGINT, 11115678);
+
+  // Error handling
+  // Empty chars are converted to default values. Pick the first char for long strings.
+  TestStringValue("mask_show_last_n('TestString-123', 4, '', 'bBBBB', '', 'dDDD')",
+      "XbbbXbbbbb-123");
+  TestIsNull("mask_show_last_n(cast(NULL as STRING))", TYPE_STRING);
+  TestIsNull("mask_show_last_n(cast(NULL as BIGINT))", TYPE_BIGINT);
+  TestErrorString("mask_show_last_n(123456789, 4, 'aa', 'bb', 'cc', -1, 'a')",
+      "Can't convert 'a' to a valid masked_number. Valid values: 0-9.\n");
+  TestErrorString("mask_show_last_n(123456789, 4, 'aa', 'bb', 'cc', -1, '10')",
+      "Can't convert '10' to a valid masked_number. Valid values: 0-9.\n");
+}
+
+TEST_P(ExprTest, MaskFirstNTest) {
+  // Test overrides for string value.
+  // Replace upper case with 'X', lower case with 'x', digit chars with '0', other chars
+  // with ':'.
+  TestStringValue("mask_first_n('TestString-123', 4, 'X', 'x', '0', ':')",
+      "XxxxString-123");
+  TestStringValue(
+      "mask_first_n(cast('TestString-123' as varchar(24)), 4, 'X', 'x', '0', ':')",
+      "XxxxString-123");
+  TestStringValue(
+      "mask_first_n(cast('TestString-123' as char(24)), 4, 'X', 'x', '0', ':')",
+      "XxxxString-123          ");
+  TestStringValue("mask_first_n('')", "");
+  TestStringValue("mask_first_n('abcdeABCDE12345-#')", "xxxxeABCDE12345-#");
+  TestStringValue("mask_first_n('abcdeABCDE12345-#', 0)", "abcdeABCDE12345-#");
+  TestStringValue("mask_first_n('abcdeABCDE12345-#', -1)", "abcdeABCDE12345-#");
+  TestStringValue("mask_first_n('abcdeABCDE12345-#', 2)", "xxcdeABCDE12345-#");
+  TestStringValue("mask_first_n('abcdeABCDE12345-#', 100)", "xxxxxXXXXXnnnnn-#");
+  TestStringValue("mask_first_n('abcdeABCDE12345-#', 3, '*', '*', '*', '*', 1)",
+      "***deABCDE12345-#");  // The last argument 1 is unused since the value is string.
+  // Most importantly, test the override used by Ranger transformer.
+  TestStringValue("mask_first_n('abcdeABCDE12345-#', 4, 'x', 'x', 'x', -1, '1')",
+      "xxxxeABCDE12345-#");
+  TestStringValue("mask_first_n('abcdeABCDE12345-#', 0, '*', '*', '*', -1, '9')",
+      "abcdeABCDE12345-#");
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestStringValue("mask_first_n('abcdeABCDE12345-#', 100, 65, 97, 48, -1, 9)",
+      "aaaaaAAAAA00000-#");
+  TestStringValue("mask_first_n('abcdeABCDE12345-#', 100, -1, -1, -1, -1, 9)",
+      "abcdeABCDE12345-#");
+
+  // Test overrides for numeric value.
+  TestValue("mask_first_n(0)", TYPE_BIGINT, 1);
+  TestValue("mask_first_n(0, 0)", TYPE_BIGINT, 0);
+  TestValue("mask_first_n(0, 4, -1, -1, -1, -1, 5)", TYPE_BIGINT, 5);
+  TestValue("mask_first_n(cast(123 as tinyint), 2, 'x', 'x', 'x', -1, '5')",
+      TYPE_BIGINT, 553);
+  TestValue("mask_first_n(cast(12345 as smallint), 3, 'x', 'x', 'x', -1, '5')",
+      TYPE_BIGINT, 55545);
+  TestValue("mask_first_n(cast(12345 as int), 0, 'x', 'x', 'x', 'x', 5)",
+      TYPE_BIGINT, 12345);
+  TestValue("mask_first_n(cast(12345 as bigint), 4, -1, -1, -1, -1, -1)",
+      TYPE_BIGINT, 11115);
+  TestValue("mask_first_n(123456789)", TYPE_BIGINT, 111156789);
+  TestValue("mask_first_n(123456789, 0)", TYPE_BIGINT, 123456789);
+  TestValue("mask_first_n(123456789, -1)", TYPE_BIGINT, 123456789);
+  TestValue("mask_first_n(123456789, 2)", TYPE_BIGINT, 113456789);
+  TestValue("mask_first_n(123456789, 100)", TYPE_BIGINT, 111111111);
+  TestValue("mask_first_n(123456789, 3, '*', '*', '*', '*', 2)", TYPE_BIGINT,
+      222456789);  // Only the last mask argument 2 is unused since the value is numeric.
+  // Most importantly, test the override used by Ranger transformer.
+  TestValue("mask_first_n(12345678900, 4, 'x', 'x', 'x', -1, '1')", TYPE_BIGINT,
+      11115678900);
+  TestValue("mask_first_n(12345678900, 20, '*', '*', '*', -1, '9')", TYPE_BIGINT,
+      99999999999);
+  TestValue("mask_first_n(-12345678900, 20, '*', '*', '*', -1, '9')", TYPE_BIGINT,
+      -99999999999);
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestValue("mask_first_n(12345678, 10, 65, 97, 48, -1, 9)", TYPE_BIGINT, 99999999);
+  // Illegal masked_number (not in [0, 9]) is converted to default value 1.
+  TestValue("mask_first_n(12345678, 4, -1, -1, -1, -1, 10)", TYPE_BIGINT, 11115678);
+  TestValue("mask_first_n(12345678, 4, -1, -1, -1, -1, -1)", TYPE_BIGINT, 11115678);
+
+  // Error handling
+  // Empty chars are converted to default values. Pick the first char for long strings.
+  TestStringValue("mask_first_n('TestString-123', 4, '', 'bBBBB', '', 'dDDD')",
+      "XbbbString-123");
+  TestIsNull("mask_first_n(cast(NULL as STRING))", TYPE_STRING);
+  TestIsNull("mask_first_n(cast(NULL as BIGINT))", TYPE_BIGINT);
+  TestErrorString("mask_first_n(123456789, 4, 'aa', 'bb', 'cc', -1, 'a')",
+      "Can't convert 'a' to a valid masked_number. Valid values: 0-9.\n");
+  TestErrorString("mask_first_n(123456789, 4, 'aa', 'bb', 'cc', -1, '10')",
+      "Can't convert '10' to a valid masked_number. Valid values: 0-9.\n");
+}
+
+TEST_P(ExprTest, MaskLastNTest) {
+  // Test overrides for string value.
+  // Replace upper case with 'X', lower case with 'x', digit chars with '0', other chars
+  // with ':'.
+  TestStringValue("mask_last_n('TestString-123', 4, 'X', 'x', '0', ':')",
+      "TestString:000");
+  TestStringValue(
+      "mask_last_n(cast('TestString-123' as varchar(24)), 4, 'X', 'x', '0', ':')",
+      "TestString:000");
+  TestStringValue(
+      "mask_last_n(cast('TestString-123' as char(24)), 4, 'X', 'x', '0', ':')",
+      "TestString-123      ::::");
+  TestStringValue("mask_last_n('')", "");
+  TestStringValue("mask_last_n('abcdeABCDE12345-#')", "abcdeABCDE123nn-#");
+  TestStringValue("mask_last_n('abcdeABCDE12345-#', 0)", "abcdeABCDE12345-#");
+  TestStringValue("mask_last_n('abcdeABCDE12345-#', -1)", "abcdeABCDE12345-#");
+  TestStringValue("mask_last_n('abcdeABCDE12345-#', 2)", "abcdeABCDE12345-#");
+  TestStringValue("mask_last_n('abcdeABCDE12345-#', 100)", "xxxxxXXXXXnnnnn-#");
+  TestStringValue("mask_last_n('abcdeABCDE12345-#', 3, '*', '*', '*', '*', 1)",
+      "abcdeABCDE1234***");  // The last argument 1 is unused since the value is string.
+  // Most importantly, test the override used by Ranger transformer.
+  TestStringValue("mask_last_n('abcdeABCDE12345-#', 4, 'x', 'x', 'x', -1, '1')",
+      "abcdeABCDE123xx-#");
+  TestStringValue("mask_last_n('abcdeABCDE12345-#', 100, '*', '*', '*', -1, '9')",
+      "***************-#");
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestStringValue("mask_last_n('abcdeABCDE12345-#', 100, 65, 97, 48, -1, 9)",
+      "aaaaaAAAAA00000-#");
+  TestStringValue("mask_last_n('abcdeABCDE12345-#', 100, -1, -1, -1, -1, 9)",
+      "abcdeABCDE12345-#");
+
+  // Test overrides for numeric value.
+  TestValue("mask_last_n(0)", TYPE_BIGINT, 1);
+  TestValue("mask_last_n(0, 0)", TYPE_BIGINT, 0);
+  TestValue("mask_last_n(0, 4, -1, -1, -1, -1, 5)", TYPE_BIGINT, 5);
+  TestValue("mask_last_n(cast(123 as tinyint), 2, 'x', 'x', 'x', -1, '5')",
+      TYPE_BIGINT, 155);
+  TestValue("mask_last_n(cast(12345 as smallint), 3, 'x', 'x', 'x', -1, '5')",
+      TYPE_BIGINT, 12555);
+  TestValue("mask_last_n(cast(12345 as int), 10, 'x', 'x', 'x', 'x', 5)",
+      TYPE_BIGINT, 55555);
+  TestValue("mask_last_n(cast(12345 as bigint), 4, -1, -1, -1, -1, -1)",
+      TYPE_BIGINT, 11111);
+  TestValue("mask_last_n(123456789)", TYPE_BIGINT, 123451111);
+  TestValue("mask_last_n(123456789, 0)", TYPE_BIGINT, 123456789);
+  TestValue("mask_last_n(123456789, -1)", TYPE_BIGINT, 123456789);
+  TestValue("mask_last_n(123456789, 2)", TYPE_BIGINT, 123456711);
+  TestValue("mask_last_n(123456789, 100)", TYPE_BIGINT, 111111111);
+  TestValue("mask_last_n(123456789, 3, '*', '*', '*', '*', 2)", TYPE_BIGINT,
+      123456222);  // Only the last mask argument 2 is unused since the value is numeric.
+  // Most importantly, test the override used by Ranger transformer.
+  TestValue("mask_last_n(12345678900, 4, 'x', 'x', 'x', -1, '1')", TYPE_BIGINT,
+      12345671111);
+  TestValue("mask_last_n(12345678900, 20, '*', '*', '*', -1, '9')", TYPE_BIGINT,
+      99999999999);
+  TestValue("mask_last_n(-12345678900, 20, '*', '*', '*', -1, '9')", TYPE_BIGINT,
+      -99999999999);
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestValue("mask_last_n(12345678, 10, 65, 97, 48, -1, 9)", TYPE_BIGINT, 99999999);
+  // Illegal masked_number (not in [0, 9]) is converted to default value 1.
+  TestValue("mask_last_n(12345678, 4, -1, -1, -1, -1, 10)", TYPE_BIGINT, 12341111);
+  TestValue("mask_last_n(12345678, 4, -1, -1, -1, -1, -1)", TYPE_BIGINT, 12341111);
+
+  // Error handling
+  // Empty chars are converted to default values. Pick the first char for long strings.
+  TestStringValue("mask_last_n('TestString-123', 4, '', 'bBBBB', '', 'dDDD')",
+      "TestStringdnnn");
+  TestIsNull("mask_last_n(cast(NULL as STRING))", TYPE_STRING);
+  TestIsNull("mask_last_n(cast(NULL as BIGINT))", TYPE_BIGINT);
+  TestErrorString("mask_last_n(123456789, 4, 'aa', 'bb', 'cc', -1, 'a')",
+      "Can't convert 'a' to a valid masked_number. Valid values: 0-9.\n");
+  TestErrorString("mask_last_n(123456789, 4, 'aa', 'bb', 'cc', -1, '10')",
+      "Can't convert '10' to a valid masked_number. Valid values: 0-9.\n");
+}
+
+TEST_P(ExprTest, MaskTest) {
+  // Test overrides for string value.
+  // Replace upper case with 'X', lower case with 'x', digit chars with '0', other chars
+  // with ':'.
+  TestStringValue("mask('TestString-123', 'X', 'x', '0', ':')", "XxxxXxxxxx:000");
+  TestStringValue("mask(cast('TestString-123' as varchar(24)), 'X', 'x', '0', ':')",
+      "XxxxXxxxxx:000");
+  TestStringValue("mask(cast('TestString-123' as char(24)), 'X', 'x', '0', ':')",
+      "XxxxXxxxxx:000::::::::::");
+  TestStringValue("mask('')", "");
+  TestStringValue("mask('abcdeABCDE12345-#')", "xxxxxXXXXXnnnnn-#");
+  TestStringValue("mask('abcdeABCDE12345-#', '*', '*', '*', '*', 1)",
+      "*****************");  // The last argument 1 is unused since the value is string.
+  // Most importantly, test the override used by Ranger transformer.
+  TestStringValue("mask('abcdeABCDE12345-#', 'x', 'x', 'x', -1, '1')",
+      "xxxxxxxxxxxxxxx-#");
+  TestStringValue("mask('abcdeABCDE12345-#', '*', '*', '*', -1, '9')",
+      "***************-#");
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestStringValue("mask('abcdeABCDE12345-#', 65, 97, 48, -1, 9)", "aaaaaAAAAA00000-#");
+  TestStringValue("mask('abcdeABCDE12345-#', -1, -1, -1, -1, 9)", "abcdeABCDE12345-#");
+
+  // Test overrides for numeric value.
+  TestValue("mask(0)", TYPE_BIGINT, 1);
+  TestValue("mask(0, -1, -1, -1, -1, 5)", TYPE_BIGINT, 5);
+  TestValue("mask(cast(123 as tinyint), 'x', 'x', 'x', -1, '5')", TYPE_BIGINT, 555);
+  TestValue("mask(cast(12345 as smallint), 'x', 'x', 'x', -1, '5')", TYPE_BIGINT, 55555);
+  TestValue("mask(cast(12345 as int), 'x', 'x', 'x', 'x', 5)", TYPE_BIGINT, 55555);
+  TestValue("mask(cast(12345 as bigint), -1, -1, -1, -1, -1)", TYPE_BIGINT, 11111);
+  TestValue("mask(12345678900)", TYPE_BIGINT, 11111111111);
+  TestValue("mask(12345678900, '*', '*', '*', '*', 2)", TYPE_BIGINT, 22222222222);
+  // Most importantly, test the override used by Ranger transformer.
+  TestValue("mask(12345678900, 'x', 'x', 'x', -1, '1')", TYPE_BIGINT, 11111111111);
+  TestValue("mask(12345678900, '*', '*', '*', -1, '9')", TYPE_BIGINT, 99999999999);
+  TestValue("mask(-12345678900, '*', '*', '*', -1, '9')", TYPE_BIGINT, -99999999999);
+  // Test all int arguments. 65 = 'A', 97 = 'a', 48 = '0'.
+  TestValue("mask(12345678, 65, 97, 48, -1, 9)", TYPE_BIGINT, 99999999);
+  // Illegal masked_number (not in [0, 9]) is converted to default value 1.
+  TestValue("mask(12345678, -1, -1, -1, -1, 10)", TYPE_BIGINT, 11111111);
+  TestValue("mask(12345678, -1, -1, -1, -1, -1)", TYPE_BIGINT, 11111111);
+
+  // Test overrides for Date value.
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, 11, 2, 2020)",
+      DateValue(2020, 3, 11));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, 32, 12, 2020)",
+      DateValue(2020, 1, 1));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, -1, -1, -1)",
+      DateValue(2019, 12, 31));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, 10, -1, -1)",
+      DateValue(2019, 12, 10));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, -1, 0, -1)",
+      DateValue(2019, 1, 31));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, -1, -1, 10)",
+      DateValue(10, 12, 31));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, 10, 0, -1)",
+      DateValue(2019, 1, 10));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, 10, -1, 10)",
+      DateValue(10, 12, 10));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, -1, 0, 10)",
+      DateValue(10, 1, 31));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, 10, 0, 10)",
+      DateValue(10, 1, 10));
+
+  // Error handling
+  // Empty chars are converted to default values. Pick the first char for long strings.
+  TestStringValue("mask('TestString-123', '', 'bBBBB', '', 'dDDD')", "XbbbXbbbbbdnnn");
+  TestIsNull("mask(cast(NULL as STRING))", TYPE_STRING);
+  TestIsNull("mask(cast(NULL as BIGINT))", TYPE_BIGINT);
+  TestIsNull("mask(cast(NULL as DATE))", TYPE_DATE);
+  TestErrorString("mask(123456789, 'aa', 'bb', 'cc', -1, 'a')",
+      "Can't convert 'a' to a valid masked_number. Valid values: 0-9.\n");
+  TestErrorString("mask(123456789, 'aa', 'bb', 'cc', -1, '10')",
+      "Can't convert '10' to a valid masked_number. Valid values: 0-9.\n");
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, 10, 0, 0)",
+      DateValue(1, 1, 10));
+  TestDateValue("mask(cast('2019-12-31' as date), -1, -1, -1, -1, -1, 10, 0, 10000)",
+      DateValue(1, 1, 10));
+  // This is a different behavior than Hive's. Hive will convert '2019-02-30' to
+  // '2019-03-02', while Impala converts it to NULL.
+  TestIsNull("mask(cast('2019-02-03' as date), -1, -1, -1, -1, -1, 30, -1, -1)",
+      TYPE_DATE);
+}
+
+TEST_P(ExprTest, MaskHashTest) {
+  if (FIPS_mode()) {
+    TestStringValue("mask_hash('TestString-123')",
+        "f3a58111be6ecec11449ac44654e72376b7759883ea11723b6e51354d50436de"
+        "645bd061cb5c2b07b68e15b7a7c342cac41f69b9c4efe19e810bbd7abf639a1c");
+    TestStringValue("mask_hash(cast('TestString-123' as varchar(24)))",
+        "f3a58111be6ecec11449ac44654e72376b7759883ea11723b6e51354d50436de"
+        "645bd061cb5c2b07b68e15b7a7c342cac41f69b9c4efe19e810bbd7abf639a1c");
+    TestStringValue("mask_hash(cast('TestString-123' as char(24)))",
+        "8eb5cfb29df20ccb1142aab8700ef4649c3b26304c35263c9bbc7db0d20e1098"
+        "47a728afe0dccdfbbb3d876a5cb3ceb0bd34b5104dd62af1feb234d705bfb193");
+  } else {
+    TestStringValue("mask_hash('TestString-123')",
+        "8b44d559dc5d60e4453c9b4edf2a455fbce054bb8504cd3eb9b5f391bd239c90");
+    TestStringValue("mask_hash(cast('TestString-123' as varchar(24)))",
+        "8b44d559dc5d60e4453c9b4edf2a455fbce054bb8504cd3eb9b5f391bd239c90");
+    TestStringValue("mask_hash(cast('TestString-123' as char(24)))",
+        "30a88603135d3a6f7a66b4f9193da1ab4423aed45fb8fe736c2f2a08977f2bdd");
+  }
+  TestIsNull("mask_hash(cast(123 as tinyint))", TYPE_BIGINT);
+  TestIsNull("mask_hash(cast(12345 as smallint))", TYPE_BIGINT);
+  TestIsNull("mask_hash(cast(12345 as int))", TYPE_BIGINT);
+  TestIsNull("mask_hash(cast(12345 as bigint))", TYPE_BIGINT);
+  TestIsNull("mask_hash(cast(1 as boolean))", TYPE_BOOLEAN);
+  TestIsNull("mask_hash(cast(12345 as double))", TYPE_DOUBLE);
+  TestIsNull("mask_hash(cast('2016-04-20' as date))", TYPE_DATE);
+  TestIsNull("mask_hash(cast('2016-04-20' as timestamp))", TYPE_TIMESTAMP);
+}
+
+TEST_P(ExprTest, Utf8MaskTest) {
+  executor_->PushExecOption("utf8_mode=true");
+  // Default is no masking for other chars so Chinese charactors are unmasked.
+  TestStringValue("mask('hello李小龙')", "xxxxx李小龙");
+  // Keeps upper, lower, digit chars and masks other chars as 'x'.
+  TestStringValue("mask('hello李小龙', -1, -1, -1, 'X')", "helloXXX");
+  TestStringValue("mask_last_n('hello李小龙', 4, -1, -1, -1, 'x')", "helloxxx");
+  TestStringValue("mask_last_n('hello李小龙', 2, -1, -1, -1, 'x')", "hello李xx");
+  TestStringValue("mask_last_n('hello李小龙', 4, 'x', 'x', 'x', 'X')", "hellxXXX");
+  TestStringValue("mask_show_first_n('hello李小龙', 6, 'x', 'x', 'x', 'X')",
+      "hello李XX");
+  TestStringValue("mask_show_first_n('hello李小龙', 4, -1, -1, -1, 'X')", "helloXXX");
+  TestStringValue("mask_show_first_n('hello李小龙', 4, 'x', 'x', 'x', 'X')",
+      "hellxXXX");
+  TestStringValue("mask_first_n('hello李小龙', 5)", "xxxxx李小龙");
+  // Default is no masking for other chars so Chinese charactors are unmasked.
+  TestStringValue("mask_first_n('hello李小龙', 6)", "xxxxx李小龙");
+  TestStringValue("mask_first_n('hello李小龙', 6, 'x', 'x', 'x', 'X')",
+      "xxxxxX小龙");
+  TestStringValue("mask_show_last_n('hello李小龙', 2, 'x', 'x', 'x', 'X')",
+      "xxxxxX小龙");
+  TestStringValue("mask_show_last_n('hello李小龙', 4, 'x', 'x', 'x', 'X')",
+      "xxxxo李小龙");
+
+  // Test masking unicode upper/lower cases.
+  TestStringValue("mask('abcd áäèü ABCD ÁÄÈÜ')", "xxxx xxxx XXXX XXXX");
+  TestStringValue("mask('Ich möchte ein Bier. Tschüss')",
+      "Xxx xxxxxx xxx Xxxx. Xxxxxxx");
+  TestStringValue("mask('Hungarian áéíöóőüúű ÁÉÍÖÓŐÜÚŰ')",
+      "Xxxxxxxxx xxxxxxxxx XXXXXXXXX");
+  TestStringValue("mask('German äöüß ÄÖÜẞ')", "Xxxxxx xxxx XXXX");
+  TestStringValue(
+      "mask('French àâæçéèêëïîôœùûüÿ ÀÂÆÇÉÈÊËÏÎÔŒÙÛÜŸ')",
+      "Xxxxxx xxxxxxxxxxxxxxxx XXXXXXXXXXXXXXXX");
+  TestStringValue("mask('Greek αβξδ άέήώ ΑΒΞΔ ΆΈΉΏ 1234')",
+      "Xxxxx xxxx xxxx XXXX XXXX nnnn");
+  TestStringValue("mask_first_n('áéíöóőüúű')", "xxxxóőüúű");
+  TestStringValue("mask_show_first_n('áéíöóőüúű')", "áéíöxxxxx");
+  TestStringValue("mask_last_n('áéíöóőüúű')", "áéíöóxxxx");
+  TestStringValue("mask_show_last_n('áéíöóőüúű')", "xxxxxőüúű");
+
+  // Test masking to unicode code points. Specify -1(unmask) for masking upper/lower/digit
+  // chars.
+  TestStringValue("mask('hello李小龙', -1, -1, -1, '某')", "hello某某某");
+  TestStringValue("mask_last_n('hello李小龙', 4, -1, -1, -1, '某')",
+      "hello某某某");
+  TestStringValue("mask_last_n('hello李小龙', 2, -1, -1, -1, '某')",
+      "hello李某某");
+  TestStringValue("mask_show_first_n('hello李小龙', 4, -1, -1, -1, '某')",
+      "hello某某某");
+  TestStringValue("mask_show_first_n('hello李小龙', 6, -1, -1, -1, '某')",
+      "hello李某某");
+  TestStringValue("mask_first_n('李小龙hello', 4, -1, -1, -1, '某')",
+      "某某某hello");
+  TestStringValue("mask_show_last_n('李小龙hello', 5, -1, -1, -1, '某')",
+      "某某某hello");
+  executor_->PopExecOption();
+}
+
+void ExprTest::TestBytes() {
+  // Verifies Bytes(exp) counts number of bytes.
+  TestIsNull("Bytes(NULL)", TYPE_INT);
+  TestValue("Bytes('你好')", TYPE_INT, 6);
+  TestValue("Bytes('你好hello')", TYPE_INT, 11);
+  TestValue("Bytes('你好 hello 你好')", TYPE_INT, 19);
+  TestValue("Bytes('hello')", TYPE_INT, 5);
+  // BINARY uses "bytes" behind "length"
+  TestIsNull("Length(CAST(NULL AS BINARY))", TYPE_INT);
+  TestValue("Length(CAST('你好' AS BINARY))", TYPE_INT, 6);
+  TestValue("Length(CAST('你好hello' AS BINARY))", TYPE_INT, 11);
+  TestValue("Length(CAST('你好 hello 你好' AS BINARY))", TYPE_INT, 19);
+  TestValue("Length(CAST('hello' AS BINARY))", TYPE_INT, 5);
+}
+
+TEST_P(ExprTest, BytesTest) {
+  // Bytes should behave the same regardless of utf8_mode.
+  TestBytes();
+  executor_->PushExecOption("utf8_mode=true");
+  TestBytes();
+  executor_->PopExecOption();
+}
+
+TEST_P(ExprTest, Utf8Test) {
+  // Verifies utf8_length() counts length by UTF-8 characters instead of bytes.
+  // '你' and '好' are both encoded into 3 bytes.
+  TestIsNull("utf8_length(NULL)", TYPE_INT);
+  TestValue("utf8_length('你好')", TYPE_INT, 2);
+  TestValue("utf8_length('你好hello')", TYPE_INT, 7);
+  TestValue("utf8_length('你好 hello 你好')", TYPE_INT, 11);
+  TestValue("utf8_length('hello')", TYPE_INT, 5);
+
+  // Verifies position and length of utf8_substring() are UTF-8 aware.
+  // '你' and '好' are both encoded into 3 bytes.
+  TestStringValue("utf8_substring('Hello', 1)", "Hello");
+  TestStringValue("utf8_substring('Hello', -2)", "lo");
+  TestStringValue("utf8_substring('Hello', cast(0 as bigint))", "");
+  TestStringValue("utf8_substring('Hello', -5)", "Hello");
+  TestStringValue("utf8_substring('Hello', cast(-6 as bigint))", "");
+  TestStringValue("utf8_substring('Hello', 100)", "");
+  TestStringValue("utf8_substring('Hello', -100)", "");
+  TestIsNull("utf8_substring(NULL, 100)", TYPE_STRING);
+  TestIsNull("utf8_substring('Hello', NULL)", TYPE_STRING);
+  TestIsNull("utf8_substring(NULL, NULL)", TYPE_STRING);
+  TestStringValue("utf8_substring('Hello', 1, 1)", "H");
+  TestStringValue("utf8_substring('Hello', cast(2 as bigint), 100)", "ello");
+  TestStringValue("utf8_substring('Hello', -3, cast(2 as bigint))", "ll");
+  TestStringValue("utf8_substring('Hello', 1, 0)", "");
+  TestStringValue("utf8_substring('Hello', cast(1 as bigint), cast(-1 as bigint))", "");
+  TestIsNull("utf8_substring(NULL, 1, 100)", TYPE_STRING);
+  TestIsNull("utf8_substring('Hello', NULL, 100)", TYPE_STRING);
+  TestIsNull("utf8_substring('Hello', 1, NULL)", TYPE_STRING);
+  TestIsNull("utf8_substring(NULL, NULL, NULL)", TYPE_STRING);
+  TestStringValue("utf8_substring('你好', 0)", "");
+  TestStringValue("utf8_substring('你好', 1)", "你好");
+  TestStringValue("utf8_substring('你好', 2)", "好");
+  TestStringValue("utf8_substring('你好', 3)", "");
+  TestStringValue("utf8_substring('你好', 0, 1)", "");
+  TestStringValue("utf8_substring('你好', 1, 0)", "");
+  TestStringValue("utf8_substring('你好', 1, 1)", "你");
+  TestStringValue("utf8_substring('你好', 1, -1)", "");
+  TestStringValue("utf8_substring('你好hello', 1, 4)", "你好he");
+  TestStringValue("utf8_substring('hello你好', 2, 5)", "ello你");
+  TestStringValue("utf8_substring('你好hello你好', -1)", "好");
+  TestStringValue("utf8_substring('你好hello你好', -2)", "你好");
+  TestStringValue("utf8_substring('你好hello你好', -3)", "o你好");
+  TestStringValue("utf8_substring('你好hello你好', -7)", "hello你好");
+  TestStringValue("utf8_substring('你好hello你好', -8)", "好hello你好");
+  TestStringValue("utf8_substring('你好hello你好', -9)", "你好hello你好");
+  TestStringValue("utf8_substring('你好hello你好', -10)", "");
+  TestStringValue("utf8_substring('你好hello你好', -3, cast(2 as bigint))", "o你");
+  TestStringValue("utf8_substring('你好hello你好', -1, -1)", "");
+
+  // Verifies utf8_reverse() reverses the UTF-8 characters (code points).
+  // '你' and '好' are both encoded into 3 bytes.
+  TestIsNull("utf8_reverse(NULL)", TYPE_STRING);
+  TestStringValue("utf8_reverse('hello')", "olleh");
+  TestStringValue("utf8_reverse('')", "");
+  TestStringValue("utf8_reverse('你好')", "好你");
+  TestStringValue("utf8_reverse('你好hello')", "olleh好你");
+  TestStringValue("utf8_reverse('hello你好')", "好你olleh");
+  TestStringValue("utf8_reverse('你好hello你好')", "好你olleh好你");
+  TestStringValue("utf8_reverse('hello你好hello')", "olleh好你olleh");
+  // '🙂' is encoded into 1 code points (U+1F642) and finally encoded into 4 bytes.
+  TestStringValue("utf8_reverse('hello🙂')", "🙂olleh");
+  // Verifies utf8_reverse() reverse code points instead of grapheme clusters.
+  // 'ñ' can be encoded into 1-2 code points depending on the normalization.
+  // In NFC, it's U+00F1 which is encoded into 2 bytes (0xc3 0xb1).
+  // In NFD, it's 'n' and U+0303 which are finally encoded into 3 bytes (0x6e for 'n' and
+  // 0xcc 0x83 for the '~'). Here "n\u0303" is a grapheme cluster.
+  TestStringValue("utf8_reverse('ma\u00f1ana')", "ana\u00f1am");
+  TestStringValue("utf8_reverse('man\u0303ana')", "ana\u0303nam");
+  // NFC(default in Linux) is used in this file so the following test can pass.
+  TestStringValue("utf8_reverse('mañana')", "anañam");
+  // "\u0928\u0940" is a grapheme clusters, same as "\u0ba8\u0bbf" and
+  // "\U0001f468\u200d\U0001f468\u200d\U0001f467\u200d\U0001f467".
+  // The string is reversed in code points.
+  TestStringValue("utf8_reverse('\u0928\u0940\u0ba8\u0bbf"
+      "\U0001f468\u200d\U0001f468\u200d\U0001f467\u200d\U0001f467')",
+      "\U0001f467\u200d\U0001f467\u200d\U0001f468\u200d\U0001f468"
+      "\u0bbf\u0ba8\u0940\u0928");
+
+  executor_->PushExecOption("utf8_mode=true");
+  // Each Chinese character is encoded into 3 bytes. But in UTF-8 mode, the positions
+  // are counted by UTF-8 characters.
+  TestValue("instr('最快的SQL引擎', 'SQL')", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎', '引擎')", TYPE_INT, 7);
+  TestValue("instr('最快的SQL引擎', 'SQL', 1)", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎', 'SQL', 4)", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎', 'SQL', 5)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎', 'SQL', 500)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎', 'SQL', -1)", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎', 'SQL', -2)", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎', 'SQL', -3)", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎', 'SQL', -5)", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎', 'SQL', -6)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎', 'SQL', -600)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎跑SQL', '引擎', 1)", TYPE_INT, 7);
+  TestValue("instr('最快的SQL引擎跑SQL', '引擎', 7)", TYPE_INT, 7);
+  TestValue("instr('最快的SQL引擎跑SQL', '引擎', 8)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎跑SQL', '引擎', -1)", TYPE_INT, 7);
+  TestValue("instr('最快的SQL引擎跑SQL', '引擎', -6)", TYPE_INT, 7);
+  TestValue("instr('最快的SQL引擎跑SQL', '引擎', -7)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎跑SQL', '引擎', -700)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL', 1, 1)", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL', 1, 2)", TYPE_INT, 10);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL', 1, 3)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL', 100, 3)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL', -1, 1)", TYPE_INT, 10);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL', -1, 2)", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL', -1, 3)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL', -100, 3)", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL引擎')", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL引擎', -1)", TYPE_INT, 4);
+  TestValue("instr('最快的SQL引擎跑SQL', 'SQL引擎, 1, 2')", TYPE_INT, 0);
+  TestValue("instr('最快的SQL引擎跑SQL', '跑SQL')", TYPE_INT, 9);
+  TestValue("instr('最快的SQL引擎跑SQL', '跑SQL', -1)", TYPE_INT, 9);
+  TestValue("instr('最快的SQL引擎跑SQL', '跑SQL', 1, 2)", TYPE_INT, 0);
+  TestValue("instr('你好你好你好你好', '好', 1, 1)", TYPE_INT, 2);
+  TestValue("instr('你好你好你好你好', '好', 1, 2)", TYPE_INT, 4);
+  TestValue("instr('你好你好你好你好', '好', 1, 3)", TYPE_INT, 6);
+  TestValue("instr('你好你好你好你好', '好', 1, 4)", TYPE_INT, 8);
+  TestValue("instr('你好你好你好你好', '好', 1, 5)", TYPE_INT, 0);
+  TestValue("instr('你好你好你好你好', '好', 4, 2)", TYPE_INT, 6);
+  TestValue("instr('你好你好你好你好', '好', -1, 1)", TYPE_INT, 8);
+  TestValue("instr('你好你好你好你好', '好', -1, 2)", TYPE_INT, 6);
+  TestValue("instr('你好你好你好你好', '好', -1, 3)", TYPE_INT, 4);
+  TestValue("instr('你好你好你好你好', '好', -1, 4)", TYPE_INT, 2);
+  TestValue("instr('你好你好你好你好', '好', -1, 5)", TYPE_INT, 0);
+  TestValue("instr('你好你好你好你好', '好', -4, 2)", TYPE_INT, 2);
+  TestIsNull("instr('最快的SQL引擎跑SQL', 'SQL', 1, NULL)", TYPE_INT);
+  TestIsNull("instr('最快的SQL引擎跑SQL', 'SQL', NULL, 1)", TYPE_INT);
+  TestIsNull("instr('最快的SQL引擎跑SQL', NULL, 1, 1)", TYPE_INT);
+  TestIsNull("instr(NULL, 'SQL', 1, 1)", TYPE_INT);
+
+  TestValue("locate('SQL', '最快的SQL引擎跑SQL')", TYPE_INT, 4);
+  TestValue("locate('SQL', '最快的SQL引擎跑SQL', 4)", TYPE_INT, 4);
+  TestValue("locate('SQL', '最快的SQL引擎跑SQL', 5)", TYPE_INT, 10);
+  TestValue("locate('SQL', '最快的SQL引擎跑SQL', 10)", TYPE_INT, 10);
+  TestValue("locate('SQL', '最快的SQL引擎跑SQL', 11)", TYPE_INT, 0);
+  // locate() only allow positive position.
+  TestValue("locate('SQL', '最快的SQL引擎跑SQL', 0)", TYPE_INT, 0);
+  TestValue("locate('SQL', '最快的SQL引擎跑SQL', -1)", TYPE_INT, 0);
+  TestIsNull("locate('SQL', '最快的SQL引擎跑SQL', NULL)", TYPE_INT);
+
+  TestStringValue("upper('abcd áäèü')", "ABCD ÁÄÈÜ");
+  TestStringValue("lower('ABCD ÁÄÈÜ')", "abcd áäèü");
+  TestStringValue("initcap('abcd áäèü ABCD ÁÄÈÜ')",
+      "Abcd Áäèü Abcd Áäèü");
+
+  TestStringValue("upper('aáàâãäăāåąæ')", "AÁÀÂÃÄĂĀÅĄÆ");
+  TestStringValue("lower('AÁÀÂÃÄĂĀÅĄÆ')", "aáàâãäăāåąæ");
+  TestStringValue("initcap('AÁÀÂÃÄĂĀÅĄÆ')", "Aáàâãäăāåąæ");
+
+  TestStringValue("upper('eéèêëěēėę')", "EÉÈÊËĚĒĖĘ");
+  TestStringValue("lower('EÉÈÊËĚĒĖĘ')", "eéèêëěēėę");
+  TestStringValue("initcap('EÉÈÊËĚĒĖĘ')", "Eéèêëěēėę");
+
+  // The uppercase of "i" and "ı" are both "I". However, the lowercase of "I" is "i"
+  // because we don't support Turkish locale yet (IMPALA-11080).
+  // Due to the same reason, the lowercase of "İ" and "I" are both "i", but the uppercase
+  // of "i" is "I".
+  TestStringValue("upper('iíìîïīįı')", "IÍÌÎÏĪĮI");
+  TestStringValue("lower('IÍÌÎÏĪĮIİ')", "iíìîïīįii");
+  TestStringValue("initcap('IÍÌÎÏĪĮIİ')", "Iíìîïīįii");
+
+  TestStringValue("upper('oóòôõöőøœ')", "OÓÒÔÕÖŐØŒ");
+  TestStringValue("lower('OÓÒÔÕÖŐØŒ')", "oóòôõöőøœ");
+  TestStringValue("initcap('OÓÒÔÕÖŐØŒ')", "Oóòôõöőøœ");
+
+  TestStringValue("upper('uúùûüűū')", "UÚÙÛÜŰŪ");
+  TestStringValue("lower('UÚÙÛÜŰŪ')", "uúùûüűū");
+  TestStringValue("initcap('UÚÙÛÜŰŪ')", "Uúùûüűū");
+
+  // The uppercase of "đ" and "ð" are both "Đ", but the lowercase of "Đ" is "đ"
+  // due to the hard-coded locale, i.e. "en_US.UTF-8".
+  TestStringValue("upper('ýćčďđðģğķłļ')", "ÝĆČĎĐÐĢĞĶŁĻ");
+  TestStringValue("lower('ÝĆČĎĐĢĞĶŁĻ')", "ýćčďđģğķłļ");
+  TestStringValue("initcap('ÝĆČĎĐĢĞĶŁĻ')", "Ýćčďđģğķłļ");
+
+  TestStringValue("upper('ńñňņŋ')", "ŃÑŇŅŊ");
+  TestStringValue("lower('ŃÑŇŅŊ')", "ńñňņŋ");
+  TestStringValue("initcap('ŃÑŇŅŊ')", "Ńñňņŋ");
+
+  TestStringValue("upper('řśšşťŧþţżźž')", "ŘŚŠŞŤŦÞŢŻŹŽ");
+  TestStringValue("lower('ŘŚŠŞŤŦÞŢŻŹŽ')", "řśšşťŧþţżźž");
+  TestStringValue("initcap('ŘŚŠŞŤŦÞŢŻŹŽ')", "Řśšşťŧþţżźž");
+
+  // Tests with the null byte ('\0') in the middle. Explicitly create the expected
+  // results as std::string in case they are truncated at '\0'.
+  TestStringValue("upper('ábć\\0èfğ')", string("ÁBĆ\0ÈFĞ", 11));
+  TestStringValue("lower('ÁBĆ\\0ÈFĞ')", string("ábć\0èfğ", 11));
+  TestStringValue("initcap('ábć\\0ÈFĞ')", string("Ábć\0èfğ", 11));
+
+  executor_->PopExecOption();
+}
+
 } // namespace impala
 
 INSTANTIATE_TEST_CASE_P(Instantiations, ExprTest, ::testing::Values(

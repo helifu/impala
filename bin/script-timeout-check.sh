@@ -93,12 +93,8 @@ echo "**** ${SCRIPT_NAME} TIMED OUT! ****"
 echo
 echo
 
-# Impala might have a thread stuck. Print the stacktrace to the console output.
-mkdir -p "$IMPALA_TIMEOUT_LOGS_DIR"
-for pid in $(pgrep impalad); do
-  echo "**** Generating stacktrace of impalad with process id: $pid ****"
-  gdb -ex "thread apply all bt"  --batch -p $pid > "${IMPALA_TIMEOUT_LOGS_DIR}/${pid}.txt"
-done
+# Impala might have a thread stuck. Dumps the stacktrace for diagnostic.
+"${IMPALA_HOME}"/bin/dump-stacktraces.sh
 
 # Now kill the caller
 kill $PPID
@@ -107,5 +103,4 @@ kill $PPID
 --error "Script ${SCRIPT_NAME} timed out. This probably happened due to a hung
 thread which can be confirmed by looking at the stacktrace of running impalad
 processes at ${IMPALA_TIMEOUT_LOGS_DIR}"
-
 

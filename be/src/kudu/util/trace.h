@@ -14,10 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_UTIL_TRACE_H
-#define KUDU_UTIL_TRACE_H
+#pragma once
 
 #include <iosfwd>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -25,7 +25,6 @@
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/threading/thread_collision_warner.h"
 #include "kudu/gutil/walltime.h"
@@ -48,12 +47,12 @@ class Trace;
 //  TRACE("Acquired timestamp $0", timestamp);
 #define TRACE(format, substitutions...) \
   do { \
-    kudu::Trace* _trace = Trace::CurrentTrace(); \
+    kudu::Trace* _trace = kudu::Trace::CurrentTrace(); \
     if (_trace) { \
       _trace->SubstituteAndTrace(__FILE__, __LINE__, (format),  \
         ##substitutions); \
     } \
-  } while (0);
+  } while (0)
 
 // Like the above, but takes the trace pointer as an explicit argument.
 #define TRACE_TO(trace, format, substitutions...) \
@@ -78,11 +77,11 @@ class Trace;
 // parameters.
 #define TRACE_COUNTER_INCREMENT(counter_name, val) \
   do { \
-    kudu::Trace* _trace = Trace::CurrentTrace(); \
+    kudu::Trace* _trace = kudu::Trace::CurrentTrace(); \
     if (_trace) { \
       _trace->metrics()->Increment(counter_name, val); \
     } \
-  } while (0);
+  } while (0)
 
 // Increment a counter for the amount of wall time spent in the current
 // scope. For example:
@@ -100,7 +99,7 @@ class Trace;
 // Construct a constant C string counter name which acts as a sort of
 // coarse-grained histogram for trace metrics.
 #define BUCKETED_COUNTER_NAME(prefix, duration_us)      \
-  [=]() -> const char* {                                \
+  [=]() {                                               \
     if (duration_us >= 100 * 1000) {                    \
       return prefix "_gt_100_ms";                       \
     } else if (duration_us >= 10 * 1000) {              \
@@ -110,7 +109,7 @@ class Trace;
     } else {                                            \
       return prefix "_lt_1ms";                          \
     }                                                   \
-  }();
+  }()
 
 namespace kudu {
 
@@ -224,7 +223,7 @@ class Trace : public RefCountedThreadSafe<Trace> {
 
   void MetricsToJSON(JsonWriter* jw) const;
 
-  gscoped_ptr<ThreadSafeArena> arena_;
+  std::unique_ptr<ThreadSafeArena> arena_;
 
   // Lock protecting the entries linked list.
   mutable simple_spinlock lock_;
@@ -289,4 +288,3 @@ class ScopedTraceLatencyCounter {
 };
 
 } // namespace kudu
-#endif /* KUDU_UTIL_TRACE_H */

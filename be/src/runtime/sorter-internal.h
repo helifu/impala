@@ -21,6 +21,10 @@
 
 #include "sorter.h"
 
+#include <random>
+
+#include "common/compiler-util.h"
+
 namespace impala {
 
 /// Wrapper around BufferPool::PageHandle that tracks additional info about the page.
@@ -218,10 +222,16 @@ class Sorter::Run {
   /// if the run is unpinned.
   Status FinalizePages(vector<Page>* pages);
 
-  /// Collect the non-null var-len (e.g. STRING) slots from 'src' in 'var_len_values' and
-  /// return the total length of all var-len values in 'total_var_len'.
+  void CheckTypeForVarLenCollectionSorting();
+
+  /// Collects the non-null var-len slots (strings and collections) from 'src'. Strings
+  /// are returned in 'string_values' and collections are returned, along with their byte
+  /// size, in 'collection_values'. The total length of all var-len values is returned in
+  /// 'total_var_len'.
   void CollectNonNullVarSlots(
-      Tuple* src, vector<StringValue*>* var_len_values, int* total_var_len);
+      Tuple* src, vector<StringValue*>* string_values,
+      std::vector<CollValueAndSize>* collection_values,
+      int* total_var_len);
 
   enum AddPageMode { KEEP_PREV_PINNED, UNPIN_PREV };
 
@@ -247,21 +257,31 @@ class Sorter::Run {
   /// this function will pin the page at 'page_index' + 1 in 'pages'.
   Status PinNextReadPage(vector<Page>* pages, int page_index);
 
-  /// Copy the StringValues in 'var_values' to 'dest' in order and update the StringValue
-  /// ptrs in 'dest' to point to the copied data.
-  void CopyVarLenData(const vector<StringValue*>& var_values, uint8_t* dest);
+  /// Copy the var len data in 'string_values' and 'collection_values_and_sizes' to 'dest'
+  /// in order and update the pointers to point to the copied data.
+  void CopyVarLenData(const vector<StringValue*>& string_values,
+      const vector<CollValueAndSize>& collection_values_and_sizes, uint8_t* dest);
 
-  /// Copy the StringValues in 'var_values' to 'dest' in order. Update the StringValue
-  /// ptrs in 'dest' to contain a packed offset for the copied data comprising
-  /// page_index and the offset relative to page_start.
-  void CopyVarLenDataConvertOffset(const vector<StringValue*>& var_values, int page_index,
-      const uint8_t* page_start, uint8_t* dest);
+  /// Copy the StringValues in 'var_values' and the CollectionValues referenced in
+  /// 'collection_values_and_sizes' to 'dest' in order. Update the StringValue ptrs in
+  /// 'dest' to contain a packed offset for the copied data comprising page_index and the
+  /// offset relative to page_start.
+  void CopyVarLenDataConvertOffset(const vector<StringValue*>& var_values,
+      const std::vector<CollValueAndSize>& collection_values_and_sizes,
+      int page_index, const uint8_t* page_start, uint8_t* dest);
 
   /// Convert encoded offsets to valid pointers in tuple with layout 'sort_tuple_desc_'.
   /// 'tuple' is modified in-place. Returns true if the pointers refer to the page at
   /// 'var_len_pages_index_' and were successfully converted or false if the var len
   /// data is in the next page, in which case 'tuple' is unmodified.
   bool ConvertOffsetsToPtrs(Tuple* tuple);
+
+  template <class ValueType>
+  bool ConvertValueOffsetsToPtrs(Tuple* tuple, uint8_t* page_start,
+      const vector<SlotDescriptor*>& slots);
+
+  bool ConvertStringValueOffsetsToPtrs(Tuple* tuple, uint8_t* page_start);
+  bool ConvertCollectionValueOffsetsToPtrs(Tuple* tuple, uint8_t* page_start);
 
   int NumOpenPages(const vector<Page>& pages);
 
@@ -285,7 +305,7 @@ class Sorter::Run {
 
   const bool has_var_len_slots_;
 
-  /// True if this is an initial run. False implies this is an sorted intermediate run
+  /// True if this is an initial run. False implies this is a sorted intermediate run
   /// resulting from merging other runs.
   const bool initial_run_;
 
@@ -374,27 +394,27 @@ class Sorter::TupleIterator {
   /// valid to dereference 'tuple_' in that case. 'run' and 'tuple_size' are passed as
   /// arguments to avoid redundantly storing the same values in multiple iterators in
   /// perf-critical algorithms.
-  void Next(Sorter::Run* run, int tuple_size);
+  void IR_ALWAYS_INLINE Next(Sorter::Run* run, int tuple_size);
 
   /// The reverse of Next(). Can advance one before the first tuple in the run, but it
   /// is invalid to dereference 'tuple_' in that case.
-  void Prev(Sorter::Run* run, int tuple_size);
+  void IR_ALWAYS_INLINE Prev(Sorter::Run* run, int tuple_size);
 
-  int64_t index() const { return index_; }
-  Tuple* tuple() const { return reinterpret_cast<Tuple*>(tuple_); }
+  int64_t IR_ALWAYS_INLINE index() const { return index_; }
+  Tuple* IR_ALWAYS_INLINE tuple() const { return reinterpret_cast<Tuple*>(tuple_); }
   /// Returns current tuple in TupleRow format. The caller should not modify the row.
-  const TupleRow* row() const {
+  const TupleRow* IR_ALWAYS_INLINE row() const {
     return reinterpret_cast<const TupleRow*>(&tuple_);
   }
 
  private:
   /// Move to the next page in the run (or do nothing if at end of run).
   /// This is the slow path for Next();
-  void NextPage(Sorter::Run* run);
+  void IR_ALWAYS_INLINE NextPage(Sorter::Run* run);
 
   /// Move to the previous page in the run (or do nothing if at beginning of run).
   /// This is the slow path for Prev();
-  void PrevPage(Sorter::Run* run);
+  void IR_ALWAYS_INLINE PrevPage(Sorter::Run* run);
 
   /// Index of the current tuple in the run.
   /// Can be -1 or run->num_rows() if Next() or Prev() moves iterator outside of run.
@@ -433,6 +453,21 @@ class Sorter::TupleSorter {
   /// query is cancelled.
   Status Sort(Run* run);
 
+  /// Makes an attempt to codegen for method SortHelper(). Stores the resulting
+  /// function in codegend_fn and returns Status::OK() if codegen was successful.
+  /// Otherwise, a Status("Sorter::TupleSorter::Codegen(): failed to finalize function")
+  /// object is returned.
+  /// 'compare_fn' is the pointer to the code-gen version of the compare method with
+  /// which to replace all non-code-gen versions.
+  static Status Codegen(FragmentState* state, llvm::Function* compare_fn,
+      int tuple_byte_size, CodegenFnPtr<SortHelperFn>* codegend_fn);
+
+  /// Mangled name of SorterHelper().
+  static const char* SORTER_HELPER_SYMBOL;
+
+  /// Class name in LLVM IR.
+  static const char* LLVM_CLASS_NAME;
+
  private:
   static const int INSERTION_THRESHOLD = 16;
 
@@ -440,6 +475,9 @@ class Sorter::TupleSorter {
 
   /// Size of the tuples in memory.
   const int tuple_size_;
+
+  /// Getter for the size of the tuples in memory. Replaced by a constant during codegen
+  int IR_NO_INLINE get_tuple_size() const { return tuple_size_; }
 
   /// Tuple comparator with method Less() that returns true if lhs < rhs.
   const TupleRowComparator& comparator_;
@@ -455,7 +493,7 @@ class Sorter::TupleSorter {
   Run* run_;
 
   /// Temporarily allocated space to copy and swap tuples (Both are used in
-  /// Partition()). Owned by this TupleSorter instance.
+  /// Partition2way() and Partition3way()). Owned by this TupleSorter instance.
   uint8_t* temp_tuple_buffer_;
   uint8_t* swap_buffer_;
 
@@ -464,14 +502,22 @@ class Sorter::TupleSorter {
   /// high: Mersenne Twister should be more than adequate.
   std::mt19937_64 rng_;
 
+  void IR_ALWAYS_INLINE FreeExprResultPoolIfNeeded();
+
   /// Wrapper around comparator_.Less(). Also call expr_results_pool_.Clear()
   /// on every 'state_->batch_size()' invocations of comparator_.Less(). Returns true
   /// if 'lhs' is less than 'rhs'.
-  bool Less(const TupleRow* lhs, const TupleRow* rhs);
+  bool IR_ALWAYS_INLINE Less(const TupleRow* lhs, const TupleRow* rhs);
+
+  /// Wrapper around comparator_.Compare(). Also call expr_results_pool_.Clear()
+  /// on every 'state_->batch_size()' invocations of comparator_.Compare(). Returns -
+  /// if 'lhs' is less than 'rhs', + if 'lhs' is greater than 'rhs' and 0 if equal
+  int IR_ALWAYS_INLINE Compare(const TupleRow* lhs, const TupleRow* rhs);
 
   /// Perform an insertion sort for rows in the range [begin, end) in a run.
   /// Only valid to call for ranges of size at least 1.
-  Status InsertionSort(const TupleIterator& begin, const TupleIterator& end);
+  Status IR_ALWAYS_INLINE InsertionSort(
+      const TupleIterator& begin, const TupleIterator& end);
 
   /// Partitions the sequence of tuples in the range [begin, end) in a run into two
   /// groups around the pivot tuple - i.e. tuples in first group are <= the pivot, and
@@ -479,22 +525,40 @@ class Sorter::TupleSorter {
   /// groups and the index to the first element in the second group is returned in
   /// 'cut'. Return an error status if any error is encountered or if the query is
   /// cancelled.
-  Status Partition(TupleIterator begin, TupleIterator end,
+  Status IR_ALWAYS_INLINE Partition2way(TupleIterator begin, TupleIterator end,
       const Tuple* pivot, TupleIterator* cut);
 
-  /// Performs a quicksort of rows in the range [begin, end) followed by insertion sort
-  /// for smaller groups of elements. Return an error status for any errors or if the
-  /// query is cancelled.
+  /// Partitions the sequence of tuples in the range [begin, end) in a run into three
+  /// groups around the pivot tuple - i.e. tuples in first group are < the pivot,
+  /// tuples in the second group are = pivot, and tuples in the third group are > pivot.
+  /// Tuples are swapped in place to create the groups and the index to
+  /// the first element in the second group is returned in 'cut_left',
+  /// and the index to the first element in the third group is returned in 'cut_right'.
+  /// Returns an error status if any error is encountered or if the query is
+  /// cancelled.
+  Status IR_ALWAYS_INLINE Partition3way(TupleIterator begin, TupleIterator end,
+      const Tuple* pivot, TupleIterator* cut_left, TupleIterator* cut_right);
+
+  /// Performs a modified quicksort of rows in the range [begin, end):
+  /// If duplicates are found during pivot selection, Partition3way
+  /// is called in that iteration, otherwise partitioning goes 2-way.
+  /// This adaptive quicksort is followed by insertion sort for smaller groups
+  /// of elements.
+  /// Return an error status for any errors or if the query is cancelled.
   Status SortHelper(TupleIterator begin, TupleIterator end);
 
   /// Select a pivot to partition [begin, end).
-  Tuple* SelectPivot(TupleIterator begin, TupleIterator end);
+  Tuple* IR_ALWAYS_INLINE SelectPivot(TupleIterator begin, TupleIterator end,
+      bool* has_equals);
 
-  /// Return median of three tuples according to the sort comparator.
-  Tuple* MedianOfThree(Tuple* t1, Tuple* t2, Tuple* t3);
+  /// Return median of three tuples according to the sort comparator. Sets has_equals
+  /// flag true if duplicates found among the pivot candidates.
+  Tuple* IR_ALWAYS_INLINE MedianOfThree(Tuple* t1, Tuple* t2, Tuple* t3,
+      bool* has_equals);
 
   /// Swaps tuples pointed to by left and right using 'swap_tuple'.
-  static void Swap(Tuple* left, Tuple* right, Tuple* swap_tuple, int tuple_size);
+  static void IR_ALWAYS_INLINE Swap(Tuple* RESTRICT left, Tuple* RESTRICT right,
+      Tuple* RESTRICT swap_tuple, int tuple_size);
 };
 
 } // namespace impala

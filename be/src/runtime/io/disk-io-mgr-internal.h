@@ -19,8 +19,8 @@
 #define IMPALA_RUNTIME_DISK_IO_MGR_INTERNAL_H
 
 #include <unistd.h>
+#include <mutex>
 #include <queue>
-#include <boost/thread/locks.hpp>
 
 #include "common/logging.h"
 #include "runtime/io/request-context.h"
@@ -77,7 +77,7 @@ class DiskQueue {
   /// Enqueue the request context to the disk queue.
   void EnqueueContext(RequestContext* worker) {
     {
-      boost::unique_lock<boost::mutex> disk_lock(lock_);
+      std::unique_lock<std::mutex> disk_lock(lock_);
       // Check that the reader is not already on the queue
       DCHECK(find(request_contexts_.begin(), request_contexts_.end(), worker) ==
           request_contexts_.end());
@@ -101,9 +101,24 @@ class DiskQueue {
     DCHECK(read_size_ == nullptr);
     read_size_ = read_size;
   }
+  void set_write_latency(HistogramMetric* write_latency) {
+    DCHECK(write_latency_ == nullptr);
+    write_latency_ = write_latency;
+  }
+  void set_write_size(HistogramMetric* write_size) {
+    DCHECK(write_size_ == nullptr);
+    write_size_ = write_size;
+  }
+  void set_write_io_err(IntCounter* write_io_err) {
+    DCHECK(write_io_err_ == nullptr);
+    write_io_err_ = write_io_err;
+  }
 
   HistogramMetric* read_latency() const { return read_latency_; }
   HistogramMetric* read_size() const { return read_size_; }
+  HistogramMetric* write_latency() const { return write_latency_; }
+  HistogramMetric* write_size() const { return write_size_; }
+  IntCounter* write_io_err() const { return write_io_err_; }
 
  private:
   /// Called from the disk thread to get the next range to process. Wait until a scan
@@ -121,8 +136,17 @@ class DiskQueue {
   /// Metric that tracks read size for this queue.
   HistogramMetric* read_size_ = nullptr;
 
+  /// Metric that tracks write latency for this queue.
+  HistogramMetric* write_latency_ = nullptr;
+
+  /// Metric that tracks write size for this queue.
+  HistogramMetric* write_size_ = nullptr;
+
+  /// Metric that tracks write io errors for this queue.
+  IntCounter* write_io_err_ = nullptr;
+
   /// Lock that protects below members.
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// Condition variable to signal the disk threads that there is work to do or the
   /// thread should shut down.  A disk thread will be woken up when there is a reader

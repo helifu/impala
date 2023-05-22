@@ -16,10 +16,7 @@
 // under the License.
 
 #include "exprs/anyval-util.h"
-#include "codegen/llvm-codegen.h"
 
-#include "common/object-pool.h"
-#include "gutil/strings/substitute.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 
@@ -92,6 +89,9 @@ FunctionContext::TypeDesc AnyValUtil::ColumnTypeToTypeDesc(const ColumnType& typ
       break;
     case TYPE_DATE:
       out.type = FunctionContext::TYPE_DATE;
+      break;
+    case TYPE_STRUCT:
+      out.type = FunctionContext::TYPE_STRUCT;
       break;
     default:
       DCHECK(false) << "Unknown type: " << type;

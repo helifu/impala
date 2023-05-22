@@ -14,9 +14,11 @@ STRING, STRING
 ---- QUERY
 # Test that DESCRIBE shows the proper database location
 # for a newly created database (regression test for IMPALA-7439)
+# After HIVE-24175 the managed location is only available when
+# explicitly set in the create database statement.
 describe database $DATABASE_2
 ---- RESULTS
-'$DATABASE_2','$NAMENODE/test-warehouse/$DATABASE_2.db','For testing'
+'$DATABASE_2','$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/$DATABASE_2.db','For testing'
 ---- TYPES
 string, string, string
 ====
@@ -24,7 +26,7 @@ string, string, string
 # Test that DESCRIBE EXTENDED also has all of the necessary info.
 describe database extended $DATABASE_2
 ---- RESULTS
-'$DATABASE_2','$NAMENODE/test-warehouse/$DATABASE_2.db','For testing'
+'$DATABASE_2','$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/$DATABASE_2.db','For testing'
 'Owner: ','',''
 '','$USER','USER'
 ---- TYPES
@@ -54,6 +56,38 @@ STRING, STRING
 drop database if exists $DATABASE_2
 ---- RESULTS
 'Database does not exist.'
+====
+---- QUERY
+# Test CREATE DATABASE ... LOCATION
+create database if not exists $DATABASE_loc comment "For testing"
+  location '$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/specified_location'
+---- RESULTS
+'Database has been created.'
+====
+---- QUERY
+# Test that DESCRIBE shows the proper database location
+# for a newly created database with location
+describe database $DATABASE_loc
+---- RESULTS
+'$DATABASE_loc','$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/specified_location','For testing'
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Test that DESCRIBE EXTENDED also has all of the necessary info.
+describe database extended $DATABASE_loc
+---- RESULTS
+'$DATABASE_loc','$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/specified_location','For testing'
+'Owner: ','',''
+'','$USER','USER'
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Test dropping the database.
+drop database $DATABASE_loc
+---- RESULTS
+'Database has been dropped.'
 ====
 ---- QUERY
 # Test DROP DATABASE ... CASCADE
@@ -129,4 +163,71 @@ drop database $DATABASE_restrict restrict
 ---- QUERY
 show databases like '$DATABASE_restrict'
 ---- RESULTS
+====
+---- QUERY
+# Test CREATE DATABASE ... MANAGEDLOCATION
+create database if not exists $DATABASE_loc comment "For testing"
+  managedlocation '$NAMENODE/$MANAGED_WAREHOUSE_DIR/specified_managedlocation'
+---- RESULTS
+'Database has been created.'
+====
+---- QUERY
+# Test that DESCRIBE shows the proper database location and managedlocation
+# for a newly created database with location
+describe database $DATABASE_loc
+---- RESULTS
+'$DATABASE_loc','$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/$DATABASE_loc.db','For testing'
+'managedlocation:','$NAMENODE/$MANAGED_WAREHOUSE_DIR/specified_managedlocation',''
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Test that DESCRIBE EXTENDED also has all of the necessary info.
+describe database extended $DATABASE_loc
+---- RESULTS
+'$DATABASE_loc','$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/$DATABASE_loc.db','For testing'
+'managedlocation:','$NAMENODE/$MANAGED_WAREHOUSE_DIR/specified_managedlocation',''
+'Owner: ','',''
+'','$USER','USER'
+---- TYPES
+string, string, string
+====
+---- QUERY
+drop database $DATABASE_loc
+---- RESULTS
+'Database has been dropped.'
+====
+---- QUERY
+# Test CREATE DATABASE ... LOCATION ... MANAGEDLOCATION
+create database if not exists $DATABASE_loc comment "For testing"
+  location '$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/specified_location'
+  managedlocation '$NAMENODE/$MANAGED_WAREHOUSE_DIR/specified_managedlocation'
+---- RESULTS
+'Database has been created.'
+====
+---- QUERY
+# Test that DESCRIBE shows the proper database location and  managedlocation
+# for a newly created database with location
+describe database $DATABASE_loc
+---- RESULTS
+'$DATABASE_loc','$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/specified_location','For testing'
+'managedlocation:','$NAMENODE/$MANAGED_WAREHOUSE_DIR/specified_managedlocation',''
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Test that DESCRIBE EXTENDED also has all of the necessary info.
+describe database extended $DATABASE_loc
+---- RESULTS
+'$DATABASE_loc','$NAMENODE/$EXTERNAL_WAREHOUSE_DIR/specified_location','For testing'
+'managedlocation:','$NAMENODE/$MANAGED_WAREHOUSE_DIR/specified_managedlocation',''
+'Owner: ','',''
+'','$USER','USER'
+---- TYPES
+string, string, string
+====
+---- QUERY
+drop database $DATABASE_loc
+---- RESULTS
+'Database has been dropped.'
 ====

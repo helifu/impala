@@ -72,6 +72,9 @@ class DictEncoderBase {
   /// The number of entries in the dictionary.
   virtual int num_entries() const = 0;
 
+  /// Returns true if the dictionary is full.
+  virtual bool IsFull() const = 0;
+
   /// Clears all the indices (but leaves the dictionary).
   void ClearIndices() { buffered_indices_.clear(); }
 
@@ -184,9 +187,28 @@ class DictEncoder : public DictEncoderBase {
     return sizeof(Node) * nodes_.size();
   }
 
-  virtual void WriteDict(uint8_t* buffer);
+  void WriteDict(uint8_t* buffer) override;
 
-  virtual int num_entries() const { return nodes_.size(); }
+  int num_entries() const override { return nodes_.size(); }
+
+  /// Returns true if the dictionary is full.
+  bool IsFull() const override {
+    return nodes_.size() >= Node::INVALID_INDEX;
+  }
+
+  /// Execute 'func' for each key that is present in the dictionary. Stops execution the
+  /// first time 'func' returns an error, propagating the error. Returns OK otherwise.
+  ///
+  /// Can be useful if we fall back to plain encoding from dict encoding but still want to
+  /// use a Bloom filter. In this case the filter can be filled with all elements that
+  /// have occured so far.
+  Status ForEachDictKey(const std::function<Status(const T&)>& func) {
+    for (auto pair : nodes_) {
+      RETURN_IF_ERROR(func(pair.value));
+    }
+
+    return Status::OK();
+  }
 
  private:
   /// Size of the table. Must be a power of 2.
@@ -212,6 +234,7 @@ class DictEncoder : public DictEncoderBase {
 
     /// The maximum number of values in the dictionary.  Chosen to be around 60% of
     /// HASH_TABLE_SIZE to limit the expected length of the chains.
+    /// Changing this value will require re-tuning test_parquet_page_index.py.
     enum { INVALID_INDEX = 40000 };
   };
 
@@ -346,10 +369,11 @@ class DictDecoder : public DictDecoderBase {
   virtual int num_entries() const { return dict_.size(); }
 
   virtual void GetValue(int index, void* buffer) {
-    T* val_ptr = reinterpret_cast<T*>(buffer);
     DCHECK_GE(index, 0);
     DCHECK_LT(index, dict_.size());
-    *val_ptr = dict_[index];
+    // Avoid an unaligned store by using memcpy
+    T val = dict_[index];
+    memcpy(buffer, reinterpret_cast<const void*>(&val), sizeof(T));
   }
 
   /// Returns the next value.  Returns false if the data is invalid.

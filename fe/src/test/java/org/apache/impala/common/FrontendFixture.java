@@ -38,6 +38,7 @@ import org.apache.impala.analysis.StmtMetadataLoader;
 import org.apache.impala.analysis.StmtMetadataLoader.StmtTableCache;
 import org.apache.impala.authorization.AuthorizationFactory;
 import org.apache.impala.authorization.NoopAuthorizationFactory;
+import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.AggregateFunction;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.CatalogException;
@@ -63,6 +64,7 @@ import org.apache.impala.util.EventSequence;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import org.apache.impala.util.TSessionStateUtil;
 
 /**
  * Test fixture for the front-end as a whole. Logically equivalent to a running
@@ -360,8 +362,9 @@ public class FrontendFixture {
   public AnalysisResult parseAndAnalyze(String stmt, AnalysisContext ctx)
       throws ImpalaException {
     StatementBase parsedStmt = Parser.parse(stmt, ctx.getQueryOptions());
+    User user = new User(TSessionStateUtil.getEffectiveUser(ctx.getQueryCtx().session));
     StmtMetadataLoader mdLoader =
-        new StmtMetadataLoader(frontend_, ctx.getQueryCtx().session.database, null);
+        new StmtMetadataLoader(frontend_, ctx.getQueryCtx().session.database, null, user);
     StmtTableCache stmtTableCache = mdLoader.loadTables(parsedStmt);
     return ctx.analyzeAndAuthorize(parsedStmt, stmtTableCache,
         frontend_.getAuthzChecker());
@@ -370,13 +373,14 @@ public class FrontendFixture {
   /**
    * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
    * If 'expectedWarning' is not null, asserts that a warning is produced.
+   * Otherwise, asserts no warnings if 'assertNoWarnings' is true.
    */
   public ParseNode analyzeStmt(String stmt, AnalysisContext ctx,
-      String expectedWarning) {
+      String expectedWarning, boolean assertNoWarnings) {
     try {
       AnalysisResult analysisResult = parseAndAnalyze(stmt, ctx);
+      List<String> actualWarnings = analysisResult.getAnalyzer().getWarnings();
       if (expectedWarning != null) {
-        List<String> actualWarnings = analysisResult.getAnalyzer().getWarnings();
         boolean matchedWarning = false;
         for (String actualWarning: actualWarnings) {
           if (actualWarning.startsWith(expectedWarning)) {
@@ -389,6 +393,9 @@ public class FrontendFixture {
                   + "Expected warning:\n%s.\nActual warnings:\n%s\nsql:\n%s",
               expectedWarning, Joiner.on("\n").join(actualWarnings), stmt));
         }
+      } else if (assertNoWarnings && !actualWarnings.isEmpty()) {
+        fail(String.format("Should not produce any warnings. Got:\n%s\nsql:\n%s",
+            Joiner.on("\n").join(actualWarnings), stmt));
       }
       Preconditions.checkNotNull(analysisResult.getStmt());
       return analysisResult.getStmt();
@@ -404,6 +411,6 @@ public class FrontendFixture {
    * Uses default options; use {@link QueryFixture} for greater control.
    */
   public ParseNode analyzeStmt(String stmt) {
-    return analyzeStmt(stmt, createAnalysisCtx(), null);
+    return analyzeStmt(stmt, createAnalysisCtx(), null, false);
   }
 }

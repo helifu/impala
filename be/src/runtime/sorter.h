@@ -21,12 +21,13 @@
 #include <deque>
 
 #include "runtime/bufferpool/buffer-pool.h"
+#include "util/runtime-profile.h"
 #include "util/tuple-row-compare.h"
+#include "runtime/sorted-run-merger.h"
 
 namespace impala {
 
 class SortedRunMerger;
-class RuntimeProfile;
 class RowBatch;
 
 /// Sorter contains the external sort implementation. Its purpose is to sort arbitrarily
@@ -78,7 +79,7 @@ class RowBatch;
 /// input run, and one batch is created to hold deep copied rows (i.e. ptrs + data) from
 /// the output of the merge.
 //
-/// Note that Init() must be called right after the constructor.
+/// Note that Prepare() must be called right after the constructor.
 //
 /// During a merge, one row batch is created for each input run, and one batch is created
 /// for the output of the merge (if is not the final merge). It is assumed that the memory
@@ -92,32 +93,41 @@ class RowBatch;
 /// tuples in place.
 class Sorter {
  public:
+
+  class TupleSorter;
+  class TupleIterator;
+  typedef Status (*SortHelperFn)(TupleSorter*, TupleIterator, TupleIterator);
+
   /// 'sort_tuple_exprs' are the slot exprs used to materialize the tuples to be
-  /// sorted. 'ordering_exprs', 'is_asc_order' and 'nulls_first' are parameters
-  /// for the comparator for the sort tuples.
+  /// sorted.
+  /// 'tuple_row_comparator_config' is used to create the comparator for the sort tuples.
   /// 'node_label' is the label of the exec node using the sorter for error reporting.
   /// 'enable_spilling' should be set to false to reduce the number of requested buffers
   /// if the caller will use AddBatchNoSpill().
+  /// 'codegend_sort_helper_fn' is a reference to the codegen version of
+  /// the Sorter::TupleSorter::SortHelp() method.
+  /// 'estimated_input_size' is the total rows in bytes that are estimated to get added
+  /// into this sorter. This is used to decide if sorter needs to proactively spill for
+  /// the first run. -1 value means estimate is unavailable.
   ///
   /// The Sorter assumes that it has exclusive use of the client's
   /// reservations for sorting, and may increase the size of the client's reservation.
   /// The caller is responsible for ensuring that the minimum reservation (returned from
   /// ComputeMinReservation()) is available.
-  Sorter(const std::vector<ScalarExpr*>& ordering_exprs,
-      const std::vector<bool>& is_asc_order, const std::vector<bool>& nulls_first,
+  Sorter(const TupleRowComparatorConfig& tuple_row_comparator_config,
       const std::vector<ScalarExpr*>& sort_tuple_exprs, RowDescriptor* output_row_desc,
       MemTracker* mem_tracker, BufferPool::ClientHandle* client, int64_t page_len,
       RuntimeProfile* profile, RuntimeState* state, const std::string& node_label,
-      bool enable_spilling);
+      bool enable_spilling,
+      const CodegenFnPtr<SortHelperFn>& codegend_sort_helper_fn,
+      const CodegenFnPtr<SortedRunMerger::HeapifyHelperFn>& codegend_heapify_helper_fn =
+            default_heapify_helper_fn_,
+      int64_t estimated_input_size = -1);
   ~Sorter();
 
   /// Initial set-up of the sorter for execution.
   /// The evaluators for 'sort_tuple_exprs_' will be created and stored in 'obj_pool'.
   Status Prepare(ObjectPool* obj_pool) WARN_UNUSED_RESULT;
-
-  /// Do codegen for the Sorter. Called after Prepare() if codegen is desired. Returns OK
-  /// if successful or a Status describing the reason why Codegen failed otherwise.
-  Status Codegen(RuntimeState* state);
 
   /// Opens the sorter for adding rows and initializes the evaluators for materializing
   /// the tuples. Must be called after Prepare() or Reset() and before calling AddBatch().
@@ -141,7 +151,7 @@ class Sorter {
   Status GetNext(RowBatch* batch, bool* eos) WARN_UNUSED_RESULT;
 
   /// Resets all internal state like ExecNode::Reset().
-  /// Init() must have been called, AddBatch()/GetNext()/InputDone()
+  /// Prepare() must have been called, AddBatch()/GetNext()/InputDone()
   /// may or may not have been called.
   void Reset();
 
@@ -159,8 +169,9 @@ class Sorter {
  private:
   class Page;
   class Run;
-  class TupleIterator;
-  class TupleSorter;
+
+  /// Minimum value for sot_run_bytes_limit query option.
+  static const int64_t MIN_SORT_RUN_BYTES_LIMIT = 32 << 20; // 32 MB
 
   /// Create a SortedRunMerger from sorted runs in 'sorted_runs_' and assign it to
   /// 'merger_'. 'num_runs' indicates how many runs should be covered by the current
@@ -207,6 +218,28 @@ class Sorter {
   /// since the Sorter has started working on it's initial runs.
   void TryToIncreaseMemAllocationForMerge();
 
+  /// Given 'estimated_input_size', compute whether we most likely going to spill or not.
+  void ComputeSpillEstimate(int64_t estimated_input_size);
+
+  /// Check if we should enable enforce_sort_run_bytes_limit_ flag.
+  void CheckSortRunBytesLimitEnforcement();
+
+  /// Get value of sort_run_bytes_limit query option. If user specifies value between
+  /// [1,MIN_SORT_RUN_BYTES_LIMIT], it will be silently overridden by
+  /// MIN_SORT_RUN_BYTES_LIMIT. Otherwise, return sort_run_bytes_limit from state_.
+  int64_t GetSortRunBytesLimit() const;
+
+  /// Check if it is necessary to do an intermediate run and spill the sorted run.
+  /// There are two cases where it is necessary to do an intermediate run.
+  /// 1) Number of rows added to a run is less than total number of rows in RowBatch,
+  ///    indicating that mem_limit has been reached.
+  /// 2) enforce_sort_run_bytes_limit_ is true and current used memory is greater than or
+  ///    equal to specified sort_run_bytes_limit.
+  bool MustSortAndSpill(const int rows_added, const int batch_num_rows);
+
+  /// Try to lower current memory reservation up to sort_run_bytes_limit.
+  void TryLowerMemUpToSortRunBytesLimit();
+
   /// Label of the ExecNode that owns the sorter, used for error reporting.
   const std::string node_label_;
 
@@ -221,8 +254,21 @@ class Sorter {
   MemPool expr_results_pool_;
 
   /// In memory sorter and less-than comparator.
-  TupleRowComparator compare_less_than_;
+  boost::scoped_ptr<TupleRowComparator> compare_less_than_;
   boost::scoped_ptr<TupleSorter> in_mem_tuple_sorter_;
+
+  /// A reference to the codegened version of TupleSorter::SortHelper() that is stored
+  /// inside SortPlanNode, PartialSortPlanNode and TopNPlanNode.
+  const CodegenFnPtr<SortHelperFn>& codegend_sort_helper_fn_;
+
+  /// A reference to the codegened version of SortedRunMerger::HeapifyHelper() that is
+  /// stored inside SortPlanNode and ExchangePlanNode.
+  const CodegenFnPtr<SortedRunMerger::HeapifyHelperFn>& codegend_heapify_helper_fn_;
+
+  /// A default codegened function pointer storing nullptr, which is used when the
+  /// merger is not needed. Used as a default value in constructor, when the CodegenFnPtr
+  /// is not provided.
+  static const CodegenFnPtr<SortedRunMerger::HeapifyHelperFn> default_heapify_helper_fn_;
 
   /// Client used to allocate pages from the buffer pool. Not owned.
   BufferPool::ClientHandle* const buffer_pool_client_;
@@ -304,6 +350,9 @@ class Sorter {
 
   /// Min, max, and avg size of runs in number of tuples.
   RuntimeProfile::SummaryStatsCounter* run_sizes_;
+
+  /// Flag to enforce sort_run_bytes_limit.
+  bool enforce_sort_run_bytes_limit_ = false;
 };
 
 } // namespace impala

@@ -15,16 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfFS
 
 # Number of tables to create per thread
 NUM_TBLS_PER_THREAD = 10
 
 # Each client will get a different test id.
-TEST_INDICES = xrange(10)
+TEST_INDICES = range(10)
 
 
 # Simple stress test for DDL operations. Attempts to create, cache,
@@ -47,11 +49,7 @@ class TestDdlStress(ImpalaTestSuite):
         lambda v: (v.get_value('table_format').file_format == 'text' and
                    v.get_value('table_format').compression_codec == 'none'))
 
-  @SkipIfS3.caching
-  @SkipIfABFS.caching
-  @SkipIfADLS.caching
-  @SkipIfIsilon.caching
-  @SkipIfLocal.caching
+  @SkipIfFS.hdfs_caching
   @pytest.mark.stress
   @pytest.mark.parametrize('test_index', TEST_INDICES)
   def test_create_cache_many_tables(self, vector, testid_checksum, test_index):
@@ -60,7 +58,7 @@ class TestDdlStress(ImpalaTestSuite):
     # rather simultaneously on the same object.
     self.client.execute("create database if not exists {0}".format(self.SHARED_DATABASE))
 
-    for i in xrange(NUM_TBLS_PER_THREAD):
+    for i in range(NUM_TBLS_PER_THREAD):
       tbl_name = "{db}.test_{checksum}_{i}".format(
           db=self.SHARED_DATABASE,
           checksum=testid_checksum,

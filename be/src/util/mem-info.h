@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_UTIL_MEM_INFO_H
-#define IMPALA_UTIL_MEM_INFO_H
+#pragma once
 
+#include <cstdint>
 #include <string>
-#include <boost/cstdint.hpp>
 
 #include "common/logging.h"
+#include "common/status.h"
 
 namespace impala {
 
@@ -122,5 +122,10 @@ class MemInfo {
   static int64_t commit_limit_;
 };
 
+/// Choose a memory limit (returned in *bytes_limit) based on the --mem_limit flag and
+/// the memory available to the daemon process. Returns an error if the memory limit is
+/// invalid or another error is encountered that should prevent starting up the daemon.
+/// Logs the memory limit chosen and any relevant diagnostics related to that choice.
+/// If avail_mem is not nullptr, the bytes of system available memory will be returned.
+Status ChooseProcessMemLimit(int64_t* bytes_limit, int64_t* avail_mem = nullptr);
 }
-#endif

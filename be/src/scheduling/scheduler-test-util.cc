@@ -17,6 +17,8 @@
 
 #include "scheduling/scheduler-test-util.h"
 
+#include <random>
+
 #include <boost/unordered_set.hpp>
 
 #include "common/names.h"
@@ -93,16 +95,17 @@ const int64_t FileSplitGeneratorSpec::DEFAULT_FILE_SIZE = 1 << 22;
 const int64_t FileSplitGeneratorSpec::DEFAULT_BLOCK_SIZE = 1 << 20;
 
 ClusterMembershipMgr::BeDescSharedPtr BuildBackendDescriptor(const Host& host) {
-  auto be_desc = make_shared<TBackendDescriptor>();
-  be_desc->address.hostname = host.ip;
-  be_desc->address.port = host.be_port;
-  be_desc->ip_address = host.ip;
-  be_desc->__set_is_coordinator(host.is_coordinator);
-  be_desc->__set_is_executor(host.is_executor);
-  be_desc->is_quiescing = false;
-  be_desc->executor_groups.push_back(TExecutorGroupDesc());
-  be_desc->executor_groups.back().name = ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME;
-  be_desc->executor_groups.back().min_size = 1;
+  auto be_desc = make_shared<BackendDescriptorPB>();
+  be_desc->mutable_address()->set_hostname(host.ip);
+  be_desc->mutable_address()->set_port(host.be_port);
+  be_desc->set_ip_address(host.ip);
+  be_desc->set_is_coordinator(host.is_coordinator);
+  be_desc->set_is_executor(host.is_executor);
+  be_desc->set_is_quiescing(false);
+  be_desc->set_admit_mem_limit(GIGABYTE);
+  ExecutorGroupDescPB* exec_desc = be_desc->add_executor_groups();
+  exec_desc->set_name(ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME);
+  exec_desc->set_min_size(1);
   return be_desc;
 }
 
@@ -503,8 +506,9 @@ int64_t Result::MinNumAssignedBytesPerHost() const {
 
 int Result::NumDistinctBackends() const {
   unordered_set<IpAddr> backends;
-  AssignmentCallback cb = [&backends](
-      const AssignmentInfo& assignment) { backends.insert(assignment.addr.hostname); };
+  AssignmentCallback cb = [&backends](const AssignmentInfo& assignment) {
+    backends.insert(assignment.addr.hostname());
+  };
   ProcessAssignments(cb);
   return backends.size();
 }
@@ -526,8 +530,9 @@ Result::AssignmentFilter Result::Any() const {
 Result::AssignmentFilter Result::IsHost(int host_idx) const {
   TNetworkAddress expected_addr;
   plan_.cluster().GetBackendAddress(host_idx, &expected_addr);
-  return [expected_addr](
-      const AssignmentInfo& assignment) { return assignment.addr == expected_addr; };
+  return [expected_addr](const AssignmentInfo& assignment) {
+    return assignment.addr == FromTNetworkAddress(expected_addr);
+  };
 }
 
 Result::AssignmentFilter Result::IsCached(AssignmentFilter filter) const {
@@ -551,19 +556,19 @@ Result::AssignmentFilter Result::IsRemote(AssignmentFilter filter) const {
 void Result::ProcessAssignments(const AssignmentCallback& cb) const {
   for (const FragmentScanRangeAssignment& assignment : assignments_) {
     for (const auto& assignment_elem : assignment) {
-      const TNetworkAddress& addr = assignment_elem.first;
+      const NetworkAddressPB& addr = assignment_elem.first;
       const PerNodeScanRanges& per_node_ranges = assignment_elem.second;
       for (const auto& per_node_ranges_elem : per_node_ranges) {
-        const vector<TScanRangeParams> scan_range_params_vector =
+        const vector<ScanRangeParamsPB> scan_range_params_vector =
             per_node_ranges_elem.second;
-        for (const TScanRangeParams& scan_range_params : scan_range_params_vector) {
-          const TScanRange& scan_range = scan_range_params.scan_range;
-          DCHECK(scan_range.__isset.hdfs_file_split);
-          const THdfsFileSplit& hdfs_file_split = scan_range.hdfs_file_split;
-          bool try_hdfs_cache = scan_range_params.__isset.try_hdfs_cache ?
-              scan_range_params.try_hdfs_cache : false;
+        for (const ScanRangeParamsPB& scan_range_params : scan_range_params_vector) {
+          const ScanRangePB& scan_range = scan_range_params.scan_range();
+          DCHECK(scan_range.has_hdfs_file_split());
+          const HdfsFileSplitPB& hdfs_file_split = scan_range.hdfs_file_split();
+          bool try_hdfs_cache = scan_range_params.has_try_hdfs_cache() ?
+              scan_range_params.try_hdfs_cache() : false;
           bool is_remote =
-              scan_range_params.__isset.is_remote ? scan_range_params.is_remote : false;
+              scan_range_params.has_is_remote() ? scan_range_params.is_remote() : false;
           cb({addr, hdfs_file_split, try_hdfs_cache, is_remote});
         }
       }
@@ -583,7 +588,7 @@ int Result::CountAssignmentsIf(const AssignmentFilter& filter) const {
 int64_t Result::CountAssignedBytesIf(const AssignmentFilter& filter) const {
   int64_t assigned_bytes = 0;
   AssignmentCallback cb = [&assigned_bytes, filter](const AssignmentInfo& assignment) {
-    if (filter(assignment)) assigned_bytes += assignment.hdfs_file_split.length;
+    if (filter(assignment)) assigned_bytes += assignment.hdfs_file_split.length();
   };
   ProcessAssignments(cb);
   return assigned_bytes;
@@ -592,8 +597,8 @@ int64_t Result::CountAssignedBytesIf(const AssignmentFilter& filter) const {
 void Result::CountAssignmentsPerBackend(
     NumAssignmentsPerBackend* num_assignments_per_backend) const {
   AssignmentCallback cb = [&num_assignments_per_backend](
-      const AssignmentInfo& assignment) {
-    ++(*num_assignments_per_backend)[assignment.addr.hostname];
+                              const AssignmentInfo& assignment) {
+    ++(*num_assignments_per_backend)[assignment.addr.hostname()];
   };
   ProcessAssignments(cb);
 }
@@ -601,9 +606,9 @@ void Result::CountAssignmentsPerBackend(
 void Result::CountAssignedBytesPerBackend(
     NumAssignedBytesPerBackend* num_assignments_per_backend) const {
   AssignmentCallback cb = [&num_assignments_per_backend](
-      const AssignmentInfo& assignment) {
-    (*num_assignments_per_backend)[assignment.addr.hostname] +=
-        assignment.hdfs_file_split.length;
+                              const AssignmentInfo& assignment) {
+    (*num_assignments_per_backend)[assignment.addr.hostname()] +=
+        assignment.hdfs_file_split.length();
   };
   ProcessAssignments(cb);
 }
@@ -645,9 +650,10 @@ Status SchedulerWrapper::Compute(bool exec_at_coord, Result* result) {
   DCHECK(membership_snapshot->local_be_desc.get() != nullptr);
   Scheduler::ExecutorConfig executor_config =
       {no_executor_group ? empty_group : it->second, *membership_snapshot->local_be_desc};
-  return scheduler_->ComputeScanRangeAssignment(executor_config, 0,
-      nullptr, false, *locations, plan_.referenced_datanodes(), exec_at_coord,
-      plan_.query_options(), nullptr, assignment);
+  std::mt19937 rng(rand());
+  return scheduler_->ComputeScanRangeAssignment(executor_config, 0, nullptr, false,
+      *locations, plan_.referenced_datanodes(), exec_at_coord, plan_.query_options(),
+      nullptr, &rng, assignment);
 }
 
 void SchedulerWrapper::AddBackend(const Host& host) {
@@ -713,9 +719,8 @@ void SchedulerWrapper::AddHostToTopicDelta(const Host& host, TTopicDelta* delta)
   // Build topic item.
   TTopicItem item;
   item.key = host.ip;
-  ThriftSerializer serializer(false);
-  Status status = serializer.SerializeToString(be_desc.get(), &item.value);
-  DCHECK(status.ok());
+  bool success = be_desc->SerializeToString(&item.value);
+  DCHECK(success);
 
   // Add to topic delta.
   delta->topic_entries.push_back(item);

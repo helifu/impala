@@ -17,13 +17,14 @@
 
 #include "statestore/statestore-subscriber.h"
 
+#include <mutex>
 #include <sstream>
 #include <utility>
 
 #include <boost/algorithm/string/join.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/thread/lock_options.hpp>
-#include <boost/thread/shared_mutex.hpp>
+#include <boost/thread/pthread/shared_mutex.hpp>
 #include <gutil/strings/substitute.h>
 
 #include "common/logging.h"
@@ -46,7 +47,6 @@
 using boost::posix_time::seconds;
 using boost::shared_lock;
 using boost::shared_mutex;
-using boost::try_to_lock;
 using std::string;
 
 using namespace apache::thrift;
@@ -66,6 +66,8 @@ DEFINE_int64_hidden(statestore_subscriber_recovery_grace_period_ms, 30000L, "Per
     "after the last successful subscription attempt until the subscriber will be "
     "considered fully recovered. After a successful reconnect attempt, updates to the "
     "cluster membership will only become effective after this period has elapsed.");
+DEFINE_int32(statestore_client_rpc_timeout_ms, 300000, "(Advanced) The underlying "
+    "TSocket send/recv timeout in milliseconds for a catalog client RPC.");
 
 DECLARE_string(debug_actions);
 DECLARE_string(ssl_client_ca_certificate);
@@ -122,17 +124,18 @@ class StatestoreSubscriberThriftIf : public StatestoreSubscriberIf {
 StatestoreSubscriber::StatestoreSubscriber(const string& subscriber_id,
     const TNetworkAddress& heartbeat_address, const TNetworkAddress& statestore_address,
     MetricGroup* metrics)
-    : subscriber_id_(subscriber_id),
-      statestore_address_(statestore_address),
-      thrift_iface_(new StatestoreSubscriberThriftIf(this)),
-      failure_detector_(new TimeoutFailureDetector(
-          seconds(FLAGS_statestore_subscriber_timeout_seconds),
-          seconds(FLAGS_statestore_subscriber_timeout_seconds / 2))),
-      client_cache_(new StatestoreClientCache(1, 0, 0, 0, "",
-                !FLAGS_ssl_client_ca_certificate.empty())),
-      metrics_(metrics->GetOrCreateChildGroup("statestore-subscriber")),
-      heartbeat_address_(heartbeat_address),
-      is_registered_(false) {
+  : subscriber_id_(subscriber_id),
+    statestore_address_(statestore_address),
+    thrift_iface_(new StatestoreSubscriberThriftIf(this)),
+    failure_detector_(
+        new TimeoutFailureDetector(seconds(FLAGS_statestore_subscriber_timeout_seconds),
+            seconds(FLAGS_statestore_subscriber_timeout_seconds / 2))),
+    client_cache_(new StatestoreClientCache(1, 0, FLAGS_statestore_client_rpc_timeout_ms,
+        FLAGS_statestore_client_rpc_timeout_ms, "",
+        !FLAGS_ssl_client_ca_certificate.empty())),
+    metrics_(metrics->GetOrCreateChildGroup("statestore-subscriber")),
+    heartbeat_address_(heartbeat_address),
+    is_registered_(false) {
   connected_to_statestore_metric_ =
       metrics_->AddProperty("statestore-subscriber.connected", false);
   connection_failure_metric_ =
@@ -230,9 +233,9 @@ Status StatestoreSubscriber::Start() {
     LOG(INFO) << "Starting statestore subscriber";
 
     // Backend must be started before registration
-    boost::shared_ptr<TProcessor> processor(
+    std::shared_ptr<TProcessor> processor(
         new StatestoreSubscriberProcessor(thrift_iface_));
-    boost::shared_ptr<TProcessorEventHandler> event_handler(
+    std::shared_ptr<TProcessorEventHandler> event_handler(
         new RpcEventHandler("statestore-subscriber", metrics_));
     processor->setEventHandler(event_handler);
 
@@ -355,7 +358,7 @@ void StatestoreSubscriber::Heartbeat(const RegistrationId& registration_id) {
   const Status& status = CheckRegistrationId(registration_id);
   if (status.ok()) {
     heartbeat_interval_metric_->Update(
-        heartbeat_interval_timer_.Reset() / (1000.0 * 1000.0 * 1000.0));
+        heartbeat_interval_timer_.LapTime() / (1000.0 * 1000.0 * 1000.0));
     failure_detector_->UpdateHeartbeat(STATESTORE_ID, true);
   } else {
     VLOG_RPC << "Heartbeat: " << status.GetDetail();
@@ -397,7 +400,7 @@ Status StatestoreSubscriber::UpdateState(const TopicDeltaMap& incoming_topic_del
   //
   // TODO: Consider returning an error in this case so that the statestore will eventually
   // stop sending updates even if re-registration fails.
-  shared_lock<shared_mutex> l(lock_, try_to_lock);
+  shared_lock<shared_mutex> l(lock_, boost::try_to_lock);
   if (!l.owns_lock()) {
     *skipped = true;
     return Status::OK();
@@ -416,7 +419,7 @@ Status StatestoreSubscriber::UpdateState(const TopicDeltaMap& incoming_topic_del
       continue;
     }
     TopicRegistration& registration = it->second;
-    unique_lock<mutex> ul(registration.update_lock, try_to_lock);
+    unique_lock<mutex> ul(registration.update_lock, std::try_to_lock);
     if (!ul.owns_lock()) {
       // Statestore sent out concurrent topic updates. Avoid blocking the RPC by skipping
       // the topic.

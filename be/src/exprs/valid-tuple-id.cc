@@ -32,7 +32,7 @@ const char* ValidTupleIdExpr::LLVM_CLASS_NAME = "class.impala::ValidTupleIdExpr"
 ValidTupleIdExpr::ValidTupleIdExpr(const TExprNode& node) : ScalarExpr(node) {}
 
 Status ValidTupleIdExpr::Init(
-    const RowDescriptor& row_desc, bool is_entry_point, RuntimeState* state) {
+    const RowDescriptor& row_desc, bool is_entry_point, FragmentState* state) {
   RETURN_IF_ERROR(ScalarExpr::Init(row_desc, is_entry_point, state));
   DCHECK_EQ(0, children_.size());
   tuple_ids_.reserve(row_desc.tuple_descriptors().size());
@@ -147,7 +147,7 @@ Status ValidTupleIdExpr::GetCodegendComputeFnImpl(
     // Add code to the block that is executed if the Tuple* was not a nullptr.
     builder.SetInsertPoint(ret_block);
     // Generate code returning an IntVal containing the tuple id.
-    CodegenAnyVal result(codegen, &builder, TYPE_INT, nullptr, "ret");
+    CodegenAnyVal result(codegen, &builder, ColumnType(TYPE_INT), nullptr, "ret");
     llvm::Constant* tuple_id =
         codegen->GetI32Constant(static_cast<uint64_t>(tuple_ids_[i]));
     result.SetVal(tuple_id);

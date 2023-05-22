@@ -15,12 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from future.utils import with_metaclass
 import re
 import sys
 
 from collections import defaultdict
 
-from common import ValExpr, ValExprList
+from tests.comparison.common import ValExpr, ValExprList
 
 module_contents = dict()
 
@@ -42,14 +44,12 @@ class DataTypeMetaclass(type):
         getattr(other, 'CMP_VALUE', other.__name__))
 
 
-class DataType(ValExpr):
+class DataType(with_metaclass(DataTypeMetaclass, ValExpr)):
   '''Base class for data types.
 
      Data types are represented as classes so inheritance can be used.
 
   '''
-
-  __metaclass__ = DataTypeMetaclass
 
   @staticmethod
   def group_by_type(vals):

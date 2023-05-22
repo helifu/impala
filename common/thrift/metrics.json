@@ -20,6 +20,66 @@
     "key": "external-data-source.class-cache.hits"
   },
   {
+    "description": "The total number of cache misses in the CodeGen Cache",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "CodeGen Cache Misses",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.codegen-cache.misses"
+  },
+  {
+    "description": "The number of in-use CodeGen Cache Entries",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "In-use CodeGen Cache Entries",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "impala.codegen-cache.entries-in-use"
+  },
+  {
+    "description": "The total bytes of in-use CodeGen Cache Entries",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "In-use CodeGen Cache Entries total bytes",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "impala.codegen-cache.entries-in-use-bytes"
+  },
+  {
+    "description": "The number of evicted CodeGen Cache Entries",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Evicted CodeGen Cache Entries",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.codegen-cache.entries-evicted"
+  },
+  {
+    "description": "The total number of cache hits in the CodeGen Cache",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "CodeGen Cache Hits",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.codegen-cache.hits"
+  },
+  {
+    "description": "Statistics for codegen cache entry sizes allocated from the system.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "CodeGen Cache Entry Sizes.",
+    "units": "BYTES",
+    "kind": "HISTOGRAM",
+    "key": "impala.codegen-cache.entry-sizes"
+  },
+  {
     "description": "Resource Pool $0 Configured Max Mem Resources",
     "contexts": [
       "RESOURCE_POOL"
@@ -90,64 +150,24 @@
     "key": "admission-controller.pool-clamp-mem-limit-query-option.$0"
   },
   {
-    "description": "This floating point number is multiplied by the current total number of executors at runtime to give the maximum number of concurrently running queries allowed in the pool.",
+    "description": "Resource Pool $0 Max Query CPU Core Per Node Limit",
     "contexts": [
       "RESOURCE_POOL"
     ],
-    "label": "Resource Pool $0 Max Running Queries Multiple",
+    "label": "Resource Pool $0 Max Query CPU Core Per Node Limit",
     "units": "UNIT",
     "kind": "GAUGE",
-    "key": "admission-controller.pool-max-running-queries-multiple.$0"
+    "key": "admission-controller.pool-max-query-cpu-core-per-node-limit.$0"
   },
   {
-    "description": "This floating point number is multiplied by the current total number of executors at runtime to give the maximum number of queries that can be queued in the pool.",
+    "description": "Resource Pool $0 Max Query CPU Core Coordinator Limit",
     "contexts": [
       "RESOURCE_POOL"
     ],
-    "label": "Resource Pool $0 Max Queued Queries Multiple",
+    "label": "Resource Pool $0 Max Query CPU Core Coordinator Limit",
     "units": "UNIT",
     "kind": "GAUGE",
-    "key": "admission-controller.pool-max-queued-queries-multiple.$0"
-  },
-  {
-    "description": "This number of bytes is multiplied by the current total number of executors at runtime to give the maximum memory available across the cluster for the pool.",
-    "contexts": [
-      "RESOURCE_POOL"
-    ],
-    "label": "Resource Pool $0 Max Memory Multiple",
-    "units": "BYTES",
-    "kind": "GAUGE",
-    "key": "admission-controller.pool-max-memory-multiple.$0"
-  },
-  {
-    "description": "The maximum number of concurrently running queries allowed in the pool. If pool-max-running-queries-multiple is set then the metric is derived by multiplying that value by the current total number of executors.",
-    "contexts": [
-      "RESOURCE_POOL"
-    ],
-    "label": "Resource Pool $0 Max Running Queries Derived",
-    "units": "UNIT",
-    "kind": "GAUGE",
-    "key": "admission-controller.pool-max-running-queries-derived.$0"
-  },
-  {
-    "description": "The maximum number of queries that can be queued in the pool. If pool-max-queued-queries-multiple is set then the metric is derived by multiplying that value by the current total number of executors.",
-    "contexts": [
-      "RESOURCE_POOL"
-    ],
-    "label": "Resource Pool $0 Max Queued Queries Derived",
-    "units": "UNIT",
-    "kind": "GAUGE",
-    "key": "admission-controller.max-queued-queries-derived.$0"
-  },
-  {
-    "description": "The maximum memory available across the cluster for the pool. If pool-max-memory-multiple is set then the metric is derived by multiplying that value by the current total number of executors.",
-    "contexts": [
-      "RESOURCE_POOL"
-    ],
-    "label": "Resource Pool $0 Max Memory Derived",
-    "units": "BYTES",
-    "kind": "GAUGE",
-    "key": "admission-controller.max-memory-derived.$0"
+    "key": "admission-controller.pool-max-query-cpu-core-coordinator-limit.$0"
   },
   {
     "description": "Resource Pool $0 Aggregate Queue Size",
@@ -470,6 +490,26 @@
     "key": "impala-server.io-mgr.cached-bytes-read"
   },
   {
+    "description": "Total number of encrypted bytes read by the IO manager.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Encrypted Bytes Read",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.encrypted-bytes-read"
+  },
+  {
+    "description": "Total number of erasure-coded bytes read by the IO manager.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Erasure Coded Bytes Read",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.erasure-coded-bytes-read"
+  },
+  {
     "description": "Total number of local bytes read by the IO manager.",
     "contexts": [
       "IMPALAD"
@@ -490,6 +530,16 @@
     "key": "impala-server.io-mgr.remote-data-cache-hit-bytes"
   },
   {
+    "description": "Total number of hits in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Hit Count",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-hit-count"
+  },
+  {
     "description": "Total number of bytes of misses in the remote data cache.",
     "contexts": [
       "IMPALAD"
@@ -498,6 +548,16 @@
     "units": "BYTES",
     "kind": "COUNTER",
     "key": "impala-server.io-mgr.remote-data-cache-miss-bytes"
+  },
+  {
+    "description": "Total number of misses in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Miss Count",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-miss-count"
   },
   {
     "description": "Current byte size of the remote data cache.",
@@ -510,14 +570,134 @@
     "key": "impala-server.io-mgr.remote-data-cache-total-bytes"
   },
   {
+    "description": "Current number of entries in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Num Entries",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "impala-server.io-mgr.remote-data-cache-num-entries"
+  },
+  {
+    "description": "Total number of writes into the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Num Writes",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-num-writes"
+  },
+  {
     "description": "Total number of bytes not inserted in remote data cache due to concurrency limit.",
     "contexts": [
       "IMPALAD"
     ],
     "label": "Impala Server Io Mgr Remote Data Cache Bytes Not Inserted Due To Concurrency limit",
-    "units": "UNIT",
+    "units": "BYTES",
     "kind": "COUNTER",
     "key": "impala-server.io-mgr.remote-data-cache-dropped-bytes"
+  },
+  {
+    "description": "Total number of entries not inserted in remote data cache due to concurrency limit.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Entries Not Inserted Due To Concurrency Limit",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-dropped-entries"
+  },
+  {
+    "description": "Total number of instantaneous evictions from the remote data cache. An instantaneous eviction happens when the eviction policy rejects an entry during insert.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Num Instant Evictions",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-instant-evictions"
+  },
+  {
+    "description": "Data Cache Partition Path",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Partition Path",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "impala-server.io-mgr.remote-data-cache-partition-$0.path"
+  },
+  {
+    "description": "Histogram of read operation times for data cache partition",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Partition Read Latency",
+    "units": "TIME_NS",
+    "kind": "HISTOGRAM",
+    "key": "impala-server.io-mgr.remote-data-cache-partition-$0.read-latency"
+  },
+  {
+    "description": "Histogram of write operation times for data cache partition",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Partition Write Latency",
+    "units": "TIME_NS",
+    "kind": "HISTOGRAM",
+    "key": "impala-server.io-mgr.remote-data-cache-partition-$0.write-latency"
+  },
+  {
+    "description": "Histogram of eviction operation times for data cache partition",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Partition Eviction Latency",
+    "units": "TIME_NS",
+    "kind": "HISTOGRAM",
+    "key": "impala-server.io-mgr.remote-data-cache-partition-$0.eviction-latency"
+  },
+  {
+    "description": "Total number of bytes of async writes outstanding in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Async Writes Outstanding In Bytes",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-async-writes-outstanding-bytes"
+  },
+  {
+    "description": "Total number of async writes submitted in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Num Async Writes Submitted",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-num-async-writes-submitted"
+  },
+  {
+    "description": "Total number of bytes not inserted in the remote data cache due to async writes buffer size limit.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Bytes Not Inserted Due To Async Writes Buffer Size Limit",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-async-writes-dropped-bytes"
+  },
+  {
+    "description": "Total number of entries not inserted in the remote data cache due to async writes buffer size limit.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Entries Not Inserted Due To Async Writes Buffer Size Limit",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-async-writes-dropped-entries"
   },
   {
     "description": "The number of allocated IO buffers. IO buffers are shared by all queries.",
@@ -598,6 +778,36 @@
     "units": "BYTES",
     "kind": "HISTOGRAM",
     "key": "impala-server.io-mgr.queue-$0.read-size"
+  },
+  {
+    "description": "Histogram of write operation times on disk.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Write Latency Histogram",
+    "units": "TIME_NS",
+    "kind": "HISTOGRAM",
+    "key": "impala-server.io-mgr.queue-$0.write-latency"
+  },
+  {
+    "description": "Histogram of write operation sizes on disk.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Write Size Histogram",
+    "units": "BYTES",
+    "kind": "HISTOGRAM",
+    "key": "impala-server.io-mgr.queue-$0.write-size"
+  },
+  {
+    "description": "The number of write io errors on disk.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Write IO Error Count",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.queue-$0.write-io-error"
   },
   {
     "description": "The number of HDFS files currently open for writing.",
@@ -1112,6 +1322,66 @@
     "key": "impala.thrift-server.hiveserver2-frontend.timedout-cnxn-requests"
   },
   {
+    "description": "The number of active External Frontend API connections to this Impala Daemon.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "External Frontend API Active Connections",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.external-frontend.connections-in-use"
+  },
+  {
+    "description": "Amount of time clients of External Frontend API spent waiting for connection to be set up",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "External Frontend API client connection setup time",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.external-frontend.connection-setup-time"
+  },
+  {
+    "description": "Amount of time clients of External Frontend API spent waiting for service threads",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "External Frontend API clients' wait time for service threads",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.external-frontend.svc-thread-wait-time"
+  },
+  {
+    "description": "The total number of External Frontend API connections made to this Impala Daemon over its lifetime.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "External Frontend API Total Connections",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.external-frontend.total-connections"
+  },
+  {
+    "description": "The number of External Frontend API connections to this Impala Daemon that have been accepted and are waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "External Frontend API Connections Queued for Setup",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.external-frontend.connection-setup-queue-size"
+  },
+  {
+    "description": "The number of External Frontend API connection requests to this Impala Daemon that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "External Frontend API Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.external-frontend.timedout-cnxn-requests"
+  },
+  {
     "description": "The number of active HiveServer2 HTTP API connections to this Impala Daemon.",
     "contexts": [
       "IMPALAD"
@@ -1212,6 +1482,26 @@
     "key": "impala.thrift-server.hiveserver2-http-frontend.total-cookie-auth-failure"
   },
   {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that skipped authentication as they originated from a trusted domain.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection Trusted Domain Check Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-trusted-domain-check-success"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that skipped authentication as they have a trusted auth header.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection Trusted Auth Header Check Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-trusted-auth-header-check-success"
+  },
+  {
     "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were successfully authenticated with Kerberos",
     "contexts": [
       "IMPALAD"
@@ -1230,6 +1520,46 @@
     "units": "NONE",
     "kind": "COUNTER",
     "key": "impala.thrift-server.hiveserver2-http-frontend.total-negotiate-auth-failure"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were successfully authenticated using SAML.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection SAML Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-saml-auth-success"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were attempted to authenticate using SAML but were unsuccessful.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection SAML Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-saml-auth-failure"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were successfully authenticated using JWT Token.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection JWT Token Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-jwt-token-auth-success"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were attempted to authenticate using JWT Token but were unsuccessful.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection JWT Token Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-jwt-token-auth-failure"
   },
   {
     "description": "The amount of memory freed by the last memory tracker garbage collection.",
@@ -2231,6 +2561,46 @@
     "key": "tmp-file-mgr.scratch-space-bytes-used.dir-$0"
   },
   {
+    "description": "The current total read memory buffer bytes for all scratch directories.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Read memory buffer used for scratch directories",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.scratch-read-memory-buffer-used"
+  },
+  {
+    "description": "The high water mark for read memory buffer bytes of all scratch directories.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Read memory buffer HWM for scratch directories",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.scratch-read-memory-buffer-used-high-water-mark"
+  },
+  {
+    "description": "The current total spilled bytes for the local buffer directory.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Per-directory local buffer space bytes used",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.local-buff-bytes-used.dir-$0"
+  },
+  {
+    "description": "The durations of dequeuing from the TmpFileBufferPool.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Dequeue durations for the TmpFileBufferPool",
+    "units": "TIME_NS",
+    "kind": "HISTOGRAM",
+    "key": "tmp-file-mgr.tmp-file-buff-pool-dequeue-durations"
+  },
+  {
     "description": "Number of senders waiting for receiving fragment to initialize",
     "contexts": [
       "IMPALAD"
@@ -2480,7 +2850,47 @@
     "label": "Average duration to fetch metastore events",
     "units": "TIME_S",
     "kind": "GAUGE",
-    "key": "events-processor.avg-events-fetch-duration"
+    "key": "events-processor.events-fetch-duration-avg"
+  },
+  {
+    "description": "75th percentile of the time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P75 duration to fetch metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-fetch-duration-p75"
+  },
+  {
+    "description": "95th percentile of the time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P95 duration to fetch metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-fetch-duration-p95"
+  },
+  {
+    "description": "99th percentile of the time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P99 duration to fetch metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-fetch-duration-p99"
+  },
+  {
+    "description": "Last time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Last duration to fetch a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-fetch-duration-latest"
   },
   {
     "description": "Average time taken to process a batch of events received from metastore",
@@ -2490,7 +2900,47 @@
     "label": "Average duration to process a batch of metastore events",
     "units": "TIME_S",
     "kind": "GAUGE",
-    "key": "events-processor.avg-events-process-duration"
+    "key": "events-processor.events-process-duration-avg"
+  },
+  {
+    "description": "75th percentile of the time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P75 duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-process-duration-p75"
+  },
+  {
+    "description": "95th percentile of the time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P95 duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-process-duration-p95"
+  },
+  {
+    "description": "99th percentile of the time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P99 duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-process-duration-p99"
+  },
+  {
+    "description": "Last time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Last duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-process-duration-latest"
   },
   {
     "description": "Exponentially weighted moving average (EWMA) of number of events received in last 1 min",
@@ -2533,6 +2983,36 @@
     "key" : "events-processor.last-synced-event-id"
   },
   {
+    "description": "Last metastore event time that the catalog server processed and synced to",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Last Synced Event Time",
+    "units": "NONE",
+    "kind" : "COUNTER",
+    "key" : "events-processor.last-synced-event-time"
+  },
+  {
+    "description": "Latest event id in Hive metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Latest Event Id",
+    "units": "NONE",
+    "kind" : "COUNTER",
+    "key" : "events-processor.latest-event-id"
+  },
+  {
+    "description": "Event time of the latest event in Hive metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Latest Event Time",
+    "units": "NONE",
+    "kind" : "COUNTER",
+    "key" : "events-processor.latest-event-time"
+  },
+  {
     "description": "Total number of executor groups that have at least one executor",
     "contexts": [
       "IMPALAD"
@@ -2552,7 +3032,7 @@
     "kind": "COUNTER",
     "key": "cluster-membership.executor-groups.total-healthy"
   },{
-    "description": "Total number of backends registered with the statestore",
+    "description": "Total number of backends (both coordinators and executors) registered with the statestore",
     "contexts": [
       "IMPALAD"
     ],
@@ -2562,11 +3042,40 @@
     "key": "cluster-membership.backends.total"
   },
   {
-  "description": "Total number of queries running on executor group: $0",
+    "description": "Total number of executor groups in the executor group set $0 that have at least one executor",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Total number of executor groups in the executor group set $0 that have at least one executor",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "cluster-membership.group-set.executor-groups.total.$0"
+  },
+  {
+    "description": "Total number of executor groups in the executor group set $0 that are in a healthy state, that is, have at least the configured minimum number of executors to be considered for admission",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Total number of executor groups in the executor group set $0 that are in a healthy state",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "cluster-membership.group-set.executor-groups.total-healthy.$0"
+  },{
+    "description": "Total number of backends in the executor group set $0 registered with the statestore",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Total number of executors in the executor group set $0 registered with the statestore",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "cluster-membership.group-set.backends.total.$0"
+  },
+  {
+  "description": "Total number of queries admitted on this coordinator running on executor group: $0",
   "contexts": [
     "IMPALAD"
   ],
-  "label": "Total number of queries running on executor group: $0",
+  "label": "Total number of queries admitted on this coordinator running on executor group: $0",
   "units": "UNIT",
   "kind": "GAUGE",
   "key": "admission-controller.executor-group.num-queries-executing.$0"
@@ -2595,7 +3104,31 @@
     "kind": "COUNTER",
     "key": "impala.webserver.total-negotiate-auth-failure"
   },
-    {
+  {
+    "description": "The number of HTTP connection requests to this daemon's webserver that were successfully authenticated with LDAP",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection LDAP Auth Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-basic-auth-success"
+  },
+  {
+    "description": "The number of HTTP connection requests to this daemon's webserver that attempted to authenticate with LDAP but were unsuccessful.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection LDAP Auth Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-basic-auth-failure"
+  },
+  {
     "description": "The number of HTTP connection requests to this daemon's webserver that were successfully authenticated using a cookie.",
     "contexts": [
       "IMPALAD",
@@ -2620,6 +3153,54 @@
     "key": "impala.webserver.total-cookie-auth-failure"
   },
   {
+    "description": "The number of HTTP connection requests to this daemon's webserver that originated from a trusted domain.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection Trusted Domain Check Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-trusted-domain-check-success"
+  },
+  {
+    "description": "The number of HTTP connection requests to this daemon's webserver that skipped authentication as they have a trusted auth header.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection Trusted Auth Header Check Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-trusted-auth-header-check-success"
+  },
+  {
+    "description": "The number of HTTP connection requests to this daemon's webserver that were successfully authenticated using a JWT token.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection JWT Token Auth Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-jwt-token-auth-success"
+  },
+  {
+    "description": "The number of HTTP connection requests to this daemon's webserver that provided an invalid JWT token.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection JWT Token Auth Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-jwt-token-auth-failure"
+  },
+  {
     "description": "The number of times the FAIL debug action returned an error. For testing only.",
     "contexts": [
       "IMPALAD"
@@ -2628,5 +3209,75 @@
     "units": "NONE",
     "kind": "COUNTER",
     "key": "impala.debug_action.fail"
+  },
+  {
+    "description": "The number of times queries cannot be dequeued because of a resource limit on the coordinator.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Query dequeue failed because of a coordinator resource limit",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "admission-controller.total-dequeue-failed-coordinator-limited"
+  },
+  {
+    "description": "The full version string of the Admission Control Server.",
+    "contexts": [
+      "ADMISSIOND"
+    ],
+    "label": "Admission Control Service Version",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "admissiond.version"
+  },
+  {
+    "description": "Catalogd HMS cache hit ratio.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalogd HMS cache hit ratio",
+    "units": "NONE",
+    "kind" : "GAUGE",
+    "key" : "catalogd.hms.cache.cache.hit.ratio"
+  },
+  {
+    "description": "Catalogd HMS cache API requests.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Status of Catalogd HMS cache",
+    "units": "NONE",
+    "kind" : "COUNTER",
+    "key" : "catalogd.hms.cache.api.requests"
+  },
+  {
+    "description": "Catalogd HMS cache API requests rate for last 1 min.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalogd HMS cache API requests rate for last 1 minute",
+    "units": "NONE",
+    "kind" : "GAUGE",
+    "key" : "catalogd.hms.cache.status.api.requests.1min"
+  },
+  {
+    "description": "Catalogd HMS cache API requests rate for last 5 min.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalogd HMS cache API requests rate for last 5 minutes",
+    "units": "NONE",
+    "kind" : "GAUGE",
+    "key" : "catalogd.hms.cache.status.api.requests.5min"
+  },
+  {
+    "description": "Catalogd HMS cache API requests rate for last 15 min.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalogd HMS cache API requests rate for last 15 minutes",
+    "units": "NONE",
+    "kind" : "GAUGE",
+    "key" : "catalogd.hms.cache.status.api.requests.15min"
   }
 ]

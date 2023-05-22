@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef UTIL_CODING_UTIL_H
-#define UTIL_CODING_UTIL_H
+#pragma once
 
+#include <cstdint>
+#include <iosfwd>
 #include <string>
 #include <vector>
-#include <boost/cstdint.hpp>
 
 namespace impala {
 
@@ -57,6 +57,7 @@ void Base64Encode(const std::vector<uint8_t>& in, std::string* out);
 void Base64Encode(const std::vector<uint8_t>& in, std::stringstream* out);
 void Base64Encode(const std::string& in, std::string* out);
 void Base64Encode(const std::string& in, std::stringstream* out);
+void Base64Encode(const char* in, int64_t in_len, std::stringstream* out);
 
 /// Calculate the maximum output buffer size needed for Base64Decode. Returns false if
 /// in_len is invalid.
@@ -75,7 +76,4 @@ bool Base64Decode(const char* in, int64_t in_len, int64_t out_max, char* out,
 /// inspects each character in turn, and copies them all to *out; use
 /// judiciously.
 void EscapeForHtml(const std::string& in, std::stringstream* out);
-
 }
-
-#endif

@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_UTIL_CONDITION_VARIABLE_H
-#define IMPALA_UTIL_CONDITION_VARIABLE_H
+#pragma once
 
-#include <boost/thread/pthread/timespec.hpp>
-#include <boost/thread/mutex.hpp>
-#include <boost/thread/thread_time.hpp>
 #include <pthread.h>
 #include <unistd.h>
+#include <mutex>
+#include <boost/thread/detail/platform_time.hpp>
 
 #include "util/time.h"
 
@@ -45,7 +43,7 @@ class ConditionVariable {
   ~ConditionVariable() { pthread_cond_destroy(&cv_); }
 
   /// Wait indefinitely on the condition variable until it's notified.
-  void Wait(boost::unique_lock<boost::mutex>& lock) {
+  void Wait(std::unique_lock<std::mutex>& lock) {
     DCHECK(lock.owns_lock());
     pthread_mutex_t* mutex = lock.mutex()->native_handle();
     pthread_cond_wait(&cv_, mutex);
@@ -54,7 +52,7 @@ class ConditionVariable {
   /// Wait until the condition variable is notified or 'abs_time' has passed.
   /// Returns true if the condition variable is notified before the absolute timeout
   /// specified in 'abs_time' has passed. Returns false otherwise.
-  bool WaitUntil(boost::unique_lock<boost::mutex>& lock, const timespec& abs_time) {
+  bool WaitUntil(std::unique_lock<std::mutex>& lock, const timespec& abs_time) {
     DCHECK(lock.owns_lock());
     pthread_mutex_t* mutex = lock.mutex()->native_handle();
     return pthread_cond_timedwait(&cv_, mutex, &abs_time) == 0;
@@ -63,7 +61,7 @@ class ConditionVariable {
   /// Wait until the condition variable is notified or 'duration_us' microseconds
   /// have passed. Returns true if the condition variable is notified in time.
   /// Returns false otherwise.
-  bool WaitFor(boost::unique_lock<boost::mutex>& lock, int64_t duration_us) {
+  bool WaitFor(std::unique_lock<std::mutex>& lock, int64_t duration_us) {
     timespec deadline;
     TimeFromNowMicros(duration_us, &deadline);
     return WaitUntil(lock, deadline);
@@ -79,6 +77,4 @@ class ConditionVariable {
   pthread_cond_t cv_;
 
 };
-
 }
-#endif

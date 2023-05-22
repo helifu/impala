@@ -27,10 +27,13 @@ import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.hadoop.hive.metastore.api.PrivilegeGrantInfo;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.IcebergColumn;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
+import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TDescribeOutputStyle;
@@ -73,9 +76,11 @@ public class DescribeResultFactory {
     org.apache.hadoop.hive.metastore.api.Database msDb = db.getMetaStoreDb();
     descResult.results = Lists.newArrayList();
     String location = null;
+    String managedLocation = null;
     String comment = null;
     if(msDb != null) {
       location = msDb.getLocationUri();
+      managedLocation = MetastoreShim.getManagedLocationUri(msDb);
       comment = msDb.getDescription();
     }
 
@@ -85,8 +90,17 @@ public class DescribeResultFactory {
     dbLocationCol.setString_val(Objects.toString(location, ""));
     TColumnValue commentCol = new TColumnValue();
     commentCol.setString_val(Objects.toString(comment, ""));
-    descResult.results.add(
-        new TResultRow(Lists.newArrayList(dbNameCol, dbLocationCol, commentCol)));
+    descResult.results.add(new TResultRow(
+        Lists.newArrayList(dbNameCol, dbLocationCol, commentCol)));
+
+    if (managedLocation != null) {
+      TColumnValue keyCol = new TColumnValue();
+      keyCol.setString_val("managedlocation:");
+      TColumnValue dbManagedLocationCol = new TColumnValue();
+      dbManagedLocationCol.setString_val(Objects.toString(managedLocation, ""));
+      descResult.results.add(new TResultRow(
+          Lists.newArrayList(keyCol, dbManagedLocationCol, EMPTY)));
+    }
     return descResult;
   }
 
@@ -185,7 +199,7 @@ public class DescribeResultFactory {
    * list of columns the user is authorized to view.
    */
   public static TDescribeResult buildDescribeFormattedResult(FeTable table,
-      List<Column> filteredColumns) {
+      List<Column> filteredColumns) throws TableLoadingException {
     TDescribeResult result = new TDescribeResult();
     result.results = Lists.newArrayList();
 
@@ -208,18 +222,25 @@ public class DescribeResultFactory {
     msTable.getSd().setCols(Column.toFieldSchemas(nonClustered));
     msTable.setPartitionKeys(Column.toFieldSchemas(clustered));
 
-    // To avoid initializing any of the SerDe classes in the metastore table Thrift
-    // struct, create the ql.metadata.Table object by calling the empty c'tor and
-    // then calling setTTable().
-    org.apache.hadoop.hive.ql.metadata.Table hiveTable =
-        new org.apache.hadoop.hive.ql.metadata.Table();
-    hiveTable.setTTable(msTable);
+    org.apache.hadoop.hive.ql.metadata.PrimaryKeyInfo pki =
+        new org.apache.hadoop.hive.ql.metadata.PrimaryKeyInfo(
+            table.getSqlConstraints().getPrimaryKeys(), table.getName(),
+            table.getDb().getName());
+    org.apache.hadoop.hive.ql.metadata.ForeignKeyInfo fki =
+        new org.apache.hadoop.hive.ql.metadata.ForeignKeyInfo(
+            table.getSqlConstraints().getForeignKeys(), table.getName(),
+            table.getDb().getName());
     StringBuilder sb = new StringBuilder();
     // First add all the columns (includes partition columns).
     sb.append(MetastoreShim.getAllColumnsInformation(msTable.getSd().getCols(),
         msTable.getPartitionKeys(), true, false, true));
+    if (table instanceof FeIcebergTable) {
+      sb.append(MetastoreShim.getPartitionTransformInformation(
+          FeIcebergTable.Utils.getPartitionTransformKeys((FeIcebergTable) table)));
+    }
     // Add the extended table metadata information.
-    sb.append(MetastoreShim.getTableInformation(hiveTable));
+    sb.append(MetastoreShim.getTableInformation(msTable));
+    sb.append(MetastoreShim.getConstraintsInformation(pki, fki));
 
     for (String line: sb.toString().split("\n")) {
       // To match Hive's HiveServer2 output, split each line into multiple column
@@ -279,6 +300,12 @@ public class DescribeResultFactory {
       // Kudu-specific describe info.
       TColumnValue pkCol = new TColumnValue();
       pkCol.setString_val(Boolean.toString(kuduColumn.isKey()));
+      TColumnValue pkUniqueCol = new TColumnValue();
+      if (kuduColumn.isKey()) {
+        pkUniqueCol.setString_val(Boolean.toString(kuduColumn.isPrimaryKeyUnique()));
+      } else {
+        pkUniqueCol.setString_val("");
+      }
       TColumnValue nullableCol = new TColumnValue();
       nullableCol.setString_val(Boolean.toString(kuduColumn.isNullable()));
       TColumnValue defaultValCol = new TColumnValue();
@@ -294,8 +321,33 @@ public class DescribeResultFactory {
       TColumnValue blockSizeCol = new TColumnValue();
       blockSizeCol.setString_val(Integer.toString(kuduColumn.getBlockSize()));
       descResult.results.add(new TResultRow(
-          Lists.newArrayList(colNameCol, dataTypeCol, commentCol, pkCol, nullableCol,
-              defaultValCol, encodingCol, compressionCol, blockSizeCol)));
+          Lists.newArrayList(colNameCol, dataTypeCol, commentCol, pkCol, pkUniqueCol,
+              nullableCol, defaultValCol, encodingCol, compressionCol, blockSizeCol)));
+    }
+    return descResult;
+  }
+
+  /**
+   * Builds a TDescribeResult for a Iceberg table from a list of columns.
+   */
+  public static TDescribeResult buildIcebergDescribeMinimalResult(List<Column> columns) {
+    TDescribeResult descResult = new TDescribeResult();
+    descResult.results = Lists.newArrayList();
+    for (Column c: columns) {
+      Preconditions.checkState(c instanceof IcebergColumn);
+      IcebergColumn icebergColumn = (IcebergColumn) c;
+      // General describe info.
+      TColumnValue colNameCol = new TColumnValue();
+      colNameCol.setString_val(icebergColumn.getName());
+      TColumnValue dataTypeCol = new TColumnValue();
+      dataTypeCol.setString_val(icebergColumn.getType().prettyPrint().toLowerCase());
+      TColumnValue commentCol = new TColumnValue();
+      commentCol.setString_val(Strings.nullToEmpty(icebergColumn.getComment()));
+      // Iceberg-specific describe info.
+      TColumnValue nullableCol = new TColumnValue();
+      nullableCol.setString_val(Boolean.toString(icebergColumn.isNullable()));
+      descResult.results.add(new TResultRow(
+          Lists.newArrayList(colNameCol, dataTypeCol, commentCol, nullableCol)));
     }
     return descResult;
   }

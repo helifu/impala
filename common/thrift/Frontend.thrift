@@ -19,19 +19,16 @@ namespace cpp impala
 namespace java org.apache.impala.thrift
 
 include "Types.thrift"
-include "ImpalaInternalService.thrift"
-include "PlanNodes.thrift"
-include "Planner.thrift"
 include "RuntimeProfile.thrift"
 include "Descriptors.thrift"
 include "Data.thrift"
 include "Results.thrift"
-include "Exprs.thrift"
 include "TCLIService.thrift"
 include "Status.thrift"
 include "CatalogObjects.thrift"
 include "CatalogService.thrift"
 include "LineageGraph.thrift"
+include "Query.thrift"
 
 // These are supporting structs for JniFrontend.java, which serves as the glue
 // between our C++ execution environment and the Java frontend.
@@ -79,7 +76,7 @@ struct TGetTablesParams {
   // Session state for the user who initiated this request. If authorization is
   // enabled, only the tables this user has access to will be returned. If not
   // set, access checks will be skipped (used for internal Impala requests)
-  3: optional ImpalaInternalService.TSessionState session
+  3: optional Query.TSessionState session
 }
 
 // getTableNames returns a list of unqualified table names
@@ -126,7 +123,7 @@ struct TGetDbsParams {
   // Session state for the user who initiated this request. If authorization is
   // enabled, only the databases this user has access to will be returned. If not
   // set, access checks will be skipped (used for internal Impala requests)
-  2: optional ImpalaInternalService.TSessionState session
+  2: optional Query.TSessionState session
 }
 
 // getDbs returns a list of databases
@@ -188,7 +185,7 @@ struct TDescribeTableParams {
   3: optional Types.TColumnType result_struct
 
   // Session state for the user who initiated this request.
-  4: optional ImpalaInternalService.TSessionState session
+  4: optional Query.TSessionState session
 }
 
 // Results of a call to describeDb() and describeTable()
@@ -217,12 +214,22 @@ enum TShowStatsOp {
   COLUMN_STATS = 1
   PARTITIONS = 2
   RANGE_PARTITIONS = 3
+  HASH_SCHEMA = 4
 }
 
 // Parameters for SHOW TABLE/COLUMN STATS and SHOW PARTITIONS commands
 struct TShowStatsParams {
   1: TShowStatsOp op
   2: CatalogObjects.TTableName table_name
+  3: optional bool show_column_minmax_stats
+}
+
+// Parameters for DESCRIBE HISTORY command
+struct TDescribeHistoryParams {
+  1: CatalogObjects.TTableName table_name
+  2: optional i64 between_start_time
+  3: optional i64 between_end_time
+  4: optional i64 from_time
 }
 
 // Parameters for SHOW FUNCTIONS commands
@@ -279,6 +286,20 @@ struct TShowRolesResult {
   1: required list<string> role_names
 }
 
+// Represents one row in the DESCRIBE HISTORY command's result.
+struct TGetTableHistoryResultItem {
+  // Timestamp in millis
+  1: required i64 creation_time
+  2: required i64 snapshot_id
+  3: optional i64 parent_id
+  4: required bool is_current_ancestor
+}
+
+// Result of the DESCRIBE HISTORY command.
+struct TGetTableHistoryResult {
+  1: required list<TGetTableHistoryResultItem> result
+}
+
 // Parameters for SHOW GRANT ROLE/USER commands
 struct TShowGrantPrincipalParams {
   // The effective user who submitted this request.
@@ -312,7 +333,7 @@ struct TGetFunctionsParams {
   // Session state for the user who initiated this request. If authorization is
   // enabled, only the functions this user has access to will be returned. If not
   // set, access checks will be skipped (used for internal Impala requests)
-  4: optional ImpalaInternalService.TSessionState session
+  4: optional Query.TSessionState session
 }
 
 // getFunctions() returns a list of function signatures
@@ -334,37 +355,6 @@ struct TExplainResult {
   1: required list<Data.TResultRow> results
 }
 
-// Metadata required to finalize a query - that is, to clean up after the query is done.
-// Only relevant for INSERT queries.
-struct TFinalizeParams {
-  // True if the INSERT query was OVERWRITE, rather than INTO
-  1: required bool is_overwrite
-
-  // The base directory in hdfs of the table targeted by this INSERT
-  2: required string hdfs_base_dir
-
-  // The target table name
-  3: required string table_name
-
-  // The target table database
-  4: required string table_db
-
-  // The full path in HDFS of a directory under which temporary files may be written
-  // during an INSERT. For a query with id a:b, files are written to <staging_dir>/.a_b/,
-  // and that entire directory is removed after the INSERT completes.
-  5: optional string staging_dir
-
-  // Identifier for the target table in the query-wide descriptor table (see
-  // TDescriptorTable and TTableDescriptor).
-  6: optional i64 table_id;
-
-  // Stores the ACID transaction id of the target table for transactional INSERTs.
-  7: optional i64 transaction_id;
-
-  // Stores the ACID write id of the target table for transactional INSERTs.
-  8: optional i64 write_id;
-}
-
 // Request for a LOAD DATA statement. LOAD DATA is only supported for HDFS backed tables.
 struct TLoadDataReq {
   // Fully qualified table name to load data into.
@@ -382,6 +372,22 @@ struct TLoadDataReq {
   // An optional partition spec. Set if this operation should apply to a specific
   // partition rather than the base table.
   4: optional list<CatalogObjects.TPartitionKeyValue> partition_spec
+
+  // True if the destination table is an Iceberg table, in this case we need to insert
+  // data to the Iceberg table based on the given files.
+  5: optional bool iceberg_tbl
+
+  // For Iceberg data load. Query template to create a temporary with table location
+  // pointing to the new files. The table location is unknown during planning, these are
+  // filled during execution.
+  6: optional string create_tmp_tbl_query_template
+
+  // For Iceberg data load. Query to insert into the destination table from the
+  // temporary table.
+  7: optional string insert_into_dst_tbl_query
+
+  // For Iceberg data load. Query to drop the temporary table.
+  8: optional string drop_tmp_tbl_query
 }
 
 // Response of a LOAD DATA statement.
@@ -389,66 +395,19 @@ struct TLoadDataResp {
   // A result row that contains information on the result of the LOAD operation. This
   // includes details like the number of files moved as part of the request.
   1: required Data.TResultRow load_summary
-}
 
-// Execution parameters for a single plan; component of TQueryExecRequest
-struct TPlanExecInfo {
-  // fragments[i] may consume the output of fragments[j > i];
-  // fragments[0] is the root fragment and also the coordinator fragment, if
-  // it is unpartitioned.
-  1: required list<Planner.TPlanFragment> fragments
+  // The loaded file paths
+  2: required list<string> loaded_files
 
-  // A map from scan node ids to a scan range specification.
-  // The node ids refer to scan nodes in fragments[].plan
-  2: optional map<Types.TPlanNodeId, Planner.TScanRangeSpec>
-      per_node_scan_ranges
-}
+  // This is needed to issue TUpdateCatalogRequest
+  3: string partition_name = ""
 
-// Result of call to ImpalaPlanService/JniFrontend.CreateQueryRequest()
-struct TQueryExecRequest {
-  // exec info for all plans; the first one materializes the query result
-  1: optional list<TPlanExecInfo> plan_exec_info
+  // For Iceberg data load. The query template after the required fields are substituted.
+  4: optional string create_tmp_tbl_query
 
-  // Metadata of the query result set (only for select)
-  2: optional Results.TResultSetMetadata result_set_metadata
-
-  // Set if the query needs finalization after it executes
-  3: optional TFinalizeParams finalize_params
-
-  4: required ImpalaInternalService.TQueryCtx query_ctx
-
-  // The same as the output of 'explain <query>'
-  5: optional string query_plan
-
-  // The statement type governs when the coordinator can judge a query to be finished.
-  // DML queries are complete after Wait(), SELECTs may not be. Generally matches
-  // the stmt_type of the parent TExecRequest, but in some cases (such as CREATE TABLE
-  // AS SELECT), these may differ.
-  6: required Types.TStmtType stmt_type
-
-  // List of replica hosts.  Used by the host_idx field of TScanRangeLocation.
-  7: required list<Types.TNetworkAddress> host_list
-
-  // Column lineage graph
-  8: optional LineageGraph.TLineageGraph lineage_graph
-
-  // Estimated per-host peak memory consumption in bytes. Used by admission control.
-  // TODO: Remove when AC doesn't rely on this any more.
-  9: optional i64 per_host_mem_estimate
-
-  // Maximum possible (in the case all fragments are scheduled on all hosts with
-  // max DOP) minimum memory reservation required per host, in bytes.
-  10: optional i64 max_per_host_min_mem_reservation;
-
-  // Maximum possible (in the case all fragments are scheduled on all hosts with
-  // max DOP) required threads per host, i.e. the number of threads that this query
-  // needs to execute successfully. Does not include "optional" threads.
-  11: optional i64 max_per_host_thread_reservation;
-
-  // Estimated coordinator's memory consumption in bytes assuming that the coordinator
-  // fragment will run on a dedicated coordinator. Set by the planner and used by
-  // admission control.
-  12: optional i64 dedicated_coord_mem_estimate;
+  // For Iceberg data load. The temporary table location, used to restore data in case of
+  // query failure.
+  5: optional string create_location
 }
 
 enum TCatalogOpType {
@@ -467,6 +426,7 @@ enum TCatalogOpType {
   SHOW_GRANT_PRINCIPAL = 12
   SHOW_FILES = 13
   SHOW_CREATE_FUNCTION = 14
+  DESCRIBE_HISTORY = 15
 }
 
 // TODO: Combine SHOW requests with a single struct that contains a field
@@ -527,6 +487,16 @@ struct TCatalogOpRequest {
 
   // Parameters for SHOW_CREATE_FUNCTION
   18: optional TGetFunctionsParams show_create_function_params
+
+  // Parameters for DESCRIBE HISTORY
+  19: optional TDescribeHistoryParams describe_history_params
+}
+
+// Query options type
+enum TQueryOptionType {
+  SET_ONE = 0
+  SET_ALL = 1
+  UNSET_ALL = 2
 }
 
 // Parameters for the SET query option command
@@ -534,8 +504,8 @@ struct TSetQueryOptionRequest {
   // Set for "SET key=value", unset for "SET" and "SET ALL" statements.
   1: optional string key
   2: optional string value
-  // Set true for "SET ALL"
-  3: optional bool is_set_all
+  // query option type
+  3: optional TQueryOptionType query_option_type
 }
 
 struct TShutdownParams {
@@ -595,7 +565,7 @@ struct TMetadataOpRequest {
   // Session state for the user who initiated this request. If authorization is
   // enabled, only the server objects this user has access to will be returned.
   // If not set, access checks will be skipped (used for internal Impala requests)
-  10: optional ImpalaInternalService.TSessionState session
+  10: optional Query.TSessionState session
   11: optional TCLIService.TGetPrimaryKeysReq get_primary_keys_req
   12: optional TCLIService.TGetCrossReferenceReq get_cross_reference_req
 }
@@ -620,11 +590,11 @@ struct TExecRequest {
   1: required Types.TStmtType stmt_type
 
   // Copied from the corresponding TClientRequest
-  2: required ImpalaInternalService.TQueryOptions query_options
+  2: required Query.TQueryOptions query_options
 
   // TQueryExecRequest for the backend
   // Set iff stmt_type is QUERY or DML
-  3: optional TQueryExecRequest query_exec_request
+  3: optional Query.TQueryExecRequest query_exec_request
 
   // Set if stmt_type is DDL
   4: optional TCatalogOpRequest catalog_op_request
@@ -665,6 +635,16 @@ struct TExecRequest {
 
   // Set iff stmt_type is TESTCASE
   15: optional string testcase_data_path
+
+  // Coordinator time when plan was submitted by external frontend
+  16: optional i64 remote_submit_time
+
+  // Additional profile nodes to be displayed nested right under 'profile' field.
+  17: optional list<RuntimeProfile.TRuntimeProfileNode> profile_children
+
+  // True if request pool is set by Frontend rather than user specifically setting it via
+  // REQUEST_POOL query option.
+  18: optional bool request_pool_set_by_frontend = false
 }
 
 // Parameters to FeSupport.cacheJar().
@@ -778,18 +758,55 @@ struct TUpdateCatalogCacheResponse {
   3: required i64 new_catalog_version
 }
 
+// Types of executor groups
+struct TExecutorGroupSet {
+  // The current max number of executors among all healthy groups of this group set.
+  1: i32 curr_num_executors = 0
+
+  // The expected size of the executor groups. Can be used to plan queries when
+  // no healthy executor groups are present(curr_num_executors is 0).
+  2: i32 expected_num_executors = 0
+
+  // The name of the request pool associated with this executor group type. All
+  // executor groups that match this prefix will be included as a part of this set.
+  // Note: this will be empty when 'default' executor group is used or
+  // 'expected_executor_group_sets' startup flag is not specified.
+  3: string exec_group_name_prefix
+
+  // The optional max_mem_limit to determine which executor group set to run for a query.
+  // The max_mem_limit value is set to the max_query_mem_limit attribute of the group set
+  // with name prefix 'exec_group_name_prefix' from the pool service. For each query,
+  // the frontend computes the per host estimated-memory after a compilation with a
+  // number of executor nodes from this group set and compares it with this variable.
+  4: optional i64 max_mem_limit
+
+  // The optional num_cores_per_executor is used to determine which executor group set to
+  // run for a query. The num_cores_per_executor value is set to
+  // max_query_cpu_core_per_node_limit attribute of the group set with name prefix
+  // 'exec_group_name_prefix' from the pool service.
+  // The total number of CPU cores among all executors in this executor group equals
+  // num_cores_per_executor * curr_num_executors if curr_num_executors is greater than 0,
+  // otherwise it equals num_cores_per_executor * expected_num_executors.
+  // For each query, the frontend computes the estimated total CPU core count required
+  // for a query to run efficiently after a compilation with a number of executor nodes
+  // from this group set and compare it with the total number of CPU cores in this
+  // executor group.
+  5: optional i32 num_cores_per_executor
+}
+
 // Sent from the impalad BE to FE with the latest membership snapshot of the
 // executors on the cluster resulting from the Membership heartbeat.
 struct TUpdateExecutorMembershipRequest {
   // The hostnames of the executor nodes.
+  // Note: There can be multiple executors running on the same host.
   1: required set<string> hostnames
 
   // The ip addresses of the executor nodes.
+  // Note: There can be multiple executors running on the same ip addresses.
   2: required set<string> ip_addresses
 
-  // The number of executors on a cluster, needed since there can be multiple
-  // impalads running on the same host.
-  3: i32 num_executors
+  // Info about existing executor group sets.
+  3: list<TExecutorGroupSet> exec_group_sets
 }
 
 // Contains all interesting statistics from a single 'memory pool' in the JVM.
@@ -956,4 +973,35 @@ struct TQueryCompleteContext {
   // this is an experimental feature and the format will likely change
   // in a future version
   1: required string lineage_string
+}
+
+// Contains all information from a HTTP request.
+// Currently used to pass from BE to FE to do SAML authentication in Java.
+struct TWrappedHttpRequest {
+  1: required string method // Currently only POST is used.
+  // The following members come from parsing the URL:
+  // server_name:server_port/path?params...
+  2: required string server_name
+  3: required i32 server_port
+  4: required string path
+  5: required map<string, string> params
+  // Headers and cookies come from parsing the HTTP header.
+  6: required map<string, string> headers
+  7: required map<string, string> cookies
+  // Filling the content is optional to allow inspecting the header in FE and
+  // continue processing the request in BE.
+  8: optional string content
+  9: required string remote_ip
+  10: required bool secure // True if TLS/SSL was used.
+}
+
+// Contains all information needed to respond to a HTTP request.
+// Currently used to pass from FE to BE to do SAML authentication in Java.
+struct TWrappedHttpResponse {
+  1: required i16 status_code
+  2: required string status_text
+  3: required map<string, string> headers
+  4: required map<string, string> cookies
+  5: optional string content
+  6: optional string content_type
 }

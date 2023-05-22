@@ -17,6 +17,8 @@
 #
 # Basic object model of an Impala cluster (set of Impala processes).
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range
 import json
 import logging
 import os
@@ -28,19 +30,16 @@ import time
 from getpass import getuser
 from random import choice
 from signal import SIGKILL
-from subprocess import check_call
+from subprocess import check_call, check_output
 from time import sleep
 
 import tests.common.environ
 from tests.common.impala_service import (
+    AdmissiondService,
     CatalogdService,
     ImpaladService,
     StateStoredService)
 from tests.util.shell_util import exec_process, exec_process_async
-
-if sys.version_info >= (2, 7):
-  # We use some functions in the docker code that don't exist in Python 2.6.
-  from subprocess import check_output
 
 LOG = logging.getLogger('impala_cluster')
 LOG.setLevel(level=logging.DEBUG)
@@ -50,14 +49,15 @@ START_DAEMON_PATH = os.path.join(IMPALA_HOME, 'bin/start-daemon.sh')
 
 DEFAULT_BEESWAX_PORT = 21000
 DEFAULT_HS2_PORT = 21050
+DEFAULT_EXTERNAL_FE_PORT = 21150
 DEFAULT_HS2_HTTP_PORT = 28000
-DEFAULT_BE_PORT = 22000
 DEFAULT_KRPC_PORT = 27000
 DEFAULT_CATALOG_SERVICE_PORT = 26000
 DEFAULT_STATE_STORE_SUBSCRIBER_PORT = 23000
 DEFAULT_IMPALAD_WEBSERVER_PORT = 25000
 DEFAULT_STATESTORED_WEBSERVER_PORT = 25010
 DEFAULT_CATALOGD_WEBSERVER_PORT = 25020
+DEFAULT_ADMISSIOND_WEBSERVER_PORT = 25030
 
 DEFAULT_IMPALAD_JVM_DEBUG_PORT = 30000
 DEFAULT_CATALOGD_JVM_DEBUG_PORT = 30030
@@ -75,8 +75,9 @@ CLUSTER_WAIT_TIMEOUT_IN_SECONDS = 240
 # * The docker minicluster with one container per process connected to a user-defined
 #   bridge network.
 class ImpalaCluster(object):
-  def __init__(self, docker_network=None):
+  def __init__(self, docker_network=None, use_admission_service=False):
     self.docker_network = docker_network
+    self.use_admission_service = use_admission_service
     self.refresh()
 
   @classmethod
@@ -91,13 +92,18 @@ class ImpalaCluster(object):
     Helpful to confirm that processes have been killed.
     """
     if self.docker_network is None:
-      self.__impalads, self.__statestoreds, self.__catalogd =\
+      self.__impalads, self.__statestoreds, self.__catalogd, self.__admissiond =\
           self.__build_impala_process_lists()
     else:
-      self.__impalads, self.__statestoreds, self.__catalogd =\
+      self.__impalads, self.__statestoreds, self.__catalogd, self.__admissiond =\
           self.__find_docker_containers()
-    LOG.debug("Found %d impalad/%d statestored/%d catalogd process(es)" %
-        (len(self.__impalads), len(self.__statestoreds), 1 if self.__catalogd else 0))
+    admissiond_str = ""
+    if self.use_admission_service:
+      admissiond_str = "/%d admissiond" % (1 if self.__admissiond else 0)
+
+    LOG.debug("Found %d impalad/%d statestored/%d catalogd%s process(es)" %
+        (len(self.__impalads), len(self.__statestoreds), 1 if self.__catalogd else 0,
+         admissiond_str))
 
   @property
   def statestored(self):
@@ -119,6 +125,11 @@ class ImpalaCluster(object):
   def catalogd(self):
     """Returns the catalogd process, or None if no catalogd process was found"""
     return self.__catalogd
+
+  @property
+  def admissiond(self):
+    """Returns the admisisond process, or None if no admissiond process was found"""
+    return self.__admissiond
 
   def get_first_impalad(self):
     return self.impalads[0]
@@ -145,7 +156,7 @@ class ImpalaCluster(object):
         result = client.execute("select 1")
         assert result.success
         ++n
-      except Exception as e: print e
+      except Exception as e: print(e)
       finally:
         client.close()
     return n
@@ -221,7 +232,9 @@ class ImpalaCluster(object):
     impalads = list()
     statestored = list()
     catalogd = None
-    for binary, process in find_user_processes(['impalad', 'catalogd', 'statestored']):
+    admissiond = None
+    daemons = ['impalad', 'catalogd', 'statestored', 'admissiond']
+    for binary, process in find_user_processes(daemons):
       # IMPALA-6889: When a process shuts down and becomes a zombie its cmdline becomes
       # empty for a brief moment, before it gets reaped by its parent (see man proc). We
       # copy the cmdline to prevent it from changing between the following checks and
@@ -241,9 +254,11 @@ class ImpalaCluster(object):
         statestored.append(StateStoreProcess(cmdline))
       elif binary == 'catalogd':
         catalogd = CatalogdProcess(cmdline)
+      elif binary == 'admissiond':
+        admissiond = AdmissiondProcess(cmdline)
 
     self.__sort_impalads(impalads)
-    return impalads, statestored, catalogd
+    return impalads, statestored, catalogd, admissiond
 
   def __find_docker_containers(self):
     """
@@ -252,7 +267,9 @@ class ImpalaCluster(object):
     impalads = []
     statestoreds = []
     catalogd = None
-    output = check_output(["docker", "network", "inspect", self.docker_network])
+    admissiond = None
+    output = check_output(["docker", "network", "inspect", self.docker_network],
+                          universal_newlines=True)
     # Only one network should be present in the top level array.
     for container_id in json.loads(output)[0]["Containers"]:
       container_info = get_container_info(container_id)
@@ -262,7 +279,7 @@ class ImpalaCluster(object):
       args = container_info["Args"]
       executable = os.path.basename(args[0])
       port_map = {}
-      for k, v in container_info["NetworkSettings"]["Ports"].iteritems():
+      for k, v in container_info["NetworkSettings"]["Ports"].items():
         # Key looks like "25000/tcp"..
         port = int(k.split("/")[0])
         # Value looks like { "HostPort": "25002", "HostIp": "" }.
@@ -278,8 +295,12 @@ class ImpalaCluster(object):
         assert catalogd is None
         catalogd = CatalogdProcess(args, container_id=container_id,
                                    port_map=port_map)
+      elif executable == 'admissiond':
+        assert admissiond is None
+        admissiond = AdmissiondProcess(args, container_id=container_id,
+                                       port_map=port_map)
     self.__sort_impalads(impalads)
-    return impalads, statestoreds, catalogd
+    return impalads, statestoreds, catalogd, admissiond
 
   def __sort_impalads(self, impalads):
     """Does an in-place sort of a list of ImpaladProcess objects into a canonical order.
@@ -436,7 +457,7 @@ class BaseImpalaProcess(Process):
   def _get_arg_value(self, arg_name, default=None):
     """Gets the argument value for given argument name"""
     for arg in self.cmd:
-      if ('%s=' % arg_name) in arg.strip().lstrip('-'):
+      if arg.strip().lstrip('-').startswith('%s=' % arg_name):
         return arg.split('=')[1]
     if default is None:
       assert 0, "Argument '{0}' not found in cmd '{1}'.".format(arg_name, self.cmd)
@@ -456,7 +477,7 @@ class ImpaladProcess(BaseImpalaProcess):
   def __init__(self, cmd, container_id=None, port_map=None):
     super(ImpaladProcess, self).__init__(cmd, container_id, port_map)
     self.service = ImpaladService(self.hostname, self.webserver_interface,
-        self.get_webserver_port(), self.__get_beeswax_port(), self.__get_be_port(),
+        self.get_webserver_port(), self.__get_beeswax_port(),
         self.__get_krpc_port(), self.__get_hs2_port(), self.__get_hs2_http_port(),
         self._get_webserver_certificate_file())
 
@@ -465,9 +486,6 @@ class ImpaladProcess(BaseImpalaProcess):
 
   def __get_beeswax_port(self):
     return int(self._get_port('beeswax_port', DEFAULT_BEESWAX_PORT))
-
-  def __get_be_port(self):
-    return int(self._get_port('be_port', DEFAULT_BE_PORT))
 
   def __get_krpc_port(self):
     return int(self._get_port('krpc_port', DEFAULT_KRPC_PORT))
@@ -478,14 +496,16 @@ class ImpaladProcess(BaseImpalaProcess):
   def __get_hs2_http_port(self):
     return int(self._get_port('hs2_http_port', DEFAULT_HS2_HTTP_PORT))
 
-  def start(self, wait_until_ready=True):
-    """Starts the impalad and waits until the service is ready to accept connections."""
+  def start(self, wait_until_ready=True, timeout=30):
+    """Starts the impalad and waits until the service is ready to accept connections.
+    'timeout' is the amount of time to wait for the Impala server to be in the
+    ready state."""
     restart_args = self.cmd[1:]
     LOG.info("Starting Impalad process with args: {0}".format(restart_args))
     run_daemon("impalad", restart_args)
     if wait_until_ready:
       self.service.wait_for_metric_value('impala-server.ready',
-                                         expected_value=1, timeout=30)
+                                         expected_value=1, timeout=timeout)
 
   def wait_for_catalog(self):
     """Waits for a catalog copy to be received by the impalad. When its received,
@@ -550,6 +570,16 @@ class CatalogdProcess(BaseImpalaProcess):
                                          expected_value=1, timeout=30)
 
 
+# Represents an admission control process.
+class AdmissiondProcess(BaseImpalaProcess):
+  def __init__(self, cmd, container_id=None, port_map=None):
+    super(AdmissiondProcess, self).__init__(cmd, container_id, port_map)
+    self.service = AdmissiondService(self.hostname, self.webserver_interface,
+        self.get_webserver_port(), self._get_webserver_certificate_file())
+
+  def _get_default_webserver_port(self):
+    return DEFAULT_ADMISSIOND_WEBSERVER_PORT
+
 def find_user_processes(binaries):
   """Returns an iterator over all processes owned by the current user with a matching
   binary name from the provided list. Return a iterable of tuples, with each tuple
@@ -566,10 +596,10 @@ def find_user_processes(binaries):
       binary_name = os.path.basename(cmdline[0])
       if binary_name in binaries:
         yield binary_name, process
-    except KeyError, e:
+    except KeyError as e:
       if "uid not found" not in str(e):
         raise
-    except psutil.NoSuchProcess, e:
+    except psutil.NoSuchProcess as e:
       # Ignore the case when a process no longer exists.
       pass
 
@@ -593,7 +623,7 @@ def run_daemon(daemon_binary, args, build_type="latest", env_vars={}, output_fil
   # achieve the same thing but it doesn't work on some platforms for some reasons.
   sys_cmd = ("{set_cmds} {cmd} {redirect} &".format(
       set_cmds=''.join(["export {0}={1};".format(k, pipes.quote(v))
-                         for k, v in env_vars.iteritems()]),
+                         for k, v in env_vars.items()]),
       cmd=' '.join([pipes.quote(tok) for tok in cmd]),
       redirect=redirect))
   os.system(sys_cmd)
@@ -601,8 +631,8 @@ def run_daemon(daemon_binary, args, build_type="latest", env_vars={}, output_fil
 
 def get_container_info(container_id):
   """Get the output of "docker container inspect" as a python data structure."""
-  containers = json.loads(
-      check_output(["docker", "container", "inspect", container_id]))
+  containers = json.loads(check_output(["docker", "container", "inspect", container_id],
+                                       universal_newlines=True))
   # Only one container should be present in the top level array.
   assert len(containers) == 1, json.dumps(containers, indent=4)
   return containers[0]

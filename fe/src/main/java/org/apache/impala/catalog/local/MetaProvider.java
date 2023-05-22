@@ -24,17 +24,27 @@ import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
-import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
 import org.apache.impala.authorization.AuthorizationPolicy;
+import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Function;
+import org.apache.impala.catalog.HdfsCachePool;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.HdfsPartitionLocationCompressor;
+import org.apache.impala.catalog.HdfsStorageDescriptor;
+import org.apache.impala.catalog.SqlConstraints;
+import org.apache.impala.catalog.VirtualColumn;
+import org.apache.impala.catalog.local.LocalIcebergTable.TableParams;
 import org.apache.impala.common.Pair;
+import org.apache.impala.thrift.TBriefTableMeta;
 import org.apache.impala.thrift.TNetworkAddress;
+import org.apache.impala.thrift.TPartialTableInfo;
+import org.apache.impala.thrift.TValidWriteIdList;
 import org.apache.impala.util.ListMap;
 import org.apache.thrift.TException;
 
+import com.google.common.collect.ImmutableCollection;
 import com.google.common.collect.ImmutableList;
 import com.google.errorprone.annotations.Immutable;
 
@@ -61,7 +71,7 @@ public interface MetaProvider {
 
   Database loadDb(String dbName) throws TException;
 
-  ImmutableList<String> loadTableNames(String dbName)
+  ImmutableCollection<TBriefTableMeta> loadTableList(String dbName)
       throws MetaException, UnknownDBException, TException;
 
   Pair<Table, TableMetaRef> loadTable(String dbName, String tableName)
@@ -77,6 +87,12 @@ public interface MetaProvider {
    */
   List<PartitionRef> loadPartitionList(TableMetaRef table)
       throws MetaException, TException;
+
+  /**
+   * Load the list of SQL constraints for the given table.
+   */
+  SqlConstraints loadConstraints(TableMetaRef table,
+      Table msTbl) throws MetaException, TException;
 
   /**
    * Retrieve the list of functions in the given database.
@@ -99,7 +115,7 @@ public interface MetaProvider {
   Map<String, PartitionMetadata> loadPartitionsByRefs(TableMetaRef table,
       List<String> partitionColumnNames, ListMap<TNetworkAddress> hostIndex,
       List<PartitionRef> partitionRefs)
-      throws MetaException, TException;
+      throws MetaException, TException, CatalogException;
 
   /**
    * Load statistics for the given columns from the given table.
@@ -111,12 +127,29 @@ public interface MetaProvider {
       List<String> colNames) throws TException;
 
   /**
+   * Loads Iceberg related table metadata.
+   */
+  public TPartialTableInfo loadIcebergTable(
+      final TableMetaRef table) throws TException;
+
+  /**
+   * Loads the Iceberg API table metadata through the Iceberg library.
+   */
+  public org.apache.iceberg.Table loadIcebergApiTable(
+      final TableMetaRef table, TableParams param, Table msTable) throws TException;
+
+  /**
    * Reference to a table as returned by loadTable(). This reference must be passed
    * back to other functions to fetch more details about the table. Implementations
    * may use this reference to store internal information such as version numbers
    * in order to perform concurrency control checks, etc.
    */
   interface TableMetaRef {
+    boolean isMarkedCached();
+    List<String> getPartitionPrefixes();
+    boolean isPartitioned();
+    boolean isTransactional();
+    List<VirtualColumn> getVirtualColumns();
   }
 
   /**
@@ -132,9 +165,20 @@ public interface MetaProvider {
    * Partition metadata as returned by loadPartitionsByRefs().
    */
   interface PartitionMetadata {
-    Partition getHmsPartition();
+    Map<String, String> getHmsParameters();
+    long getWriteId();
+    HdfsStorageDescriptor getInputFormatDescriptor();
+    HdfsPartitionLocationCompressor.Location getLocation();
     ImmutableList<FileDescriptor> getFileDescriptors();
+    ImmutableList<FileDescriptor> getInsertFileDescriptors();
+    ImmutableList<FileDescriptor> getDeleteFileDescriptors();
     byte[] getPartitionStats();
     boolean hasIncrementalStats();
+    boolean isMarkedCached();
+    long getLastCompactionId();
   }
+
+  public TValidWriteIdList getValidWriteIdList(TableMetaRef ref);
+
+  Iterable<HdfsCachePool> getHdfsCachePools();
 }

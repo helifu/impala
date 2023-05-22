@@ -17,7 +17,7 @@
 
 '''This module generates a docker environment for a job'''
 
-from __future__ import division
+from __future__ import absolute_import, division, print_function
 try:
   from fabric.api import sudo, run, settings
 except ImportError as e:
@@ -141,7 +141,7 @@ class ImpalaDockerEnv(object):
           volume_ops = ' '.join(
               ['-v {host_path}:{container_path}'.format(host_path=host_path,
                                                         container_path=container_path)
-               for host_path, container_path in volume_map.iteritems()])
+               for host_path, container_path in volume_map.items()])
         start_command += (
             'docker run -d -t {volume_ops} -p {postgres_port}:5432 -p {ssh_port}:22 '
             '-p {impala_port}:21050 {docker_image_name} /bin/docker-boot-daemon').format(
@@ -300,34 +300,32 @@ class ImpalaDockerEnv(object):
     # incompatibility with Kudu. First we have to get test data off the container, store
     # it somewhere, and then start another container using docker -v and mount the test
     # data as a volume to bypass AUFS. See also the README for Leopard.
-    if os.environ.get('KUDU_IS_SUPPORTED') == 'true':
-      LOG.info('Warming testdata cluster external volume')
-      self.start_new_container()
-      with settings(
-          warn_only=True,
-          host_string=self.host,
-          user=self.host_username,
-      ):
-        sudo(
-            'mkdir -p {host_testdata_path} && '
-            'rsync -e "ssh -i {priv_key} -o StrictHostKeyChecking=no '
-            ''         '-o UserKnownHostsFile=/dev/null -p {ssh_port}" '
-            '--delete --archive --verbose --progress '
-            '{user}@127.0.0.1:{container_testdata_path} {host_testdata_path} && '
-            'chown -R {uid}:{gid} {host_testdata_path}'.format(
-                host_testdata_path=HOST_TESTDATA_EXTERNAL_VOLUME_PATH,
-                priv_key=HOST_TO_DOCKER_SSH_KEY,
-                ssh_port=self.ssh_port,
-                uid=DOCKER_IMPALA_USER_UID,
-                gid=DOCKER_IMPALA_USER_GID,
-                user=DOCKER_USER_NAME,
-                container_testdata_path=DOCKER_TESTDATA_VOLUME_PATH))
+    LOG.info('Warming testdata cluster external volume')
+    self.start_new_container()
+    volume_map = None
+    with settings(
+        warn_only=True,
+        host_string=self.host,
+        user=self.host_username,
+    ):
+      sudo(
+          'mkdir -p {host_testdata_path} && '
+          'rsync -e "ssh -i {priv_key} -o StrictHostKeyChecking=no '
+          ''         '-o UserKnownHostsFile=/dev/null -p {ssh_port}" '
+          '--delete --archive --verbose --progress '
+          '{user}@127.0.0.1:{container_testdata_path} {host_testdata_path} && '
+          'chown -R {uid}:{gid} {host_testdata_path}'.format(
+              host_testdata_path=HOST_TESTDATA_EXTERNAL_VOLUME_PATH,
+              priv_key=HOST_TO_DOCKER_SSH_KEY,
+              ssh_port=self.ssh_port,
+              uid=DOCKER_IMPALA_USER_UID,
+              gid=DOCKER_IMPALA_USER_GID,
+              user=DOCKER_USER_NAME,
+              container_testdata_path=DOCKER_TESTDATA_VOLUME_PATH))
       self.stop_docker()
       volume_map = {
           HOST_TESTDATA_EXTERNAL_VOLUME_PATH: DOCKER_TESTDATA_VOLUME_PATH,
       }
-    else:
-      volume_map = None
 
     self.start_new_container(volume_map=volume_map)
     LOG.info('Container Started')

@@ -19,12 +19,16 @@
 
 #include "codegen/codegen-anyval.h"
 #include "exec/base-sequence-scanner.h"
-#include "exec/text-converter.h"
+#include "exec/exec-node.inline.h"
+#include "exec/file-metadata-utils.h"
 #include "exec/hdfs-scan-node.h"
 #include "exec/hdfs-scan-node-mt.h"
 #include "exec/read-write-util.h"
+#include "exec/text-converter.h"
 #include "exec/text-converter.inline.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "runtime/collection-value-builder.h"
+#include "runtime/fragment-state.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/runtime-filter.inline.h"
 #include "runtime/tuple-row.h"
@@ -43,11 +47,11 @@ DEFINE_double(min_filter_reject_ratio, 0.1, "(Advanced) If the percentage of "
 
 const char* FieldLocation::LLVM_CLASS_NAME = "struct.impala::FieldLocation";
 const char* HdfsScanner::LLVM_CLASS_NAME = "class.impala::HdfsScanner";
-const int64_t HdfsScanner::FOOTER_SIZE;
 
 HdfsScanner::HdfsScanner(HdfsScanNodeBase* scan_node, RuntimeState* state)
     : scan_node_(scan_node),
       state_(state),
+      file_metadata_utils_(scan_node),
       expr_perm_pool_(new MemPool(scan_node->expr_mem_tracker())),
       template_tuple_pool_(new MemPool(scan_node->mem_tracker())),
       tuple_byte_size_(scan_node->tuple_desc()->byte_size()),
@@ -63,6 +67,7 @@ HdfsScanner::HdfsScanner(HdfsScanNodeBase* scan_node, RuntimeState* state)
 HdfsScanner::HdfsScanner()
     : scan_node_(nullptr),
       state_(nullptr),
+      file_metadata_utils_(nullptr),
       tuple_byte_size_(0) {
   DCHECK(TestInfo::is_test());
 }
@@ -70,8 +75,26 @@ HdfsScanner::HdfsScanner()
 HdfsScanner::~HdfsScanner() {
 }
 
+Status HdfsScanner::ValidateSlotDescriptors() const {
+  if (file_format() != THdfsFileFormat::PARQUET &&
+      file_format() != THdfsFileFormat::ORC) {
+    // Virtual column FILE__POSITION is only supported for PARQUET files.
+    for (SlotDescriptor* sd : scan_node_->virtual_column_slots()) {
+      if (sd->virtual_column_type() == TVirtualColumnType::FILE_POSITION) {
+        return Status(Substitute(
+            "Virtual column FILE__POSITION is not supported for $0 files.",
+            _THdfsFileFormat_VALUES_TO_NAMES.find(file_format())->second));
+      }
+    }
+  }
+  return Status::OK();
+}
+
 Status HdfsScanner::Open(ScannerContext* context) {
   context_ = context;
+  RETURN_IF_ERROR(ValidateSlotDescriptors());
+  file_metadata_utils_.SetFile(state_, scan_node_->GetFileDesc(
+      context->partition_descriptor()->id(), context->GetStream()->filename()));
   stream_ = context->GetStream();
 
   // Clone the scan node's conjuncts map. The cloned evaluators must be closed by the
@@ -90,7 +113,7 @@ Status HdfsScanner::Open(ScannerContext* context) {
     for (auto& entry : *(scan_node_->thrift_dict_filter_conjuncts_map())) {
       SlotDescriptor* slot_desc = state_->desc_tbl().GetSlotDescriptor(entry.first);
       TupleId tuple_id = (slot_desc->type().IsCollectionType() ?
-          slot_desc->collection_item_descriptor()->id() :
+          slot_desc->children_tuple_descriptor()->id() :
           slot_desc->parent()->id());
       auto conjunct_evals_it = conjunct_evals_map_.find(tuple_id);
       DCHECK(conjunct_evals_it != conjunct_evals_map_.end());
@@ -106,10 +129,10 @@ Status HdfsScanner::Open(ScannerContext* context) {
     }
   }
 
-  // Initialize the template_tuple_.
-  template_tuple_ = scan_node_->InitTemplateTuple(
-      context_->partition_descriptor()->partition_key_value_evals(),
-      template_tuple_pool_.get(), state_);
+  std::map<const SlotId, const SlotDescriptor*> slot_descs_written;
+  template_tuple_ = file_metadata_utils_.CreateTemplateTuple(
+      context_->partition_descriptor()->id(), template_tuple_pool_.get(),
+      &slot_descs_written);
   template_tuple_map_[scan_node_->tuple_desc()] = template_tuple_;
 
   decompress_timer_ = ADD_TIMER(scan_node_->runtime_profile(), "DecompressionTime");
@@ -132,12 +155,15 @@ Status HdfsScanner::ProcessSplit() {
     }
     unique_ptr<RowBatch> batch = std::make_unique<RowBatch>(scan_node_->row_desc(),
         state_->batch_size(), scan_node_->mem_tracker());
+    if (scan_node_->is_partition_key_scan()) batch->limit_capacity(1);
     Status status = GetNextInternal(batch.get());
     if (batch->num_rows() > 0) returned_rows = true;
     // Always add batch to the queue if any rows were returned because it may contain
     // data referenced by previously appended batches.
     if (returned_rows) scan_node->AddMaterializedRowBatch(move(batch));
     RETURN_IF_ERROR(status);
+    // Only need to return one row per partition for partition key scans.
+    if (returned_rows && scan_node_->is_partition_key_scan()) eos_ = true;
   } while (!eos_ && !scan_node_->ReachedLimitShared());
   return Status::OK();
 }
@@ -176,7 +202,7 @@ Status HdfsScanner::InitializeWriteTuplesFn(HdfsPartitionDescriptor* partition,
     return Status::OK();
   }
 
-  write_tuples_fn_ = reinterpret_cast<WriteTuplesFn>(scan_node_->GetCodegenFn(type));
+  write_tuples_fn_ = scan_node_->GetCodegenFn(type);
   if (write_tuples_fn_ == NULL) {
     scan_node_->IncNumScannersCodegenDisabled();
     return Status::OK();
@@ -212,9 +238,17 @@ Status HdfsScanner::CommitRows(int num_rows, RowBatch* row_batch) {
   return Status::OK();
 }
 
+int HdfsScanner::WriteAlignedTuplesCodegenOrInterpret(MemPool* pool,
+    TupleRow* tuple_row_mem, FieldLocation* fields, int num_tuples,
+    int max_added_tuples, int slots_per_tuple, int row_idx_start, bool copy_strings) {
+  return CallCodegendOrInterpreted<WriteTuplesFn>::invoke(this, write_tuples_fn_,
+      &HdfsScanner::WriteAlignedTuples, pool, tuple_row_mem, fields, num_tuples,
+      max_added_tuples, scan_node_->materialized_slots().size(), row_idx_start,
+      copy_strings);
+}
+
 int HdfsScanner::WriteTemplateTuples(TupleRow* row, int num_tuples) {
   DCHECK_GE(num_tuples, 0);
-  DCHECK_EQ(scan_node_->tuple_idx(), 0);
   DCHECK_EQ(scan_node_->materialized_slots().size(), 0);
   int num_to_commit = 0;
   if (LIKELY(conjunct_evals_->size() == 0)) {
@@ -253,14 +287,16 @@ bool HdfsScanner::WriteCompleteTuple(MemPool* pool, FieldLocation* fields,
       need_escape = true;
     }
 
-    SlotDescriptor* desc = scan_node_->materialized_slots()[i];
-    bool error = !text_converter_->WriteSlot(desc, tuple,
+    const SlotDescriptor* slot_desc = scan_node_->materialized_slots()[i];
+    const AuxColumnType& aux_type =
+        scan_node_->hdfs_table()->GetColumnDesc(slot_desc).auxType();
+    bool error = !text_converter_->WriteSlot(slot_desc, &aux_type, tuple,
         fields[i].start, len, false, need_escape, pool);
     error_fields[i] = error;
     *error_in_row |= error;
   }
 
-  tuple_row->SetTuple(scan_node_->tuple_idx(), tuple);
+  tuple_row->SetTuple(0, tuple);
   return EvalConjuncts(tuple_row);
 }
 
@@ -321,29 +357,39 @@ bool HdfsScanner::WriteCompleteTuple(MemPool* pool, FieldLocation* fields,
 // eval_fail:                                        ; preds = %parse
 //   ret i1 false
 // }
-Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
-    LlvmCodeGen* codegen, const vector<ScalarExpr*>& conjuncts,
-    llvm::Function** write_complete_tuple_fn) {
+Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanPlanNode* node,
+    FragmentState* state, llvm::Function** write_complete_tuple_fn) {
+  const vector<ScalarExpr*>& conjuncts = node->conjuncts_;
+  LlvmCodeGen* codegen = state->codegen();
   *write_complete_tuple_fn = NULL;
-  RuntimeState* state = node->runtime_state();
 
   // Cast away const-ness.  The codegen only sets the cached typed llvm struct.
-  TupleDescriptor* tuple_desc = const_cast<TupleDescriptor*>(node->tuple_desc());
+  TupleDescriptor* tuple_desc = const_cast<TupleDescriptor*>(node->tuple_desc_);
   vector<llvm::Function*> slot_fns;
-  for (int i = 0; i < node->materialized_slots().size(); ++i) {
+  for (int i = 0; i < node->materialized_slots_.size(); ++i) {
     llvm::Function* fn = nullptr;
-    SlotDescriptor* slot_desc = node->materialized_slots()[i];
-    RETURN_IF_ERROR(TextConverter::CodegenWriteSlot(codegen, tuple_desc, slot_desc, &fn,
-        node->hdfs_table()->null_column_value().data(),
-        node->hdfs_table()->null_column_value().size(), true, state->strict_mode()));
-    if (i >= LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) codegen->SetNoInline(fn);
+    SlotDescriptor* slot_desc = node->materialized_slots_[i];
+
+    // If the type is CHAR, WriteSlot for this slot cannot be codegen'd. To keep codegen
+    // for other things, we call the interpreted code for this slot from the codegen'd
+    // code instead of failing codegen. See IMPALA-9747.
+    const AuxColumnType& aux_type =
+        node->hdfs_table_->GetColumnDesc(slot_desc).auxType();
+    if (TextConverter::SupportsCodegenWriteSlot(
+        slot_desc->type(), aux_type)) {
+      RETURN_IF_ERROR(TextConverter::CodegenWriteSlot(codegen, tuple_desc, slot_desc,
+          &aux_type, &fn, node->hdfs_table_->null_column_value().data(),
+          node->hdfs_table_->null_column_value().size(), true,
+          state->query_options().strict_mode));
+      if (i >= LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) codegen->SetNoInline(fn);
+    }
     slot_fns.push_back(fn);
   }
 
   // Compute order to materialize slots.  BE assumes that conjuncts should
   // be evaluated in the order specified (optimization is already done by FE)
   vector<int> materialize_order;
-  node->ComputeSlotMaterializationOrder(&materialize_order);
+  node->ComputeSlotMaterializationOrder(state->desc_tbl(), &materialize_order);
 
   // Get types to construct matching function signature to WriteCompleteTuple
   llvm::PointerType* uint8_ptr_type = codegen->i8_ptr_type();
@@ -382,6 +428,7 @@ Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
 
   // Extract the input args
   llvm::Value* this_arg = args[0];
+  llvm::Value* mem_pool_arg = args[1];
   llvm::Value* fields_arg = args[2];
   llvm::Value* opaque_tuple_arg = args[3];
   llvm::Value* tuple_arg =
@@ -401,7 +448,7 @@ Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
   // Put tuple in tuple_row
   llvm::Value* tuple_row_typed =
       builder.CreateBitCast(tuple_row_arg, llvm::PointerType::get(tuple_ptr_type, 0));
-  llvm::Value* tuple_row_idxs[] = {codegen->GetI32Constant(node->tuple_idx())};
+  llvm::Value* tuple_row_idxs[] = {codegen->GetI32Constant(0)};
   llvm::Value* tuple_in_row_addr =
       builder.CreateInBoundsGEP(tuple_row_typed, tuple_row_idxs);
   builder.CreateStore(tuple_arg, tuple_in_row_addr);
@@ -464,8 +511,21 @@ Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
 
       // Call slot parse function
       llvm::Function* slot_fn = slot_fns[slot_idx];
-      llvm::Value* slot_parsed = builder.CreateCall(
-          slot_fn, llvm::ArrayRef<llvm::Value*>({tuple_arg, data, len}));
+
+      llvm::Value* slot_parsed = nullptr;
+      if (LIKELY(slot_fn != nullptr)) {
+        slot_parsed = builder.CreateCall(
+            slot_fn, llvm::ArrayRef<llvm::Value*>({tuple_arg, data, len}));
+      } else {
+        llvm::Value* slot_idx_value = codegen->GetI32Constant(slot_idx);
+        llvm::Function* interpreted_slot_fn = codegen->GetFunction(
+            IRFunction::HDFS_SCANNER_TEXT_CONVERTER_WRITE_SLOT_INTERPRETED_IR, false);
+        DCHECK(interpreted_slot_fn != nullptr);
+
+        slot_parsed = builder.CreateCall(interpreted_slot_fn,
+            {this_arg, slot_idx_value, opaque_tuple_arg, data, len, mem_pool_arg});
+      }
+
       llvm::Value* slot_error = builder.CreateNot(slot_parsed, "slot_parse_error");
       error_in_row = builder.CreateOr(error_in_row, slot_error, "error_in_row");
       slot_error = builder.CreateZExt(slot_error, codegen->i8_type());
@@ -485,15 +545,9 @@ Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
       // tuple against that conjunct and start a new parse_block for the next conjunct
       parse_block = llvm::BasicBlock::Create(context, "parse", fn, eval_fail_block);
       llvm::Function* conjunct_fn;
-      Status status =
-          conjuncts[conjunct_idx]->GetCodegendComputeFn(codegen, false, &conjunct_fn);
-      if (!status.ok()) {
-        stringstream ss;
-        ss << "Failed to codegen conjunct: " << status.GetDetail();
-        state->LogError(ErrorMsg(TErrorCode::GENERAL, ss.str()));
-        return status;
-      }
-      if (node->materialized_slots().size() + conjunct_idx
+      RETURN_IF_ERROR(
+          conjuncts[conjunct_idx]->GetCodegendComputeFn(codegen, false, &conjunct_fn));
+      if (node->materialized_slots_.size() + conjunct_idx
           >= LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) {
         codegen->SetNoInline(conjunct_fn);
       }
@@ -506,7 +560,8 @@ Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
 
       llvm::Value* conjunct_args[] = {eval, tuple_row_arg};
       CodegenAnyVal result = CodegenAnyVal::CreateCallWrapped(
-          codegen, &builder, TYPE_BOOLEAN, conjunct_fn, conjunct_args, "conjunct_eval");
+          codegen, &builder, ColumnType(TYPE_BOOLEAN), conjunct_fn, conjunct_args,
+          "conjunct_eval");
       builder.CreateCondBr(result.GetVal(), parse_block, eval_fail_block);
       builder.SetInsertPoint(parse_block);
     }
@@ -516,7 +571,7 @@ Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
   builder.SetInsertPoint(eval_fail_block);
   builder.CreateRet(codegen->false_value());
 
-  if (node->materialized_slots().size() + conjuncts.size()
+  if (node->materialized_slots_.size() + conjuncts.size()
       > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
     codegen->SetNoInline(fn);
   }
@@ -527,9 +582,10 @@ Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
   return Status::OK();
 }
 
-Status HdfsScanner::CodegenWriteAlignedTuples(const HdfsScanNodeBase* node,
-    LlvmCodeGen* codegen, llvm::Function* write_complete_tuple_fn,
+Status HdfsScanner::CodegenWriteAlignedTuples(const HdfsScanPlanNode* node,
+    FragmentState* state, llvm::Function* write_complete_tuple_fn,
     llvm::Function** write_aligned_tuples_fn) {
+  LlvmCodeGen* codegen = state->codegen();
   *write_aligned_tuples_fn = NULL;
   DCHECK(write_complete_tuple_fn != NULL);
 
@@ -543,12 +599,12 @@ Status HdfsScanner::CodegenWriteAlignedTuples(const HdfsScanNodeBase* node,
 
   llvm::Function* copy_strings_fn;
   RETURN_IF_ERROR(Tuple::CodegenCopyStrings(
-      codegen, *node->tuple_desc(), &copy_strings_fn));
+      codegen, *node->tuple_desc_, &copy_strings_fn));
   replaced = codegen->ReplaceCallSites(
       write_tuples_fn, copy_strings_fn, "CopyStrings");
   DCHECK_REPLACE_COUNT(replaced, 1);
 
-  int tuple_byte_size = node->tuple_desc()->byte_size();
+  int tuple_byte_size = node->tuple_desc_->byte_size();
   replaced = codegen->ReplaceCallSitesWithValue(write_tuples_fn,
       codegen->GetI32Constant(tuple_byte_size), "tuple_byte_size");
   DCHECK_REPLACE_COUNT(replaced, 1);
@@ -561,16 +617,27 @@ Status HdfsScanner::CodegenWriteAlignedTuples(const HdfsScanNodeBase* node,
 }
 
 Status HdfsScanner::CodegenInitTuple(
-    const HdfsScanNodeBase* node, LlvmCodeGen* codegen, llvm::Function** init_tuple_fn) {
+    const HdfsScanPlanNode* node, LlvmCodeGen* codegen, llvm::Function** init_tuple_fn) {
   *init_tuple_fn = codegen->GetFunction(IRFunction::HDFS_SCANNER_INIT_TUPLE, true);
   DCHECK(*init_tuple_fn != nullptr);
 
   // Replace all of the constants in InitTuple() to specialize the code.
-  int replaced = codegen->ReplaceCallSitesWithBoolConst(
-      *init_tuple_fn, node->num_materialized_partition_keys() > 0, "has_template_tuple");
-  DCHECK_REPLACE_COUNT(replaced, 1);
+  bool has_template_tuple = !node->partition_key_slots_.empty();
+  if (!has_template_tuple) {
+    has_template_tuple = node->HasVirtualColumnInTemplateTuple();
+  }
+  int replaced = 0;
+  // If has_template_tuple is true, then we can certainly replace the callsites.
+  // If has_template_tuple is false, then we should only replace the callsites for
+  // non-Iceberg tables, as for Iceberg tables we might still create a template
+  // tuple based on the partitioning in the data files.
+  if (has_template_tuple || !node->hdfs_table_->IsIcebergTable()) {
+    replaced = codegen->ReplaceCallSitesWithBoolConst(
+      *init_tuple_fn, has_template_tuple, "has_template_tuple");
+    DCHECK_REPLACE_COUNT(replaced, 1);
+  }
 
-  const TupleDescriptor* tuple_desc = node->tuple_desc();
+  const TupleDescriptor* tuple_desc = node->tuple_desc_;
   replaced = codegen->ReplaceCallSitesWithValue(*init_tuple_fn,
       codegen->GetI32Constant(tuple_desc->byte_size()), "tuple_byte_size");
   DCHECK_REPLACE_COUNT(replaced, 1);
@@ -608,7 +675,7 @@ Status HdfsScanner::CodegenInitTuple(
 // }
 //
 // EvalRuntimeFilter() is the same as the cross-compiled version except EvalOneFilter()
-// is replaced with the one generated by CodegenEvalOneFilter().
+// is replaced with the one generated by FilterContext::CodegenEval().
 Status HdfsScanner::CodegenEvalRuntimeFilters(
     LlvmCodeGen* codegen, const vector<ScalarExpr*>& filter_exprs, llvm::Function** fn) {
   llvm::LLVMContext& context = codegen->context();
@@ -637,6 +704,7 @@ Status HdfsScanner::CodegenEvalRuntimeFilters(
 
     DCHECK_GT(num_filters, 0);
     for (int i = 0; i < num_filters; ++i) {
+      // Make a clone of HdfsScanner::EvalRuntimeFilter(int i, TupleRow* row)
       llvm::Function* eval_runtime_filter_fn =
           codegen->GetFunction(IRFunction::HDFS_SCANNER_EVAL_RUNTIME_FILTER, true);
       DCHECK(eval_runtime_filter_fn != nullptr);
@@ -649,17 +717,25 @@ Status HdfsScanner::CodegenEvalRuntimeFilters(
           &eval_one_filter_fn));
       DCHECK(eval_one_filter_fn != nullptr);
 
+      // "FilterContext4Eval" is FilterContext::Eval(impala::TupleRow*).
+      // Replace ctx->Eval(row) in the above cloned function with its LLVM version
+      // which is 'eval_one_filter_fn'.
       int replaced = codegen->ReplaceCallSites(eval_runtime_filter_fn, eval_one_filter_fn,
           "FilterContext4Eval");
       DCHECK_REPLACE_COUNT(replaced, 1);
 
+      // Create a call to the above LLVM optimized eval_runtime_filter_fn.
       llvm::Value* idx = codegen->GetI32Constant(i);
       llvm::Value* passed_filter = builder.CreateCall(
           eval_runtime_filter_fn, llvm::ArrayRef<llvm::Value*>({this_arg, idx, row_arg}));
 
+      // Create a new block "continue" at the end of eval_runtime_filters_fn block.
       llvm::BasicBlock* continue_block =
           llvm::BasicBlock::Create(context, "continue", eval_runtime_filters_fn);
+      // Create a condition on top of eval_runtime_filter_fn.
       builder.CreateCondBr(passed_filter, continue_block, row_rejected_block);
+      // Mark 'continue_block' the location to accumulate any additional LLVM code
+      // for the next filter (if any).
       builder.SetInsertPoint(continue_block);
     }
     builder.CreateRet(codegen->true_value());
@@ -773,18 +849,20 @@ void HdfsScanner::CheckFiltersEffectiveness() {
     double reject_ratio = stats->rejected / static_cast<double>(stats->considered);
     if (filter->AlwaysTrue() ||
         reject_ratio < FLAGS_min_filter_reject_ratio) {
-      stats->enabled = 0;
+      stats->enabled_for_row = 0;
     }
   }
 }
 
 Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
-    const THdfsFileFormat::type& file_type, const vector<HdfsFileDesc*>& files) {
+    const THdfsFileFormat::type& file_type, const vector<HdfsFileDesc*>& files,
+    int64_t footer_size_estimate) {
   DCHECK(!files.empty());
+  DCHECK_LE(footer_size_estimate, READ_SIZE_MIN_VALUE);
   vector<ScanRange*> footer_ranges;
   for (int i = 0; i < files.size(); ++i) {
     // Compute the offset of the file footer.
-    int64_t footer_size = min(FOOTER_SIZE, files[i]->file_length);
+    int64_t footer_size = min(footer_size_estimate, files[i]->file_length);
     int64_t footer_start = files[i]->file_length - footer_size;
     DCHECK_GE(footer_start, 0);
 
@@ -809,10 +887,9 @@ Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
         // metadata associated with the footer range.
         ScanRange* footer_range;
         if (footer_split != nullptr) {
-          footer_range = scan_node->AllocateScanRange(files[i]->fs,
-              files[i]->filename.c_str(), footer_size, footer_start,
-              split_metadata->partition_id, footer_split->disk_id(),
-              footer_split->expected_local(), files[i]->is_erasure_coded, files[i]->mtime,
+          footer_range = scan_node->AllocateScanRange(files[i]->GetFileInfo(),
+              footer_size, footer_start, split_metadata->partition_id,
+              footer_split->disk_id(), footer_split->expected_local(),
               BufferOpts(footer_split->cache_options()), split);
         } else {
           // If we did not find the last split, we know it is going to be a remote read.
@@ -820,10 +897,9 @@ Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
           int cache_options = !scan_node->IsDataCacheDisabled() ?
               BufferOpts::USE_DATA_CACHE : BufferOpts::NO_CACHING;
           footer_range =
-              scan_node->AllocateScanRange(files[i]->fs, files[i]->filename.c_str(),
-                   footer_size, footer_start, split_metadata->partition_id, -1,
-                   expected_local, files[i]->is_erasure_coded, files[i]->mtime,
-                   BufferOpts(cache_options), split);
+              scan_node->AllocateScanRange(files[i]->GetFileInfo(),
+                  footer_size, footer_start, split_metadata->partition_id, -1,
+                  expected_local, BufferOpts(cache_options), split);
         }
         footer_ranges.push_back(footer_range);
       } else {

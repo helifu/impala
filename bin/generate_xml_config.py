@@ -39,7 +39,7 @@ REPL:
 
 """
 
-from __future__ import with_statement
+from __future__ import absolute_import, division, print_function
 import imp
 import os
 import re
@@ -77,34 +77,34 @@ def dump_config(d, source_path, out):
 
       -->
       <configuration>""".format(source_path=os.path.abspath(source_path))
-  print >>out, dedent(header)
-  for k, v in sorted(d.iteritems()):
+  print(dedent(header), file=out)
+  for k, v in sorted(d.items()):
     try:
       k_new = _substitute_env_vars(k)
       if isinstance(v, int):
         v = str(v)
       v_new = _substitute_env_vars(v)
-    except KeyError, e:
+    except KeyError as e:
       raise Exception("failed environment variable substitution for value {k}: {e}"
                       .format(k=k, e=e))
-    print >>out, """\
+    print("""\
       <property>
         <name>{name}</name>
         <value>{value}</value>
-      </property>""".format(name=xmlescape(k_new), value=xmlescape(v_new))
-  print >>out, "</configuration>"
+      </property>""".format(name=xmlescape(k_new), value=xmlescape(v_new)), file=out)
+  print("</configuration>", file=out)
 
 
 def main():
   if len(sys.argv) != 3:
-    print >>sys.stderr, "usage: {prog} <template> <out>".format(prog=sys.argv[0])
+    print("usage: {prog} <template> <out>".format(prog=sys.argv[0]), file=sys.stderr)
     sys.exit(1)
 
   _, in_path, out_path = sys.argv
   try:
     mod = imp.load_source('template', in_path)
   except:  # noqa
-    print >>sys.stderr, "Unable to load template: %s" % in_path
+    print("Unable to load template: %s" % in_path, file=sys.stderr)
     raise
   conf = mod.__dict__.get('CONFIG')
   if not isinstance(conf, dict):
@@ -112,7 +112,7 @@ def main():
                     .format(path=in_path))
 
   tmp_path = out_path + ".tmp"
-  with file(tmp_path, "w") as out:
+  with open(tmp_path, "w") as out:
     try:
       dump_config(conf, in_path, out)
     except:  # noqa

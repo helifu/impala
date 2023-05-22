@@ -17,9 +17,13 @@
 
 #include "util/coding-util.h"
 
-#include <exception>
+#include <cctype>
+#include <limits>
 #include <sstream>
-#include <boost/algorithm/string.hpp>
+
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/function.hpp>
+#include <sasl/sasl.h>
 
 #include "common/compiler-util.h"
 #include "common/logging.h"
@@ -130,7 +134,7 @@ bool Base64Encode(const char* in, int64_t in_len, int64_t out_max, char* out,
   return true;
 }
 
-static inline void Base64Encode(const char* in, int64_t in_len, stringstream* out) {
+void Base64Encode(const char* in, int64_t in_len, stringstream* out) {
   if (in_len == 0) {
     (*out) << "";
     return;

@@ -17,9 +17,13 @@
 
 package org.apache.impala.planner;
 
+import java.util.List;
+
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.CollectionTableRef;
 import org.apache.impala.analysis.Expr;
+import org.apache.impala.analysis.SlotRef;
+import org.apache.impala.analysis.ToSqlUtils;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlanNode;
@@ -27,34 +31,48 @@ import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TUnnestNode;
 import com.google.common.base.Joiner;
+import com.google.common.collect.Lists;
 import com.google.common.base.Preconditions;
 
 /**
- * An UnnestNode scans over a collection materialized in memory, and returns
- * one row per item in the collection.
+ * An UnnestNode scans over collections materialized in memory, and returns
+ * one row per item in the collection if a single collection is provided or it returns as
+ * many rows as the length of the longest collection this node handles. For the shorter
+ * collections the missing items are filled with nulls.
  * An UnnestNode can only appear in the plan tree of a SubplanNode.
  */
 public class UnnestNode extends PlanNode {
   private final SubplanNode containingSubplanNode_;
-  private final CollectionTableRef tblRef_;
-  private final Expr collectionExpr_;
+  private final List<CollectionTableRef> tblRefs_;
+  private final List<Expr> collectionExprs_;
 
   public UnnestNode(PlanNodeId id, SubplanNode containingSubplanNode,
       CollectionTableRef tblRef) {
-    super(id, tblRef.getDesc().getId().asList(), "UNNEST");
+    this(id, containingSubplanNode, Lists.newArrayList(tblRef));
+  }
+
+  public UnnestNode(PlanNodeId id, SubplanNode containingSubplanNode,
+      List<CollectionTableRef> tblRefs) {
+    super(id, "UNNEST");
     containingSubplanNode_ = containingSubplanNode;
-    tblRef_ = tblRef;
-    collectionExpr_ = tblRef_.getCollectionExpr();
-    // Assume the collection expr has been fully resolved in analysis.
-    Preconditions.checkState(
-        collectionExpr_.isBoundByTupleIds(containingSubplanNode.getChild(0).tupleIds_));
+    tblRefs_ = tblRefs;
+    Preconditions.checkState(tblRefs.size() > 0);
+    collectionExprs_ = Lists.newArrayList();
+    for (CollectionTableRef ref : tblRefs) {
+      SlotRef collectionSlotRef = (SlotRef)ref.getCollectionExpr();
+      collectionExprs_.add(collectionSlotRef);
+      tupleIds_.add(collectionSlotRef.getDesc().getItemTupleDesc().getId());
+      tblRefIds_.add(collectionSlotRef.getDesc().getItemTupleDesc().getId());
+    }
+    // Assume the collection exprs have been fully resolved in analysis.
+    for (Expr collectionExpr : collectionExprs_) {
+      Preconditions.checkState(
+          collectionExpr.isBoundByTupleIds(containingSubplanNode.getChild(0).tupleIds_));
+    }
   }
 
   @Override
   public void init(Analyzer analyzer) throws ImpalaException {
-    // Do not assign binding predicates or predicates for enforcing slot equivalences
-    // because they must have been assigned in the scan node materializing the
-    // collection-typed slot.
     super.init(analyzer);
     conjuncts_ = orderConjunctsByCost(conjuncts_);
 
@@ -64,13 +82,23 @@ public class UnnestNode extends PlanNode {
   }
 
   @Override
+  protected boolean shouldPickUpZippingUnnestConjuncts() { return true; }
+
+  @Override
   public void computeStats(Analyzer analyzer) {
     super.computeStats(analyzer);
     cardinality_ = PlannerContext.AVG_COLLECTION_SIZE;
     // The containing SubplanNode has not yet been initialized, so get the number
     // of nodes from the SubplanNode's input.
     numNodes_ = containingSubplanNode_.getChild(0).getNumNodes();
+    numInstances_ = containingSubplanNode_.getChild(0).getNumInstances();
     cardinality_ = capCardinalityAtLimit(cardinality_);
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = ProcessingCost.basicCost(
+        getDisplayLabel(), containingSubplanNode_.getChild(0).getCardinality(), 0);
   }
 
   @Override
@@ -101,14 +129,30 @@ public class UnnestNode extends PlanNode {
   @Override
   protected String getDisplayLabelDetail() {
     StringBuilder strBuilder = new StringBuilder();
-    strBuilder.append(Joiner.on(".").join(tblRef_.getPath()));
-    if (tblRef_.hasExplicitAlias()) strBuilder.append(" " + tblRef_.getExplicitAlias());
+    boolean first = true;
+    tblRefs_.sort( (CollectionTableRef t1, CollectionTableRef t2) -> {
+      String path1 = ToSqlUtils.getPathSql(t1.getPath());
+      String path2 = ToSqlUtils.getPathSql(t2.getPath());
+      return path1.compareTo(path2);
+    });
+    for (CollectionTableRef tblRef : tblRefs_) {
+      if (!first) strBuilder.append(", ");
+      strBuilder.append(Joiner.on(".").join(tblRef.getPath()));
+      if (tblRef.hasExplicitAlias()) {
+        strBuilder.append(" " + tblRef.getExplicitAlias());
+      }
+      first = false;
+    }
     return strBuilder.toString();
   }
 
   @Override
   protected void toThrift(TPlanNode msg) {
     msg.node_type = TPlanNodeType.UNNEST_NODE;
-    msg.setUnnest_node(new TUnnestNode(collectionExpr_.treeToThrift()));
+    TUnnestNode unnestNode = new TUnnestNode();
+    for (Expr expr : collectionExprs_) {
+      unnestNode.addToCollection_exprs(expr.treeToThrift());
+    }
+    msg.setUnnest_node(unnestNode);
   }
 }

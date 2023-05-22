@@ -17,6 +17,15 @@
 
 #include "runtime/datetime-iso-sql-format-tokenizer.h"
 
+#include <strings.h>
+#include <algorithm>
+#include <cstring>
+#include <vector>
+
+#include <boost/algorithm/string/case_conv.hpp>
+
+#include "common/logging.h"
+
 namespace impala {
 
 namespace datetime_parse_util {
@@ -89,6 +98,8 @@ const unsigned IsoSqlFormatTokenizer::MAX_TOKEN_SIZE = 5;
 
 const int IsoSqlFormatTokenizer::MAX_FORMAT_LENGTH = 100;
 
+const int IsoSqlFormatTokenizer::FRACTIONAL_MAX_LEN = 9;
+
 FormatTokenizationResult IsoSqlFormatTokenizer::Tokenize() {
   DCHECK(dt_ctx_ != nullptr);
   DCHECK(dt_ctx_->fmt != nullptr);
@@ -146,8 +157,16 @@ FormatTokenizationResult IsoSqlFormatTokenizer::ProcessNextToken(
       }
       if (cast_mode_ == PARSE && IsUsedToken(token_to_probe)) return DUPLICATE_FORMAT;
       if (!accept_time_toks_ && token->second.time_token) return DATE_WITH_TIME_ERROR;
-      DateTimeFormatToken format_token(DateTimeFormatToken(token->second.type,
-          *current_pos - str_begin, GetMaxTokenLength(token->first), *current_pos));
+      int max_len = GetMaxTokenLength(token->first);
+      DateTimeFormatToken format_token(DateTimeFormatToken(
+          token->second.type, *current_pos - str_begin, max_len, *current_pos));
+      dt_ctx_->fmt_out_len += max_len;
+      if (token->second.type == YEAR || token->second.type == ROUND_YEAR
+          || token->second.type == ISO8601_WEEK_NUMBERING_YEAR) {
+        format_token.divisor = std::pow(10, max_len);
+      } else if (token->second.type == FRACTION) {
+        format_token.divisor = std::pow(10, FRACTIONAL_MAX_LEN - max_len);
+      }
       if (fm_modifier_active_) {
         fm_modifier_active_ = false;
         format_token.fm_modifier = true;
@@ -189,6 +208,9 @@ FormatTokenizationResult IsoSqlFormatTokenizer::CheckIncompatibilities() const {
     }
     return SUCCESS;
   }
+
+  DCHECK(cast_mode_ == PARSE);
+  if(!dt_ctx_->has_date_toks) return NO_DATE_TOKENS_ERROR;
 
   short provided_year_count = IsUsedToken("YYYY") + IsUsedToken("YYY") +
       IsUsedToken("YY") + IsUsedToken("Y");

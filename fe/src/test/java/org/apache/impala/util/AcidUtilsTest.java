@@ -18,22 +18,31 @@ package org.apache.impala.util;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
+import com.google.common.base.Preconditions;
+
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.common.ValidReadTxnList;
 import org.apache.hadoop.hive.common.ValidWriteIdList;
+import org.apache.hadoop.hive.common.ValidReaderWriteIdList;
+import org.apache.hadoop.hive.metastore.api.MetaException;
+import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.compat.MetastoreShim;
 import org.hamcrest.Matchers;
 import org.junit.Assume;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class AcidUtilsTest {
-
+  private static final Logger LOG = LoggerFactory.getLogger(AcidUtilsTest.class);
   /** Fake base path to root all FileStatuses under. */
   private static final Path BASE_PATH = new Path("file:///foo/bar/");
 
@@ -62,9 +71,33 @@ public class AcidUtilsTest {
     List<FileStatus> stats = createMockStats(relPaths);
     List<FileStatus> expectedStats = createMockStats(expectedRelPaths);
 
-    assertThat(AcidUtils.filterFilesForAcidState(stats, BASE_PATH,
-        new ValidReadTxnList(validTxnListStr), writeIds, null),
-        Matchers.containsInAnyOrder(expectedStats.toArray()));
+    try {
+      assertThat(AcidUtils.filterFilesForAcidState(stats, BASE_PATH,
+          new ValidReadTxnList(validTxnListStr), writeIds, null),
+          Matchers.containsInAnyOrder(expectedStats.toArray()));
+    } catch (CatalogException me) {
+      //TODO: Remove try-catch once IMPALA-9042 is resolved.
+      assertTrue(false);
+    }
+  }
+
+  public void filteringError(String[] relPaths, String validTxnListStr,
+      String validWriteIdListStr, String expectedErrorString) {
+    Preconditions.checkNotNull(expectedErrorString, "No expected error message given.");
+    try {
+      ValidWriteIdList writeIds = MetastoreShim.getValidWriteIdListFromString(
+        validWriteIdListStr);
+      List<FileStatus> stats = createMockStats(relPaths);
+      AcidUtils.filterFilesForAcidState(
+          stats, BASE_PATH, new ValidReadTxnList(validTxnListStr), writeIds, null);
+    } catch (Exception e) {
+      String errorString = e.getMessage();
+      Preconditions.checkNotNull(errorString, "Stack trace lost during exception.");
+      String msg = "got error:\n" + errorString + "\nexpected:\n" + expectedErrorString;
+      assertTrue(msg, errorString.startsWith(expectedErrorString));
+      return;
+    }
+    fail("Filtering didn't result in error");
   }
 
   @Test
@@ -160,6 +193,36 @@ public class AcidUtilsTest {
           "delta_0000009_0000009_0000/0000/def.txt"});
   }
 
+  public void testStreamingIngest() {
+    assertFiltering(new String[]{
+      "delta_0000001_0000005/bucket_0000",
+      "delta_0000001_0000005/bucket_0001",
+      "delta_0000001_0000005/bucket_0002",
+      "delta_0000001_0000005_v01000/bucket_0000",
+      "delta_0000001_0000005_v01000/bucket_0001",
+      "delta_0000001_0000005_v01000/bucket_0002"},
+    "1100:1000:1000:", // txn 1000 is open
+    "default.test:10:10::", // write ids are committed
+    new String[]{
+      "delta_0000001_0000005/bucket_0000",
+      "delta_0000001_0000005/bucket_0001",
+      "delta_0000001_0000005/bucket_0002"});
+
+    assertFiltering(new String[]{
+      "delta_0000001_0000005/bucket_0000",
+      "delta_0000001_0000005/bucket_0001",
+      "delta_0000001_0000005/bucket_0002",
+      "delta_0000001_0000005_v01000/bucket_0000",
+      "delta_0000001_0000005_v01000/bucket_0001",
+      "delta_0000001_0000005_v01000/bucket_0002"},
+    "1100:::", // txn 1000 is committed
+    "default.test:10:10::", // write ids are committed
+    new String[]{
+      "delta_0000001_0000005_v01000/bucket_0000",
+      "delta_0000001_0000005_v01000/bucket_0001",
+      "delta_0000001_0000005_v01000/bucket_0002"});
+  }
+
   @Test
   public void testAbortedCompaction() {
     assertFiltering(new String[]{
@@ -243,14 +306,14 @@ public class AcidUtilsTest {
         "delta_000006_0000020/",
         "delta_000006_0000020/def.txt",
         "delta_000005.txt"};
-
-    // Only committed up to transaction 10, so skip the 6-20 delta.
+    // Only committed up to write id 10, so we can select 6-20 delta.
     assertFiltering(paths,
       "default.test:10:1234:1,2,3",
       new String[]{
           "delta_000005_0000005/abc.txt",
-          "delta_000005_0000005_0000/abc.txt",
-          "delta_000005.txt"});
+          "delta_000006_0000020/def.txt",
+          "delta_000005.txt",
+          });
   }
 
   @Test
@@ -307,5 +370,244 @@ public class AcidUtilsTest {
             "delta_000005_000005_0000/lmn.txt",
             "delta_0000012_0000012_0000/0000_0",
             "delta_0000012_0000012_0000/0000_1"});
+  }
+
+  @Test
+  public void testMinorCompactionAllTxnsValid() {
+    assertFiltering(new String[]{
+            "base_0000005/",
+            "base_0000005/abc.txt",
+            "delta_0000006_0000006_v01000/00000",
+            "delta_0000007_0000007_v01000/00000",
+            "delta_0000006_0000007_v01000/00000"},
+        "", // all txns are valid
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:10:1234:1,2,3",
+        new String[]{
+          "base_0000005/abc.txt",
+          "delta_0000006_0000007_v01000/00000"});
+    // Minor compact multi-statement transaction
+    assertFiltering(new String[]{
+          "base_0000005/",
+          "base_0000005/abc.txt",
+          "delta_0000006_0000006_00001/00000",  // statement id 1
+          "delta_0000006_0000006_00002/00000",  // statement id 2
+          "delta_0000006_0000006_00003/00000",  // statement id 3
+          "delta_0000006_0000006_v01000/00000", // compacted
+          "delta_0000006_0000006_v01000/00001"},
+        "", // all txns are valid
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:10:1234:",
+        new String[]{
+          "base_0000005/abc.txt",
+          "delta_0000006_0000006_v01000/00000",
+          "delta_0000006_0000006_v01000/00001"});
+    // Disjunct minor compacted delta dirs
+    assertFiltering(new String[]{
+          "delta_0000001_0000001/00000",
+          "delta_0000002_0000002/00000",
+          "delta_0000003_0000003/00000",
+          "delta_0000004_0000004/00000",
+          "delta_0000005_0000005/00000",
+          "delta_0000006_0000006/00000",
+          "delta_0000007_0000007/00000",
+          "delta_0000001_0000003_v00100/00000",
+          "delta_0000004_0000005_v00101/00000",
+          "delta_0000001_0000005_v00102/00000",
+          "delta_0000006_0000007_v00123/00000",
+          "delta_0000006_0000007_v00123/00001"},
+        "", // all txns are valid
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:10:1234:",
+        new String[]{
+          "delta_0000001_0000005_v00102/00000",
+          "delta_0000006_0000007_v00123/00000",
+          "delta_0000006_0000007_v00123/00001"});
+    // Compacted delta range contains aborted write id
+    assertFiltering(new String[]{
+      "delta_0000001_0000001/00000",
+      "delta_0000002_0000002/00000",
+      "delta_0000003_0000003/00000",
+      "delta_0000001_0000003_v01000/00000"},
+    "", // all txns are valid
+    // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+    "default.test:10:5::2",
+    new String[]{"delta_0000001_0000003_v01000/00000"});
+  }
+
+  @Test
+  public void testInProgressMinorCompactions() {
+    assertFiltering(new String[]{
+            "base_0000005/",
+            "base_0000005/abc.txt",
+            "delta_0000006_0000006/00000",
+            "delta_0000007_0000007/00000",
+            "delta_0000006_0000007_v100/00000"},
+        // Txns valid up to id 90, so 100 is invalid
+        "90:90::",
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:10:1234:1,2,3",
+        new String[]{
+          "base_0000005/abc.txt",
+          "delta_0000006_0000006/00000",
+          "delta_0000007_0000007/00000"});
+    // Minor compact multi-statement transaction
+    assertFiltering(new String[]{
+          "base_0000005/",
+          "base_0000005/abc.txt",
+          "delta_0000006_0000006_00001/00000", // statement id 1
+          "delta_0000006_0000006_00002/00000", // statement id 2
+          "delta_0000006_0000006_00003/00000", // statement id 3
+          "delta_0000006_0000006_v100/00000",  // no statement id => compacted
+          "delta_0000006_0000006_v100/00001"},
+        // Txn 100 is invalid
+        "110:100:100:",
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:10:1234:",
+        new String[]{
+          "base_0000005/abc.txt",
+          "delta_0000006_0000006_00001/00000",
+          "delta_0000006_0000006_00002/00000",
+          "delta_0000006_0000006_00003/00000"});
+    // Disjunct minor compacted delta dirs
+    assertFiltering(new String[]{
+          "delta_0000001_0000001/00000",
+          "delta_0000002_0000002/00000",
+          "delta_0000003_0000003/00000",
+          "delta_0000004_0000004/00000",
+          "delta_0000005_0000005/00000",
+          "delta_0000006_0000006/00000",
+          "delta_0000007_0000007/00000",
+          "delta_0000001_0000003_v00100/00000",
+          "delta_0000004_0000005_v00101/00000",
+          "delta_0000001_0000005_v00102/00000",
+          "delta_0000006_0000007_v00123/00000",
+          "delta_0000006_0000007_v00123/00001"},
+        // Txn 102 is invalid (minor compaction 1-5)
+        "130:102:102:",
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:10:1234:",
+        new String[]{
+          "delta_0000001_0000003_v00100/00000",
+          "delta_0000004_0000005_v00101/00000",
+          "delta_0000006_0000007_v00123/00000",
+          "delta_0000006_0000007_v00123/00001"});
+  }
+
+  @Test
+  public void testDeleteDelta() {
+    assertFiltering(new String[]{
+            "base_0000005/",
+            "base_0000005/abc.txt",
+            "delete_delta_0000006_0000006/",
+            "delete_delta_0000006_0000006/00000"},
+        // all txns are valid
+        "",
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:10:1234:1,2,3",
+        new String[]{
+          "base_0000005/abc.txt",
+          "delete_delta_0000006_0000006/00000"});
+    assertFiltering(new String[]{
+            "base_0000005/",
+            "base_0000005/abc.txt",
+            "delete_delta_0000006_0000006/",
+            "delete_delta_0000006_0000006/00000",
+            "delete_delta_0000007_0000007/00000",
+            "delete_delta_0000007_0000007/00001",
+            "delete_delta_0000008_0000008/00000",
+            "delete_delta_0000009_0000009/00000",
+            "delete_delta_0000010_0000010/00000",
+            "delete_delta_0000011_0000011/00000"},
+        // all txns are valid
+        "",
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:10:1234:6:9",
+        new String[]{
+          "base_0000005/abc.txt",
+          "delete_delta_0000007_0000007/00000",
+          "delete_delta_0000007_0000007/00001",
+          "delete_delta_0000008_0000008/00000",
+          "delete_delta_0000010_0000010/00000"});
+  }
+
+  public void testHiveStreamingFail() {
+    filteringError(new String[]{
+            "base_0000005/",
+            "base_0000005/abc.txt",
+            "delta_0000006_0000016/",
+            "delta_0000006_0000016/00000_0",
+            "delta_0000006_0000016/00000_0_flush_length"},
+        // all txns are valid
+        "",
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:22:1234:1,2,3",
+        "Found Hive Streaming side-file"
+        );
+    assertFiltering(new String[]{
+            "base_0000005/",
+            "base_0000005/abc.txt",
+            "delta_0000006_0000016/",
+            "delta_0000006_0000016/00000_0",
+            "delta_0000006_0000016/00000_0_flush_length",
+            "base_0000017_v123/0000_0"},
+        // all txns are valid
+        "",
+        // <tbl>:<hwm>:<minOpenWriteId>:<openWriteIds>:<abortedWriteIds>
+        "default.test:22:1234:1,2,3",
+        new String[]{"base_0000017_v123/0000_0"});
+  }
+
+  @Test
+  public void testMinorCompactionBeforeBase() {
+    assertFiltering(new String[]{
+            "delta_000005_000008_0000/",
+            "delta_000005_000008_0000/abc.txt",
+            "base_000010/",
+            "base_000010/0000_0",
+            "delta_0000012_0000012_0000/",
+            "delta_0000012_0000012_0000/0000_0",
+            "delta_0000012_0000012_0000/0000_1"},
+        // <table>:<highWaterMark>:<minOpenWriteId>
+        "default.test:20:15::",
+        new String[]{
+            "base_000010/0000_0",
+            "delta_0000012_0000012_0000/0000_0",
+            "delta_0000012_0000012_0000/0000_1"});
+  }
+
+  @Test
+  public void testDeletesBeforeBase() {
+    assertFiltering(new String[]{
+            "delta_000004_000004_0000/",
+            "delta_000004_000004_0000/0000",
+            "delete_delta_000005_000005_0000/",
+            "delete_delta_000005_000005_0000/0000",
+            "base_000010/",
+            "base_000010/0000_0",
+            "delta_0000012_0000012_0000/",
+            "delta_0000012_0000012_0000/0000_0",
+            "delta_0000012_0000012_0000/0000_1"},
+        // <table>:<highWaterMark>:<minOpenWriteId>
+        "default.test:20:15::",
+        new String[]{
+            // No deletes after base directory so it should succeed.
+            "base_000010/0000_0",
+            "delta_0000012_0000012_0000/0000_0",
+            "delta_0000012_0000012_0000/0000_1"});
+  }
+
+  @Test
+  public void testWriteIdListCompare() {
+    ValidWriteIdList a =
+            new ValidReaderWriteIdList("default.test:1:1:1:");
+    ValidWriteIdList b =
+            new ValidReaderWriteIdList("default.test:1:9223372036854775807::");
+
+    // should return -1 since b is more recent
+    assert(AcidUtils.compare(a, b) == -1);
+
+    //Should return 1 since b is more recent
+    assert(AcidUtils.compare(b,a) == 1);
   }
 }

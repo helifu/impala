@@ -16,16 +16,16 @@
 // under the License.
 package org.apache.impala.catalog;
 
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 
-import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
-import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
+import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.impala.analysis.TableName;
-import org.apache.impala.common.NotImplementedException;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableStats;
 
@@ -77,9 +77,26 @@ public interface FeTable {
   TableName getTableName();
 
   /**
+   * @return the general type of this table (e.g. "TABLE" or "VIEW")
+   */
+  TImpalaTableType getTableType();
+
+  /**
+   * @return the comment of this table
+   */
+  String getTableComment();
+
+  /**
    * @return the columns in this table
    */
   List<Column> getColumns();
+
+  /**
+   * @return the virtual columns of this table
+   */
+  default List<VirtualColumn> getVirtualColumns() {
+    return Collections.emptyList();
+  }
 
   /**
    * @return an unmodifiable list of all columns, but with partition columns at the end of
@@ -94,14 +111,9 @@ public interface FeTable {
   List<String> getColumnNames();
 
   /**
-   * @return the list of primary keys for this table.
+   * @return SQL constraints for the table.
    */
-  List<SQLPrimaryKey> getPrimaryKeys();
-
-  /**
-   * @return the list of foreign keys for this table.
-   */
-  List<SQLForeignKey> getForeignKeys();
+  SqlConstraints getSqlConstraints();
 
   /**
    * @return an unmodifiable list of all partition columns.
@@ -116,6 +128,12 @@ public interface FeTable {
   int getNumClusteringCols();
 
   boolean isClusteringColumn(Column c);
+
+  /**
+   * Return true when the column is used in a computed partition, e.g. in Iceberg
+   * partition transforms.
+   */
+  default boolean isComputedPartitionColumn(Column c) { return false; }
 
   /**
    * Case-insensitive lookup.
@@ -157,7 +175,7 @@ public interface FeTable {
   /**
    * @return the valid write id list for this table
    */
-  String getValidWriteIds();
+  ValidWriteIdList getValidWriteIds();
 
   /**
    * @return the owner user for this table. If the table is not loaded or the owner is

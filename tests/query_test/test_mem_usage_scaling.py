@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 from copy import copy
 
@@ -23,7 +26,7 @@ from tests.common.test_dimensions import (create_avro_snappy_dimension,
     create_parquet_dimension)
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfNotHdfsMinicluster
+from tests.common.skip import SkipIfNotHdfsMinicluster, SkipIfFS
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 from tests.verifiers.metric_verifier import MetricVerifier
@@ -228,6 +231,7 @@ class TestTpchMemLimitError(TestLowMemoryLimits):
       verifier = MetricVerifier(impalad.service)
       verifier.wait_for_metric("impala-server.num-fragments-in-flight", 0)
 
+
 @SkipIfNotHdfsMinicluster.tuned_for_minicluster
 class TestTpchPrimitivesMemLimitError(TestLowMemoryLimits):
   """
@@ -354,9 +358,14 @@ class TestScanMemLimit(ImpalaTestSuite):
   def test_kudu_scan_mem_usage(self, vector):
     """Test that Kudu scans can stay within a low memory limit. Before IMPALA-7096 they
     were not aware of mem_limit and would start up too many scanner threads."""
+    new_vector = copy(vector)
     # .test file overrides disable_codegen.
-    del vector.get_value('exec_option')['disable_codegen']
-    self.run_test_case('QueryTest/kudu-scan-mem-usage', vector)
+    del new_vector.get_value('exec_option')['disable_codegen']
+    # IMPALA-9856: We disable query result spooling here because this test exercise low
+    # memory limit functionality. Enabling result spooling will require retuning mem_limit
+    # and other query options. Otherwise, the expected result will not be achieved.
+    new_vector.get_value('exec_option')['spool_query_results'] = '0'
+    self.run_test_case('QueryTest/kudu-scan-mem-usage', new_vector)
 
   def test_hdfs_scanner_thread_mem_scaling(self, vector):
     """Test that HDFS scans can stay within a low memory limit. Before IMPALA-7096 they
@@ -368,6 +377,33 @@ class TestScanMemLimit(ImpalaTestSuite):
 
 
 @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+class TestHashJoinMemLimit(ImpalaTestSuite):
+  """Targeted test for scan memory limits."""
+
+  @classmethod
+  def get_workload(self):
+    return 'tpch'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestHashJoinMemLimit, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(create_parquet_dimension(cls.get_workload()))
+
+  def test_low_mem_limit_selective_scan_hash_join(self, vector):
+    """Selective scan with hash join and aggregate above it. Regression test for
+    IMPALA-9712 - before the fix this ran out of memory."""
+    OPTS = {'mem_limit': "80MB", 'mt_dop': 1}
+    self.change_database(self.client, vector.get_value('table_format'))
+    result = self.execute_query_expect_success(self.client,
+        """select sum(l_extendedprice * (1 - l_discount)) as revenue
+           from lineitem join part on p_partkey = l_partkey
+           where l_comment like 'ab%'""", query_options=OPTS)
+    assert result.data[0] == '440443181.0505'
+
+
+@SkipIfNotHdfsMinicluster.tuned_for_minicluster
+@SkipIfFS.read_speed_dependent
 class TestExchangeMemUsage(ImpalaTestSuite):
   """Targeted test for exchange memory limits."""
 

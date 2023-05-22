@@ -21,14 +21,18 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import org.apache.impala.analysis.Analyzer;
+import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ExprId;
 import org.apache.impala.analysis.ExprSubstitutionMap;
+import org.apache.impala.analysis.SlotDescriptor;
+import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.ToSqlOptions;
 import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.analysis.TupleId;
@@ -44,6 +48,7 @@ import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.util.BitUtil;
+import org.apache.impala.util.ExprUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -122,9 +127,15 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   // invalid: -1
   protected long cardinality_;
 
-  // number of nodes on which the plan tree rooted at this node would execute;
+  // Estimated number of nodes on which the plan tree rooted at this node would be
+  // scheduled;
   // set in computeStats(); invalid: -1
   protected int numNodes_;
+
+  // Estimated number of instances across all nodes that the scheduler would generate for
+  // a fragment with the plan tree rooted at this node;
+  // set in computeStats(); invalid: -1
+  protected int numInstances_;
 
   // resource requirements and estimates for this plan node.
   // Initialized with a dummy value. Gets set correctly in
@@ -142,6 +153,10 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
   // Runtime filters assigned to this node.
   protected List<RuntimeFilter> runtimeFilters_ = new ArrayList<>();
+
+  // A total processing cost across all instances of this plan node.
+  // Gets set correctly in computeProcessingCost().
+  protected ProcessingCost processingCost_ = ProcessingCost.invalid();
 
   protected PlanNode(PlanNodeId id, List<TupleId> tupleIds, String displayName) {
     this(id, displayName);
@@ -163,6 +178,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     tblRefIds_ = new ArrayList<>();
     cardinality_ = -1;
     numNodes_ = -1;
+    numInstances_ = -1;
     displayName_ = displayName;
     disableCodegen_ = false;
   }
@@ -179,6 +195,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     conjuncts_ = Expr.cloneList(node.conjuncts_);
     cardinality_ = -1;
     numNodes_ = -1;
+    numInstances_ = -1;
     displayName_ = displayName;
     disableCodegen_ = node.disableCodegen_;
   }
@@ -210,6 +227,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   public boolean hasLimit() { return limit_ > -1; }
   public long getCardinality() { return cardinality_; }
   public int getNumNodes() { return numNodes_; }
+  public int getNumInstances() { return numInstances_; }
   public ResourceProfile getNodeResourceProfile() { return nodeResourceProfile_; }
   public float getAvgRowSize() { return avgRowSize_; }
   public void setFragment(PlanFragment fragment) { fragment_ = fragment; }
@@ -221,6 +239,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   public void setAssignedConjuncts(Set<ExprId> conjuncts) {
     assignedConjuncts_ = conjuncts;
   }
+  public ProcessingCost getProcessingCost() { return processingCost_; }
 
   /**
    * Set the limit_ to the given limit_ only if the limit_ hasn't been set, or the new limit_
@@ -328,6 +347,13 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
       expBuilder.append(nodeResourceProfile_.getExplainString());
       expBuilder.append("\n");
 
+      if (ProcessingCost.isComputeCost(queryOptions) && processingCost_.isValid()
+          && detailLevel.ordinal() >= TExplainLevel.VERBOSE.ordinal()) {
+        // Print processing cost.
+        expBuilder.append(processingCost_.getExplainString(detailPrefix, false));
+        expBuilder.append("\n");
+      }
+
       // Print tuple ids, row size and cardinality.
       expBuilder.append(detailPrefix + "tuple-ids=");
       for (int i = 0; i < tupleIds_.size(); ++i) {
@@ -344,10 +370,19 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     if (displayCardinality) {
       if (detailLevel == TExplainLevel.STANDARD) expBuilder.append(detailPrefix);
       expBuilder.append("row-size=")
-        .append(PrintUtils.printBytes(Math.round(avgRowSize_)))
-        .append(" cardinality=")
-        .append(PrintUtils.printEstCardinality(cardinality_))
-        .append("\n");
+          .append(PrintUtils.printBytes(Math.round(avgRowSize_)))
+          .append(" cardinality=")
+          .append(PrintUtils.printEstCardinality(cardinality_));
+      if (ProcessingCost.isComputeCost(queryOptions)) {
+        // Show processing cost total.
+        expBuilder.append(" cost=");
+        if (processingCost_.isValid()) {
+          expBuilder.append(processingCost_.getTotalCost());
+        } else {
+          expBuilder.append("<invalid>");
+        }
+      }
+      expBuilder.append("\n");
     }
 
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
@@ -375,6 +410,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
       for (int i = children_.size() - 1; i >= 1; --i) {
         PlanNode child = getChild(i);
         if (fragment_ != child.fragment_) {
+          if (detailLevel == TExplainLevel.VERBOSE) continue;
           // we're crossing a fragment boundary
           expBuilder.append(
               child.fragment_.getExplainString(
@@ -388,8 +424,8 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
       PlanFragment childFragment = children_.get(0).fragment_;
       if (fragment_ != childFragment && detailLevel == TExplainLevel.EXTENDED) {
         // we're crossing a fragment boundary - print the fragment header.
-        expBuilder.append(childFragment.getFragmentHeaderString(prefix, prefix,
-            queryOptions.getMt_dop()));
+        expBuilder.append(childFragment.getFragmentHeaderString(
+            prefix, prefix, queryOptions, detailLevel));
       }
       expBuilder.append(
           children_.get(0).getExplainString(prefix, prefix, queryOptions, detailLevel));
@@ -435,7 +471,8 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     return result;
   }
 
-  // Append a flattened version of this plan node, including all children, to 'container'.
+  // Append a flattened version of this plan node, including all children in the same
+  // fragment, to 'container'.
   private void treeToThriftHelper(TPlan container) {
     TPlanNode msg = new TPlanNode();
     msg.node_id = id_.asInt();
@@ -471,14 +508,37 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     }
     toThrift(msg);
     container.addToNodes(msg);
-    // For the purpose of the BE consider ExchangeNodes to have no children.
-    if (this instanceof ExchangeNode) {
-      msg.num_children = 0;
-      return;
-    } else {
-      msg.num_children = children_.size();
-      for (PlanNode child: children_) {
-        child.treeToThriftHelper(container);
+    // For the purpose of the BE consider cross-fragment children (i.e.
+    // ExchangeNodes and separated join builds) to have no children.
+    int numChildren = 0;
+    for (PlanNode child: children_) {
+      if (child.getFragment() != getFragment()) continue;
+      child.treeToThriftHelper(container);
+      ++numChildren;
+    }
+    msg.num_children = numChildren;
+  }
+
+  /**
+   * If there are more than one array to be zipping unnested in the 'analyzer' then
+   * removes the conjuncts related to the unnested array item from the 'conjuncts' list.
+   * This could be useful to prevent e.g. ScanNode or SingularRowSrc to pick up the
+   * conjuncts for zipping unnested arrays and let the UnnestNode to take care of them.
+   */
+  public static void removeZippingUnnestConjuncts(List<Expr> conjuncts,
+      Analyzer analyzer) {
+    Set<TupleId> zippingUnnestTupleIds = analyzer.getZippingUnnestTupleIds();
+
+    Iterator<Expr> it = conjuncts.iterator();
+    while(it.hasNext()) {
+      Expr e = it.next();
+      List<SlotRef> slotRefs = new ArrayList<>();
+      e.collect(SlotRef.class, slotRefs);
+      for (SlotRef slotRef : slotRefs) {
+        if (zippingUnnestTupleIds.contains(slotRef.getDesc().getParent().getId())) {
+          it.remove();
+          break;
+        }
       }
     }
   }
@@ -503,8 +563,62 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
    */
   protected void assignConjuncts(Analyzer analyzer) {
     List<Expr> unassigned = analyzer.getUnassignedConjuncts(this);
+    if (!shouldPickUpZippingUnnestConjuncts()) {
+      removeZippingUnnestConjuncts(unassigned, analyzer);
+    }
     conjuncts_.addAll(unassigned);
     analyzer.markConjunctsAssigned(unassigned);
+  }
+
+  protected boolean shouldPickUpZippingUnnestConjuncts() { return false; }
+
+  /**
+   * Apply the provided conjuncts to the this node, returning the new root of
+   * the plan tree. Also add any slot equivalences for tupleIds that have not
+   * yet been enforced.
+   * TODO: change this to assign the unassigned conjuncts to root itself, if that is
+   * semantically correct
+   */
+  public PlanNode addConjunctsToNode(PlannerContext plannerCtx,
+          Analyzer analyzer, List<TupleId> tupleIds, List<Expr> conjuncts) {
+    if (LOG.isTraceEnabled()) {
+      LOG.trace(String.format("conjuncts for (Node %s): %s",
+          getDisplayLabel(), Expr.debugString(conjuncts)));
+      LOG.trace("all conjuncts: " + analyzer.conjunctAssignmentsDebugString());
+    }
+    if (this instanceof EmptySetNode) return this;
+    for (TupleId tid: tupleIds) {
+      analyzer.createEquivConjuncts(tid, conjuncts);
+    }
+    if (conjuncts.isEmpty()) return this;
+
+    List<Expr> finalConjuncts = new ArrayList<>();
+    // Check if this is an inferred identity predicate i.e for c1 = c2 both
+    // sides are pointing to the same source slot. In such cases it is wrong
+    // to add the predicate to the SELECT node because it will incorrectly
+    // eliminate rows with NULL values. We also check if both sides are pointing
+    // to equal constant values.
+    for (Expr e : conjuncts) {
+      if (e instanceof BinaryPredicate && ((BinaryPredicate) e).isInferred()) {
+        Expr lhsSrcExpr = ((BinaryPredicate) e).getChild(0).findSrcExpr();
+        Expr rhsSrcExpr  = ((BinaryPredicate) e).getChild(1).findSrcExpr();
+        if (lhsSrcExpr != null && rhsSrcExpr != null) {
+          if (lhsSrcExpr.isConstant() && rhsSrcExpr.isConstant() &&
+              lhsSrcExpr.equals(rhsSrcExpr)) {
+            continue;
+          }
+          if (lhsSrcExpr instanceof SlotRef && rhsSrcExpr instanceof SlotRef) {
+            SlotRef lhsSlotRef = (SlotRef) lhsSrcExpr;
+            SlotRef rhsSlotRef = (SlotRef) rhsSrcExpr;
+            if (lhsSlotRef.getDesc().equals(rhsSlotRef.getDesc())) continue;
+          }
+        }
+      }
+      finalConjuncts.add(e);
+    }
+    if (finalConjuncts.isEmpty()) return this;
+    // The conjuncts need to be evaluated in a SelectNode.
+    return SelectNode.create(plannerCtx, analyzer, this, finalConjuncts);
   }
 
   /**
@@ -541,13 +655,16 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
    * from init() (to facilitate inserting additional nodes during plan
    * partitioning w/o the need to call init() recursively on the whole tree again).
    */
-  protected void computeStats(Analyzer analyzer) {
+  public void computeStats(Analyzer analyzer) {
     avgRowSize_ = 0.0F;
     for (TupleId tid: tupleIds_) {
       TupleDescriptor desc = analyzer.getTupleDesc(tid);
       avgRowSize_ += desc.getAvgSerializedSize();
     }
-    if (!children_.isEmpty()) numNodes_ = getChild(0).numNodes_;
+    if (!children_.isEmpty()) {
+      numNodes_ = getChild(0).numNodes_;
+      numInstances_ = getChild(0).numInstances_;
+    }
   }
 
   protected long capCardinalityAtLimit(long cardinality) {
@@ -557,7 +674,14 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     return cardinality;
   }
 
-  static long capCardinalityAtLimit(long cardinality, long limit) {
+  // Default implementation of computing the total data processed in bytes.
+  protected ProcessingCost computeDefaultProcessingCost() {
+    Preconditions.checkState(hasValidStats());
+    return ProcessingCost.basicCost(getDisplayLabel(), getInputCardinality(),
+        ExprUtil.computeExprsTotalCost(getConjuncts()));
+  }
+
+  public static long capCardinalityAtLimit(long cardinality, long limit) {
     return cardinality == -1 ? limit : Math.min(cardinality, limit);
   }
 
@@ -654,7 +778,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
   protected String getSortingOrderExplainString(List<? extends Expr> exprs,
       List<Boolean> isAscOrder, List<Boolean> nullsFirstParams,
-      TSortingOrder sortingOrder) {
+      TSortingOrder sortingOrder, int numLexicalKeysInZOrder) {
     StringBuilder output = new StringBuilder();
     switch (sortingOrder) {
     case LEXICAL:
@@ -670,9 +794,20 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
       }
       break;
     case ZORDER:
+      if (numLexicalKeysInZOrder > 0) {
+        Preconditions.checkElementIndex(numLexicalKeysInZOrder, exprs.size());
+        output.append("LEXICAL: ");
+        for (int i = 0; i < numLexicalKeysInZOrder; ++i) {
+          if (i > 0) output.append(", ");
+          // Pre-insert sorting uses ASC and NULLS LAST. See more in
+          // Planner.createPreInsertSort().
+          output.append(exprs.get(i).toSql()).append(" ASC NULLS LAST");
+        }
+        output.append(", ");
+      }
       output.append("ZORDER: ");
-      for (int i = 0; i < exprs.size(); ++i) {
-        if (i > 0) output.append(", ");
+      for (int i = numLexicalKeysInZOrder; i < exprs.size(); ++i) {
+        if (i > numLexicalKeysInZOrder) output.append(", ");
         output.append(exprs.get(i).toSql());
       }
       break;
@@ -684,8 +819,9 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   /**
    * Returns true if stats-related variables are valid.
    */
-  protected boolean hasValidStats() {
+  public boolean hasValidStats() {
     return (numNodes_ == -1 || numNodes_ >= 0) &&
+           (numInstances_ == -1 || numInstances_ >= 0) &&
            (cardinality_ == -1 || cardinality_ >= 0);
   }
 
@@ -774,13 +910,34 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     }
   }
 
+  public abstract void computeProcessingCost(TQueryOptions queryOptions);
+
   /**
    * Compute peak resources consumed when executing this PlanNode, initializing
-   * 'nodeResourceProfile_'. May only be called after this PlanNode has been placed in
-   * a PlanFragment because the cost computation is dependent on the enclosing fragment's
-   * data partition.
+   * 'nodeResourceProfile_'. May only be called after this PlanNode
+   * has been placed in a PlanFragment because the cost computation is dependent on the
+   * enclosing fragment's data partition.
    */
   public abstract void computeNodeResourceProfile(TQueryOptions queryOptions);
+
+  /**
+   * Set number of rows consumed and produced data fields in processing cost.
+   */
+  public void computeRowConsumptionAndProductionToCost() {
+    Preconditions.checkState(processingCost_.isValid(),
+        "Processing cost of PlanNode " + getDisplayLabel() + " is invalid!");
+    processingCost_.setNumRowToConsume(getInputCardinality());
+    processingCost_.setNumRowToProduce(getCardinality());
+  }
+
+  /**
+   * Get row batch size after considering 'batch_size' query option.
+   */
+  protected static long getRowBatchSize(TQueryOptions queryOptions) {
+    return (queryOptions.isSetBatch_size() && queryOptions.batch_size > 0) ?
+        queryOptions.batch_size :
+        PlanNode.DEFAULT_ROWBATCH_SIZE;
+  }
 
   /**
    * Wrapper class to represent resource profiles during different phases of execution.
@@ -860,15 +1017,28 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     return sum;
   }
 
+  /**
+   * Returns the max number of instances of a fragment that can be scheduled on a single
+   * node.
+   */
+  protected int getMaxInstancesPerNode(Analyzer analyzer) {
+    return Math.max(1, analyzer.getMaxParallelismPerNode());
+  }
+
   protected void addRuntimeFilter(RuntimeFilter filter) { runtimeFilters_.add(filter); }
 
   protected Collection<RuntimeFilter> getRuntimeFilters() { return runtimeFilters_; }
 
   protected String getRuntimeFilterExplainString(
       boolean isBuildNode, TExplainLevel detailLevel) {
-    if (runtimeFilters_.isEmpty()) return "";
+    return getRuntimeFilterExplainString(runtimeFilters_, isBuildNode, id_, detailLevel);
+  }
+
+  public static String getRuntimeFilterExplainString(List<RuntimeFilter> filters,
+      boolean isBuildNode, PlanNodeId nodeId, TExplainLevel detailLevel) {
+    if (filters.isEmpty()) return "";
     List<String> filtersStr = new ArrayList<>();
-    for (RuntimeFilter filter: runtimeFilters_) {
+    for (RuntimeFilter filter: filters) {
       StringBuilder filterStr = new StringBuilder();
       filterStr.append(filter.getFilterId());
       if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
@@ -881,7 +1051,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         filterStr.append(filter.getSrcExpr().toSql());
       } else {
         filterStr.append(" -> ");
-        filterStr.append(filter.getTargetExpr(getId()).toSql());
+        filterStr.append(filter.getTargetExpr(nodeId).toSql());
       }
       filtersStr.add(filterStr.toString());
     }
@@ -931,8 +1101,12 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     while (!remaining.isEmpty()) {
       double smallestCost = Float.MAX_VALUE;
       T bestConjunct =  null;
+      // IMPALA-9338: The bestConjunctIdx indicates the index of the bestConjunct in
+      // the remaining list.
+      int bestConjunctIdx = 0;
       double backoffExp = 1.0 / (double) (sortedConjuncts.size() + 1);
-      for (T e : remaining) {
+      for (int i = 0; i < remaining.size(); i++) {
+        T e = remaining.get(i);
         double sel = Math.pow(e.hasSelectivity() ? e.getSelectivity() : defaultSel,
             backoffExp);
 
@@ -944,17 +1118,18 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         if (cost < smallestCost) {
           smallestCost = cost;
           bestConjunct = e;
+          bestConjunctIdx = i;
         } else if (cost == smallestCost) {
           // Break ties based on toSql() to get a consistent display in explain plans.
           if (e.toSql().compareTo(bestConjunct.toSql()) < 0) {
-            smallestCost = cost;
             bestConjunct = e;
+            bestConjunctIdx = i;
           }
         }
       }
 
       sortedConjuncts.add(bestConjunct);
-      remaining.remove(bestConjunct);
+      remaining.remove(bestConjunctIdx);
       totalCost -= bestConjunct.getCost();
     }
 
@@ -963,5 +1138,18 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
   public void setDisableCodegen(boolean disableCodegen) {
     disableCodegen_ = disableCodegen;
+  }
+
+  public boolean allowPartitioned() { return !hasLimit(); }
+
+  public int getNumMaterializedSlots(TupleDescriptor desc) {
+    int numCols = 0;
+    for (SlotDescriptor slot: desc.getSlots()) {
+      // Columns used in this query
+      if (slot.isMaterialized()) {
+        ++numCols;
+      }
+    }
+    return numCols;
   }
 }

@@ -21,23 +21,22 @@
 #include <sys/sysctl.h>
 #endif
 
-#include <mmintrin.h>
 #include <sched.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <algorithm>
 #include <fstream>
-#include <iostream>
-#include <sstream>
-#include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/filesystem.hpp>
 #include <sys/sysinfo.h>
 
+#include "common/compiler-util.h"
 #include "common/config.h"
+#include "common/status.h"
+#include "gen-cpp/Metrics_types.h"
 #include "gutil/strings/substitute.h"
 #include "util/pretty-printer.h"
-#include "util/string-parser.h"
 
 #include "common/names.h"
 
@@ -50,6 +49,7 @@ DECLARE_bool(abort_on_config_error);
 DEFINE_int32(num_cores, 0, "(Advanced) If > 0, it sets the number of cores available to"
     " Impala. Setting it to 0 means Impala will use all available cores on the machine"
     " according to /proc/cpuinfo.");
+DECLARE_bool(enable_legacy_avx_support);
 
 namespace {
 // Helper function to warn if a given file does not contain an expected string as its
@@ -252,11 +252,25 @@ void CpuInfo::InitNumaNodeToCores() {
   }
 }
 
-void CpuInfo::VerifyCpuRequirements() {
-  if (!CpuInfo::IsSupported(CpuInfo::SSSE3)) {
-    LOG(ERROR) << "CPU does not support the Supplemental SSE3 (SSSE3) instruction set. "
-               << "This setup is generally unsupported and Impala might be unstable.";
+Status CpuInfo::EnforceCpuRequirements() {
+  // This imposes a CPU requirement for x86_64. This function may later be modified
+  // to impose a similar requirement for other platforms.
+#ifdef __x86_64__
+  if (!CpuInfo::IsSupported(CpuInfo::AVX)) {
+    return Status("This machine does not meet the minimum requirements for Impala "
+                  "functionality. The CPU does not support AVX (Advanced Vector "
+                  "Extensions).");
+  } else if (FLAGS_enable_legacy_avx_support) {
+    return Status::OK();
+  } else if (!CpuInfo::IsSupported(CpuInfo::AVX2)) {
+    // Impala could run with enable_legacy_avx_support=true, but that isn't set.
+    return Status("This machine does not meet the minimum requirements for Impala "
+                  "functionality. The CPU does not support AVX2 (Advanced Vector "
+                  "Extensions 2). To run in legacy mode with only AVX support, "
+                  "set enable_legacy_avx_support=true.");
   }
+#endif
+  return Status::OK();
 }
 
 void CpuInfo::VerifyPerformanceGovernor() {

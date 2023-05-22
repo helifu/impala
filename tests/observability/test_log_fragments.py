@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIfDockerizedCluster
 
@@ -40,8 +41,6 @@ class TestLogFragments(ImpalaTestSuite):
     query_id = re.search("id=([0-9a-f]+:[0-9a-f]+)",
         result.runtime_profile).groups()[0]
     self.execute_query("select 1")
-    # Logging may be buffered, so sleep to wait out the buffering.
-    time.sleep(6)
     self.assert_impalad_log_contains('INFO', query_id +
       "] Analysis and authorization finished.")
     assert query_id.endswith("000")

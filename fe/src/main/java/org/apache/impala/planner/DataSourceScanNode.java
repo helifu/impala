@@ -59,7 +59,7 @@ import org.apache.impala.thrift.TScanRangeLocationList;
 import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.thrift.TStatus;
 import com.google.common.base.Joiner;
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
@@ -275,7 +275,7 @@ public class DataSourceScanNode extends ScanNode {
       LOG.trace("computeStats DataSourceScan: cardinality=" + Long.toString(cardinality_));
     }
 
-    numNodes_ = table_.getNumNodes();
+    numInstances_ = numNodes_ = table_.getNumNodes();
     if (LOG.isTraceEnabled()) {
       LOG.trace("computeStats DataSourceScan: #nodes=" + Integer.toString(numNodes_));
     }
@@ -283,7 +283,7 @@ public class DataSourceScanNode extends ScanNode {
 
   @Override
   protected String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("tid", desc_.getId().asInt())
         .add("tblName", table_.getFullName())
         .add("dataSource", DataSource.debugString(table_.getDataSource()))
@@ -326,10 +326,15 @@ public class DataSourceScanNode extends ScanNode {
   private void computeScanRangeLocations(Analyzer analyzer) {
     // TODO: Does the port matter?
     TNetworkAddress networkAddress = addressToTNetworkAddress("localhost:12345");
-    Integer hostIndex = analyzer.getHostIndex().getIndex(networkAddress);
+    Integer hostIndex = analyzer.getHostIndex().getOrAddIndex(networkAddress);
     scanRangeSpecs_ = new TScanRangeSpec();
     scanRangeSpecs_.addToConcrete_ranges(new TScanRangeLocationList(
         new TScanRange(), Lists.newArrayList(new TScanRangeLocation(hostIndex))));
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = computeDefaultProcessingCost();
   }
 
   @Override

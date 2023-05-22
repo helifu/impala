@@ -4005,43 +4005,43 @@ select t1.bigint_col from functional.alltypestiny t1 inner join
 ---- PLAN
 PLAN-ROOT SINK
 |
-11:AGGREGATE [FINALIZE]
+12:AGGREGATE [FINALIZE]
 |  group by: bigint_col
 |  row-size=8B cardinality=8
 |
 00:UNION
-|  pass-through-operands: 01,04
+|  pass-through-operands: 01,05
 |  row-size=8B cardinality=11.70K
 |
-|--10:HASH JOIN [INNER JOIN]
+|--11:HASH JOIN [INNER JOIN]
 |  |  hash predicates: t2.bigint_col = t1.bigint_col
 |  |  runtime filters: RF004 <- t1.bigint_col
 |  |  row-size=16B cardinality=5.84K
 |  |
-|  |--08:SCAN HDFS [functional.alltypestiny t1]
+|  |--09:SCAN HDFS [functional.alltypestiny t1]
 |  |     HDFS partitions=4/4 files=4 size=460B
 |  |     row-size=8B cardinality=8
 |  |
-|  09:SCAN HDFS [functional.alltypes t2]
+|  10:SCAN HDFS [functional.alltypes t2]
 |     HDFS partitions=24/24 files=24 size=478.45KB
 |     runtime filters: RF004 -> t2.bigint_col
 |     row-size=8B cardinality=7.30K
 |
-|--07:HASH JOIN [RIGHT OUTER JOIN]
+|--08:HASH JOIN [RIGHT OUTER JOIN]
 |  |  hash predicates: t2.bigint_col = t1.bigint_col
 |  |  runtime filters: RF002 <- t1.bigint_col
 |  |  row-size=16B cardinality=5.84K
 |  |
-|  |--05:SCAN HDFS [functional.alltypestiny t1]
+|  |--06:SCAN HDFS [functional.alltypestiny t1]
 |  |     HDFS partitions=4/4 files=4 size=460B
 |  |     row-size=8B cardinality=8
 |  |
-|  06:SCAN HDFS [functional.alltypes t2]
+|  07:SCAN HDFS [functional.alltypes t2]
 |     HDFS partitions=24/24 files=24 size=478.45KB
 |     runtime filters: RF002 -> t2.bigint_col
 |     row-size=8B cardinality=7.30K
 |
-|--04:HASH JOIN [RIGHT SEMI JOIN]
+|--05:HASH JOIN [RIGHT SEMI JOIN]
 |  |  hash predicates: t2.bigint_col = t1.bigint_col
 |  |  runtime filters: RF000 <- t1.bigint_col
 |  |  row-size=8B cardinality=8
@@ -4049,6 +4049,10 @@ PLAN-ROOT SINK
 |  |--02:SCAN HDFS [functional.alltypestiny t1]
 |  |     HDFS partitions=4/4 files=4 size=460B
 |  |     row-size=8B cardinality=8
+|  |
+|  04:AGGREGATE [FINALIZE]
+|  |  group by: t2.bigint_col
+|  |  row-size=8B cardinality=10
 |  |
 |  03:SCAN HDFS [functional.alltypes t2]
 |     HDFS partitions=24/24 files=24 size=478.45KB
@@ -4103,7 +4107,7 @@ PLAN-ROOT SINK
 |     row-size=0B cardinality=10
 |
 00:SCAN HDFS [tpch_nested_parquet.customer c]
-   HDFS partitions=1/1 files=4 size=288.99MB
+   HDFS partitions=1/1 files=4 size=289.08MB
    row-size=32B cardinality=150.00K
 ====
 # IMPALA-6388: Verify that the order of the union operands does not impact the
@@ -4115,10 +4119,10 @@ select int_col from functional.alltypes
 explain_level=2
 ---- DISTRIBUTEDPLAN
 F03:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=33.50KB mem-reservation=0B thread-reservation=1
+|  Per-Host Resources: mem-estimate=4.03MB mem-reservation=4.00MB thread-reservation=1
 PLAN-ROOT SINK
 |  output exprs: f2
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 03:EXCHANGE [UNPARTITIONED]
 |  mem-estimate=33.50KB mem-reservation=0B thread-reservation=0
@@ -4148,7 +4152,7 @@ Per-Host Resources: mem-estimate=128.00MB mem-reservation=32.00KB thread-reserva
    partitions=0/0 files=0 size=0B
    stored statistics:
      table: rows=unavailable size=unavailable
-     partitions: 0/0 rows=unavailable
+     partitions: 0/0 rows=0
      columns: all
    extrapolated-rows=disabled max-scan-range-rows=0
    mem-estimate=0B mem-reservation=0B thread-reservation=0
@@ -4164,10 +4168,10 @@ select f2 from functional.emptytable
 explain_level=2
 ---- DISTRIBUTEDPLAN
 F03:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=33.50KB mem-reservation=0B thread-reservation=1
+|  Per-Host Resources: mem-estimate=4.03MB mem-reservation=4.00MB thread-reservation=1
 PLAN-ROOT SINK
 |  output exprs: int_col
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 03:EXCHANGE [UNPARTITIONED]
 |  mem-estimate=33.50KB mem-reservation=0B thread-reservation=0
@@ -4186,7 +4190,7 @@ Per-Host Resources: mem-estimate=128.00MB mem-reservation=32.00KB thread-reserva
 |     partitions=0/0 files=0 size=0B
 |     stored statistics:
 |       table: rows=unavailable size=unavailable
-|       partitions: 0/0 rows=unavailable
+|       partitions: 0/0 rows=0
 |       columns: all
 |     extrapolated-rows=disabled max-scan-range-rows=0
 |     mem-estimate=0B mem-reservation=0B thread-reservation=0
@@ -4203,4 +4207,430 @@ Per-Host Resources: mem-estimate=128.00MB mem-reservation=32.00KB thread-reserva
    mem-estimate=128.00MB mem-reservation=32.00KB thread-reservation=1
    tuple-ids=0 row-size=4B cardinality=7.30K
    in pipelines: 01(GETNEXT)
+====
+#IMPALA-8533: Analytic ordering columns are constant after union substitution
+WITH
+base_10 AS (SELECT 1 UNION ALL SELECT 1),
+base_10k AS (SELECT 2 constant FROM base_10 b1)
+SELECT ROW_NUMBER() OVER (ORDER BY b1.constant) row_num
+FROM base_10k b1;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=8.00MB mem-reservation=8.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: row_number()
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+01:ANALYTIC
+|  functions: row_number()
+|  order by: 2 ASC
+|  window: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=0,4 row-size=8B cardinality=2
+|  in pipelines: <none>
+|
+00:UNION
+   constant-operands=2
+   mem-estimate=0B mem-reservation=0B thread-reservation=0
+   tuple-ids=0 row-size=0B cardinality=2
+   in pipelines: <none>
+====
+#IMPALA-8533: Ordering on select same constant from all union arms.
+# Sort not currently eliminated.
+SELECT c1 FROM (SELECT 1 c1 UNION ALL SELECT 1 c1) a ORDER BY a.c1;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=10.00MB mem-reservation=10.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: c1
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+01:SORT
+|  order by: c1 ASC
+|  mem-estimate=6.00MB mem-reservation=6.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=2 row-size=1B cardinality=2
+|  in pipelines: 01(GETNEXT)
+|
+00:UNION
+   constant-operands=2
+   mem-estimate=0B mem-reservation=0B thread-reservation=0
+   tuple-ids=0 row-size=1B cardinality=2
+   in pipelines: <none>
+====
+#IMPALA-8533: Ordering on select constant union select same constant from table
+# Sort not currently eliminated.
+SELECT c1 FROM (SELECT 1 c1 FROM functional.alltypestiny UNION ALL SELECT 1 c1 FROM functional.alltypestiny) a ORDER BY c1;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F03:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=4.02MB mem-reservation=4.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: c1
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+04:MERGING-EXCHANGE [UNPARTITIONED]
+|  order by: c1 ASC
+|  mem-estimate=16.00KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=4 row-size=1B cardinality=16
+|  in pipelines: 03(GETNEXT)
+|
+F02:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
+Per-Host Resources: mem-estimate=38.00MB mem-reservation=6.01MB thread-reservation=2
+03:SORT
+|  order by: c1 ASC
+|  mem-estimate=6.00MB mem-reservation=6.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=4 row-size=1B cardinality=16
+|  in pipelines: 03(GETNEXT), 01(OPEN), 02(OPEN)
+|
+00:UNION
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  tuple-ids=2 row-size=1B cardinality=16
+|  in pipelines: 01(GETNEXT), 02(GETNEXT)
+|
+|--02:SCAN HDFS [functional.alltypestiny, RANDOM]
+|     HDFS partitions=4/4 files=4 size=460B
+|     stored statistics:
+|       table: rows=8 size=460B
+|       partitions: 4/4 rows=8
+|       columns: all
+|     extrapolated-rows=disabled max-scan-range-rows=2
+|     mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=1
+|     tuple-ids=1 row-size=0B cardinality=8
+|     in pipelines: 02(GETNEXT)
+|
+01:SCAN HDFS [functional.alltypestiny, RANDOM]
+   HDFS partitions=4/4 files=4 size=460B
+   stored statistics:
+     table: rows=8 size=460B
+     partitions: 4/4 rows=8
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=2
+   mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=1
+   tuple-ids=0 row-size=0B cardinality=8
+   in pipelines: 01(GETNEXT)
+====
+#IMPALA-8533: Select constant from unioned query.
+# Sort not currently eliminated.
+SELECT 1 FROM (SELECT int_col FROM functional.alltypestiny UNION ALL SELECT int_col FROM functional.alltypestiny) a ORDER BY int_col;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F03:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=4.02MB mem-reservation=4.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: CAST(1 AS TINYINT)
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+04:MERGING-EXCHANGE [UNPARTITIONED]
+|  order by: int_col ASC
+|  mem-estimate=16.00KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=4 row-size=4B cardinality=16
+|  in pipelines: 03(GETNEXT)
+|
+F02:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
+Per-Host Resources: mem-estimate=38.00MB mem-reservation=6.01MB thread-reservation=2
+03:SORT
+|  order by: int_col ASC
+|  mem-estimate=6.00MB mem-reservation=6.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=4 row-size=4B cardinality=16
+|  in pipelines: 03(GETNEXT), 01(OPEN), 02(OPEN)
+|
+00:UNION
+|  pass-through-operands: all
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  tuple-ids=2 row-size=4B cardinality=16
+|  in pipelines: 01(GETNEXT), 02(GETNEXT)
+|
+|--02:SCAN HDFS [functional.alltypestiny, RANDOM]
+|     HDFS partitions=4/4 files=4 size=460B
+|     stored statistics:
+|       table: rows=8 size=460B
+|       partitions: 4/4 rows=8
+|       columns: all
+|     extrapolated-rows=disabled max-scan-range-rows=2
+|     mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=1
+|     tuple-ids=1 row-size=4B cardinality=8
+|     in pipelines: 02(GETNEXT)
+|
+01:SCAN HDFS [functional.alltypestiny, RANDOM]
+   HDFS partitions=4/4 files=4 size=460B
+   stored statistics:
+     table: rows=8 size=460B
+     partitions: 4/4 rows=8
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=2
+   mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=1
+   tuple-ids=0 row-size=4B cardinality=8
+   in pipelines: 01(GETNEXT)
+====
+#IMPALA-8533: Select constant from select constant union select same constant
+# Sort not currently eliminated.
+SELECT 1 FROM (SELECT 1 c1 FROM functional.alltypestiny UNION ALL SELECT 1 c1 FROM functional.alltypestiny) a ORDER BY c1;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F03:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=4.02MB mem-reservation=4.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: CAST(1 AS TINYINT)
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+04:MERGING-EXCHANGE [UNPARTITIONED]
+|  order by: c1 ASC
+|  mem-estimate=16.00KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=4 row-size=1B cardinality=16
+|  in pipelines: 03(GETNEXT)
+|
+F02:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
+Per-Host Resources: mem-estimate=38.00MB mem-reservation=6.01MB thread-reservation=2
+03:SORT
+|  order by: c1 ASC
+|  mem-estimate=6.00MB mem-reservation=6.00MB spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=4 row-size=1B cardinality=16
+|  in pipelines: 03(GETNEXT), 01(OPEN), 02(OPEN)
+|
+00:UNION
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  tuple-ids=2 row-size=1B cardinality=16
+|  in pipelines: 01(GETNEXT), 02(GETNEXT)
+|
+|--02:SCAN HDFS [functional.alltypestiny, RANDOM]
+|     HDFS partitions=4/4 files=4 size=460B
+|     stored statistics:
+|       table: rows=8 size=460B
+|       partitions: 4/4 rows=8
+|       columns: all
+|     extrapolated-rows=disabled max-scan-range-rows=2
+|     mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=1
+|     tuple-ids=1 row-size=0B cardinality=8
+|     in pipelines: 02(GETNEXT)
+|
+01:SCAN HDFS [functional.alltypestiny, RANDOM]
+   HDFS partitions=4/4 files=4 size=460B
+   stored statistics:
+     table: rows=8 size=460B
+     partitions: 4/4 rows=8
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=2
+   mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=1
+   tuple-ids=0 row-size=0B cardinality=8
+   in pipelines: 01(GETNEXT)
+====
+#IMPALA-8533: Select constant from union order by 1
+# Sort is eliminated.
+SELECT 1 FROM (SELECT int_col c1 FROM functional.alltypestiny UNION ALL SELECT int_col c1 FROM functional.alltypestiny) a ORDER BY 1;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F03:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=4.02MB mem-reservation=4.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: CAST(1 AS TINYINT)
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+03:EXCHANGE [UNPARTITIONED]
+|  mem-estimate=16.00KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=2 row-size=0B cardinality=16
+|  in pipelines: 01(GETNEXT), 02(GETNEXT)
+|
+F02:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
+Per-Host Resources: mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=2
+00:UNION
+|  pass-through-operands: all
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  tuple-ids=2 row-size=0B cardinality=16
+|  in pipelines: 01(GETNEXT), 02(GETNEXT)
+|
+|--02:SCAN HDFS [functional.alltypestiny, RANDOM]
+|     HDFS partitions=4/4 files=4 size=460B
+|     stored statistics:
+|       table: rows=8 size=460B
+|       partitions: 4/4 rows=8
+|       columns: all
+|     extrapolated-rows=disabled max-scan-range-rows=2
+|     mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=1
+|     tuple-ids=1 row-size=0B cardinality=8
+|     in pipelines: 02(GETNEXT)
+|
+01:SCAN HDFS [functional.alltypestiny, RANDOM]
+   HDFS partitions=4/4 files=4 size=460B
+   stored statistics:
+     table: rows=8 size=460B
+     partitions: 4/4 rows=8
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=2
+   mem-estimate=32.00MB mem-reservation=8.00KB thread-reservation=1
+   tuple-ids=0 row-size=0B cardinality=8
+   in pipelines: 01(GETNEXT)
+====
+# IMPALA-9429: Test partition elimination merging inputs with different
+# partitioning
+select month from (
+    select year, month from functional.alltypes
+    union all
+    select year, 1 month from functional.alltypesagg
+  ) a where year = 0 or month = 0;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F03:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=4.02MB mem-reservation=4.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: month
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+03:EXCHANGE [UNPARTITIONED]
+|  mem-estimate=16.00KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=2 row-size=4B cardinality=0
+|  in pipelines: 01(GETNEXT), 02(GETNEXT)
+|
+F02:PLAN FRAGMENT [RANDOM] hosts=1 instances=1
+Per-Host Resources: mem-estimate=0B mem-reservation=0B thread-reservation=1
+00:UNION
+|  pass-through-operands: 01
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  tuple-ids=2 row-size=4B cardinality=0
+|  in pipelines: 01(GETNEXT), 02(GETNEXT)
+|
+|--02:SCAN HDFS [functional.alltypesagg, RANDOM]
+|     partition predicates: `year` = CAST(0 AS INT) OR FALSE
+|     partitions=0/11 files=0 size=0B
+|     stored statistics:
+|       table: rows=11.00K size=814.73KB
+|       partitions: 0/0 rows=unavailable
+|       columns: all
+|     extrapolated-rows=disabled max-scan-range-rows=0
+|     mem-estimate=0B mem-reservation=0B thread-reservation=0
+|     tuple-ids=1 row-size=0B cardinality=0
+|     in pipelines: 02(GETNEXT)
+|
+01:SCAN HDFS [functional.alltypes, RANDOM]
+   partition predicates: functional.alltypes.year = CAST(0 AS INT) OR functional.alltypes.month = CAST(0 AS INT)
+   partitions=0/24 files=0 size=0B
+   stored statistics:
+     table: rows=7.30K size=478.45KB
+     partitions: 0/0 rows=unavailable
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=0
+   mem-estimate=0B mem-reservation=0B thread-reservation=0
+   tuple-ids=0 row-size=4B cardinality=0
+   in pipelines: 01(GETNEXT)
+====
+select month from (
+    select year, month from functional.alltypes
+    union all
+    select year, 1 month from functional.alltypesagg
+  ) a where year = NULL or month = NULL;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F03:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=4.02MB mem-reservation=4.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: month
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+03:EXCHANGE [UNPARTITIONED]
+|  mem-estimate=16.00KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=2 row-size=4B cardinality=0
+|  in pipelines: 01(GETNEXT), 02(GETNEXT)
+|
+F02:PLAN FRAGMENT [RANDOM] hosts=1 instances=1
+Per-Host Resources: mem-estimate=0B mem-reservation=0B thread-reservation=1
+00:UNION
+|  pass-through-operands: 01
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  tuple-ids=2 row-size=4B cardinality=0
+|  in pipelines: 01(GETNEXT), 02(GETNEXT)
+|
+|--02:SCAN HDFS [functional.alltypesagg, RANDOM]
+|     partition predicates: `year` = NULL OR NULL
+|     partitions=0/11 files=0 size=0B
+|     stored statistics:
+|       table: rows=11.00K size=814.73KB
+|       partitions: 0/0 rows=unavailable
+|       columns: all
+|     extrapolated-rows=disabled max-scan-range-rows=0
+|     mem-estimate=0B mem-reservation=0B thread-reservation=0
+|     tuple-ids=1 row-size=0B cardinality=0
+|     in pipelines: 02(GETNEXT)
+|
+01:SCAN HDFS [functional.alltypes, RANDOM]
+   partition predicates: functional.alltypes.year = NULL OR functional.alltypes.month = NULL
+   partitions=0/24 files=0 size=0B
+   stored statistics:
+     table: rows=7.30K size=478.45KB
+     partitions: 0/0 rows=unavailable
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=0
+   mem-estimate=0B mem-reservation=0B thread-reservation=0
+   tuple-ids=0 row-size=4B cardinality=0
+   in pipelines: 01(GETNEXT)
+====
+select year, month from (
+   select year, 1 month from functional.alltypesagg
+ ) t where year = 2010 or month = 0;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F01:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=4.04MB mem-reservation=4.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: `year`, CAST(1 AS TINYINT)
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+01:EXCHANGE [UNPARTITIONED]
+|  mem-estimate=38.32KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=0 row-size=4B cardinality=11.00K
+|  in pipelines: 00(GETNEXT)
+|
+F00:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
+Per-Host Resources: mem-estimate=80.00MB mem-reservation=128.00KB thread-reservation=2
+00:SCAN HDFS [functional.alltypesagg, RANDOM]
+   partition predicates: `year` = CAST(2010 AS INT) OR FALSE
+   HDFS partitions=11/11 files=11 size=814.73KB
+   stored statistics:
+     table: rows=11.00K size=814.73KB
+     partitions: 11/11 rows=11.00K
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=1.00K
+   mem-estimate=80.00MB mem-reservation=128.00KB thread-reservation=1
+   tuple-ids=0 row-size=4B cardinality=11.00K
+   in pipelines: 00(GETNEXT)
+====
+select year, month from (
+   select year, 1 month from functional.alltypesagg
+ ) t where year = 2010 or month between 1 and 2;
+---- QUERYOPTIONS
+explain_level=2
+---- DISTRIBUTEDPLAN
+F01:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=4.04MB mem-reservation=4.00MB thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: `year`, CAST(1 AS TINYINT)
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|
+01:EXCHANGE [UNPARTITIONED]
+|  mem-estimate=38.32KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=0 row-size=4B cardinality=11.00K
+|  in pipelines: 00(GETNEXT)
+|
+F00:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
+Per-Host Resources: mem-estimate=80.00MB mem-reservation=128.00KB thread-reservation=2
+00:SCAN HDFS [functional.alltypesagg, RANDOM]
+   partition predicates: `year` = CAST(2010 AS INT) OR TRUE
+   HDFS partitions=11/11 files=11 size=814.73KB
+   stored statistics:
+     table: rows=11.00K size=814.73KB
+     partitions: 11/11 rows=11.00K
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=1.00K
+   mem-estimate=80.00MB mem-reservation=128.00KB thread-reservation=1
+   tuple-ids=0 row-size=4B cardinality=11.00K
+   in pipelines: 00(GETNEXT)
 ====

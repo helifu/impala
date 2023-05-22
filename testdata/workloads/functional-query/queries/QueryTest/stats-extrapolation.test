@@ -11,7 +11,7 @@ explain select id from alltypes;
 ---- RESULTS: VERIFY_IS_SUBSET
 '   stored statistics:'
 '     table: rows=unavailable size=unavailable'
-'     partitions: 0/12 rows=unavailable'
+'     partitions: 0/12 rows=5.97K'
 '     columns: unavailable'
 row_regex:.* extrapolated-rows=unavailable.*
 '   tuple-ids=0 row-size=4B cardinality=5.97K'
@@ -43,23 +43,23 @@ STRING
 # Only the table-level row count is stored. The partition row counts are extrapolated.
 show table stats alltypes
 ---- LABELS
-YEAR, MONTH, #ROWS, EXTRAP #ROWS, #FILES, SIZE, BYTES CACHED, CACHE REPLICATION, FORMAT, INCREMENTAL STATS, LOCATION
+YEAR, MONTH, #ROWS, EXTRAP #ROWS, #FILES, SIZE, BYTES CACHED, CACHE REPLICATION, FORMAT, INCREMENTAL STATS, LOCATION, EC POLICY
 ---- RESULTS
-'2009','1',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=1'
-'2009','10',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=10'
-'2009','11',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=11'
-'2009','12',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=12'
-'2009','2',-1,290,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=2'
-'2009','3',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=3'
-'2009','4',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=4'
-'2009','5',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=5'
-'2009','6',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=6'
-'2009','7',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=7'
-'2009','8',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=8'
-'2009','9',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=9'
-'Total','',3650,3650,12,regex:.*B,'0B','','','',''
+'2009','1',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=1','$ERASURECODE_POLICY'
+'2009','10',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=10','$ERASURECODE_POLICY'
+'2009','11',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=11','$ERASURECODE_POLICY'
+'2009','12',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=12','$ERASURECODE_POLICY'
+'2009','2',-1,290,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=2','$ERASURECODE_POLICY'
+'2009','3',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=3','$ERASURECODE_POLICY'
+'2009','4',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=4','$ERASURECODE_POLICY'
+'2009','5',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=5','$ERASURECODE_POLICY'
+'2009','6',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=6','$ERASURECODE_POLICY'
+'2009','7',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=7','$ERASURECODE_POLICY'
+'2009','8',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=8','$ERASURECODE_POLICY'
+'2009','9',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=9','$ERASURECODE_POLICY'
+'Total','',3650,3650,12,regex:.*B,'0B','','','','',''
 ---- TYPES
-STRING,STRING,BIGINT,BIGINT,BIGINT,STRING,STRING,STRING,STRING,STRING,STRING
+STRING,STRING,BIGINT,BIGINT,BIGINT,STRING,STRING,STRING,STRING,STRING,STRING,STRING
 ====
 ---- QUERY
 # Stats are available now.
@@ -155,7 +155,7 @@ select * from functional_parquet.alltypes where year = 2010;
 explain select id from alltypes where year = 2010;
 ---- RESULTS: VERIFY_IS_EQUAL
 row_regex:.*Max Per-Host Resource Reservation: Memory=.*
-row_regex:.*Per-Host Resource Estimates: Memory=16MB.*
+row_regex:.*Per-Host Resource Estimates: Memory=20MB.*
 'Codegen disabled by planner'
 row_regex:.*Analyzed query: SELECT id FROM test_stats_extrapolation_.*.alltypes WHERE.*
 '`year` = CAST(2010 AS INT)'
@@ -186,7 +186,7 @@ compute stats alltypes;
 explain select id from alltypes where year = 2010;
 ---- RESULTS: VERIFY_IS_EQUAL
 row_regex:.*Max Per-Host Resource Reservation: Memory=.*
-row_regex:.*Per-Host Resource Estimates: Memory=16MB.*
+row_regex:.*Per-Host Resource Estimates: Memory=20MB.*
 'Codegen disabled by planner'
 row_regex:.*Analyzed query: SELECT id FROM test_stats_extrapolation_.*.alltypes WHERE.*
 '`year` = CAST(2010 AS INT)'
@@ -218,10 +218,10 @@ explain select id from alltypes;
 ---- RESULTS: VERIFY_IS_SUBSET
 '   stored statistics:'
 '     table: rows=unavailable size=unavailable'
-'     partitions: 0/24 rows=unavailable'
+row_regex:.* partitions: 0/24 rows=17\.9.*K
 '     columns: unavailable'
 row_regex:.* extrapolated-rows=unavailable.*
-'   tuple-ids=0 row-size=4B cardinality=17.91K'
+row_regex:.* tuple-ids=0 row-size=4B cardinality=17\.9.*K
 '   in pipelines: 00(GETNEXT)'
 ---- TYPES
 STRING

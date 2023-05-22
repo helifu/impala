@@ -28,11 +28,15 @@ if [ "$0" = "$BASH_SOURCE" ]; then
   exit 1
 fi
 
+# IMPALA-10057: The fe/target/classes and fe/target/test-classes
+# directory can get cleaned out / rebuilt as part of running the
+# frontend tests. This uses jars to avoid issues related to that
+# inconsistency.
 CLASSPATH=\
 "$IMPALA_HOME"/fe/src/test/resources:\
-"$IMPALA_HOME"/fe/target/classes:\
+"$IMPALA_HOME"/fe/target/impala-frontend-${IMPALA_VERSION}.jar:\
 "$IMPALA_HOME"/fe/target/dependency:\
-"$IMPALA_HOME"/fe/target/test-classes:
+"$IMPALA_HOME"/fe/target/impala-frontend-${IMPALA_VERSION}-tests.jar:
 
 FE_CP_FILE="$IMPALA_HOME/fe/target/build-classpath.txt"
 
@@ -42,7 +46,12 @@ if [ ! -s "$FE_CP_FILE" ]; then
   return 1
 fi
 
-CLASSPATH=$(cat "$IMPALA_HOME"/fe/target/build-classpath.txt):"$CLASSPATH"
+CLASSPATH=$(cat $FE_CP_FILE):"$CLASSPATH"
+
+if [[ "${1:-notest}" = "test" ]]; then
+  FE_TEST_CP_FILE="$IMPALA_HOME/fe/target/test-classpath.txt"
+  CLASSPATH=$(cat $FE_TEST_CP_FILE):"$CLASSPATH"
+fi
 
 : ${CUSTOM_CLASSPATH=}
 CLASSPATH="$CUSTOM_CLASSPATH:$CLASSPATH"

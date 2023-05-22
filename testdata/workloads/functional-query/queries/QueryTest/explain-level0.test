@@ -12,8 +12,8 @@ row_regex:.*Per-Host Resource Estimates: Memory=[0-9.]*MB.*
 '04:EXCHANGE [UNPARTITIONED]'
 '02:HASH JOIN [INNER JOIN, BROADCAST]'
 '|--03:EXCHANGE [BROADCAST]'
-'|  01:SCAN HDFS [tpch.orders]'
-'00:SCAN HDFS [tpch.lineitem]'
+'|  01:SCAN $FILESYSTEM_NAME [tpch.orders]'
+'00:SCAN $FILESYSTEM_NAME [tpch.lineitem]'
 ====
 ---- QUERY
 # Tests the warning about missing table stats in the explain header.
@@ -25,4 +25,12 @@ where t1.month = 1 and t2.year = 2009 and t3.bool_col = false
 ---- RESULTS: VERIFY_IS_SUBSET
 'WARNING: The following tables are missing relevant table and/or column statistics.'
 'functional_avro.alltypes, functional_parquet.alltypessmall'
+====
+---- QUERY
+# Tests the set operation statement rewrite
+explain select year, month from functional.alltypes
+  intersect
+select year, month from functional.alltypes where year=2009;
+---- RESULTS: VERIFY_IS_SUBSET
+'04:HASH JOIN [LEFT SEMI JOIN, PARTITIONED]'
 ====

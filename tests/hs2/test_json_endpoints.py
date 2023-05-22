@@ -17,10 +17,15 @@
 #
 # Tests for query expiration.
 
+from __future__ import absolute_import, division, print_function
 import json
 import pytest
+from time import time
 
-from urllib2 import urlopen
+try:
+  from urllib.request import urlopen
+except ImportError:
+  from urllib2 import urlopen
 
 from tests.common.environ import IS_DOCKERIZED_TEST_CLUSTER
 from tests.common.impala_cluster import ImpalaCluster
@@ -88,11 +93,18 @@ class TestJsonEndpoints(HS2TestSuite):
     assert not query["executing"]
     assert query["waiting"]
 
-    # Close the query and check that in_flight_queries is empty.
+    # Close the query and check that in_flight_queries becomes empty when the query
+    # gets unregistered.
     close_operation_req = TCLIService.TCloseOperationReq()
     close_operation_req.operationHandle = select_statement_resp.operationHandle
     close_operation_resp = self.hs2_client.CloseOperation(close_operation_req)
     TestJsonEndpoints.check_response(close_operation_resp)
+
+    def no_inflight_queries():
+      queries_json = self._get_json_queries(http_addr)
+      return len(queries_json["in_flight_queries"]) == 0
+
+    self.assert_eventually(60, 0.1, no_inflight_queries)
     queries_json = self._get_json_queries(http_addr)
     assert len(queries_json["in_flight_queries"]) == 0
     assert queries_json["num_in_flight_queries"] == 0

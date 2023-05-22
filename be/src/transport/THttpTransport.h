@@ -36,38 +36,39 @@ namespace transport {
  */
 class THttpTransport : public TVirtualTransport<THttpTransport> {
 public:
-  THttpTransport(boost::shared_ptr<TTransport> transport);
+  THttpTransport(std::shared_ptr<TTransport> transport);
 
   virtual ~THttpTransport();
 
-  void open() { transport_->open(); }
+  void open() override { transport_->open(); }
 
-  bool isOpen() { return transport_->isOpen(); }
+  bool isOpen() const override { return transport_->isOpen(); }
 
-  bool peek() { return transport_->peek(); }
+  bool peek() override { return transport_->peek(); }
 
-  void close() { transport_->close(); }
+  void close() override { transport_->close(); }
 
   uint32_t read(uint8_t* buf, uint32_t len);
 
-  uint32_t readEnd();
+  uint32_t readEnd() override;
 
   void write(const uint8_t* buf, uint32_t len);
 
-  virtual void flush() = 0;
+  virtual void flush() override = 0;
 
-  virtual const std::string getOrigin();
+  virtual const std::string getOrigin() const override;
 
-  boost::shared_ptr<TTransport> getUnderlyingTransport() { return transport_; }
+  std::shared_ptr<TTransport> getUnderlyingTransport() { return transport_; }
 
 protected:
-  boost::shared_ptr<TTransport> transport_;
+  std::shared_ptr<TTransport> transport_;
   std::string origin_;
 
   TMemoryBuffer writeBuffer_;
   TMemoryBuffer readBuffer_;
 
   bool readHeaders_;
+  bool readWholeBodyForAuth_;
   bool chunked_;
   bool chunkedDone_;
   uint32_t chunkSize_;
@@ -77,6 +78,11 @@ protected:
   uint32_t httpPos_;
   uint32_t httpBufLen_;
   uint32_t httpBufSize_;
+
+  // Set to 'true' for a request if the "Expect: 100-continue" header was present.
+  // Indicates that we should return a "100 Continue" response if the headers are
+  // successfully validated before reading the contents of the request.
+  bool continue_ = false;
 
   void init();
 
@@ -89,6 +95,7 @@ protected:
   // Called each time we finish reading a set of headers. Allows subclasses to do
   // verification, eg. of authorization, before proceeding.
   virtual void headersDone() {}
+  virtual void bodyDone(uint32_t size) {}
 
   uint32_t readChunked();
   void readChunkedFooters();

@@ -24,6 +24,9 @@ include "Types.thrift"
 include "beeswax.thrift"
 include "TCLIService.thrift"
 include "RuntimeProfile.thrift"
+include "Frontend.thrift"
+include "BackendGflags.thrift"
+include "Query.thrift"
 
 // ImpalaService accepts query execution options through beeswax.Query.configuration in
 // key:value form. For example, the list of strings could be:
@@ -71,6 +74,12 @@ enum TImpalaQueryOptions {
   MAX_IO_BUFFERS = 7 // Removed
 
   // Number of scanner threads.
+  // EXPERIMENTAL: if COMPUTE_PROCESSING_COST=true, this query option will be used to
+  // cap scan node cost to:
+  //    (num_executor * NUM_SCANNER_THREADS * min_processing_per_thread)
+  // if the original scan cost exceed that value during the first round of planning.
+  // NUM_SCANNER_THREADS will be ignored once MT_DOP is restored in the second round of
+  // planning.
   NUM_SCANNER_THREADS = 8
 
   ALLOW_UNSUPPORTED_FORMATS = 9 // Removed
@@ -106,7 +115,7 @@ enum TImpalaQueryOptions {
   //    The code executing the debug action may respond to different error messages by
   //    exercising different error paths.
   // Examples:
-  // - CRS_BEFORE_ADMISSION:SLEEP@1000
+  // - AC_BEFORE_ADMISSION:SLEEP@1000
   //   Causes a 1 second sleep before queries are submitted to the admission controller.
   // - IMPALA_SERVICE_POOL:127.0.0.1:27002:TransmitData:FAIL@0.1@REJECT_TOO_BUSY
   //   Causes TransmitData rpcs to the third minicluster impalad to fail 10% of the time
@@ -503,6 +512,285 @@ enum TImpalaQueryOptions {
   // exchange will exceed this limit, it will not consider a broadcast and instead
   // fall back on a hash partition exchange. 0 or -1 means this has no effect.
   BROADCAST_BYTES_LIMIT = 97
+
+  // The max reservation that each grouping class in a preaggregation will use.
+  // 0 or -1 means this has no effect.
+  PREAGG_BYTES_LIMIT = 98
+
+  // Indicates whether the FE should rewrite disjunctive predicates to conjunctive
+  // normal form (CNF) for optimization purposes. Default is False.
+  ENABLE_CNF_REWRITES = 99
+
+  // The max number of conjunctive normal form (CNF) exprs to create when converting
+  // a disjunctive expression to CNF. Each AND counts as 1 expression. A value of
+  // -1 or 0 means no limit. Default is 200.
+  MAX_CNF_EXPRS = 100
+
+  // Set the timestamp for Kudu snapshot reads in Unix time micros. Only valid if
+  // KUDU_READ_MODE is set to READ_AT_SNAPSHOT.
+  KUDU_SNAPSHOT_READ_TIMESTAMP_MICROS = 101
+
+  // Transparently retry queries that fail due to cluster membership changes. A cluster
+  // membership change includes blacklisting a node and the statestore detecting that a
+  // node has been removed from the cluster membership. From Impala's perspective, a
+  // retried query is a brand new query. From the client perspective, requests for the
+  // failed query are transparently re-routed to the new query.
+  RETRY_FAILED_QUERIES = 102
+
+  // Enabled runtime filter types to be applied to scanner.
+  // This option only apply to Kudu now, will apply to HDFS once we support
+  // min-max filter for HDFS.
+  //     BLOOM   - apply bloom filter only,
+  //     MIN_MAX - apply min-max filter only.
+  //     ALL     - apply both bloom filter and min-max filter (default).
+  ENABLED_RUNTIME_FILTER_TYPES = 103
+
+  // Enable asynchronous codegen.
+  ASYNC_CODEGEN = 104
+
+  // If true, the planner will consider adding a distinct aggregation to SEMI JOIN
+  // operations. If false, disables the optimization (i.e. falls back to pre-Impala-4.0
+  // behaviour).
+  ENABLE_DISTINCT_SEMI_JOIN_OPTIMIZATION = 105
+
+  // The max reservation that sorter will use for intermediate sort runs.
+  // 0 or -1 means this has no effect.
+  SORT_RUN_BYTES_LIMIT = 106
+
+  // Sets an upper limit on the number of fs writer instances to be scheduled during
+  // insert. Currently this limit only applies to HDFS inserts.
+  MAX_FS_WRITERS = 107
+
+  // When this query option is set, a refresh table statement will detect existing
+  // partitions which have been changed in metastore and refresh them. By default, this
+  // option is disabled since there is additional performance hit to fetch all the
+  // partitions and detect if they are not same as ones in the catalogd. Currently, this
+  // option is only applicable for refresh table statement.
+  REFRESH_UPDATED_HMS_PARTITIONS = 108
+
+  // If RETRY_FAILED_QUERIES and SPOOL_QUERY_RESULTS are enabled and this is true,
+  // retryable queries will try to spool all results before returning any to the client.
+  // If the result set is too large to fit into the spooling memory (including the spill
+  // mem), results will be returned and the query will not be retryable. This may have
+  // some performance impact. Set it to false then clients can fetch results immediately
+  // when any of them are ready. Note that in this case, query retry will be skipped if
+  // the client has fetched some results.
+  SPOOL_ALL_RESULTS_FOR_RETRIES = 109
+
+  // A value (0.0, 1.0) that is the target false positive probability for runtime bloom
+  // filters. If not set, falls back to max_filter_error_rate.
+  RUNTIME_FILTER_ERROR_RATE = 110
+
+  // When true, TIMESTAMPs are interpreted in the local time zone (set in query option
+  // TIMEZONE) when converting to and from Unix times.
+  // When false, TIMESTAMPs are interpreted in the UTC time zone.
+  USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS = 111
+
+  // When true, TIMESTAMPs read from files written by Parquet-MR (used by Hive) will
+  // be converted from UTC to local time. Writes are unaffected.
+
+  CONVERT_LEGACY_HIVE_PARQUET_UTC_TIMESTAMPS = 112
+
+  // Indicates whether the FE should attempt to transform outer joins into inner joins.
+  ENABLE_OUTER_JOIN_TO_INNER_TRANSFORMATION = 113
+
+  // Set the target scan range length for scanning kudu tables (in bytes). This is
+  // used to split kudu scan tokens and is treated as a hint by kudu. Therefore,
+  // does not guarantee a limit on the size of the scan range. If unspecified or
+  // set to 0 disables this feature.
+  TARGETED_KUDU_SCAN_RANGE_LENGTH = 114
+
+  // Enable (>=0) or disable(<0) reporting of skews for a query in runtime profile.
+  // When enabled, used as the CoV threshold value in the skew detection formula.
+  REPORT_SKEW_LIMIT = 115
+
+  // If true, for simple limit queries (limit with no order-by, group-by, aggregates,
+  // joins, analytic functions but does allow where predicates) optimize the planning
+  // time by only considering a small number of partitions. The number of files within
+  // a partition is used as an approximation to number of rows (1 row per file).
+  // This option is opt-in by default as this optimization may in some cases produce
+  // fewer (but correct) rows than the limit value in the query.
+  OPTIMIZE_SIMPLE_LIMIT = 116
+
+  // When true, the degree of parallelism (if > 1) is used in costing decision
+  // of a broadcast vs partition distribution.
+  USE_DOP_FOR_COSTING = 117
+
+  // A multiplying factor between 0 to 1000 that is applied to the costing decision of
+  // a broadcast vs partition distribution. Fractional values between 0 to 1 favor
+  // broadcast by reducing the build side cost of a broadcast join. Values above 1.0
+  // favor partition distribution.
+  BROADCAST_TO_PARTITION_FACTOR = 118
+
+  // A limit on the number of join rows produced by the query. The query will be
+  // canceled if the query is still executing after this limit is hit. A value
+  // of 0 means there is no limit on the number of join rows produced.
+  JOIN_ROWS_PRODUCED_LIMIT = 119
+
+  // If true, strings are processed in a UTF-8 aware way, e.g. counting lengths by UTF-8
+  // characters instead of bytes.
+  UTF8_MODE = 120
+
+  // If > 0, the rank()/row_number() pushdown into pre-analytic sorts is enabled
+  // if the limit would be less than or equal to the threshold.
+  // If 0 or -1, disables the optimization (i.e. falls back to pre-Impala-4.0
+  // behaviour).
+  // Default is 1000. Setting it higher increases the max size of the in-memory heaps
+  // used in the top-n operation. The larger the heaps, the less beneficial the
+  // optimization is compared to a full sort and the more potential for perf regressions.
+  ANALYTIC_RANK_PUSHDOWN_THRESHOLD = 121
+
+  // Specifiy a threshold between 0.0 and 1.0 to control the operation of overlap
+  // predicates (via min/max filters) for equi-hash joins at the Parquet table scan
+  // operator. Set to 0.0 to disable the feature. Set to 1.0 to evaluate all
+  // overlap predicates. Set to a value between 0.0 and 1.0 to evaluate only those
+  // with an overlap ratio less than the threshold.
+  MINMAX_FILTER_THRESHOLD = 122
+
+  // Minmax filtering level to be applied to Parquet scanners.
+  //     ROW_GROUP - apply to row groups only,
+  //     PAGE      - apply to row groups and pages only.
+  //     ROW       - apply to row groups, pages and rows.
+  MINMAX_FILTERING_LEVEL = 123
+
+  // If true, compute the column min and max stats during compute stats.
+  COMPUTE_COLUMN_MINMAX_STATS = 124
+
+  // If true, show the min and max stats during show column stats.
+  SHOW_COLUMN_MINMAX_STATS = 125
+
+  // Default NDV scale settings, make it easier to change scale in SQL function
+  // NDV(<expr>).
+  DEFAULT_NDV_SCALE = 126
+
+  // Policy with which to choose amongst multiple Kudu replicas.
+  //     LEADER_ONLY     - Select the LEADER replica.
+  //     CLOSEST_REPLICA - Select the closest replica to the client (default).
+  KUDU_REPLICA_SELECTION = 127
+
+  // If false, a truncate DDL operation will not delete table stats.
+  // the default value of this is true as set in Query.thrift
+  DELETE_STATS_IN_TRUNCATE = 128
+
+  // Indicates whether to use Bloom filtering for Parquet files
+  PARQUET_BLOOM_FILTERING = 129
+
+  // If true, generate min/max filters when join into sorted columns.
+  MINMAX_FILTER_SORTED_COLUMNS = 130
+
+  // Control setting for taking the fast code path when min/max filtering sorted columns.
+  //     OFF - Take the regular code path,
+  //     ON  - Take the fast code path,
+  //     VERIFICATION - Take both code paths and verify that the results from both are
+  //                    the same.
+  MINMAX_FILTER_FAST_CODE_PATH = 131
+
+  // If true, Kudu's multi-row transaction is enabled.
+  ENABLE_KUDU_TRANSACTION = 132
+
+  // Indicates whether to use min/max filtering on partition columns
+  MINMAX_FILTER_PARTITION_COLUMNS = 133
+
+  // Controls when to write Parquet Bloom filters.
+  //     NEVER      - never write Parquet Bloom filters
+  //     TBL_PROPS  - write Parquet Bloom filters as set in table properties
+  //     IF_NO_DICT - write Parquet Bloom filters if the row group is not fully
+  //                  dictionary encoded
+  //     ALWAYS     - always write Parquet Bloom filters, even if the row group is fully
+  //                  dictionary encoded
+  PARQUET_BLOOM_FILTER_WRITE = 134
+
+  // Indicates whether to use ORC's search argument to push down predicates.
+  ORC_READ_STATISTICS = 135
+
+  // Indicates whether to run most of ddl requests in async mode.
+  ENABLE_ASYNC_DDL_EXECUTION = 136
+
+  // Indicates whether to run load data requests in async mode.
+  ENABLE_ASYNC_LOAD_DATA_EXECUTION = 137
+
+  // Number of minimum consecutive rows when filtered out, will avoid materialization
+  // of columns in parquet. Set it to -1 to turn off late materialization feature.
+  PARQUET_LATE_MATERIALIZATION_THRESHOLD = 138;
+
+  // Max entries in the dictionary before skipping runtime filter evaluation for row
+  // groups. If a dictionary has many entries, then runtime filter evaluation is more
+  // likely to give false positive results, which means that the row groups won't be
+  // rejected. Set it to 0 to disable runtime filter dictionary filtering, above 0 will
+  // enable runtime filtering on the row group. For example, 2 means that runtime filter
+  // will be evaluated when the dictionary size is smaller or equal to 2.
+  PARQUET_DICTIONARY_RUNTIME_FILTER_ENTRY_LIMIT = 139;
+
+  // Abort the Java UDF if an exception is thrown. Default is that only a
+  // warning will be logged if the Java UDF throws an exception.
+  ABORT_JAVA_UDF_ON_EXCEPTION = 140;
+
+  // Indicates whether to use ORC's async read.
+  ORC_ASYNC_READ = 141
+
+  // Maximum number of distinct entries in a runtime in-list filter.
+  RUNTIME_IN_LIST_FILTER_ENTRY_LIMIT = 142;
+
+  // If true, replanning is enabled.
+  ENABLE_REPLAN = 143;
+
+  // If true, test replan by imposing artificial two executor groups in FE.
+  TEST_REPLAN = 144;
+
+  // Maximum wait time on HMS ACID lock in seconds.
+  LOCK_MAX_WAIT_TIME_S = 145
+
+  // Determines how to resolve ORC files' schemas. Valid values are "position" and "name".
+  ORC_SCHEMA_RESOLUTION = 146;
+
+  // Expands complex types in star queries
+  EXPAND_COMPLEX_TYPES = 147;
+
+  // Specify the database name which stores global udf
+  FALLBACK_DB_FOR_FUNCTIONS = 148;
+
+  // Specify whether to use codegen cache.
+  DISABLE_CODEGEN_CACHE = 149;
+
+  // Specify how the entry stores to the codegen cache, would affect the entry size.
+  // Possible values are NORMAL, OPTIMAL, NORMAL_DEBUG and OPTIMAL_DEBUG.
+  // The normal mode will use a full key for the cache, while the optimal mode uses
+  // a hashcode of 128 bits for the key to save the memory consumption.
+  // The debug mode of each of them allows more logs, would be helpful to target
+  // an issue.
+  // Only valid if DISABLE_CODEGEN_CACHE is set to false.
+  CODEGEN_CACHE_MODE = 150;
+
+  // Convert non-string map keys to string to produce valid JSON.
+  STRINGIFY_MAP_KEYS = 151
+
+  // Enable immediate admission for trivial queries.
+  ENABLE_TRIVIAL_QUERY_FOR_ADMISSION = 152
+
+  // Control whether to consider CPU processing cost during query planning.
+  COMPUTE_PROCESSING_COST = 153;
+
+  // Minimum number of threads of a query fragment per node in processing
+  // cost algorithm. It is recommend to not set it with value more than number of
+  // physical cores in executor node. Valid values are in [1, 128]. Default to 1.
+  PROCESSING_COST_MIN_THREADS = 154;
+
+  // When calculating estimated join cardinality of 2 or more conjuncts
+  // e.g t1.a1 = t2.a2 AND t1.b1 = t2.b2, this selectivity correlation factor
+  // provides more control over the join cardinality estimation. The range is a
+  // double value between 0 to 1 inclusive. The default value of 0 preserves the
+  // existing behavior of using the minimum cardinality of the conjucts. Setting
+  // this to a value between 0 to 1 computes the combined selectivity by
+  // taking the product of the selectivities and dividing by this factor.
+  JOIN_SELECTIVITY_CORRELATION_FACTOR = 155;
+
+  // Maximum number of threads of a query fragment per node in processing
+  // cost algorithm. It is recommend to not set it with value more than number of
+  // physical cores in executor node. This query option may be ignored if selected
+  // executor group has lower max-query-cpu-core-per-node-limit configuration or
+  // PROCESSING_COST_MIN_THREADS option has higher value.
+  // Valid values are in [1, 128]. Default to 128.
+  MAX_FRAGMENT_INSTANCES_PER_NODE = 156
 }
 
 // The summary of a DML statement.
@@ -556,6 +844,9 @@ struct TPingImpalaHS2ServiceResp {
 
   // The Impalad's webserver address.
   3: optional string webserver_address
+
+  // The Impalad's local monotonic time
+  4: optional i64 timestamp
 }
 
 // CloseImpalaOperation()
@@ -617,12 +908,21 @@ struct TGetExecSummaryReq {
   1: optional TCLIService.TOperationHandle operationHandle
 
   2: optional TCLIService.TSessionHandle sessionHandle
+
+  // If true, returns the summaries of all query attempts. A TGetExecSummaryResp
+  // always returns the profile for the most recent query attempt, regardless of the
+  // query id specified. Clients should set this to true if they want to retrieve the
+  // summaries of all query attempts (including the failed ones).
+  3: optional bool include_query_attempts = false
 }
 
 struct TGetExecSummaryResp {
   1: required TCLIService.TStatus status
 
   2: optional ExecStats.TExecSummary summary
+
+  // A list of all summaries of the failed query attempts.
+  3: optional list<ExecStats.TExecSummary> failed_summaries
 }
 
 struct TGetRuntimeProfileReq {
@@ -632,6 +932,12 @@ struct TGetRuntimeProfileReq {
 
   3: optional RuntimeProfile.TRuntimeProfileFormat format =
       RuntimeProfile.TRuntimeProfileFormat.STRING
+
+  // If true, returns the profiles of all query attempts. A TGetRuntimeProfileResp
+  // always returns the profile for the most recent query attempt, regardless of the
+  // query id specified. Clients should set this to true if they want to retrieve the
+  // profiles of all query attempts (including the failed ones).
+  4: optional bool include_query_attempts = false
 }
 
 struct TGetRuntimeProfileResp {
@@ -643,10 +949,58 @@ struct TGetRuntimeProfileResp {
 
   // Will be set on success if TGetRuntimeProfileReq.format was THRIFT.
   3: optional RuntimeProfile.TRuntimeProfileTree thrift_profile
+
+  // A list of all the failed query attempts in either STRING, BASE64 or JSON format.
+  4: optional list<string> failed_profiles
+
+  // A list of all the failed query attempts in THRIFT format.
+  5: optional list<RuntimeProfile.TRuntimeProfileTree> failed_thrift_profiles
+}
+
+// ExecutePlannedStatement()
+//
+// Execute a statement where the ExecRequest has been externally supplied.
+// The returned OperationHandle can be used to check on the
+// status of the plan, and to fetch results once the
+// plan has finished executing.
+struct TExecutePlannedStatementReq {
+  1: required TCLIService.TExecuteStatementReq statementReq
+
+  // The plan to be executed
+  2: required Frontend.TExecRequest plan
+}
+
+struct TGetBackendConfigReq {
+  1: required TCLIService.TSessionHandle sessionHandle
+}
+
+struct TGetBackendConfigResp {
+  1: required TCLIService.TStatus status
+
+  2: required BackendGflags.TBackendGflags backend_config
+}
+
+struct TGetExecutorMembershipReq {
+  1: required TCLIService.TSessionHandle sessionHandle
+}
+
+struct TGetExecutorMembershipResp {
+  1: required TCLIService.TStatus status
+
+  2: required Frontend.TUpdateExecutorMembershipRequest executor_membership
+}
+
+struct TInitQueryContextResp {
+  1: required TCLIService.TStatus status
+
+  2: required Query.TQueryCtx query_ctx
 }
 
 service ImpalaHiveServer2Service extends TCLIService.TCLIService {
-  // Returns the exec summary for the given query
+  // Returns the exec summary for the given query. The exec summary is only valid for
+  // queries that execute with Impala's backend, i.e. QUERY, DML and COMPUTE_STATS
+  // queries. Otherwise a default-initialized TExecSummary is returned for
+  // backwards-compatibility with impala-shell - see IMPALA-9729.
   TGetExecSummaryResp GetExecSummary(1:TGetExecSummaryReq req);
 
   // Returns the runtime profile string for the given query
@@ -658,4 +1012,18 @@ service ImpalaHiveServer2Service extends TCLIService.TCLIService {
 
   // Same as HS2 CloseOperation but can return additional information.
   TCloseImpalaOperationResp CloseImpalaOperation(1:TCloseImpalaOperationReq req);
+
+  // Returns an initialized TQueryCtx. Only supported for the "external fe" service.
+  TInitQueryContextResp InitQueryContext();
+
+  // Execute statement with supplied ExecRequest
+  TCLIService.TExecuteStatementResp ExecutePlannedStatement(
+      1:TExecutePlannedStatementReq req);
+
+  // Returns the current TBackendGflags. Only supported for the "external fe" service.
+  TGetBackendConfigResp GetBackendConfig(1:TGetBackendConfigReq req);
+
+  // Returns the executor membership information. Only supported for the "external fe"
+  // service.
+  TGetExecutorMembershipResp GetExecutorMembership(1:TGetExecutorMembershipReq req);
 }

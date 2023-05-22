@@ -23,6 +23,7 @@
 #include <string>
 
 #include <boost/algorithm/string/join.hpp>
+#include <gflags/gflags.h>
 #include <gutil/strings/substitute.h>
 #include "common/logging.h"
 
@@ -40,12 +41,12 @@
 #include "runtime/krpc-data-stream-recvr.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/query-state.h"
-#include "runtime/runtime-filter-bank.h"
 #include "runtime/thread-resource-mgr.h"
 #include "runtime/timestamp-value.h"
 #include "util/auth-util.h" // for GetEffectiveUser()
 #include "util/bitmap.h"
 #include "util/cpu-info.h"
+#include "util/cyclic-barrier.h"
 #include "util/debug-util.h"
 #include "util/disk-info.h"
 #include "util/error-util.h"
@@ -58,22 +59,32 @@
 
 using strings::Substitute;
 
-DECLARE_int32(max_errors);
+DEFINE_int32(max_error_logs_per_instance, 2000,
+    "Maximum number of non-fatal error to be logged in log level 1 (INFO). "
+    "Once this number exceeded, further non-fatal error will be logged at log level 2 "
+    "(DEBUG) severity. This flag is ignored if user set negative max_errors query "
+    "option. Default to 2000");
 
 namespace impala {
 
 const char* RuntimeState::LLVM_CLASS_NAME = "class.impala::RuntimeState";
 
-RuntimeState::RuntimeState(QueryState* query_state, const TPlanFragmentCtx& fragment_ctx,
-    const TPlanFragmentInstanceCtx& instance_ctx, ExecEnv* exec_env)
+RuntimeState::RuntimeState(QueryState* query_state, const TPlanFragment& fragment,
+    const TPlanFragmentInstanceCtx& instance_ctx,
+    const PlanFragmentCtxPB& fragment_ctx,
+    const PlanFragmentInstanceCtxPB& instance_ctx_pb, ExecEnv* exec_env)
   : query_state_(query_state),
-    fragment_ctx_(&fragment_ctx),
+    fragment_(&fragment),
     instance_ctx_(&instance_ctx),
+    fragment_ctx_(&fragment_ctx),
+    instance_ctx_pb_(&instance_ctx_pb),
     now_(new TimestampValue(TimestampValue::ParseSimpleDateFormat(
         query_state->query_ctx().now_string))),
     utc_timestamp_(new TimestampValue(TimestampValue::ParseSimpleDateFormat(
         query_state->query_ctx().utc_timestamp_string))),
-    local_time_zone_(&TimezoneDatabase::GetUtcTimezone()),
+    local_time_zone_(UTCPTR),
+    time_zone_for_unix_time_conversions_(UTCPTR),
+    time_zone_for_legacy_parquet_time_conversions_(UTCPTR),
     profile_(RuntimeProfile::Create(
         obj_pool(), "Fragment " + PrintId(instance_ctx.fragment_instance_id))),
     instance_buffer_reservation_(obj_pool()->Add(new ReservationTracker)) {
@@ -90,13 +101,17 @@ RuntimeState::RuntimeState(
             qctx.client_request.query_options.mem_limit :
             -1,
         "test-pool")),
-    fragment_ctx_(nullptr),
+    fragment_(nullptr),
     instance_ctx_(nullptr),
+    fragment_ctx_(nullptr),
+    instance_ctx_pb_(nullptr),
     local_query_state_(query_state_),
     now_(new TimestampValue(TimestampValue::ParseSimpleDateFormat(qctx.now_string))),
     utc_timestamp_(new TimestampValue(TimestampValue::ParseSimpleDateFormat(
         qctx.utc_timestamp_string))),
-    local_time_zone_(&TimezoneDatabase::GetUtcTimezone()),
+    local_time_zone_(UTCPTR),
+    time_zone_for_unix_time_conversions_(UTCPTR),
+    time_zone_for_legacy_parquet_time_conversions_(UTCPTR),
     profile_(RuntimeProfile::Create(obj_pool(), "<unnamed>")),
     instance_buffer_reservation_(nullptr) {
   // We may use execution resources while evaluating exprs, etc. Decremented in
@@ -123,9 +138,9 @@ void RuntimeState::Init() {
   // Register with the thread mgr
   resource_pool_ = ExecEnv::GetInstance()->thread_mgr()->CreatePool();
   DCHECK(resource_pool_ != nullptr);
-  if (fragment_ctx_ != nullptr) {
+  if (fragment_ != nullptr) {
     // Ensure that the planner correctly determined the required threads.
-    resource_pool_->set_max_required_threads(fragment_ctx_->fragment.thread_reservation);
+    resource_pool_->set_max_required_threads(fragment_->thread_reservation);
   }
 
   total_thread_statistics_ = ADD_THREAD_COUNTERS(runtime_profile(), "TotalThreads");
@@ -148,40 +163,24 @@ void RuntimeState::Init() {
   if (!TestInfo::is_fe_test()) {
     const Timezone* tz = TimezoneDatabase::FindTimezone(query_ctx().local_time_zone);
     if (tz != nullptr) {
-      local_time_zone_ = tz;
+      // Use UTCPTR (actually a nullptr) if the timezone is UTC. This makes it easy to
+      // optimize many code paths for the UTC case.
+      local_time_zone_ = tz == &TimezoneDatabase::GetUtcTimezone() ? UTCPTR : tz;
     } else {
       const string msg = Substitute(
           "Failed to find local timezone '$0'.Falling back to UTC.",
           query_ctx().local_time_zone);
       LOG(WARNING) << msg;
       LogError(ErrorMsg(TErrorCode::GENERAL, msg));
-      local_time_zone_ = &TimezoneDatabase::GetUtcTimezone();
+      local_time_zone_ = UTCPTR;
+    }
+    if (query_options().use_local_tz_for_unix_timestamp_conversions) {
+      time_zone_for_unix_time_conversions_ = local_time_zone_;
+    }
+    if (query_options().convert_legacy_hive_parquet_utc_timestamps) {
+      time_zone_for_legacy_parquet_time_conversions_ = local_time_zone_;
     }
   }
-}
-
-Status RuntimeState::InitFilterBank(long runtime_filters_reservation_bytes) {
-  filter_bank_.reset(
-      new RuntimeFilterBank(query_ctx(), this, runtime_filters_reservation_bytes));
-  return filter_bank_->ClaimBufferReservation();
-}
-
-Status RuntimeState::CreateCodegen() {
-  if (codegen_.get() != NULL) return Status::OK();
-  // TODO: add the fragment ID to the codegen ID as well
-  RETURN_IF_ERROR(LlvmCodeGen::CreateImpalaCodegen(this,
-      instance_mem_tracker_, PrintId(fragment_instance_id()), &codegen_));
-  codegen_->EnableOptimizations(true);
-  profile_->AddChild(codegen_->runtime_profile());
-  return Status::OK();
-}
-
-Status RuntimeState::CodegenScalarExprs() {
-  for (auto& item : scalar_exprs_to_codegen_) {
-    llvm::Function* fn;
-    RETURN_IF_ERROR(item.first->GetCodegendComputeFn(codegen_.get(), item.second, &fn));
-  }
-  return Status::OK();
 }
 
 Status RuntimeState::StartSpilling(MemTracker* mem_tracker) {
@@ -195,11 +194,37 @@ string RuntimeState::ErrorLog() {
 
 bool RuntimeState::LogError(const ErrorMsg& message, int vlog_level) {
   lock_guard<SpinLock> l(error_log_lock_);
-  // All errors go to the log, unreported_error_count_ is counted independently of the
-  // size of the error_log to account for errors that were already reported to the
-  // coordinator
-  VLOG(vlog_level) << "Error from query " << PrintId(query_id()) << ": " << message.msg();
-  if (ErrorCount(error_log_) < query_options().max_errors) {
+  // All errors go to the log. If the amount of errors logged to vlog level 1 exceed
+  // or equal max_error_logs_per_instance, then that error will be downgraded to vlog
+  // level 2.
+  int user_max_errors = query_options().max_errors;
+  if (vlog_level == 1 && user_max_errors >= 0
+      && vlog_1_errors >= FLAGS_max_error_logs_per_instance) {
+    vlog_level = 2;
+  }
+
+  if (VLOG_IS_ON(vlog_level)) {
+    VLOG(vlog_level) << "Error from query " << PrintId(query_id()) << ": "
+                     << message.msg();
+  }
+
+  if (vlog_level == 1 && user_max_errors >= 0) {
+    vlog_1_errors++;
+    DCHECK_LE(vlog_1_errors, FLAGS_max_error_logs_per_instance);
+    if (vlog_1_errors == FLAGS_max_error_logs_per_instance) {
+      VLOG(vlog_level) << "Query " << PrintId(query_id()) << " printed "
+                       << FLAGS_max_error_logs_per_instance
+                       << " non-fatal error to log level 1 (INFO). Further non-fatal "
+                       << "error will be downgraded to log level 2 (DEBUG).";
+    }
+  }
+
+  TErrorCode::type code = message.error();
+  if (ErrorCount(error_log_) < max_errors()
+      || (code != TErrorCode::GENERAL && error_log_.find(code) != error_log_.end())) {
+    // Appending general error is expensive since it writes the entire message to the
+    // error_log_ map. Meanwhile, appending non-general (specific) error that already
+    // exist in error_log_ is cheap since it only increment count.
     AppendError(&error_log_, message);
     return true;
   }
@@ -238,7 +263,41 @@ Status RuntimeState::LogOrReturnError(const ErrorMsg& message) {
 
 void RuntimeState::Cancel() {
   is_cancelled_.Store(true);
-  if (filter_bank_ != nullptr) filter_bank_->Cancel();
+  {
+    lock_guard<SpinLock> l(cancellation_cvs_lock_);
+    for (pair<std::mutex*, ConditionVariable*>& entry : cancellation_cvs_) {
+      // Acquire the lock to prevent races between readers of 'is_cancelled_' and this
+      // writing thread (e.g. IMPALA-9611) - the caller should read 'is_cancelled_' while
+      // holding the lock. Drop it before signalling the CV so that a blocked thread can
+      // immediately acquire the mutex when it wakes up.
+      {
+        lock_guard<mutex> l(*entry.first);
+      }
+      entry.second->NotifyAll();
+    }
+    for (CyclicBarrier* cb : cancellation_cbs_) {
+      cb->Cancel(Status::CancelledInternal("RuntimeState::Cancel()"));
+    }
+  }
+
+}
+
+void RuntimeState::AddCancellationCV(mutex* mutex, ConditionVariable* cv) {
+  lock_guard<SpinLock> l(cancellation_cvs_lock_);
+  for (pair<std::mutex*, ConditionVariable*>& entry : cancellation_cvs_) {
+    // Don't add if already present.
+    if (mutex == entry.first && cv == entry.second) return;
+  }
+  cancellation_cvs_.push_back(make_pair(mutex, cv));
+}
+
+void RuntimeState::AddBarrierToCancel(CyclicBarrier* cb) {
+  lock_guard<SpinLock> l(cancellation_cvs_lock_);
+  for (CyclicBarrier* cb2 : cancellation_cbs_) {
+    // Don't add if already present.
+    if (cb == cb2) return;
+  }
+  cancellation_cbs_.push_back(cb);
 }
 
 double RuntimeState::ComputeExchangeScanRatio() const {
@@ -258,15 +317,16 @@ void RuntimeState::SetMemLimitExceeded(MemTracker* tracker,
   // cannot abort the fragment immediately. It relies on callers checking status
   // periodically. This means that this function could be called a large number of times
   // (e.g. once per row) before the fragment aborts. See IMPALA-6997.
-  {
-    lock_guard<SpinLock> l(query_status_lock_);
-    if (!query_status_.ok()) return;
-  }
+  if (!is_query_status_ok_.Load()) return;
   Status status = tracker->MemLimitExceeded(this, msg == nullptr ? "" : msg->msg(),
       failed_allocation_size);
   {
     lock_guard<SpinLock> l(query_status_lock_);
-    if (query_status_.ok()) query_status_ = status;
+    if (query_status_.ok()) {
+      query_status_ = status;
+      bool set_query_status_ok_ = is_query_status_ok_.CompareAndSwap(true, false);
+      DCHECK(set_query_status_ok_);
+    }
   }
   LogError(status.msg());
   // Add warning about missing stats except for compute stats child queries.
@@ -288,13 +348,9 @@ Status RuntimeState::CheckQueryState() {
 
 void RuntimeState::ReleaseResources() {
   DCHECK(!released_resources_);
-  if (filter_bank_ != nullptr) filter_bank_->Close();
   if (resource_pool_ != nullptr) {
     ExecEnv::GetInstance()->thread_mgr()->DestroyPool(move(resource_pool_));
   }
-  // Release any memory associated with codegen.
-  if (codegen_ != nullptr) codegen_->Close();
-
   // Release the reservation, which should be unused at the point.
   if (instance_buffer_reservation_ != nullptr) instance_buffer_reservation_->Close();
 
@@ -311,23 +367,23 @@ void RuntimeState::ReleaseResources() {
   released_resources_ = true;
 }
 
-void RuntimeState::SetRPCErrorInfo(TNetworkAddress dest_node, int16_t posix_error_code) {
-  boost::lock_guard<SpinLock> l(aux_error_info_lock_);
-  if (aux_error_info_ == nullptr) {
+void RuntimeState::SetRPCErrorInfo(NetworkAddressPB dest_node, int16_t posix_error_code) {
+  std::lock_guard<SpinLock> l(aux_error_info_lock_);
+  if (aux_error_info_ == nullptr && !reported_aux_error_info_) {
     aux_error_info_.reset(new AuxErrorInfoPB());
     RPCErrorInfoPB* rpc_error_info = aux_error_info_->mutable_rpc_error_info();
-    NetworkAddressPB* network_addr = rpc_error_info->mutable_dest_node();
-    network_addr->set_hostname(dest_node.hostname);
-    network_addr->set_port(dest_node.port);
+    *rpc_error_info->mutable_dest_node() = dest_node;
     rpc_error_info->set_posix_error_code(posix_error_code);
   }
 }
 
-void RuntimeState::GetAuxErrorInfo(AuxErrorInfoPB* aux_error_info) {
-  boost::lock_guard<SpinLock> l(aux_error_info_lock_);
+void RuntimeState::GetUnreportedAuxErrorInfo(AuxErrorInfoPB* aux_error_info) {
+  std::lock_guard<SpinLock> l(aux_error_info_lock_);
   if (aux_error_info_ != nullptr) {
     aux_error_info->CopyFrom(*aux_error_info_);
   }
+  aux_error_info_ = nullptr;
+  reported_aux_error_info_ = true;
 }
 
 const std::string& RuntimeState::GetEffectiveUser() const {
@@ -356,6 +412,11 @@ const TQueryOptions& RuntimeState::query_options() const {
 MemTracker* RuntimeState::query_mem_tracker() {
   DCHECK(query_state_ != nullptr);
   return query_state_->query_mem_tracker();
+}
+
+RuntimeFilterBank* RuntimeState::filter_bank() const {
+  DCHECK(query_state_ != nullptr);
+  return query_state_->filter_bank();
 }
 
 }

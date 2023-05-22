@@ -15,27 +15,46 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range
 import getpass
 import itertools
 import pytest
 import re
 import time
 
+from beeswaxd.BeeswaxService import QueryState
+from copy import deepcopy
 from test_ddl_base import TestDdlBase
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.environ import (HIVE_MAJOR_VERSION)
+from tests.common.file_utils import create_table_from_orc
 from tests.common.impala_test_suite import LOG
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import (SkipIf, SkipIfABFS, SkipIfADLS, SkipIfKudu, SkipIfLocal,
+from tests.common.skip import (SkipIf, SkipIfFS, SkipIfKudu, SkipIfLocal,
                                SkipIfCatalogV2, SkipIfHive2)
 from tests.common.test_dimensions import create_single_exec_option_dimension
+from tests.common.test_dimensions import (create_exec_option_dimension,
+    create_client_protocol_dimension)
+from tests.common.test_vector import ImpalaTestDimension
 from tests.util.filesystem_utils import (
+    get_fs_path,
     WAREHOUSE,
+    WAREHOUSE_PREFIX,
     IS_HDFS,
     IS_S3,
     IS_ADLS,
+    IS_OZONE,
     FILESYSTEM_NAME)
 from tests.common.impala_cluster import ImpalaCluster
+from tests.util.filesystem_utils import FILESYSTEM_PREFIX
+
+
+def get_trash_path(bucket, path):
+  if IS_OZONE:
+    return get_fs_path('/{0}/.Trash/{1}/Current{2}/{0}/{3}'.format(bucket,
+        getpass.getuser(), WAREHOUSE_PREFIX, path))
+  return '/user/{0}/.Trash/Current/{1}/{2}'.format(getpass.getuser(), bucket, path)
 
 # Validates DDL statements (create, drop)
 class TestDdlStatements(TestDdlBase):
@@ -46,22 +65,16 @@ class TestDdlStatements(TestDdlBase):
     self.client.execute("create table {0}.t1(i int)".format(unique_database))
     self.client.execute("create table {0}.t2(i int)".format(unique_database))
     # Create sample test data files under the table directories
-    self.filesystem_client.create_file("test-warehouse/{0}.db/t1/t1.txt".\
-        format(unique_database), file_data='t1')
-    self.filesystem_client.create_file("test-warehouse/{0}.db/t2/t2.txt".\
-        format(unique_database), file_data='t2')
+    dbpath = "{0}/{1}.db".format(WAREHOUSE, unique_database)
+    self.filesystem_client.create_file("{}/t1/t1.txt".format(dbpath), file_data='t1')
+    self.filesystem_client.create_file("{}/t2/t2.txt".format(dbpath), file_data='t2')
     # Drop the table (without purge) and make sure it exists in trash
     self.client.execute("drop table {0}.t1".format(unique_database))
-    assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/t1.txt".\
-        format(unique_database))
-    assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/".\
-        format(unique_database))
-    assert self.filesystem_client.exists(\
-        "user/{0}/.Trash/Current/test-warehouse/{1}.db/t1/t1.txt".\
-        format(getpass.getuser(), unique_database))
-    assert self.filesystem_client.exists(\
-        "user/{0}/.Trash/Current/test-warehouse/{1}.db/t1".\
-        format(getpass.getuser(), unique_database))
+    assert not self.filesystem_client.exists("{}/t1/t1.txt".format(dbpath))
+    assert not self.filesystem_client.exists("{}/t1/".format(dbpath))
+    trash = get_trash_path("test-warehouse", unique_database + ".db")
+    assert self.filesystem_client.exists("{}/t1/t1.txt".format(trash))
+    assert self.filesystem_client.exists("{}/t1".format(trash))
     # Drop the table (with purge) and make sure it doesn't exist in trash
     self.client.execute("drop table {0}.t2 purge".format(unique_database))
     if not IS_S3 and not IS_ADLS:
@@ -71,54 +84,45 @@ class TestDdlStatements(TestDdlBase):
       # consistent.
       # The ADLS Python client is not strongly consistent, so these files may still be
       # visible after a DROP. (Remove after IMPALA-5335 is resolved)
-      assert not self.filesystem_client.exists("test-warehouse/{0}.db/t2/".\
-          format(unique_database))
-      assert not self.filesystem_client.exists("test-warehouse/{0}.db/t2/t2.txt".\
-          format(unique_database))
-    assert not self.filesystem_client.exists(\
-        "user/{0}/.Trash/Current/test-warehouse/{1}.db/t2/t2.txt".\
-        format(getpass.getuser(), unique_database))
-    assert not self.filesystem_client.exists(\
-        "user/{0}/.Trash/Current/test-warehouse/{1}.db/t2".\
-        format(getpass.getuser(), unique_database))
+      assert not self.filesystem_client.exists("{}/t2/".format(dbpath))
+      assert not self.filesystem_client.exists("{}/t2/t2.txt".format(dbpath))
+    assert not self.filesystem_client.exists("{}/t2/t2.txt".format(trash))
+    assert not self.filesystem_client.exists("{}/t2".format(trash))
     # Create an external table t3 and run the same test as above. Make
     # sure the data is not deleted
-    self.filesystem_client.make_dir(
-        "test-warehouse/{0}.db/data_t3/".format(unique_database), permission=777)
+    self.filesystem_client.make_dir("{}/data_t3/".format(dbpath), permission=777)
     self.filesystem_client.create_file(
-        "test-warehouse/{0}.db/data_t3/data.txt".format(unique_database), file_data='100')
+        "{}/data_t3/data.txt".format(dbpath), file_data='100')
     self.client.execute("create external table {0}.t3(i int) stored as "
-      "textfile location \'/test-warehouse/{0}.db/data_t3\'" .format(unique_database))
+        "textfile location \'{1}/data_t3\'".format(unique_database, dbpath))
     self.client.execute("drop table {0}.t3 purge".format(unique_database))
-    assert self.filesystem_client.exists(
-        "test-warehouse/{0}.db/data_t3/data.txt".format(unique_database))
-    self.filesystem_client.delete_file_dir(
-        "test-warehouse/{0}.db/data_t3".format(unique_database), recursive=True)
+    assert self.filesystem_client.exists("{}/data_t3/data.txt".format(dbpath))
+    self.filesystem_client.delete_file_dir("{}/data_t3".format(dbpath), recursive=True)
 
-  @SkipIfADLS.eventually_consistent
+  @SkipIfFS.eventually_consistent
   @SkipIfLocal.hdfs_client
   def test_drop_cleans_hdfs_dirs(self, unique_database):
     self.client.execute('use default')
     # Verify the db directory exists
     assert self.filesystem_client.exists(
-        "test-warehouse/{0}.db/".format(unique_database))
+        "{1}/{0}.db/".format(unique_database, WAREHOUSE))
 
     self.client.execute("create table {0}.t1(i int)".format(unique_database))
     # Verify the table directory exists
     assert self.filesystem_client.exists(
-        "test-warehouse/{0}.db/t1/".format(unique_database))
+        "{1}/{0}.db/t1/".format(unique_database, WAREHOUSE))
 
     # Dropping the table removes the table's directory and preserves the db's directory
     self.client.execute("drop table {0}.t1".format(unique_database))
     assert not self.filesystem_client.exists(
-        "test-warehouse/{0}.db/t1/".format(unique_database))
+        "{1}/{0}.db/t1/".format(unique_database, WAREHOUSE))
     assert self.filesystem_client.exists(
-        "test-warehouse/{0}.db/".format(unique_database))
+        "{1}/{0}.db/".format(unique_database, WAREHOUSE))
 
     # Dropping the db removes the db's directory
     self.client.execute("drop database {0}".format(unique_database))
     assert not self.filesystem_client.exists(
-        "test-warehouse/{0}.db/".format(unique_database))
+        "{1}/{0}.db/".format(unique_database, WAREHOUSE))
 
     # Dropping the db using "cascade" removes all tables' and db's directories
     # but keeps the external tables' directory
@@ -129,31 +133,31 @@ class TestDdlStatements(TestDdlBase):
         "location '{1}/{0}/t3/'".format(unique_database, WAREHOUSE))
     self.client.execute("drop database {0} cascade".format(unique_database))
     assert not self.filesystem_client.exists(
-        "test-warehouse/{0}.db/".format(unique_database))
+        "{1}/{0}.db/".format(unique_database, WAREHOUSE))
     assert not self.filesystem_client.exists(
-        "test-warehouse/{0}.db/t1/".format(unique_database))
+        "{1}/{0}.db/t1/".format(unique_database, WAREHOUSE))
     assert not self.filesystem_client.exists(
-        "test-warehouse/{0}.db/t2/".format(unique_database))
+        "{1}/{0}.db/t2/".format(unique_database, WAREHOUSE))
     assert self.filesystem_client.exists(
-        "test-warehouse/{0}/t3/".format(unique_database))
+        "{1}/{0}/t3/".format(unique_database, WAREHOUSE))
     self.filesystem_client.delete_file_dir(
-        "test-warehouse/{0}/t3/".format(unique_database), recursive=True)
+        "{1}/{0}/t3/".format(unique_database, WAREHOUSE), recursive=True)
     assert not self.filesystem_client.exists(
-        "test-warehouse/{0}/t3/".format(unique_database))
+        "{1}/{0}/t3/".format(unique_database, WAREHOUSE))
     # Re-create database to make unique_database teardown succeed.
     self._create_db(unique_database)
 
-  @SkipIfADLS.eventually_consistent
+  @SkipIfFS.eventually_consistent
   @SkipIfLocal.hdfs_client
   def test_truncate_cleans_hdfs_files(self, unique_database):
     # Verify the db directory exists
     assert self.filesystem_client.exists(
-        "test-warehouse/{0}.db/".format(unique_database))
+        "{1}/{0}.db/".format(unique_database, WAREHOUSE))
 
     self.client.execute("create table {0}.t1(i int)".format(unique_database))
     # Verify the table directory exists
     assert self.filesystem_client.exists(
-        "test-warehouse/{0}.db/t1/".format(unique_database))
+        "{1}/{0}.db/t1/".format(unique_database, WAREHOUSE))
 
     try:
       # If we're testing S3, we want the staging directory to be created.
@@ -161,35 +165,36 @@ class TestDdlStatements(TestDdlBase):
       # Should have created one file in the table's dir
       self.client.execute("insert into {0}.t1 values (1)".format(unique_database))
       assert len(self.filesystem_client.ls(
-          "test-warehouse/{0}.db/t1/".format(unique_database))) == 2
+          "{1}/{0}.db/t1/".format(unique_database, WAREHOUSE))) == 2
 
       # Truncating the table removes the data files and preserves the table's directory
       self.client.execute("truncate table {0}.t1".format(unique_database))
       assert len(self.filesystem_client.ls(
-          "test-warehouse/{0}.db/t1/".format(unique_database))) == 1
+          "{1}/{0}.db/t1/".format(unique_database, WAREHOUSE))) == 1
 
       self.client.execute(
           "create table {0}.t2(i int) partitioned by (p int)".format(unique_database))
       # Verify the table directory exists
       assert self.filesystem_client.exists(
-          "test-warehouse/{0}.db/t2/".format(unique_database))
+          "{1}/{0}.db/t2/".format(unique_database, WAREHOUSE))
 
       # Should have created the partition dir, which should contain exactly one file
       self.client.execute(
           "insert into {0}.t2 partition(p=1) values (1)".format(unique_database))
       assert len(self.filesystem_client.ls(
-          "test-warehouse/{0}.db/t2/p=1".format(unique_database))) == 1
+          "{1}/{0}.db/t2/p=1".format(unique_database, WAREHOUSE))) == 1
 
       # Truncating the table removes the data files and preserves the partition's directory
       self.client.execute("truncate table {0}.t2".format(unique_database))
       assert self.filesystem_client.exists(
-          "test-warehouse/{0}.db/t2/p=1".format(unique_database))
+          "{1}/{0}.db/t2/p=1".format(unique_database, WAREHOUSE))
       assert len(self.filesystem_client.ls(
-          "test-warehouse/{0}.db/t2/p=1".format(unique_database))) == 0
+          "{1}/{0}.db/t2/p=1".format(unique_database, WAREHOUSE))) == 0
     finally:
       # Reset to its default value.
       self.client.execute("set s3_skip_insert_staging=true")
 
+  @SkipIfFS.incorrent_reported_ec
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_truncate_table(self, vector, unique_database):
     vector.get_value('exec_option')['abort_on_error'] = False
@@ -282,6 +287,7 @@ class TestDdlStatements(TestDdlBase):
     self.run_test_case('QueryTest/create-table', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
 
+  @SkipIfFS.incorrent_reported_ec
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_create_table_like_table(self, vector, unique_database):
     vector.get_value('exec_option')['abort_on_error'] = False
@@ -294,13 +300,31 @@ class TestDdlStatements(TestDdlBase):
     self.run_test_case('QueryTest/create-table-like-file', vector,
         use_db=unique_database, multiple_impalad=self._use_multiple_impalad(vector))
 
+  @SkipIfHive2.orc
+  @SkipIfFS.hive
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  def test_create_table_like_file_orc(self, vector, unique_database):
+    COMPLEXTYPETBL_PATH = 'test-warehouse/managed/functional_orc_def.db/' \
+                          'complextypestbl_orc_def/'
+    base_dir = list(filter(lambda s: s.startswith('base'),
+      self.filesystem_client.ls(COMPLEXTYPETBL_PATH)))[0]
+    bucket_file = list(filter(lambda s: s.startswith('bucket'),
+      self.filesystem_client.ls(COMPLEXTYPETBL_PATH + base_dir)))[0]
+    vector.get_value('exec_option')['abort_on_error'] = False
+    create_table_from_orc(self.client, unique_database,
+        'timestamp_with_local_timezone')
+    self.run_test_case('QueryTest/create-table-like-file-orc', vector,
+        use_db=unique_database, multiple_impalad=self._use_multiple_impalad(vector),
+        test_file_vars={
+          '$TRANSACTIONAL_COMPLEXTYPESTBL_FILE':
+          FILESYSTEM_PREFIX + '/' + COMPLEXTYPETBL_PATH + base_dir + '/' + bucket_file})
+
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_create_table_as_select(self, vector, unique_database):
     vector.get_value('exec_option')['abort_on_error'] = False
     self.run_test_case('QueryTest/create-table-as-select', vector,
         use_db=unique_database, multiple_impalad=self._use_multiple_impalad(vector))
 
-  @SkipIf.kudu_not_supported
   @UniqueDatabase.parametrize(sync_ddl=True)
   @SkipIfKudu.no_hybrid_clock
   def test_create_kudu(self, vector, unique_database):
@@ -420,6 +444,7 @@ class TestDdlStatements(TestDdlBase):
 
   # TODO: don't use hdfs_client
   @SkipIfLocal.hdfs_client
+  @SkipIfFS.incorrent_reported_ec
   @UniqueDatabase.parametrize(sync_ddl=True, num_dbs=2)
   def test_alter_table(self, vector, unique_database):
     vector.get_value('exec_option')['abort_on_error'] = False
@@ -428,17 +453,15 @@ class TestDdlStatements(TestDdlBase):
     # use the (key=value) format. The directory is automatically cleanup up
     # by the unique_database fixture.
     self.client.execute("create table {0}.part_data (i int)".format(unique_database))
-    assert self.filesystem_client.exists(
-        "test-warehouse/{0}.db/part_data".format(unique_database))
+    dbpath = "{1}/{0}.db".format(unique_database, WAREHOUSE)
+    assert self.filesystem_client.exists("{}/part_data".format(dbpath))
     self.filesystem_client.create_file(
-        "test-warehouse/{0}.db/part_data/data.txt".format(unique_database),
-        file_data='1984')
+        "{}/part_data/data.txt".format(dbpath), file_data='1984')
     self.run_test_case('QueryTest/alter-table', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
 
-  @SkipIf.not_hdfs
+  @SkipIfFS.hdfs_caching
   @SkipIfLocal.hdfs_client
-  @SkipIfCatalogV2.hdfs_caching_ddl_unsupported()
   @UniqueDatabase.parametrize(sync_ddl=True, num_dbs=2)
   def test_alter_table_hdfs_caching(self, vector, unique_database):
     self.run_test_case('QueryTest/alter-table-hdfs-caching', vector,
@@ -457,22 +480,16 @@ class TestDdlStatements(TestDdlBase):
     # Add two partitions (j=1) and (j=2) to table t1
     self.client.execute("alter table {0}.t1 add partition(j=1)".format(unique_database))
     self.client.execute("alter table {0}.t1 add partition(j=2)".format(unique_database))
-    self.filesystem_client.create_file(\
-        "test-warehouse/{0}.db/t1/j=1/j1.txt".format(unique_database), file_data='j1')
-    self.filesystem_client.create_file(\
-        "test-warehouse/{0}.db/t1/j=2/j2.txt".format(unique_database), file_data='j2')
+    dbpath = "{1}/{0}.db".format(unique_database, WAREHOUSE)
+    self.filesystem_client.create_file("{}/t1/j=1/j1.txt".format(dbpath), file_data='j1')
+    self.filesystem_client.create_file("{}/t1/j=2/j2.txt".format(dbpath), file_data='j2')
     # Drop the partition (j=1) without purge and make sure it exists in trash
     self.client.execute("alter table {0}.t1 drop partition(j=1)".format(unique_database))
-    assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/j=1/j1.txt".\
-        format(unique_database))
-    assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/j=1".\
-        format(unique_database))
-    assert self.filesystem_client.exists(\
-        "user/{0}/.Trash/Current/test-warehouse/{1}.db/t1/j=1/j1.txt".\
-        format(getpass.getuser(), unique_database))
-    assert self.filesystem_client.exists(\
-        "user/{0}/.Trash/Current/test-warehouse/{1}.db/t1/j=1".\
-        format(getpass.getuser(), unique_database))
+    assert not self.filesystem_client.exists("{}/t1/j=1/j1.txt".format(dbpath))
+    assert not self.filesystem_client.exists("{}/t1/j=1".format(dbpath))
+    trash = get_trash_path("test-warehouse", unique_database + ".db")
+    assert self.filesystem_client.exists('{}/t1/j=1/j1.txt'.format(trash))
+    assert self.filesystem_client.exists('{}/t1/j=1'.format(trash))
     # Drop the partition (with purge) and make sure it doesn't exist in trash
     self.client.execute("alter table {0}.t1 drop partition(j=2) purge".\
         format(unique_database));
@@ -483,16 +500,10 @@ class TestDdlStatements(TestDdlBase):
       # consistent.
       # The ADLS Python client is not strongly consistent, so these files may still be
       # visible after a DROP. (Remove after IMPALA-5335 is resolved)
-      assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/j=2/j2.txt".\
-          format(unique_database))
-      assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/j=2".\
-          format(unique_database))
-    assert not self.filesystem_client.exists(\
-        "user/{0}/.Trash/Current/test-warehouse/{1}.db/t1/j=2".\
-        format(getpass.getuser(), unique_database))
-    assert not self.filesystem_client.exists(
-        "user/{0}/.Trash/Current/test-warehouse/{1}.db/t1/j=2/j2.txt".\
-        format(getpass.getuser(), unique_database))
+      assert not self.filesystem_client.exists("{}/t1/j=2/j2.txt".format(dbpath))
+      assert not self.filesystem_client.exists("{}/t1/j=2".format(dbpath))
+    assert not self.filesystem_client.exists('{}/t1/j=2/j2.txt'.format(trash))
+    assert not self.filesystem_client.exists('{}/t1/j=2'.format(trash))
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_views_ddl(self, vector, unique_database):
@@ -564,7 +575,7 @@ class TestDdlStatements(TestDdlBase):
             result = self.execute_query_expect_success(
                 client, "describe formatted %s" % view_name)
             exp_line = [l for l in result.data if 'View Expanded' in l][0]
-          except ImpalaBeeswaxException, e:
+          except ImpalaBeeswaxException as e:
             # In non-SYNC_DDL tests, it's OK to get a "missing view" type error
             # until the metadata propagates.
             exp_line = "Exception: %s" % e
@@ -616,7 +627,7 @@ class TestDdlStatements(TestDdlBase):
          "location '{1}/{0}'".format(fq_tbl_name, WAREHOUSE))
 
     # Add some partitions (first batch of two)
-    for i in xrange(num_parts / 5):
+    for i in range(num_parts // 5):
       start = time.time()
       self.client.execute(
           "alter table {0} add partition(j={1}, s='{1}')".format(fq_tbl_name, i))
@@ -638,7 +649,7 @@ class TestDdlStatements(TestDdlBase):
         .format(fq_tbl_name, WAREHOUSE))
 
     # Add some more partitions
-    for i in xrange(num_parts / 5, num_parts):
+    for i in range(num_parts // 5, num_parts):
       start = time.time()
       self.client.execute(
           "alter table {0} add partition(j={1},s='{1}')".format(fq_tbl_name, i))
@@ -649,6 +660,29 @@ class TestDdlStatements(TestDdlBase):
         "insert into table {0} partition(j=1, s='1') select 1".format(fq_tbl_name))
     assert '1' == self.execute_scalar("select count(*) from {0}".format(fq_tbl_name))
 
+  @SkipIfLocal.hdfs_client
+  def test_alter_table_set_fileformat(self, vector, unique_database):
+    # Tests that SET FILEFORMAT clause is set for ALTER TABLE ADD PARTITION statement
+    fq_tbl_name = unique_database + ".p_fileformat"
+    self.client.execute(
+        "create table {0}(i int) partitioned by (p int)".format(fq_tbl_name))
+
+    # Add a partition with Parquet fileformat
+    self.execute_query_expect_success(self.client,
+        "alter table {0} add partition(p=1) set fileformat parquet"
+        .format(fq_tbl_name))
+
+    # Add two partitions with ORC fileformat
+    self.execute_query_expect_success(self.client,
+        "alter table {0} add partition(p=2) partition(p=3) set fileformat orc"
+        .format(fq_tbl_name))
+
+    result = self.execute_query_expect_success(self.client,
+        "SHOW PARTITIONS %s" % fq_tbl_name)
+
+    assert 1 == len([line for line in result.data if line.find("PARQUET") != -1])
+    assert 2 == len([line for line in result.data if line.find("ORC") != -1])
+
   def test_alter_table_create_many_partitions(self, vector, unique_database):
     """
     Checks that creating more partitions than the MAX_PARTITION_UPDATES_PER_RPC
@@ -658,7 +692,7 @@ class TestDdlStatements(TestDdlBase):
         "create table {0}.t(i int) partitioned by (p int)".format(unique_database))
     MAX_PARTITION_UPDATES_PER_RPC = 500
     alter_stmt = "alter table {0}.t add ".format(unique_database) + " ".join(
-        "partition(p=%d)" % (i,) for i in xrange(MAX_PARTITION_UPDATES_PER_RPC + 2))
+        "partition(p=%d)" % (i,) for i in range(MAX_PARTITION_UPDATES_PER_RPC + 2))
     self.client.execute(alter_stmt)
     partitions = self.client.execute("show partitions {0}.t".format(unique_database))
     # Show partitions will contain partition HDFS paths, which we expect to contain
@@ -666,8 +700,8 @@ class TestDdlStatements(TestDdlBase):
     # paths, converts them to integers, and checks that wehave all the ones we
     # expect.
     PARTITION_RE = re.compile("p=([0-9]+)")
-    assert map(int, PARTITION_RE.findall(str(partitions))) == \
-        range(MAX_PARTITION_UPDATES_PER_RPC + 2)
+    assert list(map(int, PARTITION_RE.findall(str(partitions)))) == \
+        list(range(MAX_PARTITION_UPDATES_PER_RPC + 2))
 
   def test_create_alter_tbl_properties(self, vector, unique_database):
     fq_tbl_name = unique_database + ".test_alter_tbl"
@@ -729,8 +763,8 @@ class TestDdlStatements(TestDdlBase):
     tbl_name = "test_tbl"
     self.execute_query_expect_success(self.client, "create table {0}.{1} (c1 string)"
                                       .format(unique_database, tbl_name))
-    self.filesystem_client.create_file("test-warehouse/{0}.db/{1}/f".
-                                       format(unique_database, tbl_name),
+    self.filesystem_client.create_file("{2}/{0}.db/{1}/f".
+                                       format(unique_database, tbl_name, WAREHOUSE),
                                        file_data="\nfoo\n")
     self.execute_query_expect_success(self.client,
                                       "alter table {0}.{1} set tblproperties"
@@ -743,6 +777,7 @@ class TestDdlStatements(TestDdlBase):
     assert result.data[0] == ''
     assert result.data[1] == 'NULL'
 
+  @SkipIfFS.incorrent_reported_ec
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_partition_ddl_predicates(self, vector, unique_database):
     self.run_test_case('QueryTest/partition-ddl-predicates-all-fs', vector,
@@ -878,6 +913,232 @@ class TestDdlStatements(TestDdlBase):
     comment = self._get_column_comment(table, 'j')
     assert "comment4" == comment
 
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  def test_describe_materialized_view(self, vector, unique_database):
+    vector.get_value('exec_option')['abort_on_error'] = False
+    self.run_test_case('QueryTest/describe-materialized-view', vector,
+        use_db=unique_database, multiple_impalad=self._use_multiple_impalad(vector))
+
+# IMPALA-10811: RPC to submit query getting stuck for AWS NLB forever
+# Test HS2, Beeswax and HS2-HTTP three clients.
+class TestAsyncDDL(TestDdlBase):
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestAsyncDDL, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(create_client_protocol_dimension())
+    cls.ImpalaTestMatrix.add_dimension(create_exec_option_dimension(
+        sync_ddl=[0], disable_codegen_options=[False]))
+
+  def test_async_ddl(self, vector, unique_database):
+    self.run_test_case('QueryTest/async_ddl', vector, use_db=unique_database)
+
+  def test_async_ddl_with_JDBC(self, vector, unique_database):
+    self.exec_with_jdbc("drop table if exists {0}.test_table".format(unique_database))
+    self.exec_with_jdbc_and_compare_result(
+        "create table {0}.test_table(a int)".format(unique_database),
+        "'Table has been created.'")
+
+    self.exec_with_jdbc("drop table if exists {0}.alltypes_clone".format(unique_database))
+    self.exec_with_jdbc_and_compare_result(
+        "create table {0}.alltypes_clone as select * from\
+        functional_parquet.alltypes".format(unique_database),
+        "'Inserted 7300 row(s)'")
+
+  @classmethod
+  def test_get_operation_status_for_client(self, client, unique_database,
+          init_state, pending_state, running_state):
+    # Setup
+    client.execute("drop table if exists {0}.alltypes_clone".format(unique_database))
+    client.execute("select count(*) from functional_parquet.alltypes")
+    client.execute("set enable_async_ddl_execution=true")
+    client.execute("set debug_action=\"CRS_DELAY_BEFORE_CATALOG_OP_EXEC:SLEEP@10000\"")
+
+    # Run the test query which will only compile the DDL in execute_statement()
+    # and measure the time spent. Should be less than 3s.
+    start = time.time()
+    handle = client.execute_async(
+        "create table {0}.alltypes_clone as select * from \
+        functional_parquet.alltypes".format(unique_database))
+    end = time.time()
+    assert (end - start <= 3)
+
+    # The table creation and population part will be done in a separate thread.
+    # The repeated call below to get_operation_status() finds out the number of
+    # times that each state is reached in BE for that part of the work.
+    num_times_in_initialized_state = 0
+    num_times_in_pending_state = 0
+    num_times_in_running_state = 0
+    while not client.state_is_finished(handle):
+
+      state = client.get_state(handle)
+
+      if (state == init_state):
+        num_times_in_initialized_state += 1
+
+      if (state == pending_state):
+        num_times_in_pending_state += 1
+
+      if (state == running_state):
+        num_times_in_running_state += 1
+
+    # The query must reach INITIALIZED_STATE 0 time and PENDING_STATE at least
+    # once. The number of times in PENDING_STATE is a function of the length of
+    # the delay. The query reaches RUNNING_STATE when it populates the new table.
+    assert num_times_in_initialized_state == 0
+    assert num_times_in_pending_state > 1
+    assert num_times_in_running_state > 0
+
+  def test_get_operation_status_for_async_ddl(self, vector, unique_database):
+    """Tests that for an asynchronously executed DDL with delay, GetOperationStatus
+    must be issued repeatedly. Test client hs2-http, hs2 and beeswax"""
+
+    if vector.get_value('protocol') == 'hs2-http':
+      self.test_get_operation_status_for_client(self.hs2_http_client, unique_database,
+      "INITIALIZED_STATE", "PENDING_STATE", "RUNNING_STATE")
+
+    if vector.get_value('protocol') == 'hs2':
+      self.test_get_operation_status_for_client(self.hs2_client, unique_database,
+      "INITIALIZED_STATE", "PENDING_STATE", "RUNNING_STATE")
+
+    if vector.get_value('protocol') == 'beeswax':
+      self.test_get_operation_status_for_client(self.client, unique_database,
+      QueryState.INITIALIZED, QueryState.COMPILED, QueryState.RUNNING)
+
+
+class TestAsyncDDLTiming(TestDdlBase):
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestAsyncDDLTiming, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(create_client_protocol_dimension())
+    cls.ImpalaTestMatrix.add_dimension(create_exec_option_dimension(
+        sync_ddl=[0], disable_codegen_options=[False]))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('enable_async_ddl_execution', True, False))
+
+  def test_alter_table_recover(self, vector, unique_database):
+    enable_async_ddl = vector.get_value('enable_async_ddl_execution')
+    client = self.create_impala_client(protocol=vector.get_value('protocol'))
+    is_hs2 = vector.get_value('protocol') in ['hs2', 'hs2-http']
+    pending_state = "PENDING_STATE" if is_hs2 else QueryState.COMPILED
+    running_state = "RUNNING_STATE" if is_hs2 else QueryState.RUNNING
+    finished_state = "FINISHED_STATE" if is_hs2 else QueryState.FINISHED
+
+    try:
+      # Setup for the alter table case (create table that points to an existing
+      # location)
+      alltypes_location = get_fs_path("/test-warehouse/alltypes_parquet")
+      source_tbl = "functional_parquet.alltypes"
+      dest_tbl = "{0}.alltypes_clone".format(unique_database)
+      create_table_stmt = 'create external table {0} like {1} location "{2}"'.format(
+          dest_tbl, source_tbl, alltypes_location)
+      self.execute_query_expect_success(client, create_table_stmt)
+
+      # Describe the table to fetch its metadata
+      self.execute_query_expect_success(client, "describe {0}".format(dest_tbl))
+
+      # Configure whether to use async DDL and add appropriate delays
+      new_vector = deepcopy(vector)
+      new_vector.get_value('exec_option')['enable_async_ddl_execution'] = enable_async_ddl
+      new_vector.get_value('exec_option')['debug_action'] = \
+          "CRS_DELAY_BEFORE_CATALOG_OP_EXEC:SLEEP@10000"
+      exec_start = time.time()
+      alter_stmt = "alter table {0} recover partitions".format(dest_tbl)
+      handle = self.execute_query_async_using_client(client, alter_stmt, new_vector)
+      exec_end = time.time()
+      exec_time = exec_end - exec_start
+      state = client.get_state(handle)
+      if enable_async_ddl:
+        assert state == pending_state or state == running_state
+      else:
+        assert state == running_state or state == finished_state
+
+      # Wait for the statement to finish with a timeout of 20 seconds
+      wait_start = time.time()
+      self.wait_for_state(handle, finished_state, 20, client=client)
+      wait_end = time.time()
+      wait_time = wait_end - wait_start
+      self.close_query_using_client(client, handle)
+      # In sync mode:
+      #  The entire DDL is processed in the exec step with delay. exec_time should be
+      #  more than 10 seconds.
+      #
+      # In async mode:
+      #  The compilation of DDL is processed in the exec step without delay. And the
+      #  processing of the DDL plan is in wait step with delay. The wait time should
+      #  definitely take more time than 10 seconds.
+      if enable_async_ddl:
+        assert(wait_time >= 10)
+      else:
+        assert(exec_time >= 10)
+    finally:
+      client.close()
+
+  def test_ctas(self, vector, unique_database):
+    enable_async_ddl = vector.get_value('enable_async_ddl_execution')
+    client = self.create_impala_client(protocol=vector.get_value('protocol'))
+    is_hs2 = vector.get_value('protocol') in ['hs2', 'hs2-http']
+    pending_state = "PENDING_STATE" if is_hs2 else QueryState.COMPILED
+    finished_state = "FINISHED_STATE" if is_hs2 else QueryState.FINISHED
+
+    try:
+      # The CTAS is going to need the metadata of the source table in the
+      # select. To avoid flakiness about metadata loading, this selects from
+      # that source table first to get the metadata loaded.
+      self.execute_query_expect_success(client,
+          "select count(*) from functional_parquet.alltypes")
+
+      # Configure whether to use async DDL and add appropriate delays
+      new_vector = deepcopy(vector)
+      new_vector.get_value('exec_option')['enable_async_ddl_execution'] = enable_async_ddl
+      create_delay = "CRS_DELAY_BEFORE_CATALOG_OP_EXEC:SLEEP@10000"
+      insert_delay = "CRS_BEFORE_COORD_STARTS:SLEEP@2000"
+      new_vector.get_value('exec_option')['debug_action'] = \
+          "{0}|{1}".format(create_delay, insert_delay)
+      dest_tbl = "{0}.ctas_test".format(unique_database)
+      source_tbl = "functional_parquet.alltypes"
+      ctas_stmt = 'create external table {0} as select * from {1}'.format(
+          dest_tbl, source_tbl)
+      exec_start = time.time()
+      handle = self.execute_query_async_using_client(client, ctas_stmt, new_vector)
+      exec_end = time.time()
+      exec_time = exec_end - exec_start
+      # The CRS_BEFORE_COORD_STARTS delay postpones the transition from PENDING
+      # to RUNNING, so the sync case should be in PENDING state at the end of
+      # the execute call. This means that the sync and async cases are the same.
+      assert client.get_state(handle) == pending_state
+
+      # Wait for the statement to finish with a timeout of 20 seconds
+      # (30 seconds without shortcircuit reads)
+      wait_time = 20 if IS_HDFS else 30
+      wait_start = time.time()
+      self.wait_for_state(handle, finished_state, wait_time, client=client)
+      wait_end = time.time()
+      wait_time = wait_end - wait_start
+      self.close_query_using_client(client, handle)
+      # In sync mode:
+      #  The entire CTAS is processed in the exec step with delay. exec_time should be
+      #  more than 10 seconds.
+      #
+      # In async mode:
+      #  The compilation of CTAS is processed in the exec step without delay. And the
+      #  processing of the CTAS plan is in wait step with delay. The wait time should
+      #  definitely take more time than 10 seconds.
+      if enable_async_ddl:
+        assert(wait_time >= 10)
+      else:
+        assert(exec_time >= 10)
+    finally:
+      client.close()
+
+
 # IMPALA-2002: Tests repeated adding/dropping of .jar and .so in the lib cache.
 class TestLibCache(TestDdlBase):
   @classmethod
@@ -975,7 +1236,7 @@ class TestLibCache(TestDdlBase):
     """
     self.client.set_configuration(vector.get_value("exec_option"))
     for drop_stmt in drop_stmts: self.client.execute(drop_stmt % ("if exists"))
-    for i in xrange(0, num_iterations):
+    for i in range(0, num_iterations):
       for create_stmt in create_stmts: self.client.execute(create_stmt)
       self.client.execute(select_stmt)
       for drop_stmt in drop_stmts: self.client.execute(drop_stmt % (""))

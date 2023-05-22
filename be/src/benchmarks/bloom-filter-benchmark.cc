@@ -21,6 +21,8 @@
 #include <iostream>
 #include <vector>
 
+#include "gen-cpp/data_stream_service.pb.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "runtime/bufferpool/buffer-allocator.h"
 #include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/bufferpool/buffer-pool.h"
@@ -33,8 +35,16 @@
 
 #include "common/names.h"
 
+// kudu::BlockBloomFilter::kCpu is a static variable and is initialized once.
+// To temporarily disable AVX2 for Bloom Filter in runtime testing, set flag
+// disable_blockbloomfilter_avx2 as true. See kudu::BlockBloomFilter::has_avx2().
+// This flag has no effect if the target CPU doesn't support AVX2.
+DECLARE_bool(disable_blockbloomfilter_avx2);
+
 using namespace std;
 using namespace impala;
+
+using kudu::rpc::RpcController;
 
 // Tests Bloom filter performance on:
 //
@@ -191,7 +201,7 @@ void Benchmark(int batch_size, void* data) {
   CHECK(client.IncreaseReservation(BloomFilter::GetExpectedMemoryUsed(*d)));
   for (int i = 0; i < batch_size; ++i) {
     BloomFilter bf(&client);
-    CHECK(bf.Init(*d).ok());
+    CHECK(bf.Init(*d, 0).ok());
     bf.Close();
   }
   env->buffer_pool()->DeregisterClient(&client);
@@ -206,7 +216,7 @@ namespace insert {
 struct TestData {
   explicit TestData(int log_bufferpool_size, BufferPool::ClientHandle* client)
     : bf(client), data(1ull << 20) {
-    CHECK(bf.Init(log_bufferpool_size).ok());
+    CHECK(bf.Init(log_bufferpool_size, 0).ok());
     for (size_t i = 0; i < data.size(); ++i) {
       data[i] = MakeRand();
     }
@@ -240,7 +250,7 @@ struct TestData {
       present(size),
       absent(size),
       result(0) {
-    CHECK(bf.Init(log_bufferpool_size).ok());
+    CHECK(bf.Init(log_bufferpool_size, 0).ok());
     for (size_t i = 0; i < size; ++i) {
       present[i] = MakeRand();
       absent[i] = MakeRand();
@@ -282,19 +292,47 @@ namespace either {
 struct TestData {
   explicit TestData(int log_bufferpool_size, BufferPool::ClientHandle* client) {
     BloomFilter bf(client);
-    CHECK(bf.Init(log_bufferpool_size).ok());
-    BloomFilter::ToThrift(&bf, &tbf1);
-    BloomFilter::ToThrift(&bf, &tbf2);
+    CHECK(bf.Init(log_bufferpool_size, 0).ok());
+
+    RpcController controller1;
+    RpcController controller2;
+    BloomFilter::ToProtobuf(&bf, &controller1, &pbf1);
+    BloomFilter::ToProtobuf(&bf, &controller2, &pbf2);
+
+    // Need to set 'always_false_' of pbf2 to false because
+    // (i) 'always_false_' of a BloomFilter is set to true when the Bloom filter
+    // hasn't had any elements inserted (since nothing is inserted to the
+    /// BloomFilter bf),
+    // (ii) ToProtobuf() will set 'always_false_' of a BloomFilterPB
+    // to true, and
+    // (iii) Or() will check 'always_false_' of the output BloomFilterPB is not true
+    /// before performing the corresponding bit operations.
+    /// The field 'always_false_' was added by IMPALA-5789, which aims to allow
+    /// an HdfsScanner to early terminate the scan at file and split granularities.
+    pbf2.set_always_false(false);
+
+    int64_t directory_size = BloomFilter::GetExpectedMemoryUsed(log_bufferpool_size);
+    string d1(reinterpret_cast<const char*>(bf.GetBlockBloomFilter()->directory().data()),
+        directory_size);
+    string d2(reinterpret_cast<const char*>(bf.GetBlockBloomFilter()->directory().data()),
+        directory_size);
+
+    directory1 = d1;
+    directory2 = d2;
+
     bf.Close();
   }
 
-  TBloomFilter tbf1, tbf2;
+  BloomFilterPB pbf1, pbf2;
+  string directory1, directory2;
 };
 
 void Benchmark(int batch_size, void* data) {
   TestData* d = reinterpret_cast<TestData*>(data);
   for (int i = 0; i < batch_size; ++i) {
-    BloomFilter::Or(d->tbf1, &d->tbf2);
+    BloomFilter::Or(d->pbf1, reinterpret_cast<const uint8_t*>((d->directory1).data()),
+        &(d->pbf2), reinterpret_cast<uint8_t*>(const_cast<char*>((d->directory2).data())),
+        d->directory1.size());
   }
 }
 
@@ -339,7 +377,7 @@ void RunBenchmarks() {
         CHECK(client.IncreaseReservation(
             BloomFilter::GetExpectedMemoryUsed(log_required_size)));
         testdata.emplace_back(
-            new find::TestData(BloomFilter::MinLogSpace(ndv, fpp), &client , ndv));
+            new find::TestData(BloomFilter::MinLogSpace(ndv, fpp), &client, ndv));
         snprintf(name, sizeof(name), "present ndv %7dk fpp %6.1f%%", ndv/1000, fpp*100);
         suite.AddBenchmark(name, find::Present, testdata.back().get());
 
@@ -401,9 +439,9 @@ int main(int argc, char **argv) {
   }
 
   cout << "With AVX2:" << endl << endl;
+  FLAGS_disable_blockbloomfilter_avx2 = false;
   RunBenchmarks();
   cout << endl << "Without AVX or AVX2:" << endl << endl;
-  CpuInfo::TempDisable t1(CpuInfo::AVX);
-  CpuInfo::TempDisable t2(CpuInfo::AVX2);
+  FLAGS_disable_blockbloomfilter_avx2 = true;
   RunBenchmarks();
 }

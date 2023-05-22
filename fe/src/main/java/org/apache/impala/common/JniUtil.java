@@ -20,6 +20,7 @@ package org.apache.impala.common;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.io.Writer;
+import java.lang.StackTraceElement;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
@@ -31,6 +32,8 @@ import java.lang.management.ThreadInfo;
 import java.util.ArrayList;
 import java.util.Map;
 
+import org.apache.commons.lang.StringUtils;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TGetJMXJsonResponse;
 import org.apache.impala.util.JMXJsonUtil;
 import org.apache.thrift.TBase;
@@ -49,7 +52,9 @@ import org.apache.impala.thrift.TJvmMemoryPool;
 import org.apache.impala.thrift.TJvmThreadInfo;
 import org.apache.impala.util.JvmPauseMonitor;
 
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * Utility class with methods intended for JNI clients
  */
@@ -57,7 +62,7 @@ public class JniUtil {
   private final static TBinaryProtocol.Factory protocolFactory_ =
       new TBinaryProtocol.Factory();
 
-  private static final Logger LOG = Logger.getLogger(JniUtil.class);
+  private static final Logger LOG = LoggerFactory.getLogger(JniUtil.class);
 
   /**
    * Initializes the JvmPauseMonitor instance.
@@ -98,8 +103,8 @@ public class JniUtil {
    */
   public static <T extends TBase<?, ?>>
   byte[] serializeToThrift(T input) throws ImpalaException {
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(input);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -111,8 +116,8 @@ public class JniUtil {
    */
   public static <T extends TBase<?, ?>, F extends TProtocolFactory>
   byte[] serializeToThrift(T input, F protocolFactory) throws ImpalaException {
-    TSerializer serializer = new TSerializer(protocolFactory);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory);
       return serializer.serialize(input);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -131,12 +136,96 @@ public class JniUtil {
   void deserializeThrift(F protocolFactory, T result, byte[] thriftData)
       throws ImpalaException {
     // TODO: avoid creating deserializer for each query?
-    TDeserializer deserializer = new TDeserializer(protocolFactory);
     try {
+      TDeserializer deserializer = new TDeserializer(protocolFactory);
       deserializer.deserialize(result, thriftData);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
     }
+  }
+
+  public static class OperationLog {
+    private final long startTime;
+    private final String methodName;
+    private final String shortDescription;
+    private final boolean silentStartAndFinish;
+
+    public OperationLog(
+        String methodName, String shortDescription, boolean silentStartAndFinish) {
+      this.startTime = System.currentTimeMillis();
+      this.methodName = methodName;
+      this.shortDescription = shortDescription;
+      this.silentStartAndFinish = silentStartAndFinish;
+    }
+
+    public void logStart() {
+      final String startFormat = "{} request: {}";
+      if (silentStartAndFinish) {
+        LOG.trace(startFormat, methodName, shortDescription);
+      } else {
+        LOG.info(startFormat, methodName, shortDescription);
+      }
+    }
+
+    public void logFinish() {
+      final String finishFormat = "Finished {} request: {}. Time spent: {}";
+      long duration = getDurationFromStart();
+      String durationString = PrintUtils.printTimeMs(duration);
+      if (silentStartAndFinish) {
+        LOG.trace(finishFormat, methodName, shortDescription, durationString);
+      } else {
+        LOG.info(finishFormat, methodName, shortDescription, durationString);
+      }
+    }
+
+    public void logError() {
+      long duration = getDurationFromStart();
+      LOG.error("Error in {}. Time spent: {}", shortDescription,
+          PrintUtils.printTimeMs(duration));
+    }
+
+    /**
+     * Warn if the result size or the response time exceeds thresholds.
+     */
+    public void logResponse(long resultSize, TBase<?, ?> thriftReq) {
+      long duration = getDurationFromStart();
+      boolean tooLarge =
+          (resultSize > BackendConfig.INSTANCE.getWarnCatalogResponseSize());
+      boolean tooSlow =
+          (duration > BackendConfig.INSTANCE.getWarnCatalogResponseDurationMs());
+      if (tooLarge || tooSlow) {
+        String header = (tooLarge && tooSlow) ?
+            "Response too large and too slow" :
+            (tooLarge ? "Response too large" : "Response too slow");
+        String request = (thriftReq == null) ?
+            "" :
+            ", request: " + StringUtils.abbreviate(thriftReq.toString(), 1000);
+        LOG.warn("{}: size={} ({}), duration={}ms ({}), method: {}{}", header, resultSize,
+            PrintUtils.printBytes(resultSize), duration, PrintUtils.printTimeMs(duration),
+            methodName, request);
+      }
+    }
+
+    private long getDurationFromStart() {
+      return System.currentTimeMillis() - this.startTime;
+    }
+  }
+
+  private static OperationLog logOperationInternal(
+      String methodName, String shortDescription, boolean silentStartAndFinish) {
+    OperationLog operationLog =
+        new OperationLog(methodName, shortDescription, silentStartAndFinish);
+    operationLog.logStart();
+    return operationLog;
+  }
+
+  public static OperationLog logOperation(String methodName, String shortDescription) {
+    return logOperationInternal(methodName, shortDescription, false);
+  }
+
+  public static OperationLog logOperationSilentStartAndFinish(
+      String methodName, String shortDescription) {
+    return logOperationInternal(methodName, shortDescription, true);
   }
 
   /**
@@ -246,7 +335,22 @@ public class JniUtil {
       for (ThreadInfo threadInfo: threadBean.dumpAllThreads(true, true)) {
         TJvmThreadInfo tThreadInfo = new TJvmThreadInfo();
         long id = threadInfo.getThreadId();
-        tThreadInfo.setSummary(threadInfo.toString());
+        // The regular ThreadInfo.toString() method limits the depth of the stacktrace.
+        // To get around this, we use the first line of the toString() output (which
+        // contains non-stacktrace information) and then construct our own stacktrace
+        // based on ThreadInfo.getStackTrace() information.
+        StringBuffer customSummary = new StringBuffer();
+        String regularSummary = threadInfo.toString();
+        int firstNewlineIndex = regularSummary.indexOf("\n");
+        // Keep only the first line from the regular summary
+        customSummary.append(regularSummary.substring(0, firstNewlineIndex));
+        customSummary.append("\n");
+        // Append a full stack trace that mimics how jstack displays the stack
+        // (with indentation and "at")
+        for (StackTraceElement ste : threadInfo.getStackTrace()) {
+          customSummary.append("\tat " + ste.toString() + "\n");
+        }
+        tThreadInfo.setSummary(customSummary.toString());
         tThreadInfo.setCpu_time_in_ns(threadBean.getThreadCpuTime(id));
         tThreadInfo.setUser_time_in_ns(threadBean.getThreadUserTime(id));
         tThreadInfo.setBlocked_count(threadInfo.getBlockedCount());

@@ -20,6 +20,8 @@
 # This module implements helpers for representing queries to be executed by the
 # stress test, loading them and generating them.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import logging
 import os
 from textwrap import dedent
@@ -35,7 +37,7 @@ LOG = logging.getLogger(os.path.splitext(os.path.basename(__file__))[0])
 
 
 class QueryType(object):
-  COMPUTE_STATS, DELETE, INSERT, SELECT, UPDATE, UPSERT = range(6)
+  COMPUTE_STATS, DELETE, INSERT, SELECT, UPDATE, UPSERT = list(range(6))
 
 
 class Query(object):
@@ -115,7 +117,7 @@ def load_tpc_queries(workload):
   LOG.info("Loading %s queries", workload)
   queries = []
   for query_name, query_sql in test_file_parser.load_tpc_queries(workload,
-      include_stress_queries=True).iteritems():
+      include_stress_queries=True).items():
     query = Query()
     query.name = query_name
     query.sql = query_sql

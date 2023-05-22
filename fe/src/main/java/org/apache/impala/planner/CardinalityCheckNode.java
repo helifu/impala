@@ -40,7 +40,7 @@ import com.google.common.base.Preconditions;
 public class CardinalityCheckNode extends PlanNode {
   private final String displayStatement_;
 
-  protected CardinalityCheckNode(PlanNodeId id, PlanNode child, String displayStmt) {
+  public CardinalityCheckNode(PlanNodeId id, PlanNode child, String displayStmt) {
     super(id, "CARDINALITY CHECK");
     Preconditions.checkState(child.getLimit() <= 2);
     cardinality_ = 1;
@@ -76,6 +76,11 @@ public class CardinalityCheckNode extends PlanNode {
     TCardinalityCheckNode cardinalityCheckNode = new TCardinalityCheckNode(
         displayStatement_);
     msg.setCardinality_check_node(cardinalityCheckNode);
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = computeDefaultProcessingCost();
   }
 
   @Override

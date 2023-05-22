@@ -15,18 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfLocal, SkipIfEC
+from tests.common.network import get_external_ip
+from tests.common.skip import SkipIfLocal
 from tests.util.filesystem_utils import (
     IS_ISILON,
-    IS_ABFS,
-    IS_ADLS)
+    IS_ADLS,
+    IS_GCS,
+    IS_COS,
+    IS_OSS)
 from time import sleep
 
+
 @SkipIfLocal.hdfs_fd_caching
-@SkipIfEC.remote_read
 class TestHdfsFdCaching(CustomClusterTestSuite):
   """Tests that if HDFS file handle caching is enabled, file handles are actually cached
   and the associated metrics return valid results. In addition, tests that the upper bound
@@ -119,20 +124,20 @@ class TestHdfsFdCaching(CustomClusterTestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args="--max_cached_file_handles=16 " +
-          " --unused_file_handle_timeout_sec=18446744073709551600",
+      impalad_args="--max_cached_file_handles=16"
+                   " --unused_file_handle_timeout_sec=18446744073709551600",
       catalogd_args="--load_catalog_in_background=false")
   def test_caching_enabled(self, vector):
     """
     Test of the HDFS file handle cache with the parameter specified and a very
     large file handle timeout
     """
-
     cache_capacity = 16
 
-    # Caching applies to HDFS and S3 files. If this is HDFS or S3, then verify
-    # that caching works. Otherwise, verify that file handles are not cached.
-    if IS_ABFS or IS_ADLS or IS_ISILON:
+    # Caching applies to HDFS, Ozone, S3, and ABFS files. If this is HDFS, Ozone, S3, or
+    # ABFS, then verify that caching works. Otherwise, verify that file handles are not
+    # cached.
+    if IS_ADLS or IS_ISILON or IS_GCS or IS_COS or IS_OSS:
       caching_expected = False
     else:
       caching_expected = True
@@ -148,7 +153,7 @@ class TestHdfsFdCaching(CustomClusterTestSuite):
     handle_timeout = 5
 
     # Only test eviction on platforms where caching is enabled.
-    if IS_ABFS or IS_ADLS or IS_ISILON:
+    if IS_ADLS or IS_ISILON or IS_GCS or IS_COS or IS_OSS:
       return
     caching_expected = True
     self.run_fd_caching_test(vector, caching_expected, cache_capacity, handle_timeout)
@@ -162,6 +167,74 @@ class TestHdfsFdCaching(CustomClusterTestSuite):
     cache_capacity = 0
     caching_expected = False
     self.run_fd_caching_test(vector, caching_expected, cache_capacity, None)
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--cache_remote_file_handles=false --cache_s3_file_handles=false "
+                   "--cache_abfs_file_handles=false --cache_ozone_file_handles=false "
+                   "--hostname=" + get_external_ip(),
+      catalogd_args="--load_catalog_in_background=false")
+  def test_remote_caching_disabled_by_param(self, vector):
+    """Test that the file handle cache is disabled for remote files when disabled"""
+    cache_capacity = 0
+    caching_expected = False
+    self.run_fd_caching_test(vector, caching_expected, cache_capacity, None)
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--max_cached_file_handles=0 --hostname=" + get_external_ip(),
+      catalogd_args="--load_catalog_in_background=false")
+  def test_remote_caching_disabled_by_global_param(self, vector):
+    """Test that the file handle cache is disabled for remote files when all caching is
+    disabled"""
+    cache_capacity = 0
+    caching_expected = False
+    self.run_fd_caching_test(vector, caching_expected, cache_capacity, None)
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--max_cached_file_handles=16 --unused_file_handle_timeout_sec=5 "
+                   "--always_use_data_cache=true",
+      start_args="--data_cache_dir=/tmp --data_cache_size=500MB",
+      catalogd_args="--load_catalog_in_background=false")
+  def test_no_fd_caching_on_cached_data(self, vector):
+    """IMPALA-10147: Test that no file handle should be opened nor cached again if data
+    is being read from data cache."""
+    cache_capacity = 16
+    eviction_timeout_secs = 5
+
+    # Only test eviction on platforms where caching is enabled.
+    if IS_ADLS or IS_ISILON or IS_GCS or IS_COS or IS_OSS:
+      return
+
+    # Maximum number of file handles cached.
+    assert self.max_cached_handles() <= cache_capacity
+
+    num_handles_start = self.cached_handles()
+    # The table has one file. If caching is expected, there should be one more
+    # handle cached after the first select. If caching is not expected, the
+    # number of handles should not change from the initial number.
+    # Read 5 times to make sure the data cache is fully warmed up.
+    for x in range(5):
+      self.execute_query("select * from cachefd.simple", vector=vector)
+      num_handles_after = self.cached_handles()
+      assert self.max_cached_handles() <= cache_capacity
+      assert num_handles_after == (num_handles_start + 1)
+
+    # No open handles if scanning is finished.
+    assert self.outstanding_handles() == 0
+
+    # To test unused file handle eviction, sleep for longer than the timeout.
+    # All the cached handles should be evicted.
+    sleep(eviction_timeout_secs + 5)
+    assert self.cached_handles() == 0
+
+    # Reread from data cache. Expect that no handle should be opened nor cached again.
+    for x in range(10):
+      self.execute_query("select * from cachefd.simple", vector=vector)
+      assert self.cached_handles() == 0
+      assert self.max_cached_handles() <= cache_capacity
+      assert self.outstanding_handles() == 0
 
   def cached_handles(self):
     return self.get_agg_metric("impala-server.io.mgr.num-cached-file-handles")

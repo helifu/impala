@@ -17,10 +17,12 @@
 #
 # Filsystem access abstraction
 
+from __future__ import absolute_import, division, print_function
 from abc import ABCMeta, abstractmethod
+from future.utils import with_metaclass
 
-class BaseFilesystem(object):
-  __metaclass__ = ABCMeta
+
+class BaseFilesystem(with_metaclass(ABCMeta, object)):
 
   @abstractmethod
   def create_file(self, path, file_data, overwrite):
@@ -68,4 +70,11 @@ class BaseFilesystem(object):
   def get_all_file_sizes(self, path):
     """Returns a list of integers which are all the file sizes of files found under
     'path'."""
+    pass
+
+  @abstractmethod
+  def touch(self, paths):
+    """Updates the access and modification times of the files specified by 'paths' to
+    the current time. If the files don't exist, zero length files will be created with
+    current time as the timestamp of them."""
     pass

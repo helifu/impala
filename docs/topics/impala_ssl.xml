@@ -38,7 +38,7 @@ under the License.
     <p>
       Impala supports TLS/SSL network encryption, between Impala and client programs, and
       between the Impala-related daemons running on different nodes in the cluster. This feature
-      is important when you also use other features such as Kerberos authentication or Sentry
+      is important when you also use other features such as Kerberos authentication or Ranger
       authorization, where credentials are being transmitted back and forth.
     </p>
 
@@ -166,8 +166,7 @@ under the License.
       <ul>
         <li>
           <p>
-            <codeph>tlsv1</codeph>: Allow any TLS version of 1.0 or higher. This setting is the
-            default when TLS/SSL is enabled.
+            <codeph>tlsv1</codeph>: Allow any TLS version of 1.0 or higher.
           </p>
         </li>
 
@@ -185,6 +184,10 @@ under the License.
       </ul>
 
       <p>
+        The default version was changed from 'tlsv1' to 'tlsv1.2' starting in <keyword keyref="impala40"/>
+      </p>
+
+      <p>
         Along with specifying the version, you can also specify the allowed set of TLS ciphers
         by using the <codeph>--ssl_cipher_list</codeph> configuration setting. The argument to
         this option is a list of keywords, separated by colons, commas, or spaces, and
@@ -196,9 +199,13 @@ under the License.
 </codeblock>
 
       <p>
-        By default, the cipher list is empty, and Impala uses the default cipher list for the
-        underlying platform. See the output of <cmdname>man ciphers</cmdname> for the full set
+        See the output of <cmdname>man ciphers</cmdname> for the full set
         of keywords and notation allowed in the argument string.
+        Since <keyword keyref="impala42"/> the default value of <codeph>--ssl_cipher_list</codeph>
+        is a set of ciphers based on Mozilla's intermediate compatibility recommendations
+        from https://wiki.mozilla.org/Security/Server_Side_TLS.
+        Prior to <keyword keyref="impala42"/> the default was unset, and Impala used the default
+        cipher list for the underlying platform.
       </p>
 
     </conbody>

@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.List;
 
 import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function.CompareMode;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.Type;
@@ -32,7 +33,7 @@ import org.apache.impala.extdatasource.thrift.TComparisonOp;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
@@ -74,6 +75,15 @@ public class BinaryPredicate extends Predicate {
     public String getName() { return name_; }
     public TComparisonOp getThriftOp() { return thriftOp_; }
     public boolean isEquivalence() { return this == EQ || this == NOT_DISTINCT; }
+    public boolean isSqlEquivalence() { return this == EQ; }
+
+
+    /**
+     * Test if the operator specifies a single range.
+    **/
+    public boolean isSingleRange() {
+      return this == EQ || this == LE || this == GE || this == LT || this == GT;
+    }
 
     public Operator converse() {
       switch (this) {
@@ -91,6 +101,24 @@ public class BinaryPredicate extends Predicate {
       }
     }
   }
+
+  public static final com.google.common.base.Predicate<BinaryPredicate>
+      IS_RANGE_PREDICATE = new com.google.common.base.Predicate<BinaryPredicate>() {
+        @Override
+        public boolean apply(BinaryPredicate arg) {
+          return arg.getOp() == Operator.LT
+              || arg.getOp() == Operator.LE
+              || arg.getOp() == Operator.GT
+              || arg.getOp() == Operator.GE;
+        }
+      };
+  public static final com.google.common.base.Predicate<BinaryPredicate> IS_EQ_PREDICATE =
+      new com.google.common.base.Predicate<BinaryPredicate>() {
+        @Override
+        public boolean apply(BinaryPredicate arg) {
+          return arg.getOp() == Operator.EQ;
+        }
+      };
 
   public static void initBuiltins(Db db) {
     for (Type t: Type.getSupportedTypes()) {
@@ -162,7 +190,7 @@ public class BinaryPredicate extends Predicate {
 
   @Override
   public String debugString() {
-    Objects.ToStringHelper toStrHelper = Objects.toStringHelper(this);
+    MoreObjects.ToStringHelper toStrHelper = MoreObjects.toStringHelper(this);
     toStrHelper.add("op", op_).addValue(super.debugString());
     if (isAuxExpr()) toStrHelper.add("isAux", true);
     if (isInferred_) toStrHelper.add("isInferred", true);
@@ -211,17 +239,72 @@ public class BinaryPredicate extends Predicate {
     }
 
     // Determine selectivity
+    computeSelectivity();
+  }
+
+  protected void computeSelectivity() {
     // TODO: Compute selectivity for nested predicates.
     // TODO: Improve estimation using histograms.
+    if (hasValidSelectivityHint()) {
+      return;
+    }
+
     Reference<SlotRef> slotRefRef = new Reference<SlotRef>();
-    if ((op_ == Operator.EQ || op_ == Operator.NOT_DISTINCT)
-        && isSingleColumnPredicate(slotRefRef, null)) {
-      long distinctValues = slotRefRef.getRef().getNumDistinctValues();
-      if (distinctValues > 0) {
-        selectivity_ = 1.0 / distinctValues;
-        selectivity_ = Math.max(0, Math.min(1, selectivity_));
+    if (!isSingleColumnPredicate(slotRefRef, null)) {
+      return;
+    }
+    boolean rChildIsNull = Expr.IS_NULL_LITERAL.apply(getChild(1));
+    long distinctValues = slotRefRef.getRef().getNumDistinctValues();
+    if (distinctValues < 0) {
+      // Lack of statistics to estimate the selectivity.
+      return;
+    } else if ((distinctValues == 0 && (op_ == Operator.EQ || op_ == Operator.NE))
+        || (rChildIsNull && (op_ == Operator.EQ || op_ == Operator.NE))) {
+      // If the table is empty, then distinctValues is 0. This case is equivalent
+      // to selectivity is 0.
+      // For case <column> = NULL or <column> != NULL, all values are false
+      selectivity_ = 0.0;
+      return;
+    }
+
+    if (op_ == Operator.EQ || op_ == Operator.NOT_DISTINCT) {
+      selectivity_ = 1.0 / distinctValues;
+    } else if (op_ == Operator.NE || op_ == Operator.DISTINCT_FROM) {
+      // For case <column> IS DISTINCT FROM NULL, all non-null values are true
+      if (op_ == Operator.DISTINCT_FROM && rChildIsNull) {
+        selectivity_ = 1.0;
+      } else {
+        // avoid 0.0 selectivity if ndv == 1 (IMPALA-11301).
+        selectivity_ = distinctValues == 1 ? 0.5 : (1.0 - 1.0 / distinctValues);
+      }
+    } else {
+      return;
+    }
+
+    SlotDescriptor slotDesc = slotRefRef.getRef().getDesc();
+    if (slotDesc.getStats().hasNullsStats()) {
+      FeTable table = slotDesc.getParent().getTable();
+      if (table != null && table.getNumRows() > 0) {
+        long numRows = table.getNumRows();
+        long numNulls = slotDesc.getStats().getNumNulls();
+        if (op_ == Operator.EQ || op_ == Operator.NE
+            || (op_ == Operator.DISTINCT_FROM && rChildIsNull)
+            || (op_ == Operator.NOT_DISTINCT && !rChildIsNull)) {
+          // For =, !=, "is distinct from null" and "is not distinct from non-null",
+          // all null values are false.
+          selectivity_ *= (double) (numRows - numNulls) / numRows;
+        } else if (op_ == Operator.NOT_DISTINCT && rChildIsNull) {
+          // For is not distinct from null, only null values are true
+          selectivity_ = numNulls / numRows;
+        } else if (op_ == Operator.DISTINCT_FROM && !rChildIsNull) {
+          // For is distinct from not-null, null values are true, So need to add it
+          selectivity_ = selectivity_ * (double) (numRows - numNulls) / numRows +
+              numNulls / numRows;
+        }
       }
     }
+
+    selectivity_ = Math.max(0, Math.min(1, selectivity_));
   }
 
   @Override

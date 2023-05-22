@@ -15,9 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
+from tests.common.parametrize import UniqueDatabase
+from tests.common.skip import SkipIfFS
 
 
 class TestDisableFeatures(CustomClusterTestSuite):
@@ -27,7 +30,32 @@ class TestDisableFeatures(CustomClusterTestSuite):
   def get_workload(self):
     return 'functional-query'
 
+  @SkipIfFS.hdfs_caching
   @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args("--enable_orc_scanner=false")
-  def test_disable_orc_scanner(self, vector):
-    self.run_test_case('QueryTest/disable-orc-scanner', vector)
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  @CustomClusterTestSuite.with_args(
+    catalogd_args="--enable_incremental_metadata_updates=false")
+  def test_disable_incremental_metadata_updates(self, vector, unique_database):
+    """Canary tests for disabling incremental metadata updates. Copy some partition
+    related tests in metadata/test_ddl.py here."""
+    vector.get_value('exec_option')['sync_ddl'] = True
+    self.run_test_case('QueryTest/alter-table-hdfs-caching', vector,
+        use_db=unique_database, multiple_impalad=True)
+    self.run_test_case('QueryTest/alter-table-set-column-stats', vector,
+        use_db=unique_database, multiple_impalad=True)
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args("--allow_ordinals_in_having=true")
+  def test_allow_ordinals_in_having(self, vector):
+    """Mirror the FE tests in AnalyzeStmtsTest#TestHavingIntegers to make sure the flag
+       can bring back the legacy feature"""
+    self.client.execute("select not bool_col as nb from functional.alltypes having 1")
+    self.execute_query_expect_failure(
+        self.client, "select count(*) from functional.alltypes having 1")
+    self.client.execute("select count(*) > 10 from functional.alltypes having 1")
+    self.execute_query_expect_failure(
+        self.client,
+        "select sum(id) over(order by id) from functional.alltypes having 1")
+    self.execute_query_expect_failure(
+        self.client,
+        "select sum(id) over(order by id) from functional.alltypes having -1")

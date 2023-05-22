@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_dimensions import create_client_protocol_dimension
 
@@ -1160,6 +1162,10 @@ class TestCastWithFormat(ImpalaTestSuite):
         "timestamp FORMAT 'YYYY-MM-DD HH12:MI A.M.TZH:TZM')")
     assert result.data == ["2018-12-31 08:00:00"]
 
+    result = self.client.execute("select cast('2018-12-31 08:00 AM-+1:10' as "
+        "timestamp FORMAT 'YYYY-MM-DD HH12:MI A.M. TZH:TZM')")
+    assert result.data == ["2018-12-31 08:00:00"]
+
     # Invalid TZH and TZM
     result = self.client.execute("select cast('2016-01-01 10:00 AM +16:00' as "
         "timestamp FORMAT 'YYYY-MM-DD HH12:MI A.M. TZH:TZM')")
@@ -1451,6 +1457,12 @@ class TestCastWithFormat(ImpalaTestSuite):
         r''' 'FXYYYY-"\\\'"-MM-DD') ''')
     assert result.data == ["2010-02-01"]
 
+    # Test error message where format contains text token with escaped double quote.
+    err = self.execute_query_expect_failure(self.client,
+        r'''select cast('1985-AB"CD11-23' as date format 'YYYY-"AB\"C"MM-DD')''')
+    assert (r'''String to Date parse failed. Input '1985-AB"CD11-23' doesn't match '''
+        r'''with format 'YYYY-"AB\"C"MM-DD''' in str(err))
+
   def test_iso8601_week_based_date_tokens(self):
     # Format 0001-01-01 and 9999-12-31 dates.
     # 0001-01-01 is Monday, belongs to the 1st week of year 1.
@@ -1470,10 +1482,12 @@ class TestCastWithFormat(ImpalaTestSuite):
     # Year 9999 has 52 weeks. 9999-12-31 is Friday.
     err = self.execute_query_expect_failure(self.client,
         "select cast('9999/52/06' as date format 'IYYY/IW/ID')")
-    assert 'String to Date parse failed. Invalid string val: "9999/52/06"' in str(err)
+    assert (r'''String to Date parse failed. Input '9999/52/06' doesn't match with '''
+        r'''format 'IYYY/IW/ID''' in str(err))
     err = self.execute_query_expect_failure(self.client,
         "select cast('9999/53/01' as date format 'IYYY/IW/ID')")
-    assert 'String to Date parse failed. Invalid string val: "9999/53/01"' in str(err)
+    assert (r'''String to Date parse failed. Input '9999/53/01' doesn't match with '''
+        r'''format 'IYYY/IW/ID''' in str(err))
 
     # Format 1400-01-01 and 9999-12-31 timestamps.
     # 1400-01-01 is Wednesday, belongs to the 1st week of year 1400.
@@ -1525,7 +1539,8 @@ class TestCastWithFormat(ImpalaTestSuite):
 
     err = self.execute_query_expect_failure(self.client,
         "select cast('2019/53/01' as date format 'IYYY/IW/ID')")
-    assert 'String to Date parse failed. Invalid string val: "2019/53/01"' in str(err)
+    assert (r'''String to Date parse failed. Input '2019/53/01' doesn't match with '''
+        r'''format 'IYYY/IW/ID''' in str(err))
 
     # Format 4, 3, 2, 1-digit week numbering year.
     # 2020-01-01 is Wednesday, belongs to week 1 of year 2020.
@@ -1666,7 +1681,8 @@ class TestCastWithFormat(ImpalaTestSuite):
     assert result.data == ["NULL\tNULL\tNULL\tNULL\tNULL"]
     err = self.execute_query_expect_failure(self.client,
         "select cast('2015/3/05' as date format 'FXIYYY/IW/ID')")
-    assert 'String to Date parse failed. Invalid string val: "2015/3/05"' in str(err)
+    assert (r'''String to Date parse failed. Input '2015/3/05' doesn't match with '''
+        r'''format 'FXIYYY/IW/ID''' in str(err))
 
     query_options = dict({'now_string': '2019-01-01 11:11:11'})
     result = self.execute_query(
@@ -2018,24 +2034,37 @@ class TestCastWithFormat(ImpalaTestSuite):
 
     # Multiple fraction second token conflict
     err = self.execute_query_expect_failure(self.client,
-        "select cast('2018-10-10' as timestamp format 'FF FF1')")
+        "select cast('2018-10-10' as timestamp format 'YYYY-MM-DD FF FF1')")
     assert "Multiple fractional second tokens provided." in str(err)
 
     err = self.execute_query_expect_failure(self.client,
-        "select cast('2018-10-10' as timestamp format 'FF2 FF3')")
+        "select cast('2018-10-10' as timestamp format 'YYYY-MM-DD FF2 FF3')")
     assert "Multiple fractional second tokens provided." in str(err)
 
     err = self.execute_query_expect_failure(self.client,
-        "select cast('2018-10-10' as timestamp format 'FF4 FF5')")
+        "select cast('2018-10-10' as timestamp format 'YYYY-MM-DD FF4 FF5')")
     assert "Multiple fractional second tokens provided." in str(err)
 
     err = self.execute_query_expect_failure(self.client,
-        "select cast('2018-10-10' as timestamp format 'FF6 FF7')")
+        "select cast('2018-10-10' as timestamp format 'YYYY-MM-DD FF6 FF7')")
     assert "Multiple fractional second tokens provided." in str(err)
 
     err = self.execute_query_expect_failure(self.client,
-        "select cast('2018-10-10' as timestamp format 'FF8 FF9')")
+        "select cast('2018-10-10' as timestamp format 'YYYY-MM-DD FF8 FF9')")
     assert "Multiple fractional second tokens provided." in str(err)
+
+    # No date token
+    err = self.execute_query_expect_failure(self.client,
+        "select cast('2020-05-05' as timestamp format 'FF1')")
+    assert "No date tokens provided." in str(err)
+
+    err = self.execute_query_expect_failure(self.client,
+        "select cast('2020-05-05' as timestamp format 'SSSSS')")
+    assert "No date tokens provided." in str(err)
+
+    err = self.execute_query_expect_failure(self.client,
+        "select cast('2020-05-05' as timestamp format 'HH:MI:SS')")
+    assert "No date tokens provided." in str(err)
 
     # ISO 8601 Week-based and normal date pattern tokens must not be mixed.
     err = self.execute_query_expect_failure(self.client,

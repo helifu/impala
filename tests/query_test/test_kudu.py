@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from kudu.schema import (
     BOOL,
     DOUBLE,
@@ -28,26 +30,69 @@ from kudu.schema import (
     BINARY,
     UNIXTIME_MICROS)
 from kudu.client import Partitioning
+from kudu.util import to_unixtime_micros
 import logging
 import pytest
 import random
+import re
 import textwrap
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, date
 from pytz import utc
 
 from tests.common.environ import ImpalaTestClusterProperties, HIVE_MAJOR_VERSION
 from tests.common.kudu_test_suite import KuduTestSuite
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.skip import SkipIfNotHdfsMinicluster, SkipIfKudu, SkipIfHive2
-from tests.common.test_dimensions import add_exec_option_dimension
+from tests.common.test_dimensions import (add_exec_option_dimension,
+    extend_exec_option_dimension)
 from tests.verifiers.metric_verifier import MetricVerifier
 
 KUDU_MASTER_HOSTS = pytest.config.option.kudu_master_hosts
 IMPALA_TEST_CLUSTER_PROPERTIES = ImpalaTestClusterProperties.get_instance()
 
 LOG = logging.getLogger(__name__)
+
+
+# TODO(IMPALA-8614): parameterize some tests to run with HMS integration enabled.
+class TestKuduBasicDML(KuduTestSuite):
+  """
+  This suite tests the basic DML operations when using a kudu table.
+  """
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestKuduBasicDML, cls).add_test_dimensions()
+    # The default read mode of READ_LATEST does not provide high enough consistency for
+    # these tests.
+    add_exec_option_dimension(cls, "kudu_read_mode", "READ_AT_SNAPSHOT")
+    # Run with and without multithreading to ensure Kudu DML works with both threading
+    # models. E.g. see IMPALA-9782.
+    add_exec_option_dimension(cls, "mt_dop", "0")
+    extend_exec_option_dimension(cls, "mt_dop", "4")
+
+  @SkipIfKudu.no_hybrid_clock
+  def test_kudu_insert(self, vector, unique_database):
+    self.run_test_case('QueryTest/kudu_insert', vector, use_db=unique_database)
+
+  @SkipIfKudu.no_hybrid_clock
+  def test_kudu_update(self, vector, unique_database):
+    self.run_test_case('QueryTest/kudu_update', vector, use_db=unique_database)
+
+  @SkipIfKudu.no_hybrid_clock
+  def test_kudu_upsert(self, vector, unique_database):
+    self.run_test_case('QueryTest/kudu_upsert', vector, use_db=unique_database)
+
+  @SkipIfKudu.no_hybrid_clock
+  def test_kudu_delete(self, vector, unique_database):
+    self.run_test_case('QueryTest/kudu_delete', vector, use_db=unique_database)
+
+  @SkipIfKudu.no_hybrid_clock
+  def test_kudu_create_table_like_table(self, vector, unique_database):
+    self.run_test_case(
+      'QueryTest/kudu_create_table_like_table',
+      vector,
+      use_db=unique_database)
 
 # TODO(IMPALA-8614): parameterize some tests to run with HMS integration enabled.
 class TestKuduOperations(KuduTestSuite):
@@ -66,6 +111,7 @@ class TestKuduOperations(KuduTestSuite):
   @SkipIfKudu.hms_integration_enabled
   def test_out_of_range_timestamps(self, vector, cursor, kudu_client, unique_database):
     """Test timestamp values that are outside of Impala's supported date range."""
+    cursor.execute("set kudu_read_mode=READ_AT_SNAPSHOT")
     cursor.execute("""CREATE TABLE %s.times (a INT PRIMARY KEY, ts TIMESTAMP)
         PARTITION BY HASH(a) PARTITIONS 3 STORED AS KUDU""" % unique_database)
     assert kudu_client.table_exists(
@@ -81,6 +127,8 @@ class TestKuduOperations(KuduTestSuite):
     #session.apply(table.new_insert((2, datetime(12000, 1, 1, 0, 0, tzinfo=utc))))
     session.flush()
 
+    cursor.execute("set kudu_snapshot_read_timestamp_micros=%s" %
+        to_unixtime_micros(kudu_client.latest_observed_timestamp()))
     # TODO: The test driver should have a way to specify query options in an 'options'
     # section rather than having to split abort_on_error cases into separate files.
     vector.get_value('exec_option')['abort_on_error'] = 0
@@ -94,27 +142,10 @@ class TestKuduOperations(KuduTestSuite):
   @SkipIfKudu.no_hybrid_clock
   def test_kudu_scan_node(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu-scan-node', vector, use_db=unique_database)
-
-  @SkipIfKudu.no_hybrid_clock
-  def test_kudu_insert(self, vector, unique_database):
-    self.run_test_case('QueryTest/kudu_insert', vector, use_db=unique_database)
-
   @SkipIfNotHdfsMinicluster.tuned_for_minicluster
   @SkipIfKudu.no_hybrid_clock
   def test_kudu_insert_mem_limit(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_insert_mem_limit', vector, use_db=unique_database)
-
-  @SkipIfKudu.no_hybrid_clock
-  def test_kudu_update(self, vector, unique_database):
-    self.run_test_case('QueryTest/kudu_update', vector, use_db=unique_database)
-
-  @SkipIfKudu.no_hybrid_clock
-  def test_kudu_upsert(self, vector, unique_database):
-    self.run_test_case('QueryTest/kudu_upsert', vector, use_db=unique_database)
-
-  @SkipIfKudu.no_hybrid_clock
-  def test_kudu_delete(self, vector, unique_database):
-    self.run_test_case('QueryTest/kudu_delete', vector, use_db=unique_database)
 
   @SkipIfKudu.no_hybrid_clock
   def test_kudu_partition_ddl(self, vector, unique_database):
@@ -167,6 +198,7 @@ class TestKuduOperations(KuduTestSuite):
       self, cursor, kudu_client, unique_database, cluster_properties):
     """Test changing a Kudu column outside of Impala results in a failure on read with
        outdated metadata (IMPALA-4828)."""
+    cursor.execute("set kudu_read_mode=READ_AT_SNAPSHOT")
     cursor.execute("""CREATE TABLE %s.foo (a INT PRIMARY KEY, s STRING)
         PARTITION BY HASH(a) PARTITIONS 3 STORED AS KUDU""" % unique_database)
     assert kudu_client.table_exists(
@@ -191,6 +223,8 @@ class TestKuduOperations(KuduTestSuite):
       session.apply(op)
     session.flush()
 
+    cursor.execute("set kudu_snapshot_read_timestamp_micros=%s" %
+        to_unixtime_micros(kudu_client.latest_observed_timestamp()))
     # Scanning should result in an error with Catalog V1, since the metadata is cached.
     try:
       cursor.execute("SELECT * FROM %s.foo" % (unique_database))
@@ -212,6 +246,7 @@ class TestKuduOperations(KuduTestSuite):
       self, cursor, kudu_client, unique_database, cluster_properties):
     """Test changing a NOT NULL Kudu column outside of Impala results in a failure
        on read with outdated metadata (IMPALA-4828)."""
+    cursor.execute("set kudu_read_mode=READ_AT_SNAPSHOT")
     cursor.execute("""CREATE TABLE %s.foo (a INT PRIMARY KEY, s STRING NOT NULL)
         PARTITION BY HASH(a) PARTITIONS 3 STORED AS KUDU""" % unique_database)
     assert kudu_client.table_exists(
@@ -236,6 +271,8 @@ class TestKuduOperations(KuduTestSuite):
       session.apply(op)
     session.flush()
 
+    cursor.execute("set kudu_snapshot_read_timestamp_micros=%s" %
+        to_unixtime_micros(kudu_client.latest_observed_timestamp()))
     # Scanning should result in an error
     try:
       cursor.execute("SELECT * FROM %s.foo" % (unique_database))
@@ -258,6 +295,7 @@ class TestKuduOperations(KuduTestSuite):
       self, cursor, kudu_client, unique_database, cluster_properties):
     """Test changing a NULL Kudu column outside of Impala results in a failure
        on read with outdated metadata (IMPALA-4828)."""
+    cursor.execute("set kudu_read_mode=READ_AT_SNAPSHOT")
     cursor.execute("""CREATE TABLE %s.foo (a INT PRIMARY KEY, s STRING NULL)
         PARTITION BY HASH(a) PARTITIONS 3 STORED AS KUDU""" % unique_database)
     assert kudu_client.table_exists(
@@ -282,6 +320,8 @@ class TestKuduOperations(KuduTestSuite):
       session.apply(op)
     session.flush()
 
+    cursor.execute("set kudu_snapshot_read_timestamp_micros=%s" %
+        to_unixtime_micros(kudu_client.latest_observed_timestamp()))
     # Scanning should result in an error
     try:
       cursor.execute("SELECT * FROM %s.foo" % (unique_database))
@@ -302,6 +342,7 @@ class TestKuduOperations(KuduTestSuite):
 
   def test_kudu_col_added(self, cursor, kudu_client, unique_database, cluster_properties):
     """Test adding a Kudu column outside of Impala."""
+    cursor.execute("set kudu_read_mode=READ_AT_SNAPSHOT")
     cursor.execute("""CREATE TABLE %s.foo (a INT PRIMARY KEY)
         PARTITION BY HASH(a) PARTITIONS 3 STORED AS KUDU""" % unique_database)
     assert kudu_client.table_exists(
@@ -322,6 +363,8 @@ class TestKuduOperations(KuduTestSuite):
     session.apply(op)
     session.flush()
 
+    cursor.execute("set kudu_snapshot_read_timestamp_micros=%s" %
+        to_unixtime_micros(kudu_client.latest_observed_timestamp()))
     cursor.execute("SELECT * FROM %s.foo" % (unique_database))
     if cluster_properties.is_catalog_v2_cluster():
       # Changes in Kudu should be immediately visible to Impala with Catalog V2.
@@ -409,11 +452,12 @@ class TestKuduOperations(KuduTestSuite):
       pytest.skip("Only runs in exhaustive to reduce core time.")
     table_name = "%s.storage_attrs" % unique_database
     types = ['boolean', 'tinyint', 'smallint', 'int', 'bigint', 'float', 'double', \
-        'string', 'timestamp', 'decimal']
+        'string', 'timestamp', 'decimal', 'date', 'varchar(10)']
     cursor.execute("set kudu_read_mode=READ_AT_SNAPSHOT")
     create_query = "create table %s (id int primary key" % table_name
     for t in types:
-      create_query += ", %s_col %s" % (t, t)
+      # We truncate the type attributes in the column name to keep things simple.
+      create_query += ", %s_col %s" % (t.split('(')[0], t)
     create_query += ") partition by hash(id) partitions 16 stored as kudu"
     cursor.execute(create_query)
 
@@ -425,18 +469,21 @@ class TestKuduOperations(KuduTestSuite):
       for c in compressions:
         for t in types:
           try:
+            # We truncate the type attributes in the column name to keep things simple.
             cursor.execute("""alter table %s alter column %s_col
-                set encoding %s compression %s""" % (table_name, t, e, c))
+                set encoding %s compression %s""" % (table_name, t.split('(')[0], e, c))
           except Exception as err:
             assert "encoding %s not supported for type" % e in str(err)
         cursor.execute("""insert into %s values (%s, true, 0, 0, 0, 0, 0, 0, '0',
-            cast('2009-01-01' as timestamp), cast(0 as decimal))""" % (table_name, i))
+            cast('2009-01-01' as timestamp), cast(0 as decimal),
+            cast('2010-01-01' as date), cast('' as varchar(10)))""" % (table_name, i))
         cursor.execute("select * from %s where id = %s" % (table_name, i))
         assert cursor.fetchall() == \
-            [(i, True, 0, 0, 0, 0, 0.0, 0.0, '0', datetime(2009, 1, 1, 0, 0), 0)]
+            [(i, True, 0, 0, 0, 0, 0.0, 0.0, '0', datetime(2009, 1, 1, 0, 0), 0,
+                date(2010, 1, 1), '')]
         i += 1
     cursor.execute("select count(*) from %s" % table_name)
-    print cursor.fetchall() == [(i, )]
+    print(cursor.fetchall() == [(i, )])
 
   def test_concurrent_schema_change(self, cursor, unique_database):
     """Tests that an insert into a Kudu table with a concurrent schema change either
@@ -512,6 +559,91 @@ class TestKuduOperations(KuduTestSuite):
     where id > 2 limit 100""" % table_name)
     self._retry_query(cursor, "select count(*) from %s" % table_name, [(103,)])
 
+  def test_replica_selection(self, cursor, unique_database):
+    """This test verifies that scans work as expected with different replica selection.
+    """
+    table_name = "%s.replica_selection" % unique_database
+    cursor.execute("set kudu_read_mode=READ_AT_SNAPSHOT")
+    cursor.execute("""create table %s (a int primary key, b string) partition by hash(a)
+        partitions 8 stored as kudu""" % table_name)
+    cursor.execute("""insert into %s select id, string_col from functional.alltypes
+        limit 100""" % table_name)
+
+    cursor.execute("set kudu_replica_selection=LEADER_ONLY")
+    cursor.execute("select count(*) from %s" % table_name)
+    assert cursor.fetchall() == [(100,)]
+
+    cursor.execute("set kudu_replica_selection=CLOSEST_REPLICA")
+    cursor.execute("select count(*) from %s" % table_name)
+    assert cursor.fetchall() == [(100,)]
+
+
+class TestKuduPartitioning(KuduTestSuite):
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestKuduPartitioning, cls).add_test_dimensions()
+
+    # Test both the interpreted and the codegen'd path.
+    add_exec_option_dimension(cls, "disable_codegen", "0")
+    extend_exec_option_dimension(cls, "disable_codegen", "1")
+
+  def test_partitions_evenly_distributed(self, vector, cursor,
+      kudu_client, unique_database):
+    """Sanity check for KuduPartitionExpr. We insert numbers into a table and check that
+    inserted elements are distributed evenly among the partitions. The assumption here is
+    that the source distribution is more or less uniform and that hashing retains this
+    property. This protects against some but not all errors. The number of partitions
+    should be the same as the number of impalads."""
+
+    table_name = "partitioning"
+    table_full_name = unique_database + ".partitioning"
+    cursor.execute("""CREATE TABLE %s (a INT PRIMARY KEY)
+        PARTITION BY HASH(a) PARTITIONS 3 STORED AS KUDU""" % table_full_name)
+    assert kudu_client.table_exists(KuduTestSuite.to_kudu_table_name(
+        unique_database, table_name))
+
+    query = "INSERT INTO %s SELECT id FROM functional.alltypes" % table_full_name
+    exec_options = dict((k, str(v)) for k, v
+        in vector.get_value('exec_option').items())
+    cursor.execute(query, configuration=exec_options)
+
+    profile = cursor.get_profile()
+
+    numbers = TestKuduPartitioning.extract_kudu_rows_from_profile(profile)
+    TestKuduPartitioning.assert_rows_evenly_distributed(numbers)
+
+  @staticmethod
+  def assert_rows_evenly_distributed(rows):
+    TOLERANCE_RATIO = 0.1
+    avg = rows[0]  # The first result is from the averaged summary.
+    values = rows[1:]
+
+    for value in values:
+      abs_diff = abs(avg - value)
+      ratio = float(abs_diff) / avg
+      assert ratio < TOLERANCE_RATIO
+
+  @staticmethod
+  def extract_kudu_rows_from_profile(profile):
+    # First we look for a header that contains "KuduTableSink", then under that we find
+    # the number of rows.
+    res = []
+    kudu_table_sink = "KuduTableSink"
+    total_num_rows_re = re.compile("TotalNumRows:.*\(([0-9]+)\)")
+
+    within_kudu_table_sink_section = False
+    for line in profile.splitlines():
+        if within_kudu_table_sink_section:
+            match = total_num_rows_re.search(line)
+            if match:
+                res.append(int(match.group(1)))
+                within_kudu_table_sink_section = False
+        else:
+            if kudu_table_sink in line:
+                within_kudu_table_sink_section = True
+    return res
+
+
 class TestCreateExternalTable(KuduTestSuite):
 
   @SkipIfKudu.hms_integration_enabled
@@ -541,8 +673,8 @@ class TestCreateExternalTable(KuduTestSuite):
         table_desc = [[col.strip() if col else col for col in row] for row in cursor]
         # Pytest shows truncated output on failure, so print the details just in case.
         LOG.info(table_desc)
-        assert ["ts", "timestamp", "", "false", "true", "1230768000000000", \
-          "AUTO_ENCODING", "DEFAULT_COMPRESSION", "0"] in table_desc
+        assert ["ts", "timestamp", "", "false", "", "true", "1230768000000000",
+            "AUTO_ENCODING", "DEFAULT_COMPRESSION", "0"] in table_desc
     finally:
       if kudu_client.table_exists(name):
         kudu_client.delete_table(name)
@@ -582,7 +714,7 @@ class TestCreateExternalTable(KuduTestSuite):
       with self.drop_impala_table_after_context(cursor, impala_table_name):
         cursor.execute("DESCRIBE %s" % impala_table_name)
         kudu_schema = kudu_table.schema
-        for i, (col_name, col_type, _, _, _, _, _, _, _) in enumerate(cursor):
+        for i, (col_name, col_type, _, _, _, _, _, _, _, _) in enumerate(cursor):
           kudu_col = kudu_schema[i]
           assert col_name == kudu_col.name
           assert col_type.upper() == \
@@ -653,7 +785,7 @@ class TestCreateExternalTable(KuduTestSuite):
         with self.drop_impala_table_after_context(cursor, impala_table_name):
           cursor.execute("DESCRIBE %s" % impala_table_name)
           assert cursor.fetchall() == \
-              [("a", "bigint", "", "true", "false", "", "AUTO_ENCODING",
+              [("a", "bigint", "", "true", "true", "false", "", "AUTO_ENCODING",
                 "DEFAULT_COMPRESSION", "0")]
 
   @SkipIfKudu.hms_integration_enabled
@@ -1143,7 +1275,7 @@ class TestImpalaKuduIntegration(KuduTestSuite):
           impala_table_name, props))
       cursor.execute("DESCRIBE %s" % (impala_table_name))
       assert cursor.fetchall() == \
-          [("a", "int", "", "true", "false", "", "AUTO_ENCODING",
+          [("a", "int", "", "true", "true", "false", "", "AUTO_ENCODING",
             "DEFAULT_COMPRESSION", "0")]
 
       # Drop the underlying Kudu table and replace it with another Kudu table that has
@@ -1161,9 +1293,9 @@ class TestImpalaKuduIntegration(KuduTestSuite):
         cursor.execute("REFRESH %s" % (impala_table_name))
         cursor.execute("DESCRIBE %s" % (impala_table_name))
         assert cursor.fetchall() == \
-            [("b", "string", "", "true", "false", "", "AUTO_ENCODING",
+            [("b", "string", "", "true", "true", "false", "", "AUTO_ENCODING",
               "DEFAULT_COMPRESSION", "0"),
-             ("c", "string", "", "false", "true", "", "AUTO_ENCODING",
+             ("c", "string", "", "false", "", "true", "", "AUTO_ENCODING",
               "DEFAULT_COMPRESSION", "0")]
 
   @SkipIfKudu.hms_integration_enabled
@@ -1179,7 +1311,7 @@ class TestImpalaKuduIntegration(KuduTestSuite):
           impala_table_name, props))
       cursor.execute("DESCRIBE %s" % (impala_table_name))
       assert cursor.fetchall() == \
-          [("a", "int", "", "true", "false", "", "AUTO_ENCODING",
+          [("a", "int", "", "true", "true", "false", "", "AUTO_ENCODING",
             "DEFAULT_COMPRESSION", "0")]
       # Drop the underlying Kudu table
       kudu_client.delete_table(kudu_table.name)
@@ -1225,8 +1357,11 @@ class TestKuduMemLimits(KuduTestSuite):
     """Tests that the queries specified in this test suite run under the given
     memory limits."""
     exec_options = dict((k, str(v)) for k, v
-                        in vector.get_value('exec_option').iteritems())
+                        in vector.get_value('exec_option').items())
     exec_options['mem_limit'] = "{0}m".format(mem_limit)
+    # IMPALA-9856: We disable query result spooling so that this test can run queries
+    # with low mem_limit.
+    exec_options['spool_query_results'] = "0"
     for i, q in enumerate(self.QUERIES):
       try:
         cursor.execute(q, configuration=exec_options)
@@ -1378,3 +1513,114 @@ class TestCreateSynchronizedTable(KuduTestSuite):
       except Exception as e:
         assert "Not allowed to set 'kudu.table_name' manually for" \
                " synchronized Kudu tables" in str(e)
+
+
+class TestKuduReadTokenSplit(KuduTestSuite):
+  """
+  This suite verifies impala's integration of Kudu's split token API.
+  """
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestKuduReadTokenSplit, cls).add_test_dimensions()
+    # The default read mode of READ_LATEST does not provide high enough consistency for
+    # these tests.
+    add_exec_option_dimension(cls, "kudu_read_mode", "READ_AT_SNAPSHOT")
+
+  @SkipIfKudu.no_hybrid_clock
+  @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+  def test_kudu_scanner(self, vector, unique_database):
+    """This runs explain query with variations of mt_dop and
+    targeted_kudu_scan_range_length to verify targeted_kudu_scan_range_length's
+    functionality.
+    Test disabled for EC since the erasure coded files when loaded in kudu
+    during data load cause the expected behaviour to change"""
+    explain_query = "explain select * from tpch_kudu.lineitem "
+    plans = []
+
+    regular_num_inst = self.__get_num_scanner_instances(explain_query, mt_dop=None,
+      targeted_kudu_scan_range_length=None, plans=plans)
+
+    mt_dop_1_num_inst = self.__get_num_scanner_instances(explain_query, mt_dop=1,
+      targeted_kudu_scan_range_length=None, plans=plans)
+
+    # targeted_kudu_scan_range_length should be disabled by default and num instances
+    # will be equal to the number of partitions
+    with_mt_dop_num_inst = self.__get_num_scanner_instances(explain_query, mt_dop=10,
+      targeted_kudu_scan_range_length=None, plans=plans)
+
+    # This will result is more splits
+    with_mt_dop_and_low_range_len_num_inst = self.__get_num_scanner_instances(
+      explain_query, mt_dop=10, targeted_kudu_scan_range_length="8mb", plans=plans)
+
+    assert mt_dop_1_num_inst == regular_num_inst, str(plans)
+    assert regular_num_inst < with_mt_dop_num_inst, str(plans)
+    assert with_mt_dop_num_inst < with_mt_dop_and_low_range_len_num_inst, str(plans)
+
+  def __get_num_scanner_instances(self, explain_query, mt_dop,
+                                  targeted_kudu_scan_range_length, plans):
+    """This is a helper method that runs the explain query with the provided query
+    options (mt_dop and targeted_kudu_scan_range_length). Appends the generated plan to
+    'plans' and returns the num of kudu scanner instances """
+    regex = r'F00:PLAN FRAGMENT \[RANDOM\] hosts=3 instances=([0-9]+)'
+    self.client.set_configuration_option("explain_level", 3)
+    if targeted_kudu_scan_range_length:
+      self.client.set_configuration_option("targeted_kudu_scan_range_length",
+                                           targeted_kudu_scan_range_length)
+    if mt_dop:
+      self.client.set_configuration_option("mt_dop", mt_dop)
+    result = self.client.execute(explain_query)
+    plan = "\n".join(result.data)
+    plans.append(plan)
+    matches = re.search(regex, plan)
+    assert len(matches.groups()) == 1, plan
+    self.client.clear_configuration()
+    return int(matches.group(1))
+
+
+@SkipIfHive2.create_external_kudu_table
+class TestKuduInsertWithBufferedTupleDesc(KuduTestSuite):
+  """
+  This test verifies bug fixing for IMPALA-11029.
+  """
+
+  # queries to create Kudu tables.
+  _create_kudu_table_1_query = "CREATE TABLE {0} (id1 INT NOT NULL, " \
+      "agrmt INT NOT NULL, big_id BIGINT NOT NULL, outdated_flag STRING NOT NULL, " \
+      "mod_ts TIMESTAMP NOT NULL, PRIMARY KEY (id1, agrmt)) " \
+      "PARTITION BY HASH (id1) PARTITIONS 2 STORED AS KUDU"
+
+  _create_kudu_table_2_query = "CREATE TABLE {0} (cl_id INT NOT NULL, " \
+      "cl_agrmt INT NOT NULL, outdat STRING NULL, mod_dat TIMESTAMP NULL, " \
+      "PRIMARY KEY (cl_id, cl_agrmt)) " \
+      "PARTITION BY HASH (cl_id) PARTITIONS 2 STORED AS KUDU"
+
+  # query to insert rows to Kudu table.
+  _insert_query = "INSERT INTO {0} (id1, agrmt, big_id, outdated_flag, mod_ts) " \
+      "SELECT i.cl_id, cast(row_number() over(order by null) as int), i.cl_agrmt, 'Y', " \
+      "case when outdat='Y' and i.mod_dat is not null then i.mod_dat else now() end " \
+      "from {1} i left join {0} u on u.big_id=i.cl_agrmt " \
+      "left join (select id1, big_id from {0} group by id1, big_id) uu " \
+      "on uu.big_id=i.cl_agrmt " \
+      "where u.big_id is null"
+
+  @SkipIfKudu.no_hybrid_clock
+  def test_kudu_insert_with_buffered_tuple_desc(self, cursor, kudu_client,
+      unique_database):
+    # Create Kudu tables.
+    table_1_name = "%s.tab1" % unique_database
+    cursor.execute(self._create_kudu_table_1_query.format(table_1_name))
+    assert kudu_client.table_exists(
+        KuduTestSuite.to_kudu_table_name(unique_database, "tab1"))
+    table_2_name = "%s.tab2" % unique_database
+    cursor.execute(self._create_kudu_table_2_query.format(table_2_name))
+    assert kudu_client.table_exists(
+        KuduTestSuite.to_kudu_table_name(unique_database, "tab2"))
+
+    # Insert rows
+    try:
+      cursor.execute(self._insert_query.format(table_1_name, table_2_name))
+      cursor.execute("SELECT * FROM %s" % table_1_name)
+      assert len(cursor.fetchall()) == 0
+    except Exception as e:
+      # Not expect to throw exception like "IllegalStateException: null"
+      assert False, str(e)

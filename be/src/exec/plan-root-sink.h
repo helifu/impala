@@ -27,6 +27,13 @@ class RowBatch;
 class QueryResultSet;
 class ScalarExprEvaluator;
 
+class PlanRootSinkConfig : public DataSinkConfig {
+ public:
+  DataSink* CreateSink(RuntimeState* state) const override;
+
+  ~PlanRootSinkConfig() override {}
+};
+
 /// Sink which manages the handoff between a 'sender' (a fragment instance) that produces
 /// batches by calling Send(), and a 'consumer' (e.g. the coordinator) which consumes rows
 /// formed by computing a set of output expressions over the input batches, by calling
@@ -54,7 +61,8 @@ class ScalarExprEvaluator;
 /// ensures that this outlives any calls to Send() and GetNext(), respectively.
 class PlanRootSink : public DataSink {
  public:
-  PlanRootSink(TDataSinkId sink_id, const RowDescriptor* row_desc, RuntimeState* state);
+  PlanRootSink(
+    TDataSinkId sink_id, const DataSinkConfig& sink_config, RuntimeState* state);
   virtual ~PlanRootSink();
 
   /// Called before Send(), Open(), or Close(). Performs any additional setup necessary,
@@ -92,13 +100,6 @@ class PlanRootSink : public DataSink {
   virtual void Cancel(RuntimeState* state) = 0;
 
  protected:
-  /// Validates that all collection-typed slots in the given batch are set to NULL
-  /// See SubplanNode for details on when collection-typed slots are set to NULL.
-  /// TODO: This validation will become obsolete when we can return collection values.
-  /// We will then need a different mechanism to assert the correct behavior of the
-  /// SubplanNode with respect to setting collection-slots to NULL.
-  void ValidateCollectionSlots(const RowDescriptor& row_desc, RowBatch* batch);
-
   /// Check to ensure that the number of rows produced by query execution does not exceed
   /// the NUM_ROWS_PRODUCED_LIMIT query option. Returns an error Status if the given
   /// batch causes the limit to be exceeded. Updates the value of num_rows_produced_.

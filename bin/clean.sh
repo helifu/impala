@@ -30,7 +30,7 @@ setup_report_build_error
 "${MAKE_CMD:-make}" clean || :
 
 # clean the external data source project
-pushd "${IMPALA_HOME}/ext-data-source"
+pushd "${IMPALA_HOME}/java/ext-data-source"
 rm -rf api/generated-sources/*
 ${IMPALA_HOME}/bin/mvn-quiet.sh clean
 popd
@@ -39,7 +39,7 @@ popd
 # don't use git clean because we need to retain Eclipse conf files
 pushd "${IMPALA_FE_DIR}"
 rm -rf target
-rm -f src/test/resources/{core,hbase,hive}-site.xml
+rm -f src/test/resources/{core,hbase,hive,ozone}-site.xml
 rm -rf generated-sources/*
 [ -z "${IMPALA_LOGS_DIR}" ] || rm -rf "${IMPALA_LOGS_DIR}"/*
 mkdir -p ${IMPALA_ALL_LOGS_DIRS}
@@ -66,13 +66,6 @@ popd
 # clean llvm
 rm -f "${IMPALA_HOME}/llvm-ir/"impala*.ll
 rm -f "${IMPALA_HOME}/be/generated-sources/impala-ir/"*
-
-# Cleanup Impala-lzo
-if [ -e "${IMPALA_LZO}" ]; then
-  pushd "${IMPALA_LZO}"
-  git rev-parse 2>/dev/null && git clean -fdx
-  popd
-fi
 
 # When switching to and from toolchain, make sure to remove all CMake generated files
 "${IMPALA_HOME}/bin/clean-cmake.sh"

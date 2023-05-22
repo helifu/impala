@@ -17,14 +17,16 @@
 
 package org.apache.impala.authorization.ranger;
 
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import org.apache.hadoop.hive.metastore.api.PrincipalType;
-import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.impala.authorization.AuthorizationDelta;
 import org.apache.impala.authorization.AuthorizationManager;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.InternalException;
 import org.apache.impala.common.UnsupportedFeatureException;
 import org.apache.impala.thrift.TCatalogServiceRequestHeader;
 import org.apache.impala.thrift.TColumn;
@@ -50,7 +52,9 @@ import org.apache.ranger.plugin.policyengine.RangerAccessResourceImpl;
 import org.apache.ranger.plugin.policyengine.RangerPolicyEngine;
 import org.apache.ranger.plugin.policyengine.RangerResourceACLs;
 import org.apache.ranger.plugin.policyengine.RangerResourceACLs.AccessResult;
-import org.apache.ranger.plugin.service.RangerAuthContext;
+import org.apache.ranger.plugin.model.RangerRole;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -73,14 +77,14 @@ import java.util.stream.Collectors;
  * Operations not supported by Ranger will throw an {@link UnsupportedFeatureException}.
  */
 public class RangerImpaladAuthorizationManager implements AuthorizationManager {
+  private static final Logger LOG = LoggerFactory.getLogger(
+      RangerImpaladAuthorizationManager.class);
   private static final String ANY = "*";
 
   private final Supplier<RangerImpalaPlugin> plugin_;
-  private final Supplier<RangerAuthContext> authContext_;
 
   public RangerImpaladAuthorizationManager(Supplier<RangerImpalaPlugin> pluginSupplier) {
     plugin_ = pluginSupplier;
-    authContext_ = () -> plugin_.get().createRangerAuthContext();
   }
 
   @Override
@@ -97,15 +101,62 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
         "%s is not supported in Impalad", ClassUtil.getMethodName()));
   }
 
+  /**
+   * This method will be called for the statements of 1) SHOW ROLES,
+   * 2) SHOW CURRENT ROLES, or 3) SHOW ROLE GRANT GROUP <group_name>.
+   */
   @Override
   public TShowRolesResult getRoles(TShowRolesParams params) throws ImpalaException {
-    if (params.getGrant_group() != null) {
-      throw new UnsupportedFeatureException(
-          "SHOW ROLE GRANT GROUP is not supported by Ranger.");
+    try {
+      TShowRolesResult result = new TShowRolesResult();
+      Set<String> groups = RangerUtil.getGroups(params.getRequesting_user());
+
+      boolean adminOp =
+          !(groups.contains(params.getGrant_group()) || params.is_show_current_roles);
+
+      if (adminOp) {
+        RangerUtil.validateRangerAdmin(plugin_.get(), params.getRequesting_user());
+      }
+
+      // The branch for SHOW CURRENT ROLES and SHOW ROLE GRANT GROUP.
+      Set<String> roleNames;
+      if (params.isIs_show_current_roles() || params.isSetGrant_group()) {
+        Set<String> groupNames;
+        if (params.isIs_show_current_roles()) {
+          groupNames = groups;
+        } else {
+          Preconditions.checkState(params.isSetGrant_group());
+          groupNames = Sets.newHashSet(params.getGrant_group());
+        }
+        roleNames = plugin_.get().getRolesFromUserAndGroups(null, groupNames);
+      } else {
+        // The branch for SHOW ROLES.
+        Preconditions.checkState(!params.isIs_show_current_roles());
+        Set<RangerRole> roles = plugin_.get().getRoles().getRangerRoles();
+        roleNames = roles.stream().map(RangerRole::getName).collect(Collectors.toSet());
+      }
+
+      // Need to instantiate the field of 'role_names' in 'result' since its field of
+      // 'role_names' was initialized as null by default.
+      result.setRole_names(Lists.newArrayList(roleNames));
+      Collections.sort(result.getRole_names());
+      return result;
+    } catch (Exception e) {
+      if (params.is_show_current_roles) {
+        LOG.error("Error executing SHOW CURRENT ROLES.", e);
+        throw new InternalException("Error executing SHOW CURRENT ROLES."
+            + " Ranger error message: " + e.getMessage());
+      } else if (params.isSetGrant_group()) {
+        LOG.error("Error executing SHOW ROLE GRANT GROUP " + params.getGrant_group() +
+            ".");
+        throw new InternalException("Error executing SHOW ROLE GRANT GROUP "
+            + params.getGrant_group() + ". Ranger error message: " + e.getMessage());
+      } else {
+        LOG.error("Error executing SHOW ROLES.");
+        throw new InternalException("Error executing SHOW ROLES."
+            + " Ranger error message: " + e.getMessage());
+      }
     }
-    throw new UnsupportedFeatureException(
-        String.format("SHOW %sROLES is not supported by Ranger.",
-            params.is_show_current_roles ? "CURRENT " : ""));
   }
 
   @Override
@@ -164,11 +215,6 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
         "%s is not supported in Impalad", ClassUtil.getMethodName()));
   }
 
-  private static Set<String> getGroups(String principal) {
-    UserGroupInformation ugi = UserGroupInformation.createRemoteUser(principal);
-    return Sets.newHashSet(ugi.getGroupNames());
-  }
-
   private static Optional<String> getResourceName(String resourceType,
       String resourceName, AccessResult accessResult) {
     RangerPolicy.RangerPolicyResource rangerPolicyResource =
@@ -195,6 +241,11 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
           break;
         case GROUP:
           if (item.getGroups().contains(principal)) {
+            return item.getDelegateAdmin();
+          }
+          break;
+        case ROLE:
+          if (item.getRoles().contains(principal)) {
             return item.getDelegateAdmin();
           }
           break;
@@ -237,29 +288,18 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
         privilege.getColumn_name(), accessResult);
     Optional<String> uri = getResourceName(RangerImpalaResourceBuilder.URL,
         privilege.getUri(), accessResult);
-    Optional<String> udf = getResourceName(RangerImpalaResourceBuilder.UDF, ANY,
+    Optional<String> storageType = getResourceName(
+        RangerImpalaResourceBuilder.STORAGE_TYPE, privilege.getStorage_type(),
         accessResult);
-
-    switch (privilege.getScope()) {
-      case COLUMN:
-        if (!column.isPresent() || column.get().equals("*")) return null;
-      case TABLE:
-        if (!table.isPresent() || table.get().equals("*")) return null;
-      case DATABASE:
-        if (!database.isPresent() || database.get().equals("*")) return null;
-        break;
-      case URI:
-        if (!uri.isPresent() || uri.get().equals("*")) return null;
-        break;
-      case SERVER:
-        break;
-      default:
-        throw new IllegalArgumentException("Unsupported privilege scope " +
-            privilege.getScope());
-    }
+    Optional<String> storageUri = getResourceName(
+        RangerImpalaResourceBuilder.STORAGE_URL, privilege.getStorage_url(),
+        accessResult);
+    Optional<String> udf = getResourceName(RangerImpalaResourceBuilder.UDF,
+        privilege.getFn_name(), accessResult);
 
     return new RangerResultRow(type, principal, database.orElse(""), table.orElse(""),
-        column.orElse(""), uri.orElse(""), udf.orElse(""), level, grantOption, longTime);
+        column.orElse(""), uri.orElse(""), storageType.orElse(""), storageUri.orElse(""),
+        udf.orElse(""), level, grantOption, longTime);
   }
 
   private static List<RangerAccessRequest> buildAccessRequests(TPrivilege privilege) {
@@ -274,14 +314,20 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
       resources.add(RangerUtil.createColumnResource(privilege));
     } else if (privilege.getUri() != null) {
       resources.add(RangerUtil.createUriResource(privilege));
+    } else if (privilege.getFn_name() != null) {
+      resources.add(RangerUtil.createFunctionResource(privilege));
     } else if (privilege.getDb_name() != null) {
       // DB is used by column and function resources.
       resources.add(RangerUtil.createColumnResource(privilege));
       resources.add(RangerUtil.createFunctionResource(privilege));
+    } else if (privilege.getStorage_url() != null ||
+        privilege.getStorage_type() != null) {
+      resources.add(RangerUtil.createStorageHandlerUriResource(privilege));
     } else {
-      // Server is used by column, function, and URI resources.
+      // Server is used by column, function, URI, and storage handler URI resources.
       resources.add(RangerUtil.createColumnResource(privilege));
       resources.add(RangerUtil.createUriResource(privilege));
+      resources.add(RangerUtil.createStorageHandlerUriResource(privilege));
       resources.add(RangerUtil.createFunctionResource(privilege));
     }
 
@@ -306,11 +352,6 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
   @Override
   public TResultSet getPrivileges(TShowGrantPrincipalParams params)
       throws ImpalaException {
-    if (params.principal_type == TPrincipalType.ROLE) {
-      throw new UnsupportedFeatureException(
-          "SHOW GRANT ROLE is not supported by Ranger.");
-    }
-
     List<RangerAccessRequest> requests = buildAccessRequests(params.privilege);
     Set<TResultRow> resultSet = new TreeSet<>();
     TResultSet result = new TResultSet();
@@ -320,14 +361,14 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
 
     for (RangerAccessRequest request : requests) {
       List<RangerResultRow> resultRows;
-      RangerResourceACLs acls = authContext_.get().getResourceACLs(request);
+      RangerResourceACLs acls = plugin_.get().getResourceACLs(request);
 
       switch (params.principal_type) {
         case USER:
           resultRows = new ArrayList<>(aclToPrivilege(
               acls.getUserACLs().getOrDefault(params.name, Collections.emptyMap()),
               params.name, params.privilege, TPrincipalType.USER));
-          for (String group : getGroups(params.name)) {
+          for (String group : RangerUtil.getGroups(params.name)) {
             resultRows.addAll(aclToPrivilege(
                 acls.getGroupACLs().getOrDefault(group, Collections.emptyMap()),
                 params.name, params.privilege, TPrincipalType.GROUP));
@@ -338,19 +379,38 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
               acls.getGroupACLs().getOrDefault(params.name, Collections.emptyMap()),
               params.name, params.privilege, TPrincipalType.GROUP));
           break;
+        case ROLE:
+          resultRows = new ArrayList<>(aclToPrivilege(
+              acls.getRoleACLs().getOrDefault(params.name, Collections.emptyMap()),
+              params.name, params.privilege, TPrincipalType.ROLE));
+          break;
         default:
           throw new UnsupportedOperationException(String.format("Unsupported principal " +
               "type %s.", params.principal_type));
       }
 
-      boolean all = resultRows.stream().anyMatch(row ->
-          row.privilege_ == TPrivilegeLevel.ALL);
+      RangerResourceResult resourceResult = new RangerResourceResult();
 
-      List<RangerResultRow> rows = all ? resultRows.stream()
-          .filter(row -> row.privilege_ == TPrivilegeLevel.ALL)
-          .collect(Collectors.toList()) : resultRows;
+      // Categorize 'resultRows' based on their lowest non-wildcard resource in the
+      // resource hierarchy. RangerResultRow's falling into the same category correspond
+      // to the same resource.
+      // TODO: To support displaying privileges on UDF's later.
+      for (RangerResultRow row : resultRows) {
+        if (!row.column_.equals("*") && !row.column_.isEmpty()) {
+          resourceResult.addColumnResult(row);
+        } else if (!row.table_.equals("*") && !row.table_.isEmpty()) {
+          resourceResult.addTableResult(row);
+        } else if (!row.udf_.equals("*") && !row.udf_.isEmpty()) {
+          resourceResult.addUdfResult(row);
+        } else if (!row.database_.equals("*") && !row.database_.isEmpty()) {
+          resourceResult.addDatabaseResult(row);
+        } else {
+          resourceResult.addServerResult(row);
+        }
+      }
 
-      rows.forEach(principal -> resultSet.add(principal.toResultRow()));
+      resourceResult.getResultRows()
+          .forEach(principal -> resultSet.add(principal.toResultRow()));
     }
     resultSet.forEach(result::addToRows);
 
@@ -375,6 +435,75 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
         "%s is not supported in Impalad", ClassUtil.getMethodName()));
   }
 
+  private static class RangerResourceResult {
+    private List<RangerResultRow> server = new ArrayList<>();
+    private List<RangerResultRow> database = new ArrayList<>();
+    private List<RangerResultRow> table = new ArrayList<>();
+    private List<RangerResultRow> column = new ArrayList<>();
+    private List<RangerResultRow> udf = new ArrayList<>();
+
+    public RangerResourceResult() { }
+
+    public RangerResourceResult addServerResult(RangerResultRow result) {
+      server.add(result);
+      return this;
+    }
+
+    public RangerResourceResult addDatabaseResult(RangerResultRow result) {
+      database.add(result);
+      return this;
+    }
+
+    public RangerResourceResult addTableResult(RangerResultRow result) {
+      table.add(result);
+      return this;
+    }
+
+    public RangerResourceResult addColumnResult(RangerResultRow result) {
+      column.add(result);
+      return this;
+    }
+
+    public RangerResourceResult addUdfResult(RangerResultRow result) {
+      udf.add(result);
+      return this;
+    }
+
+    /**
+     * For each disjoint List corresponding to a given resource, if there exists a
+     * RangerResultRow indicating the specified principal's privilege of
+     * TPrivilegeLevel.ALL, we filter out other RangerResultRow's that could be deduced
+     * from this wildcard RangerResultRow.
+     */
+    public List<RangerResultRow> getResultRows() {
+      List<RangerResultRow> results = new ArrayList<>();
+
+      results.addAll(filterIfAll(server));
+      results.addAll(filterIfAll(database));
+      results.addAll(filterIfAll(table));
+      results.addAll(filterIfAll(column));
+      results.addAll(filterIfAll(udf));
+      return results;
+    }
+
+    /**
+     * Given that the elements on 'resultRow' refer to the same resource, in the case
+     * when any of the granted privileges on this resource equals 'TPrivilegeLevel.ALL',
+     * we only keep this wildcard RangerResultRow since any other RangerResultRow in
+     * 'resultRow' could be inferred from this wildcard RangerResultRow.
+     */
+    private static List<RangerResultRow> filterIfAll(List<RangerResultRow> resultRows) {
+      boolean all = resultRows.stream().anyMatch(row ->
+          row.privilege_ == TPrivilegeLevel.ALL);
+
+      List<RangerResultRow> rows = all ? resultRows.stream()
+          .filter(row -> row.privilege_ == TPrivilegeLevel.ALL)
+          .collect(Collectors.toList()) : resultRows;
+
+      return rows;
+    }
+  }
+
   private static class RangerResultRow {
     private final TPrincipalType principalType_;
     private final String principalName_;
@@ -382,20 +511,25 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
     private final String table_;
     private final String column_;
     private final String uri_;
+    private final String storageType_;
+    private final String storageUri_;
     private final String udf_;
     private final TPrivilegeLevel privilege_;
     private final boolean grantOption_;
     private final Long createTime_;
 
     public RangerResultRow(TPrincipalType principalType, String principalName,
-        String database, String table, String column, String uri, String udf,
-        TPrivilegeLevel privilege, boolean grantOption, Long createTime) {
+        String database, String table, String column, String uri, String storageType,
+        String storageUri, String udf, TPrivilegeLevel privilege, boolean grantOption,
+        Long createTime) {
       this.principalType_ = principalType;
       this.principalName_ = principalName;
       this.database_ = database;
       this.table_ = table;
       this.column_ = column;
       this.uri_ = uri;
+      this.storageType_ = storageType;
+      this.storageUri_ = storageUri;
       this.udf_ = udf;
       this.privilege_ = privilege;
       this.grantOption_ = grantOption;
@@ -411,6 +545,8 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
       schema.addToColumns(new TColumn("table", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("column", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("uri", Type.STRING.toThrift()));
+      schema.addToColumns(new TColumn("storage_type", Type.STRING.toThrift()));
+      schema.addToColumns(new TColumn("storage_uri", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("udf", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("privilege", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("grant_option", Type.BOOLEAN.toThrift()));
@@ -428,6 +564,8 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
       rowBuilder.add(table_);
       rowBuilder.add(column_);
       rowBuilder.add(uri_);
+      rowBuilder.add(storageType_);
+      rowBuilder.add(storageUri_);
       rowBuilder.add(udf_);
       rowBuilder.add(privilege_.name().toLowerCase());
       rowBuilder.add(grantOption_);

@@ -28,6 +28,8 @@
 #include "rpc/auth-provider.h"
 #include "rpc/thrift-server.h"
 #include "rpc/rpc-mgr.h"
+#include "runtime/fragment-state.h"
+#include "runtime/query-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/exec-env.h"
@@ -36,7 +38,6 @@
 #include "runtime/krpc-data-stream-sender.h"
 #include "runtime/descriptors.h"
 #include "runtime/client-cache.h"
-#include "runtime/backend-client.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
 #include "service/data-stream-service.h"
@@ -50,6 +51,7 @@
 #include "util/parse-util.h"
 #include "util/test-info.h"
 #include "util/tuple-row-compare.h"
+#include "util/uid-util.h"
 #include "gen-cpp/data_stream_service.pb.h"
 #include "gen-cpp/Types_types.h"
 #include "gen-cpp/Descriptors_types.h"
@@ -61,6 +63,8 @@
 
 #include "common/names.h"
 
+using boost::uuids::random_generator;
+using boost::uuids::uuid;
 using namespace impala;
 using namespace apache::thrift;
 using namespace apache::thrift::protocol;
@@ -70,7 +74,7 @@ using kudu::rpc::ResultTracker;
 using kudu::rpc::RpcContext;
 using kudu::rpc::ServiceIf;
 
-DEFINE_int32(port, 20001, "port on which to run Impala Thrift based test backend.");
+DEFINE_int32(port, 20001, "port on which to run Impala krpc based test backend.");
 DECLARE_int32(datastream_sender_timeout_ms);
 DECLARE_int32(datastream_service_num_deserialization_threads);
 DECLARE_int32(datastream_service_deserialization_queue_size);
@@ -104,7 +108,8 @@ class ImpalaKRPCTestBackend : public DataStreamServiceIf {
   virtual ~ImpalaKRPCTestBackend() {}
 
   Status Init() {
-    return rpc_mgr_->RegisterService(CpuInfo::num_cores(), 1024, this, mem_tracker());
+    return rpc_mgr_->RegisterService(CpuInfo::num_cores(), 1024, this, mem_tracker(),
+        ExecEnv::GetInstance()->rpc_metrics());
   }
 
   virtual bool Authorize(const google::protobuf::Message* req,
@@ -121,6 +126,12 @@ class ImpalaKRPCTestBackend : public DataStreamServiceIf {
       EndDataStreamResponsePB* response, RpcContext* rpc_context) {
     stream_mgr_->CloseSender(request, response, rpc_context);
   }
+
+  virtual void UpdateFilter(
+      const UpdateFilterParamsPB* req, UpdateFilterResultPB* resp, RpcContext* context) {}
+
+  virtual void PublishFilter(const PublishFilterParamsPB* req,
+      PublishFilterResultPB* resp, RpcContext* context) {}
 
   MemTracker* mem_tracker() { return mem_tracker_.get(); }
 
@@ -140,9 +151,14 @@ class DataStreamTest : public testing::Test {
 
   virtual void SetUp() {
     exec_env_.reset(new ExecEnv());
-    ABORT_IF_ERROR(exec_env_->InitForFeTests());
+    ABORT_IF_ERROR(exec_env_->InitForFeSupport());
     exec_env_->InitBufferPool(32 * 1024, 1024 * 1024 * 1024, 32 * 1024);
     runtime_state_.reset(new RuntimeState(TQueryCtx(), exec_env_.get()));
+    TPlanFragment* fragment = runtime_state_->obj_pool()->Add(new TPlanFragment());
+    PlanFragmentCtxPB* fragment_ctx =
+        runtime_state_->obj_pool()->Add(new PlanFragmentCtxPB());
+    fragment_state_ = runtime_state_->obj_pool()->Add(
+        new FragmentState(runtime_state_->query_state(), *fragment, *fragment_ctx));
     mem_pool_.reset(new MemPool(&tracker_));
 
     // Register a BufferPool client for allocating buffers for row batches.
@@ -153,12 +169,16 @@ class DataStreamTest : public testing::Test {
 
     CreateRowDesc();
 
-    is_asc_.push_back(true);
-    nulls_first_.push_back(true);
-    CreateTupleComparator();
+    SlotRef* lhs_slot = obj_pool_.Add(new SlotRef(ColumnType(TYPE_BIGINT), 0));
+    ASSERT_OK(lhs_slot->Init(RowDescriptor(), true, fragment_state_));
+    ordering_exprs_.push_back(lhs_slot);
 
-    next_instance_id_.lo = 0;
-    next_instance_id_.hi = 0;
+    tsort_info_.sorting_order = TSortingOrder::LEXICAL;
+    tsort_info_.is_asc_order.push_back(true);
+    tsort_info_.nulls_first.push_back(true);
+
+    next_instance_id_.set_lo(0);
+    next_instance_id_.set_hi(0);
     stream_mgr_ = exec_env_->stream_mgr();
 
     broadcast_sink_.dest_node_id = DEST_NODE_ID;
@@ -186,7 +206,9 @@ class DataStreamTest : public testing::Test {
 
     IpAddr ip;
     ASSERT_OK(HostnameToIpAddr(FLAGS_hostname, &ip));
-    krpc_address_ = MakeNetworkAddress(ip, FLAGS_port);
+    UUIDToUniqueIdPB(boost::uuids::random_generator()(), &backend_id_);
+    krpc_address_ = MakeNetworkAddressPB(
+        ip, FLAGS_port, backend_id_, exec_env_->rpc_mgr()->GetUdsAddressUniqueId());
     StartKrpcBackend();
   }
 
@@ -210,8 +232,12 @@ class DataStreamTest : public testing::Test {
 
   virtual void TearDown() {
     desc_tbl_->ReleaseResources();
-    less_than_->Close(runtime_state_.get());
+    for (auto less_than_comparator : less_than_comparators_) {
+      less_than_comparator->Close(runtime_state_.get());
+    }
     ScalarExpr::Close(ordering_exprs_);
+    fragment_state_->ReleaseResources();
+    fragment_state_ = nullptr;
     mem_pool_->FreeAll();
     StopKrpcBackend();
     exec_env_->buffer_pool()->DeregisterClient(&buffer_pool_client_);
@@ -220,7 +246,7 @@ class DataStreamTest : public testing::Test {
   void Reset() {
     sender_info_.clear();
     receiver_info_.clear();
-    dest_.clear();
+    dest_.Clear();
   }
 
   ObjectPool obj_pool_;
@@ -228,12 +254,12 @@ class DataStreamTest : public testing::Test {
   scoped_ptr<MemPool> mem_pool_;
   DescriptorTbl* desc_tbl_;
   const RowDescriptor* row_desc_;
-  vector<bool> is_asc_;
-  vector<bool> nulls_first_;
-  TupleRowComparator* less_than_;
+  TSortInfo tsort_info_;
+  vector<TupleRowComparator*> less_than_comparators_;
   boost::scoped_ptr<ExecEnv> exec_env_;
   scoped_ptr<RuntimeState> runtime_state_;
-  TUniqueId next_instance_id_;
+  FragmentState* fragment_state_;
+  UniqueIdPB next_instance_id_;
   string stmt_;
   // The sorting expression for the single BIGINT column.
   vector<ScalarExpr*> ordering_exprs_;
@@ -246,8 +272,11 @@ class DataStreamTest : public testing::Test {
   int next_val_;
   int64_t* tuple_mem_;
 
+  // Backend Id
+  UniqueIdPB backend_id_;
+
   // Only used for KRPC. Not owned.
-  TNetworkAddress krpc_address_;
+  NetworkAddressPB krpc_address_;
 
   // The test service implementation. Owned by this class.
   unique_ptr<ImpalaKRPCTestBackend> test_service_;
@@ -259,7 +288,7 @@ class DataStreamTest : public testing::Test {
   TDataStreamSink broadcast_sink_;
   TDataStreamSink random_sink_;
   TDataStreamSink hash_sink_;
-  vector<TPlanFragmentDestination> dest_;
+  google::protobuf::RepeatedPtrField<PlanFragmentDestinationPB> dest_;
 
   struct SenderInfo {
     unique_ptr<thread> thread_handle;
@@ -295,14 +324,13 @@ class DataStreamTest : public testing::Test {
 
   // Create an instance id and add it to dest_
   void GetNextInstanceId(TUniqueId* instance_id) {
-    dest_.push_back(TPlanFragmentDestination());
-    TPlanFragmentDestination& dest = dest_.back();
-    dest.fragment_instance_id = next_instance_id_;
-    dest.thrift_backend.hostname = "localhost";
-    dest.thrift_backend.port = FLAGS_port;
-    dest.__set_krpc_backend(krpc_address_);
-    *instance_id = next_instance_id_;
-    ++next_instance_id_.lo;
+    PlanFragmentDestinationPB* dest = dest_.Add();
+    *dest->mutable_fragment_instance_id() = next_instance_id_;
+    *dest->mutable_address() = MakeNetworkAddressPB("localhost", FLAGS_port, backend_id_,
+        exec_env_->rpc_mgr()->GetUdsAddressUniqueId());
+    *dest->mutable_krpc_backend() = krpc_address_;
+    UniqueIdPBToTUniqueId(next_instance_id_, instance_id);
+    next_instance_id_.set_lo(next_instance_id_.lo() + 1);
   }
 
   // RowDescriptor to mimic "select bigint_col from alltypesagg", except the slot
@@ -336,13 +364,12 @@ class DataStreamTest : public testing::Test {
   }
 
   // Create a tuple comparator to sort in ascending order on the single bigint column.
-  void CreateTupleComparator() {
-    SlotRef* lhs_slot = obj_pool_.Add(new SlotRef(TYPE_BIGINT, 0));
-    ASSERT_OK(lhs_slot->Init(RowDescriptor(), true, runtime_state_.get()));
-    ordering_exprs_.push_back(lhs_slot);
-    less_than_ = obj_pool_.Add(new TupleRowComparator(ordering_exprs_,
-        is_asc_, nulls_first_));
-    ASSERT_OK(less_than_->Open(
+  void CreateTupleComparator(TupleRowComparator** less_than_comparator) {
+    TupleRowComparatorConfig* comparator_config =
+        obj_pool_.Add(new TupleRowComparatorConfig(tsort_info_, ordering_exprs_));
+    *less_than_comparator =
+        obj_pool_.Add(new TupleRowLexicalComparator(*comparator_config));
+    ASSERT_OK((*less_than_comparator)->Open(
         &obj_pool_, runtime_state_.get(), mem_pool_.get(), mem_pool_.get()));
   }
 
@@ -382,11 +409,15 @@ class DataStreamTest : public testing::Test {
     info->stream_recvr = stream_mgr_->CreateRecvr(row_desc_, *runtime_state_.get(),
         instance_id, DEST_NODE_ID, num_senders, buffer_size, is_merging, profile,
         &tracker_, &buffer_pool_client_);
-    if (!is_merging) {
+   if (!is_merging) {
       info->thread_handle.reset(new thread(&DataStreamTest::ReadStream, this, info));
     } else {
+      TupleRowComparator* less_than_comparator = nullptr;
+      CreateTupleComparator(&less_than_comparator);
+      DCHECK(less_than_comparator != nullptr);
+      less_than_comparators_.push_back(less_than_comparator);
       info->thread_handle.reset(new thread(&DataStreamTest::ReadStreamMerging, this, info,
-          profile));
+          profile, less_than_comparator));
     }
     if (out_id != nullptr) *out_id = instance_id;
   }
@@ -416,8 +447,13 @@ class DataStreamTest : public testing::Test {
     VLOG_QUERY << "done reading";
   }
 
-  void ReadStreamMerging(ReceiverInfo* info, RuntimeProfile* profile) {
-    info->status = info->stream_recvr->CreateMerger(*less_than_);
+  void ReadStreamMerging(ReceiverInfo* info, RuntimeProfile* profile,
+      TupleRowComparator* less_than_comparator) {
+    /// Note that codegend_heapify_helper_fn currently stores a nullptr.
+    /// The codegened case of this function is covered in end-to-end tests.
+    CodegenFnPtr<SortedRunMerger::HeapifyHelperFn> codegend_heapify_helper_fn;
+    info->status = info->stream_recvr->CreateMerger(
+        *less_than_comparator, codegend_heapify_helper_fn);
     if (info->status.IsCancelled()) return;
     RowBatch batch(row_desc_, 1024, &tracker_);
     VLOG_QUERY << "start reading merging";
@@ -462,8 +498,9 @@ class DataStreamTest : public testing::Test {
         } else if (stream_type == TPartitionType::HASH_PARTITIONED) {
           // hash-partitioned streams send values to the right partition
           int64_t value = *j;
-          uint64_t hash_val = RawValue::GetHashValueFastHash(&value, TYPE_BIGINT,
-              KrpcDataStreamSender::EXCHANGE_HASH_SEED);
+          uint64_t hash_val = RawValue::GetHashValueFastHash(
+              &value, ColumnType(TYPE_BIGINT),
+              GetExchangeHashSeed(runtime_state_->query_id()));
           EXPECT_EQ(hash_val % receiver_info_.size(), info->receiver_num);
         }
       }
@@ -480,6 +517,45 @@ class DataStreamTest : public testing::Test {
         if (k/num_senders != *j) break;
       }
     }
+  }
+
+  // Returns a map of reciever to all it's data values.
+  unordered_map<int, multiset<int64_t>> GetHashPartitionedReceiversDataMap(
+      int num_receivers, bool reset_hash_seed) {
+    int num_senders = 1;
+    int buffer_size = 1024;
+    bool merging = false;
+    unordered_map<int, multiset<int64_t>> receiver_data_map;
+    Reset();
+    for (int i = 0; i < num_receivers; ++i) {
+      StartReceiver(TPartitionType::HASH_PARTITIONED, num_senders, i,
+          buffer_size, merging);
+    }
+    for (int i = 0; i < num_senders; ++i) {
+      StartSender(TPartitionType::HASH_PARTITIONED, buffer_size,
+          reset_hash_seed);
+    }
+    JoinSenders();
+    CheckSenders();
+    JoinReceivers();
+    receiver_data_map.clear();
+
+    for (int i = 0; i < receiver_info_.size(); i++) {
+      // Store a map of receiver and list of it's data values.
+      ReceiverInfo* info = receiver_info_[i].get();
+      multiset<int64_t> data_set;
+      for (multiset<int64_t>::iterator j = info->data_values.begin();
+           j != info->data_values.end(); ++j) {
+        data_set.insert(*j);
+      }
+      receiver_data_map[info->receiver_num] = data_set;
+    }
+    return receiver_data_map;
+  }
+
+  /// Returns a hash seed with query_id.
+  uint64_t GetExchangeHashSeed(TUniqueId query_id) {
+    return 0x66bd68df22c3ef37 ^ query_id.hi;
   }
 
   void CheckSenders() {
@@ -505,13 +581,13 @@ class DataStreamTest : public testing::Test {
   }
 
   void StartSender(TPartitionType::type partition_type = TPartitionType::UNPARTITIONED,
-                   int channel_buffer_size = 1024) {
+      int channel_buffer_size = 1024, bool reset_hash_seed = false) {
     VLOG_QUERY << "start sender";
     int num_senders = sender_info_.size();
     sender_info_.emplace_back(make_unique<SenderInfo>());
     sender_info_.back()->thread_handle.reset(
         new thread(&DataStreamTest::Sender, this, num_senders, channel_buffer_size,
-            partition_type));
+            partition_type, sender_info_[num_senders].get(), reset_hash_seed));
   }
 
   void JoinSenders() {
@@ -521,29 +597,38 @@ class DataStreamTest : public testing::Test {
     }
   }
 
-  void Sender(
-      int sender_num, int channel_buffer_size, TPartitionType::type partition_type) {
+  void Sender(int sender_num, int channel_buffer_size,
+      TPartitionType::type partition_type, SenderInfo* info, bool reset_hash_seed) {
     RuntimeState state(TQueryCtx(), exec_env_.get(), desc_tbl_);
     VLOG_QUERY << "create sender " << sender_num;
-    const TDataSink& sink = GetSink(partition_type);
+    const TDataSink sink = GetSink(partition_type);
+    TPlanFragment fragment;
+    fragment.output_sink = sink;
+    PlanFragmentCtxPB fragment_ctx;
+    *fragment_ctx.mutable_destinations() = dest_;
+    FragmentState fragment_state(state.query_state(), fragment, fragment_ctx);
+    DataSinkConfig* data_sink = nullptr;
+    EXPECT_OK(DataSinkConfig::CreateConfig(sink, row_desc_, &fragment_state, &data_sink));
 
     // We create an object of the base class DataSink and cast to the appropriate sender
     // according to the 'is_thrift' option.
     scoped_ptr<DataSink> sender;
 
-    TExprNode expr_node;
-    expr_node.node_type = TExprNodeType::SLOT_REF;
-    TExpr output_exprs;
-    output_exprs.nodes.push_back(expr_node);
+    KrpcDataStreamSenderConfig& config =
+        *(static_cast<KrpcDataStreamSenderConfig*>(data_sink));
 
-    sender.reset(new KrpcDataStreamSender(-1,
-        sender_num, row_desc_, sink.stream_sink, dest_, channel_buffer_size, &state));
-    EXPECT_OK(static_cast<KrpcDataStreamSender*>(
-        sender.get())->Init(vector<TExpr>({output_exprs}), sink, &state));
+    // Reset the hash seed with a new query id. Useful for testing hash exchanges are
+    // random.
+    if (reset_hash_seed) {
+      config.exchange_hash_seed_ =
+          GetExchangeHashSeed(UuidToQueryId(random_generator()()));
+    }
+
+    sender.reset(new KrpcDataStreamSender(-1, sender_num, config,
+        data_sink->tsink_->stream_sink, dest_, channel_buffer_size, &state));
     EXPECT_OK(sender->Prepare(&state, &tracker_));
     EXPECT_OK(sender->Open(&state));
     scoped_ptr<RowBatch> batch(CreateRowBatch());
-    SenderInfo* info = sender_info_[sender_num].get();
     int next_val = 0;
     for (int i = 0; i < NUM_BATCHES; ++i) {
       GetNextBatch(batch.get(), &next_val);
@@ -634,9 +719,9 @@ TEST_F(DataStreamTest, UnknownSenderLargeResult) {
 TEST_F(DataStreamTest, Cancel) {
   TUniqueId instance_id;
   StartReceiver(TPartitionType::UNPARTITIONED, 1, 1, 1024, false, &instance_id);
-  stream_mgr_->Cancel(instance_id);
+  stream_mgr_->Cancel(GetQueryId(instance_id));
   StartReceiver(TPartitionType::UNPARTITIONED, 1, 1, 1024, true, &instance_id);
-  stream_mgr_->Cancel(instance_id);
+  stream_mgr_->Cancel(GetQueryId(instance_id));
   JoinReceivers();
   EXPECT_TRUE(receiver_info_[0]->status.IsCancelled());
   EXPECT_TRUE(receiver_info_[1]->status.IsCancelled());
@@ -663,6 +748,29 @@ TEST_F(DataStreamTest, BasicTest) {
       }
     }
   }
+}
+
+// Test streams with different query ids should hash to different destinations.
+TEST_F(DataStreamTest, HashPartitionTest) {
+  bool result = false;
+  int num_receivers = 4;
+
+  unordered_map<int, multiset<int64_t>> receiver_data_map_1 =
+      GetHashPartitionedReceiversDataMap(num_receivers, false);
+
+  unordered_map<int, multiset<int64_t>> receiver_data_map_2 =
+      GetHashPartitionedReceiversDataMap(num_receivers, true);
+
+  // Check the sizes of the receiver data values in each receiver is different.
+  for (int i = 0; i < num_receivers; ++i) {
+    // Compare the data values in the recievers for the two queries. Verify the values
+    // don't match for at least one reciever.
+    if (receiver_data_map_1[i] != receiver_data_map_2[i]) {
+      result = true;
+      break;
+    }
+  }
+  ASSERT_EQ(result, true);
 }
 
 // This test is to exercise a previously present deadlock path which is now fixed, to

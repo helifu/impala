@@ -19,7 +19,10 @@
 
 #include <sstream>
 
+#include "rpc/thrift-util.h"
 #include "transport/THttpTransport.h"
+
+#include "common/logging.h"
 
 namespace apache {
 namespace thrift {
@@ -31,10 +34,12 @@ using namespace std;
 const char* THttpTransport::CRLF = "\r\n";
 const int THttpTransport::CRLF_LEN = 2;
 
-THttpTransport::THttpTransport(boost::shared_ptr<TTransport> transport)
-  : transport_(transport),
+THttpTransport::THttpTransport(std::shared_ptr<TTransport> transport)
+  : TVirtualTransport(impala::DefaultTConfiguration()),
+    transport_(transport),
     origin_(""),
     readHeaders_(true),
+    readWholeBodyForAuth_(false),
     chunked_(false),
     chunkedDone_(false),
     chunkSize_(0),
@@ -85,9 +90,6 @@ uint32_t THttpTransport::readEnd() {
 uint32_t THttpTransport::readMoreData() {
   uint32_t size;
 
-  // Get more data!
-  refill();
-
   if (readHeaders_) {
     readHeaders();
   }
@@ -99,6 +101,13 @@ uint32_t THttpTransport::readMoreData() {
   } else {
     size = readContent(contentLength_);
     readHeaders_ = true;
+  }
+
+  if (readWholeBodyForAuth_) {
+    readWholeBodyForAuth_ = false;
+    bodyDone(size);
+    // Do not return any bytes to Thrift, as whole body was consumed by authentication.
+    size = 0;
   }
 
   return size;
@@ -225,6 +234,7 @@ void THttpTransport::readHeaders() {
   chunked_ = false;
   chunkedDone_ = false;
   chunkSize_ = 0;
+  continue_ = false;
 
   // Control state flow
   bool statusLine = true;
@@ -244,22 +254,37 @@ void THttpTransport::readHeaders() {
       }
     } else {
       if (statusLine) {
+        VLOG(4) << line;
         statusLine = false;
         finished = parseStatusLine(line);
       } else {
+        VLOG(4) << "  " << line;
         parseHeader(line);
       }
     }
   }
 
+  // Perform any validation of the headers needed.
   headersDone();
+
+  // The headers have been validated, so if the client included the 'Expect: 100-continue"
+  // header, we respond that it can continue with sending the request. See Section 8.2.3
+  // of RFC2616 for more details: https://www.w3.org/Protocols/rfc2616/rfc2616-sec8.html
+  if (continue_) {
+    std::ostringstream h;
+    h << "HTTP/1.1 100 Continue" << CRLF << CRLF;
+    string header = h.str();
+    transport_->write(
+        (const uint8_t*)header.c_str(), static_cast<uint32_t>(header.size()));
+    transport_->flush();
+  }
 }
 
 void THttpTransport::write(const uint8_t* buf, uint32_t len) {
   writeBuffer_.write(buf, len);
 }
 
-const std::string THttpTransport::getOrigin() {
+const std::string THttpTransport::getOrigin() const {
   std::ostringstream oss;
   if (!origin_.empty()) {
     oss << origin_ << ", ";

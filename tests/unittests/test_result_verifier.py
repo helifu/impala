@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_dimensions import create_uncompressed_text_dimension
 from tests.common.test_result_verifier import create_query_result
@@ -48,14 +49,14 @@ class TestResultVerifier(ImpalaTestSuite):
     try:
       res.rows[0]['does_not_exist']
       assert False, 'Expected error due to column alias not existing'
-    except IndexError, e:
-      assert "No column with label: does_not_exist" in e.message
+    except IndexError as e:
+      assert "No column with label: does_not_exist" in str(e)
 
     try:
       res.rows[0][2]
       assert False, 'Expected error due to column position not existing'
-    except IndexError, e:
-      assert 'list index out of range' in e.message
+    except IndexError as e:
+      assert 'list index out of range' in str(e)
 
   def test_compute_aggregation(self, vector):
     profile = '''

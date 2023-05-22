@@ -17,24 +17,23 @@
 
 #pragma once
 
-#include <gtest/gtest_prod.h> // for FRIEND_TEST
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
-#include "common/global-types.h"
 #include "common/status.h"
-#include "gen-cpp/StatestoreService_types.h"
-#include "gutil/threading/thread_collision_warner.h"
+#include "gen-cpp/Frontend_types.h"
 #include "scheduling/executor-blacklist.h"
 #include "scheduling/executor-group.h"
 #include "statestore/statestore-subscriber.h"
-#include "util/container-util.h"
 #include "util/metrics-fwd.h"
 
 namespace impala {
+
+class TUpdateExecutorMembershipRequest;
 
 namespace test {
 class SchedulerWrapper;
@@ -57,10 +56,6 @@ class SchedulerWrapper;
 /// subscriber is recovering from a connection failure. This allows other backends to
 /// re-register with the statestore after a statestore restart.
 ///
-/// TODO(IMPALA-8484): Allow specifying executor groups during backend startup. Currently
-/// only one executor group named "default" exists. All backends are part of that group
-/// and it's the only group available for scheduling.
-///
 /// The class also allows the local backend (ImpalaServer), the local Frontend and the
 /// AdmissionController to register callbacks to receive notifications of changes to the
 /// cluster membership. Note: The notifications for blacklisted executors are not sent
@@ -75,13 +70,12 @@ class ClusterMembershipMgr {
  public:
   /// A immutable pointer to a backend descriptor. It is used to return a consistent,
   /// immutable copy of a backend descriptor.
-  typedef std::shared_ptr<const TBackendDescriptor> BeDescSharedPtr;
+  typedef std::shared_ptr<const BackendDescriptorPB> BeDescSharedPtr;
 
-  /// Maps statestore subscriber IDs to backend descriptors.
-  typedef std::unordered_map<std::string, TBackendDescriptor> BackendIdMap;
+  /// Maps backend IDs to backend descriptors.
+  typedef std::unordered_map<std::string, BackendDescriptorPB> BackendIdMap;
 
-  /// Maps executor group names to executor groups. For now, only a default group exists
-  /// and all executors are part of that group.
+  /// Maps executor group names to executor groups.
   typedef std::unordered_map<std::string, ExecutorGroup> ExecutorGroups;
 
   // A snapshot of the current cluster membership. The ClusterMembershipMgr maintains a
@@ -93,11 +87,12 @@ class ClusterMembershipMgr {
     Snapshot(const Snapshot&) = default;
     /// The current backend descriptor of the local backend.
     BeDescSharedPtr local_be_desc;
-    /// Map from unique backend ID to TBackendDescriptor for all known backends, including
-    /// those that are quiescing or blacklisted. The {backend ID, TBackendDescriptor}
-    /// pairs represent the IMPALA_MEMBERSHIP_TOPIC {key, value} pairs of known executors
-    /// retrieved from the statestore. It's important to track both the backend ID as well
-    /// as the TBackendDescriptor so we know what is being removed in a given update.
+    /// Map from unique backend ID to BackendDescriptorPB for all known backends,
+    /// including those that are quiescing or blacklisted. The {backend ID,
+    /// BackendDescriptorPB} pairs represent the IMPALA_MEMBERSHIP_TOPIC {key, value}
+    /// pairs of known executors retrieved from the statestore. It's important to track
+    /// both the backend ID as well as the BackendDescriptorPB so we know what is being
+    /// removed in a given update.
     BackendIdMap current_backends;
     /// A map of executor groups by their names. Only contains executors that are
     /// available for scheduling queries on and not executors that are quiescing or
@@ -164,11 +159,26 @@ class ClusterMembershipMgr {
 
   /// Adds the given backend to the local blacklist. Updates 'current_membership_' to
   /// remove the backend from 'executor_groups' so that it will not be scheduled on.
-  void BlacklistExecutor(const TBackendDescriptor& be_desc);
+  /// 'cause' is an error status representing the reason the node was blacklisted.
+  void BlacklistExecutor(const UniqueIdPB& backend_id, const Status& cause);
+
+  /// Returns a pointer to the static empty group reserved for scheduling coord only
+  /// queries.
+  const ExecutorGroup* GetEmptyExecutorGroup() { return &empty_exec_group_; }
+
+  const std::vector<TExecutorGroupSet>& GetExpectedExecGroupSets() {
+    return expected_exec_group_sets_;
+  }
 
  private:
+  struct GroupSetMetrics {
+    IntCounter* total_live_executor_groups_ = nullptr;
+    IntCounter* total_healthy_executor_groups_ = nullptr;
+    IntCounter* total_backends_ = nullptr;
+  };
+
   /// Serializes and adds the local backend descriptor to 'subscriber_topic_updates'.
-  void AddLocalBackendToStatestore(const TBackendDescriptor& local_be_desc,
+  void AddLocalBackendToStatestore(const BackendDescriptorPB& local_be_desc,
       std::vector<TTopicDelta>* subscriber_topic_updates);
 
   /// Returns the local backend descriptor or nullptr if no local backend has been
@@ -197,18 +207,44 @@ class ClusterMembershipMgr {
   /// Updates the membership metrics. Is registered as an updated callback function to
   /// receive any membership updates. The only exception is that this is called directly
   /// in BlacklistExecutor() where updates are not required to be sent to external
-  /// listeners.
+  /// listeners. InitMetrics() must have been called before registering this method.
   void UpdateMetrics(const SnapshotPtr& new_state);
+
+  /// Returns true if the 'be_desc' is in any of the 'executor_groups', false otherwise.
+  /// Used to check the consistency of the ClusterMembershipMgr state. Currently, only
+  /// used in DCHECKs.
+  bool IsBackendInExecutorGroups(
+      const BackendDescriptorPB& be_desc, const ExecutorGroups& executor_groups);
+
+  /// Parses the --expected_executor_group_sets startup flag and populates
+  /// 'expected_exec_group_sets' with the group name prefix and expected group size. Also
+  /// sorts it in increasing order by the expected group size.
+  static Status PopulateExpectedExecGroupSets(
+      std::vector<TExecutorGroupSet>& expected_exec_group_sets);
+
+  /// Helper method to initialize metrics. Also initializes metrics for all group sets if
+  /// expected group sets are specified.
+  void InitMetrics(MetricGroup* metrics);
+
+  /// An empty group used for scheduling coordinator only queries.
+  const ExecutorGroup empty_exec_group_;
+
+  /// Info about expected executor group sets parsed from num_expected_executor_groups
+  /// flag in Init() and sorted by the expected group size in increasing order.
+  std::vector<TExecutorGroupSet> expected_exec_group_sets_;
 
   /// Ensures that only one thread is processing a membership update at a time, either
   /// from a statestore update or a blacklisting decision. Must be taken before any other
   /// locks in this class.
-  boost::mutex update_membership_lock_;
+  std::mutex update_membership_lock_;
 
-  /// Membership metrics
-  IntCounter* total_live_executor_groups_ = nullptr;
-  IntCounter* total_healthy_executor_groups_ = nullptr;
-  IntCounter* total_backends_ = nullptr;
+  /// Membership metrics for all executor groups regardless of which group set they belong
+  /// to. The value for total backends also includes the coordinators.
+  GroupSetMetrics aggregated_group_set_metrics_;
+
+  /// Maps from the group set prefix to its group set metrics. Is empty if group sets are
+  /// not used.
+  std::unordered_map<string, GroupSetMetrics> per_group_set_metrics_;
 
   /// The snapshot of the current cluster membership. When receiving changes to the
   /// executors configuration from the statestore we will make a copy of the stored
@@ -218,7 +254,7 @@ class ClusterMembershipMgr {
 
   /// Protects current_membership_. Cannot be held at the same time as
   /// 'callback_fn_lock_'.
-  mutable boost::mutex current_membership_lock_;
+  mutable std::mutex current_membership_lock_;
 
   /// A temporary membership snapshot to hold updates while the statestore is in its
   /// post-recovery grace period. Not exposed to clients. Protected by
@@ -229,10 +265,6 @@ class ClusterMembershipMgr {
   /// for dynamic updates to the set of available backends. May be nullptr if the set of
   /// backends is fixed (only useful for tests). Thread-safe, not protected by a lock.
   StatestoreSubscriber* statestore_subscriber_;
-
-  /// Serializes TBackendDescriptors when creating topic updates. Not protected by a lock
-  /// - only used in statestore thread.
-  ThriftSerializer thrift_serializer_;
 
   /// Unique - across the cluster - identifier for this impala backend. Used to validate
   /// incoming backend descriptors and to register this backend with the statestore. Not
@@ -245,9 +277,20 @@ class ClusterMembershipMgr {
 
   /// Protects the callbacks. Cannot be held at the same time as
   /// 'current_membership_lock_'.
-  mutable boost::mutex callback_fn_lock_;
+  mutable std::mutex callback_fn_lock_;
 
   friend class impala::test::SchedulerWrapper;
+  friend class ClusterMembershipMgrUnitTest_TestPopulateExpectedExecGroupSets_Test;
 };
+
+/// Helper method to populate a thrift request object 'update_req' for cluster membership
+/// using a supplied 'snapshot' from the cluster membership manager and the
+/// 'expected_exec_group_sets' sorted in increasing order by their expected group size.
+/// The frontend uses cluster membership information to determine whether it expects the
+/// scheduler to assign local or remote reads. It also uses the number of executors to
+/// determine the join type (partitioned vs broadcast).
+void PopulateExecutorMembershipRequest(ClusterMembershipMgr::SnapshotPtr& snapshot,
+    const std::vector<TExecutorGroupSet>& expected_exec_group_sets,
+    TUpdateExecutorMembershipRequest& update_req);
 
 } // end namespace impala

@@ -27,6 +27,7 @@
 #   - Stores the execution details in JSON format.
 #
 
+from __future__ import absolute_import, division, print_function
 import getpass
 import json
 import logging
@@ -119,7 +120,6 @@ if options.get_password:
   options.password = getpass.getpass()
   options.get_password = None
 
-logging.basicConfig(level=logging.INFO, format='[%(name)s]: %(message)s')
 LOG = logging.getLogger('run-workload')
 
 
@@ -159,21 +159,21 @@ def prettytable_print(results, failed=False):
   table.float_format = '.2'
   # Group the results by table format.
   for table_format_str, gr in groupby(results, lambda x: x.query.table_format_str):
-    print "Table Format: %s" % table_format_str
+    print("Table Format: %s" % table_format_str)
     for result in gr:
       start_time = result.start_time.strftime("%Y-%m-%d %H:%M:%S") if result.start_time \
           is not None else '-'
       row = [result.query.name, start_time, result.time_taken, result.client_name]
       if failed: row.append(result.query_error)
       table.add_row(row)
-    print table.get_string(sortby='Client ID')
+    print(table.get_string(sortby='Client ID'))
     table.clear_rows()
-    print str()
+    print(str())
 
 def print_result_summary(results):
   """Print failed and successfull queries for a given result list"""
-  failed_results = filter(lambda x: x.success == False, results)
-  successful_results = filter(lambda x: x.success == True, results)
+  failed_results = [x for x in results if not x.success]
+  successful_results = [x for x in results if x.success]
   prettytable_print(successful_results)
   if failed_results: prettytable_print(failed_results, failed=True)
 
@@ -195,7 +195,7 @@ def get_workload_scale_factor():
 def split_and_strip(input_string, delim=","):
   """Convert a string into a list using the given delimiter"""
   if not input_string: return list()
-  return map(str.strip, input_string.split(delim))
+  return list(map(str.strip, input_string.split(delim)))
 
 def create_workload_config():
   """Parse command line inputs.
@@ -239,6 +239,7 @@ def _validate_options():
       raise RuntimeError("Impalads must be of the form host:port or host.")
 
 if __name__ == "__main__":
+  logging.basicConfig(level=logging.INFO, format='[%(name)s]: %(message)s')
   # Check for badly formed user options.
   _validate_options()
 
@@ -271,12 +272,12 @@ if __name__ == "__main__":
       if not all(result.success for result in workload_runner.results): exit_code = 1
 
       # Print the results
-      print "\nWorkload: {0}, Scale Factor: {1}\n".format(
-          workload_runner.workload.name.upper(), workload_runner.scale_factor)
+      print("\nWorkload: {0}, Scale Factor: {1}\n".format(
+          workload_runner.workload.name.upper(), workload_runner.scale_factor))
       print_result_summary(workload_runner.results)
 
   # Store the results
   with open(options.results_json_file, 'w') as f:
-    json.dump(result_map, f, cls=CustomJSONEncoder)
+    json.dump(result_map, f, cls=CustomJSONEncoder, ensure_ascii=False)
 
   exit(exit_code)

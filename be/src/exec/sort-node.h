@@ -25,20 +25,31 @@ namespace impala {
 
 class SortPlanNode : public PlanNode {
  public:
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status Init(const TPlanNode& tnode, FragmentState* state) override;
+  virtual void Close() override;
   virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+  virtual void Codegen(FragmentState* state) override;
 
   ~SortPlanNode(){}
 
-  /// Expressions and parameters used for tuple comparison.
+  /// Expressions used for tuple comparison.
   std::vector<ScalarExpr*> ordering_exprs_;
 
   /// Expressions used to materialize slots in the tuples to be sorted.
   /// One expr per slot in the materialized tuple.
   std::vector<ScalarExpr*> sort_tuple_slot_exprs_;
 
-  std::vector<bool> is_asc_order_;
-  std::vector<bool> nulls_first_;
+  /// Config used to create a TupleRowComparator instance.
+  TupleRowComparatorConfig* row_comparator_config_ = nullptr;
+
+  /// Number of backend nodes executing the same sort node plan.
+  int32_t num_backends_;
+
+  /// Codegened version of Sorter::TupleSorter::SortHelper().
+  CodegenFnPtr<Sorter::SortHelperFn> codegend_sort_helper_fn_;
+
+  /// Codegened version of SortedRunMerger::HeapifyHelper().
+  CodegenFnPtr<SortedRunMerger::HeapifyHelperFn> codegend_heapify_helper_fn_;
 };
 
 /// Node that implements a full sort of its input with a fixed memory budget, spilling
@@ -57,7 +68,6 @@ class SortNode : public ExecNode {
   ~SortNode();
 
   virtual Status Prepare(RuntimeState* state);
-  virtual void Codegen(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
   virtual Status Reset(RuntimeState* state, RowBatch* row_batch);
@@ -70,22 +80,28 @@ class SortNode : public ExecNode {
   /// Fetch input rows and feed them to the sorter until the input is exhausted.
   Status SortInput(RuntimeState* state) WARN_UNUSED_RESULT;
 
+  /// Compute estimated bytes of input that will go into the sort node.
+  /// Return -1 if estimate can not be determined.
+  int64_t ComputeInputSizeEstimate();
+
   /// Number of rows to skip.
   int64_t offset_;
 
-  /// Expressions and parameters used for tuple comparison.
-  std::vector<ScalarExpr*> ordering_exprs_;
-
   /// Expressions used to materialize slots in the tuples to be sorted.
   /// One expr per slot in the materialized tuple.
-  std::vector<ScalarExpr*> sort_tuple_exprs_;
+  const std::vector<ScalarExpr*>& sort_tuple_exprs_;
 
-  std::vector<bool> is_asc_order_;
-  std::vector<bool> nulls_first_;
+  const TupleRowComparatorConfig& tuple_row_comparator_config_;
 
   /// Whether the previous call to GetNext() returned a buffer attached to the RowBatch.
   /// Used to avoid unnecessary calls to ReleaseUnusedReservation().
   bool returned_buffer_ = false;
+
+  /// Min, max, and avg time spent in AddBatch
+  RuntimeProfile::SummaryStatsCounter* add_batch_timer_;
+
+  /// Number of backend nodes executing the same sort node plan.
+  int32_t num_backends_;
 
   /////////////////////////////////////////
   /// BEGIN: Members that must be Reset()

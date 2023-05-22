@@ -18,12 +18,14 @@
 # Superclass for all tests that need a custom cluster.
 # TODO: Configure cluster size and other parameters.
 
+from __future__ import absolute_import, division, print_function
 import logging
 import os
 import os.path
 import pipes
 import pytest
 import subprocess
+from impala_py_lib.helpers import find_all_files, is_core_dump
 from subprocess import check_call
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.impala_cluster import ImpalaCluster
@@ -38,11 +40,11 @@ NUM_COORDINATORS = DEFAULT_CLUSTER_SIZE
 IMPALAD_ARGS = 'impalad_args'
 STATESTORED_ARGS = 'state_store_args'
 CATALOGD_ARGS = 'catalogd_args'
+ADMISSIOND_ARGS = 'admissiond_args'
 KUDU_ARGS = 'kudu_args'
 # Additional args passed to the start-impala-cluster script.
 START_ARGS = 'start_args'
-SENTRY_CONFIG = 'sentry_config'
-SENTRY_LOG_DIR = 'sentry_log_dir'
+JVM_ARGS = 'jvm_args'
 HIVE_CONF_DIR = 'hive_conf_dir'
 CLUSTER_SIZE = "cluster_size"
 # Default query options passed to the impala daemon command line. Handled separately from
@@ -52,6 +54,9 @@ IMPALA_LOG_DIR = 'impala_log_dir'
 NUM_EXCLUSIVE_COORDINATORS = 'num_exclusive_coordinators'
 STATESTORED_TIMEOUT_S = 'statestored_timeout_s'
 IMPALAD_TIMEOUT_S = 'impalad_timeout_s'
+EXPECT_CORES = 'expect_cores'
+# Additional arg to determine whether we should reset the Ranger policy repository.
+RESET_RANGER = 'reset_ranger'
 
 # Run with fast topic updates by default to reduce time to first query running.
 DEFAULT_STATESTORE_ARGS = '--statestore_update_frequency_ms=50 \
@@ -76,7 +81,6 @@ class CustomClusterTestSuite(ImpalaTestSuite):
     # Defines constraints for custom cluster tests, called by add_test_dimensions.
     # By default, custom cluster tests only run on text/none and with a limited set of
     # exec options. Subclasses may override this to relax these default constraints.
-    super(CustomClusterTestSuite, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format == 'text' and
         v.get_value('table_format').compression_codec == 'none')
@@ -103,97 +107,123 @@ class CustomClusterTestSuite(ImpalaTestSuite):
 
   @staticmethod
   def with_args(impalad_args=None, statestored_args=None, catalogd_args=None,
-      start_args=None, sentry_config=None, default_query_options=None,
-      impala_log_dir=None, sentry_log_dir=None, hive_conf_dir=None, cluster_size=None,
+      start_args=None, default_query_options=None, jvm_args=None,
+      impala_log_dir=None, hive_conf_dir=None, cluster_size=None,
       num_exclusive_coordinators=None, kudu_args=None, statestored_timeout_s=None,
-      impalad_timeout_s=None):
+      impalad_timeout_s=None, expect_cores=None, reset_ranger=False):
     """Records arguments to be passed to a cluster by adding them to the decorated
     method's func_dict"""
     def decorate(func):
       if impalad_args is not None:
-        func.func_dict[IMPALAD_ARGS] = impalad_args
-      func.func_dict[STATESTORED_ARGS] = statestored_args
+        func.__dict__[IMPALAD_ARGS] = impalad_args
+      func.__dict__[STATESTORED_ARGS] = statestored_args
       if catalogd_args is not None:
-        func.func_dict[CATALOGD_ARGS] = catalogd_args
+        func.__dict__[CATALOGD_ARGS] = catalogd_args
       if start_args is not None:
-        func.func_dict[START_ARGS] = start_args.split()
-      if sentry_config is not None:
-        func.func_dict[SENTRY_CONFIG] = sentry_config
-      if sentry_log_dir is not None:
-        func.func_dict[SENTRY_LOG_DIR] = sentry_log_dir
+        func.__dict__[START_ARGS] = start_args.split()
+      if jvm_args is not None:
+        func.__dict__[JVM_ARGS] = jvm_args
       if hive_conf_dir is not None:
-        func.func_dict[HIVE_CONF_DIR] = hive_conf_dir
+        func.__dict__[HIVE_CONF_DIR] = hive_conf_dir
       if kudu_args is not None:
-        func.func_dict[KUDU_ARGS] = kudu_args
+        func.__dict__[KUDU_ARGS] = kudu_args
       if default_query_options is not None:
-        func.func_dict[DEFAULT_QUERY_OPTIONS] = default_query_options
+        func.__dict__[DEFAULT_QUERY_OPTIONS] = default_query_options
       if impala_log_dir is not None:
-        func.func_dict[IMPALA_LOG_DIR] = impala_log_dir
+        func.__dict__[IMPALA_LOG_DIR] = impala_log_dir
       if cluster_size is not None:
-        func.func_dict[CLUSTER_SIZE] = cluster_size
+        func.__dict__[CLUSTER_SIZE] = cluster_size
       if num_exclusive_coordinators is not None:
-        func.func_dict[NUM_EXCLUSIVE_COORDINATORS] = num_exclusive_coordinators
+        func.__dict__[NUM_EXCLUSIVE_COORDINATORS] = num_exclusive_coordinators
       if statestored_timeout_s is not None:
-        func.func_dict[STATESTORED_TIMEOUT_S] = statestored_timeout_s
+        func.__dict__[STATESTORED_TIMEOUT_S] = statestored_timeout_s
       if impalad_timeout_s is not None:
-        func.func_dict[IMPALAD_TIMEOUT_S] = impalad_timeout_s
+        func.__dict__[IMPALAD_TIMEOUT_S] = impalad_timeout_s
+      if expect_cores is not None:
+        func.__dict__[EXPECT_CORES] = expect_cores
+      if reset_ranger is not False:
+        func.__dict__[RESET_RANGER] = True
       return func
     return decorate
 
   def setup_method(self, method):
     cluster_args = list()
-    for arg in [IMPALAD_ARGS, STATESTORED_ARGS, CATALOGD_ARGS]:
-      if arg in method.func_dict:
-        cluster_args.append("--%s=%s " % (arg, method.func_dict[arg]))
-    if START_ARGS in method.func_dict:
-      cluster_args.extend(method.func_dict[START_ARGS])
+    for arg in [IMPALAD_ARGS, STATESTORED_ARGS, CATALOGD_ARGS, ADMISSIOND_ARGS, JVM_ARGS]:
+      if arg in method.__dict__:
+        cluster_args.append("--%s=%s " % (arg, method.__dict__[arg]))
+    if START_ARGS in method.__dict__:
+      cluster_args.extend(method.__dict__[START_ARGS])
 
-    if HIVE_CONF_DIR in method.func_dict:
-      self._start_hive_service(method.func_dict[HIVE_CONF_DIR])
+    if HIVE_CONF_DIR in method.__dict__:
+      self._start_hive_service(method.__dict__[HIVE_CONF_DIR])
       # Should let Impala adopt the same hive-site.xml. The only way is to add it in the
       # beginning of the CLASSPATH. Because there's already a hive-site.xml in the
       # default CLASSPATH (see bin/set-classpath.sh).
       cluster_args.append(
-        '--env_vars=CUSTOM_CLASSPATH=%s ' % method.func_dict[HIVE_CONF_DIR])
+        '--env_vars=CUSTOM_CLASSPATH=%s ' % method.__dict__[HIVE_CONF_DIR])
 
-    if KUDU_ARGS in method.func_dict:
-      self._restart_kudu_service(method.func_dict[KUDU_ARGS])
+    if KUDU_ARGS in method.__dict__:
+      self._restart_kudu_service(method.__dict__[KUDU_ARGS])
 
-    if SENTRY_CONFIG in method.func_dict:
-      self._start_sentry_service(method.func_dict[SENTRY_CONFIG],
-          method.func_dict.get(SENTRY_LOG_DIR))
+    if RESET_RANGER in method.__dict__:
+      self._reset_ranger_policy_repository()
 
     cluster_size = DEFAULT_CLUSTER_SIZE
-    if CLUSTER_SIZE in method.func_dict:
-      cluster_size = method.func_dict[CLUSTER_SIZE]
+    if CLUSTER_SIZE in method.__dict__:
+      cluster_size = method.__dict__[CLUSTER_SIZE]
 
     use_exclusive_coordinators = False
     num_coordinators = cluster_size
-    if NUM_EXCLUSIVE_COORDINATORS in method.func_dict:
-      num_coordinators = method.func_dict[NUM_EXCLUSIVE_COORDINATORS]
+    if NUM_EXCLUSIVE_COORDINATORS in method.__dict__:
+      num_coordinators = method.__dict__[NUM_EXCLUSIVE_COORDINATORS]
       use_exclusive_coordinators = True
 
     # Start a clean new cluster before each test
     kwargs = {
       "cluster_size": cluster_size,
       "num_coordinators": num_coordinators,
-      "expected_num_executors": cluster_size,
-      "default_query_options": method.func_dict.get(DEFAULT_QUERY_OPTIONS),
+      "expected_num_impalads": cluster_size,
+      "default_query_options": method.__dict__.get(DEFAULT_QUERY_OPTIONS),
       "use_exclusive_coordinators": use_exclusive_coordinators
     }
-    if IMPALA_LOG_DIR in method.func_dict:
-      kwargs["impala_log_dir"] = method.func_dict[IMPALA_LOG_DIR]
-    if STATESTORED_TIMEOUT_S in method.func_dict:
-      kwargs["statestored_timeout_s"] = method.func_dict[STATESTORED_TIMEOUT_S]
-    if IMPALAD_TIMEOUT_S in method.func_dict:
-      kwargs["impalad_timeout_s"] = method.func_dict[IMPALAD_TIMEOUT_S]
-    self._start_impala_cluster(cluster_args, **kwargs)
-    super(CustomClusterTestSuite, self).setup_class()
+    if IMPALA_LOG_DIR in method.__dict__:
+      kwargs["impala_log_dir"] = method.__dict__[IMPALA_LOG_DIR]
+    if STATESTORED_TIMEOUT_S in method.__dict__:
+      kwargs["statestored_timeout_s"] = method.__dict__[STATESTORED_TIMEOUT_S]
+    if IMPALAD_TIMEOUT_S in method.__dict__:
+      kwargs["impalad_timeout_s"] = method.__dict__[IMPALAD_TIMEOUT_S]
+
+    if method.__dict__.get(EXPECT_CORES, False):
+      # Make a note of any core files that already exist
+      possible_cores = find_all_files('*core*')
+      self.pre_test_cores = set([f for f in possible_cores if is_core_dump(f)])
+
+      # Explicitly allow startup to exception, since startup is expected to fail
+      try:
+        self._start_impala_cluster(cluster_args, **kwargs)
+        pytest.fail("cluster startup should have failed")
+      except Exception:
+        self._stop_impala_cluster()
+    else:
+      self._start_impala_cluster(cluster_args, **kwargs)
+      super(CustomClusterTestSuite, self).setup_class()
 
   def teardown_method(self, method):
-    if HIVE_CONF_DIR in method.func_dict:
+    if HIVE_CONF_DIR in method.__dict__:
       self._start_hive_service(None)  # Restart Hive Service using default configs
-    super(CustomClusterTestSuite, self).teardown_class()
+
+    if method.__dict__.get(EXPECT_CORES, False):
+      # The core dumps expected to be generated by this test should be cleaned up
+      possible_cores = find_all_files('*core*')
+      post_test_cores = set([f for f in possible_cores if is_core_dump(f)])
+
+      for f in (post_test_cores - self.pre_test_cores):
+        logging.info(
+            "Cleaned up {core} created by {name}".format(core=f, name=method.__name__))
+        os.remove(f)
+      # Skip teardown_class as setup was skipped.
+    else:
+      super(CustomClusterTestSuite, self).teardown_class()
 
   @classmethod
   def _stop_impala_cluster(cls):
@@ -217,26 +247,6 @@ class CustomClusterTestSuite(ImpalaTestSuite):
       raise RuntimeError("Unable to restart Kudu")
 
   @classmethod
-  def _start_sentry_service(cls, sentry_service_config, sentry_log_dir=None):
-    sentry_env = dict(os.environ)
-    if sentry_log_dir is not None:
-        sentry_env['SENTRY_LOG_DIR'] = sentry_log_dir
-    sentry_env['SENTRY_SERVICE_CONFIG'] = sentry_service_config
-    call = subprocess.Popen(
-        ['/bin/bash', '-c', os.path.join(IMPALA_HOME,
-                                         'testdata/bin/run-sentry-service.sh')],
-        env=sentry_env)
-    call.wait()
-    if call.returncode != 0:
-      raise RuntimeError("Unable to start Sentry")
-
-  @classmethod
-  def _stop_sentry_service(cls):
-    subprocess.check_call([os.path.join(os.environ["IMPALA_HOME"],
-                                        "testdata/bin/kill-sentry-service.sh")],
-                          close_fds=True)
-
-  @classmethod
   def _start_hive_service(cls, hive_conf_dir):
     hive_env = dict(os.environ)
     if hive_conf_dir is not None:
@@ -255,6 +265,21 @@ class CustomClusterTestSuite(ImpalaTestSuite):
                           close_fds=True)
 
   @classmethod
+  def _reset_ranger_policy_repository(cls):
+    script_kill_ranger = os.path.join(os.environ['IMPALA_HOME'],
+                                      'testdata/bin/kill-ranger-server.sh')
+    script_run_ranger = os.path.join(os.environ['IMPALA_HOME'],
+                                     'testdata/bin/run-ranger-server.sh')
+    script_create_test_config = os.path.join(os.environ['IMPALA_HOME'],
+                                             'bin/create-test-configuration.sh')
+    script_setup_ranger = os.path.join(os.environ['IMPALA_HOME'],
+                                       'testdata/bin/setup-ranger.sh')
+    check_call([script_kill_ranger])
+    check_call([script_create_test_config, '-create_ranger_policy_db'])
+    check_call([script_run_ranger])
+    check_call([script_setup_ranger])
+
+  @classmethod
   def _start_impala_cluster(cls,
                             options,
                             impala_log_dir=os.getenv('LOG_DIR', "/tmp/"),
@@ -263,7 +288,7 @@ class CustomClusterTestSuite(ImpalaTestSuite):
                             use_exclusive_coordinators=False,
                             add_executors=False,
                             log_level=1,
-                            expected_num_executors=DEFAULT_CLUSTER_SIZE,
+                            expected_num_impalads=DEFAULT_CLUSTER_SIZE,
                             expected_subscribers=0,
                             default_query_options=None,
                             statestored_timeout_s=60,
@@ -291,8 +316,6 @@ class CustomClusterTestSuite(ImpalaTestSuite):
 
     default_query_option_kvs = []
     # Put any defaults first, then any arguments after that so they can override defaults.
-    if os.environ.get("ERASURE_CODING") == "true":
-      default_query_option_kvs.append(("allow_erasure_coded_files", "true"))
     if default_query_options is not None:
       default_query_option_kvs.extend(default_query_options)
     # Add the default query options after any arguments. This will override any default
@@ -315,10 +338,12 @@ class CustomClusterTestSuite(ImpalaTestSuite):
     # The number of statestore subscribers is
     # cluster_size (# of impalad) + 1 (for catalogd).
     if expected_subscribers == 0:
-      expected_subscribers = expected_num_executors + 1
+      expected_subscribers = expected_num_impalads + 1
+      if "--enable_admission_service" in options:
+        expected_subscribers += 1
 
     statestored.service.wait_for_live_subscribers(expected_subscribers,
                                                   timeout=statestored_timeout_s)
     for impalad in cls.cluster.impalads:
-      impalad.service.wait_for_num_known_live_backends(expected_num_executors,
+      impalad.service.wait_for_num_known_live_backends(expected_num_impalads,
                                                        timeout=impalad_timeout_s)

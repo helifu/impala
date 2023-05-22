@@ -25,13 +25,13 @@ namespace impala {
 class CatalogServiceClientWrapper : public CatalogServiceClient {
  public:
   CatalogServiceClientWrapper(
-      boost::shared_ptr<::apache::thrift::protocol::TProtocol> prot)
+      std::shared_ptr<::apache::thrift::protocol::TProtocol> prot)
     : CatalogServiceClient(prot) {
   }
 
   CatalogServiceClientWrapper(
-      boost::shared_ptr<::apache::thrift::protocol::TProtocol> iprot,
-      boost::shared_ptr<::apache::thrift::protocol::TProtocol> oprot)
+      std::shared_ptr<::apache::thrift::protocol::TProtocol> iprot,
+      std::shared_ptr<::apache::thrift::protocol::TProtocol> oprot)
     : CatalogServiceClient(iprot, oprot) {
   }
 
@@ -101,14 +101,6 @@ class CatalogServiceClientWrapper : public CatalogServiceClient {
     send_GetPartitionStats(req);
     *send_done = true;
     recv_GetPartitionStats(_return);
-  }
-
-  void SentryAdminCheck(TSentryAdminCheckResponse& _return,
-      const TSentryAdminCheckRequest& req, bool* send_done) {
-    DCHECK(!*send_done);
-    send_SentryAdminCheck(req);
-    *send_done = true;
-    recv_SentryAdminCheck(_return);
   }
 
   void UpdateTableUsage(TUpdateTableUsageResponse& _return,

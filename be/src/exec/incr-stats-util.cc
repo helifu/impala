@@ -42,7 +42,7 @@ using namespace strings;
 // of the NDV computation into its output StringVal.
 StringVal IncrementNdvFinalize(FunctionContext* ctx, const StringVal& src) {
   if (UNLIKELY(src.is_null)) return src;
-  DCHECK_EQ(src.len, AggregateFunctions::HLL_LEN);
+  DCHECK_EQ(src.len, AggregateFunctions::DEFAULT_HLL_LEN);
   StringVal result_str(ctx, src.len);
   if (UNLIKELY(result_str.is_null)) return result_str;
   memcpy(result_str.ptr, src.ptr, src.len);
@@ -60,8 +60,8 @@ StringVal IncrementNdvFinalize(FunctionContext* ctx, const StringVal& src) {
 // shorter than the input. Otherwise it is set to false, and the input is returned
 // unencoded.
 string EncodeNdv(const string& ndv, bool* is_encoded) {
-  DCHECK_EQ(ndv.size(), AggregateFunctions::HLL_LEN);
-  string encoded_ndv(AggregateFunctions::HLL_LEN, 0);
+  DCHECK_EQ(ndv.size(), AggregateFunctions::DEFAULT_HLL_LEN);
+  string encoded_ndv(AggregateFunctions::DEFAULT_HLL_LEN, 0);
   int idx = 0;
   char last = ndv[0];
 
@@ -69,9 +69,9 @@ string EncodeNdv(const string& ndv, bool* is_encoded) {
   // a byte 0-255, but the actual count is always one more than the encoded value
   // (i.e. in the range 1-256 inclusive).
   uint8_t count = 0;
-  for (int i = 1; i < AggregateFunctions::HLL_LEN; ++i) {
+  for (int i = 1; i < AggregateFunctions::DEFAULT_HLL_LEN; ++i) {
     if (ndv[i] != last || count == numeric_limits<uint8_t>::max()) {
-      if (idx + 2 > AggregateFunctions::HLL_LEN) break;
+      if (idx + 2 > AggregateFunctions::DEFAULT_HLL_LEN) break;
       // Write a (count, value) pair to two successive bytes
       encoded_ndv[idx++] = count;
       count = 0;
@@ -83,7 +83,7 @@ string EncodeNdv(const string& ndv, bool* is_encoded) {
   }
 
   // +2 for the remaining two bytes written below
-  if (idx + 2 > AggregateFunctions::HLL_LEN) {
+  if (idx + 2 > AggregateFunctions::DEFAULT_HLL_LEN) {
     *is_encoded = false;
     return ndv;
   }
@@ -94,97 +94,125 @@ string EncodeNdv(const string& ndv, bool* is_encoded) {
   *is_encoded = true;
   encoded_ndv.resize(idx);
   DCHECK_GT(encoded_ndv.size(), 0);
-  DCHECK_LE(encoded_ndv.size(), AggregateFunctions::HLL_LEN);
+  DCHECK_LE(encoded_ndv.size(), AggregateFunctions::DEFAULT_HLL_LEN);
   return encoded_ndv;
 }
 
 string DecodeNdv(const string& ndv, bool is_encoded) {
   if (!is_encoded) return ndv;
   DCHECK_EQ(ndv.size() % 2, 0);
-  string decoded_ndv(AggregateFunctions::HLL_LEN, 0);
+  string decoded_ndv(AggregateFunctions::DEFAULT_HLL_LEN, 0);
   int idx = 0;
   for (int i = 0; i < ndv.size(); i += 2) {
     for (int j = 0; j < (static_cast<uint8_t>(ndv[i])) + 1; ++j) {
       decoded_ndv[idx++] = ndv[i+1];
     }
   }
-  DCHECK_EQ(idx, AggregateFunctions::HLL_LEN);
+  DCHECK_EQ(idx, AggregateFunctions::DEFAULT_HLL_LEN);
   return decoded_ndv;
 }
 
-// A container for statistics for a single column that are aggregated partition by
-// partition during the incremental computation of column stats. The aggregations are
-// updated during Update(), and the final statistics are computed by Finalize().
-struct PerColumnStats {
-  // Should have length AggregateFunctions::HLL_PRECISION. Intermediate buckets for the
-  // HLL calculation.
-  string intermediate_ndv;
+#define UPDATE_LOW_VALUE(TYPE)                                                      \
+  if (!(low_value.__isset.TYPE##_val) || value.TYPE##_val < low_value.TYPE##_val) { \
+    low_value.__set_##TYPE##_val(value.TYPE##_val);                                 \
+  }
 
-  // The total number of nulls counted, or -1 for no sample.
-  int64_t num_nulls;
+void PerColumnStats::UpdateLowValue(const impala::TColumnValue& value) {
+  if (value.__isset.double_val) {
+    UPDATE_LOW_VALUE(double);
+  } else if (value.__isset.byte_val) {
+    UPDATE_LOW_VALUE(byte);
+  } else if (value.__isset.int_val) {
+    UPDATE_LOW_VALUE(int);
+  } else if (value.__isset.short_val) {
+    UPDATE_LOW_VALUE(short);
+  } else if (value.__isset.long_val) {
+    UPDATE_LOW_VALUE(long);
+  }
+}
 
-  // The maximum width of the column, in bytes.
-  int32_t max_width;
+#define UPDATE_HIGH_VALUE(TYPE)                                                       \
+  if (!(high_value.__isset.TYPE##_val) || value.TYPE##_val > high_value.TYPE##_val) { \
+    high_value.__set_##TYPE##_val(value.TYPE##_val);                                  \
+  }
 
-  // The total number of rows
-  int64_t num_rows;
+void PerColumnStats::UpdateHighValue(const impala::TColumnValue& value) {
+  if (value.__isset.double_val) {
+    UPDATE_HIGH_VALUE(double);
+  } else if (value.__isset.byte_val) {
+    UPDATE_HIGH_VALUE(byte);
+  } else if (value.__isset.int_val) {
+    UPDATE_HIGH_VALUE(int);
+  } else if (value.__isset.short_val) {
+    UPDATE_HIGH_VALUE(short);
+  } else if (value.__isset.long_val) {
+    UPDATE_HIGH_VALUE(long);
+  }
+}
 
-  // The sum of avg_width * num_rows for each partition, so that avg_width can be
-  // correctly computed during Finalize()
-  double total_width;
-
-  // Populated after Finalize(), the result of the HLL computation
-  int64_t ndv_estimate;
-
-  // The average column width, in bytes (but may have non-integer value)
-  double avg_width;
-
-  PerColumnStats()
-      : intermediate_ndv(AggregateFunctions::HLL_LEN, 0), num_nulls(0),
-        max_width(0), num_rows(0), avg_width(0) { }
-
-  // Updates all aggregate statistics with a new set of measurements.
-  void Update(const string& ndv, int64_t num_new_rows, double new_avg_width,
-      int32_t max_new_width, int64_t num_new_nulls) {
-    DCHECK_EQ(intermediate_ndv.size(), ndv.size()) << "Incompatible intermediate NDVs";
-    DCHECK_GE(num_new_rows, 0);
-    DCHECK_GE(max_new_width, 0);
-    DCHECK_GE(new_avg_width, 0);
-    DCHECK_GE(num_new_nulls, 0);
-    for (int j = 0; j < ndv.size(); ++j) {
-      intermediate_ndv[j] = ::max(intermediate_ndv[j], ndv[j]);
+void PerColumnStats::Update(const string& ndv, int64_t num_new_rows, double new_avg_width,
+    int32_t max_new_width, int64_t num_new_nulls, int64_t num_new_trues,
+    int64_t num_new_falses, const impala::TColumnValue& low_value_new,
+    const impala::TColumnValue& high_value_new) {
+  DCHECK_EQ(intermediate_ndv.size(), ndv.size()) << "Incompatible intermediate NDVs";
+  DCHECK_GE(num_new_rows, 0);
+  DCHECK_GE(max_new_width, 0);
+  DCHECK_GE(new_avg_width, 0);
+  DCHECK_GE(num_new_nulls, -1); // '-1' needed to be backward compatible
+  DCHECK_GE(num_trues, 0);
+  DCHECK_GE(num_falses, 0);
+  for (int j = 0; j < ndv.size(); ++j) {
+    intermediate_ndv[j] = ::max(intermediate_ndv[j], ndv[j]);
+  }
+  // Earlier the 'num_nulls' were initialized and persisted with '-1', this condition
+  // ensures metadata backward compatibility between releases
+  if (num_nulls >= 0) {
+    if (num_new_nulls >= 0) {
+      num_nulls += num_new_nulls;
+    } else {
+      num_nulls = -1;
     }
-    num_nulls += num_new_nulls;
-    max_width = ::max(max_width, max_new_width);
-    avg_width += (new_avg_width * num_new_rows);
-    num_rows += num_new_rows;
   }
 
-  // Performs any stats computations that are not distributive, that is they may not be
-  // computed in part during Update(). After this method returns, ndv_estimate and
-  // avg_width contain valid values.
-  void Finalize() {
-    ndv_estimate = AggregateFunctions::HllFinalEstimate(
-        reinterpret_cast<const uint8_t*>(intermediate_ndv.data()));
-    avg_width = num_rows == 0 ? 0 : avg_width / num_rows;
-  }
+  num_trues += num_new_trues;
+  num_falses += num_new_falses;
+  max_width = ::max(max_width, max_new_width);
+  total_width += (new_avg_width * num_new_rows);
+  num_rows += num_new_rows;
 
-  TColumnStats ToTColumnStats() const {
-    TColumnStats col_stats;
-    col_stats.__set_num_distinct_values(ndv_estimate);
-    col_stats.__set_num_nulls(num_nulls);
-    col_stats.__set_max_size(max_width);
-    col_stats.__set_avg_size(avg_width);
-    return col_stats;
-  }
+  UpdateLowValue(low_value_new);
+  UpdateHighValue(high_value_new);
+}
 
-  // Returns a string with debug information for this
-  string DebugString() const {
-    return Substitute(
-        "ndv: $0, num_nulls: $1, max_width: $2, avg_width: $3, num_rows: $4",
-        ndv_estimate, num_nulls, max_width, avg_width, num_rows);
-  }
-};
+void PerColumnStats::Finalize() {
+  ndv_estimate = AggregateFunctions::HllFinalEstimate(
+      reinterpret_cast<const uint8_t*>(intermediate_ndv.data()));
+  avg_width = num_rows == 0 ? 0 : total_width / num_rows;
+}
+
+TColumnStats PerColumnStats::ToTColumnStats() const {
+  TColumnStats col_stats;
+  col_stats.__set_num_distinct_values(ndv_estimate);
+  col_stats.__set_num_nulls(num_nulls);
+  col_stats.__set_max_size(max_width);
+  col_stats.__set_avg_size(avg_width);
+  col_stats.__set_num_trues(num_trues);
+  col_stats.__set_num_falses(num_falses);
+  col_stats.__set_low_value(low_value);
+  col_stats.__set_high_value(high_value);
+  return col_stats;
+}
+
+string PerColumnStats::DebugString() const {
+  stringstream ss_low_value;
+  ss_low_value << low_value;
+  stringstream ss_high_value;
+  ss_high_value << high_value;
+  return Substitute("ndv: $0, num_nulls: $1, max_width: $2, avg_width: $3, num_rows: "
+                    "$4, num_trues: $5, num_falses: $6, low_value: $7, high_value: $8",
+      ndv_estimate, num_nulls, max_width, avg_width, num_rows, num_trues, num_falses,
+      ss_low_value.str(), ss_high_value.str());
+}
 
 namespace impala {
 
@@ -193,9 +221,10 @@ void FinalizePartitionedColumnStats(const TTableSchema& col_stats_schema,
     const vector<vector<string>>& expected_partitions, const TRowSet& rowset,
     int32_t num_partition_cols, TAlterTableUpdateStatsParams* params) {
   // The rowset should have the following schema: for every column in the source table,
-  // five columns are produced, one row per partition.
-  // <ndv buckets>, <num nulls>, <max width>, <avg width>, <count rows>
-  static const int COLUMNS_PER_STAT = 5;
+  // seven columns are produced, one row per partition.
+  // <ndv buckets>, <num nulls>, <max width>, <avg width>, <count rows>,
+  // <num trues>, <num falses>, <low value>, <high value>
+  static const int COLUMNS_PER_STAT = 9;
 
   const int num_cols =
       (col_stats_schema.columns.size() - num_partition_cols) / COLUMNS_PER_STAT;
@@ -226,8 +255,24 @@ void FinalizePartitionedColumnStats(const TTableSchema& col_stats_schema,
         double avg_width = col_stats_row.colVals[i + 3].doubleVal.value;
         int32_t max_width = col_stats_row.colVals[i + 2].i32Val.value;
         int64_t num_nulls = col_stats_row.colVals[i + 1].i64Val.value;
+        int64_t num_trues = col_stats_row.colVals[i + 5].i64Val.value;
+        int64_t num_falses = col_stats_row.colVals[i + 6].i64Val.value;
+        TColumnValueHive low_value = col_stats_row.colVals[i + 7];
+        TColumnValueHive high_value = col_stats_row.colVals[i + 8];
 
-        stat->Update(ndv, num_rows, avg_width, max_width, num_nulls);
+        impala::TColumnValue low_value_impala =
+            ConvertToTColumnValue(col_stats_schema.columns[i + 7], low_value);
+        impala::TColumnValue high_value_impala =
+            ConvertToTColumnValue(col_stats_schema.columns[i + 8], high_value);
+
+        VLOG(3) << "Updated statistics for column=["
+                << col_stats_schema.columns[i].columnName << "]," << " statistics={"
+                << ndv << "," << num_rows << "，" << avg_width << "," << num_trues
+                << "," << max_width << "," << num_nulls << "," << num_falses
+                << PrintTColumnValue(low_value_impala) << ","
+                << PrintTColumnValue(high_value_impala) << "}";
+        stat->Update(ndv, num_rows, avg_width, max_width, num_nulls, num_trues,
+            num_falses, low_value_impala, high_value_impala);
 
         // Save the intermediate state per-column, per-partition
         TIntermediateColumnStats int_stats;
@@ -238,6 +283,10 @@ void FinalizePartitionedColumnStats(const TTableSchema& col_stats_schema,
         int_stats.__set_max_width(max_width);
         int_stats.__set_avg_width(avg_width);
         int_stats.__set_num_rows(num_rows);
+        int_stats.__set_num_trues(num_trues);
+        int_stats.__set_num_falses(num_falses);
+        int_stats.__set_low_value(low_value_impala);
+        int_stats.__set_high_value(high_value_impala);
 
         part_stat->intermediate_col_stats[col_stats_schema.columns[i].columnName] =
             int_stats;
@@ -251,12 +300,14 @@ void FinalizePartitionedColumnStats(const TTableSchema& col_stats_schema,
   TIntermediateColumnStats empty_column_stats;
   bool is_encoded;
   empty_column_stats.__set_intermediate_ndv(
-      EncodeNdv(string(AggregateFunctions::HLL_LEN, 0), &is_encoded));
+      EncodeNdv(string(AggregateFunctions::DEFAULT_HLL_LEN, 0), &is_encoded));
   empty_column_stats.__set_is_ndv_encoded(is_encoded);
   empty_column_stats.__set_num_nulls(0);
   empty_column_stats.__set_max_width(0);
   empty_column_stats.__set_avg_width(0);
   empty_column_stats.__set_num_rows(0);
+  empty_column_stats.__set_num_trues(0);
+  empty_column_stats.__set_num_falses(0);
   TPartitionStats empty_part_stats;
   for (int i = 0; i < num_cols * COLUMNS_PER_STAT; i += COLUMNS_PER_STAT) {
     empty_part_stats.intermediate_col_stats[col_stats_schema.columns[i].columnName] =
@@ -288,9 +339,16 @@ void FinalizePartitionedColumnStats(const TTableSchema& col_stats_schema,
       }
 
       const TIntermediateColumnStats& int_stats = it->second;
+      VLOG(3) << "Updated intermediate value for column=[" << col_name << "], "
+              << "statistics={" << int_stats.intermediate_ndv << ","
+              << int_stats.num_rows << "，" << int_stats.avg_width << ","
+              << int_stats.max_width << ","<< int_stats.num_nulls << ","
+              << int_stats.num_trues << "," << int_stats.num_falses << ","
+              << int_stats.low_value << "," << int_stats.high_value << "}";
       stats[i].Update(DecodeNdv(int_stats.intermediate_ndv, int_stats.is_ndv_encoded),
           int_stats.num_rows, int_stats.avg_width, int_stats.max_width,
-          int_stats.num_nulls);
+          int_stats.num_nulls, int_stats.num_trues, int_stats.num_falses,
+          int_stats.low_value, int_stats.high_value);
     }
   }
 

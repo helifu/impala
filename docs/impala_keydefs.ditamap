@@ -53,6 +53,14 @@ under the License.
     <topicmeta><linktext>the Apache HBase documentation</linktext></topicmeta>
   </keydef>
 
+  <keydef href="https://iceberg.apache.org" scope="external" format="html" keys="upstream_iceberg_site">
+    <topicmeta><linktext>the Apache Iceberg site</linktext></topicmeta>
+  </keydef>
+
+  <keydef href="https://ozone.apache.org" scope="external" format="html" keys="upstream_ozone_site">
+    <topicmeta><linktext>the Apache Ozone site</linktext></topicmeta>
+  </keydef>
+
   <keydef href="https://hbase.apache.org/book.html#security" scope="external" format="html" keys="upstream_hbase_security_docs">
     <topicmeta><linktext>the Security chapter in the Apache HBase documentation</linktext></topicmeta>
   </keydef>
@@ -69,13 +77,13 @@ under the License.
   <keydef href="" scope="external" format="html" keys="udf-samples">
     <topicmeta><linktext>impala-udf-samples</linktext></topicmeta>
   </keydef>
-  <keydef href="" scope="external" format="html" keys="uda-sample.cc">
+  <keydef href="https://github.com/cloudera/impala-udf-samples/blob/master/uda-sample.cc" scope="external" format="html" keys="uda-sample.cc">
     <topicmeta><linktext>uda-sample.cc</linktext></topicmeta>
   </keydef>
   <keydef href="" scope="external" format="html" keys="udf-sample.h">
     <topicmeta><linktext>udf-sample.h</linktext></topicmeta>
   </keydef>
-  <keydef href="" scope="external" format="html" keys="uda-sample.h">
+  <keydef href="https://github.com/cloudera/impala-udf-samples/blob/master/uda-sample.h" scope="external" format="html" keys="uda-sample.h">
     <topicmeta><linktext>uda-sample.h</linktext></topicmeta>
   </keydef>
   <keydef href="https://github.com/apache/impala/blob/master/be/src/testutil/test-udas.cc" scope="external" format="html" keys="test-udas.cc">
@@ -10521,6 +10529,9 @@ under the License.
   <keydef href="https://issues.apache.org/jira/browse/IMPALA-9999" scope="external" format="html" keys="IMPALA-9999"/>
 
 <!-- Short form of mapping from Impala release to vendor-specific releases, for use in headings. -->
+  <keydef keys="impala42"><topicmeta><keywords><keyword>Impala 4.2</keyword></keywords></topicmeta></keydef>
+  <keydef keys="impala41"><topicmeta><keywords><keyword>Impala 4.1</keyword></keywords></topicmeta></keydef>
+  <keydef keys="impala40"><topicmeta><keywords><keyword>Impala 4.0</keyword></keywords></topicmeta></keydef>
   <keydef keys="impala34"><topicmeta><keywords><keyword>Impala 3.4</keyword></keywords></topicmeta></keydef>
   <keydef keys="impala33"><topicmeta><keywords><keyword>Impala 3.3</keyword></keywords></topicmeta></keydef>
   <keydef keys="impala32"><topicmeta><keywords><keyword>Impala 3.2</keyword></keywords></topicmeta></keydef>
@@ -10586,6 +10597,7 @@ under the License.
   <keydef keys="impala132"><topicmeta><keywords><keyword>Impala 1.3.2</keyword></keywords></topicmeta></keydef>
   <keydef keys="impala130"><topicmeta><keywords><keyword>Impala 1.3.0</keyword></keywords></topicmeta></keydef>
 
+  <keydef keys="impala42_full"><topicmeta><keywords><keyword>Impala 4.2</keyword></keywords></topicmeta></keydef>
   <keydef keys="impala34_full"><topicmeta><keywords><keyword>Impala 3.4</keyword></keywords></topicmeta></keydef>
   <keydef keys="impala33_full"><topicmeta><keywords><keyword>Impala 3.3</keyword></keywords></topicmeta></keydef>
   <keydef keys="impala32_full"><topicmeta><keywords><keyword>Impala 3.2</keyword></keywords></topicmeta></keydef>
@@ -10609,6 +10621,8 @@ under the License.
   <keydef keys="impala13_full"><topicmeta><keywords><keyword>Impala 1.3</keyword></keywords></topicmeta></keydef>
 
 <!-- Pointers to changelog pages -->
+  <keydef keys="release_notes_40" href="https://impala.apache.org/docs/release-notes-4.0.html" scope="external" format="html"/>
+  <keydef keys="changelog_40" href="https://impala.apache.org/docs/changelog-4.0.html" scope="external" format="html"/>
   <keydef keys="changelog_34" href="https://impala.apache.org/docs/changelog-3.4.html" scope="external" format="html"/>
   <keydef keys="changelog_33" href="https://impala.apache.org/docs/changelog-3.3.html" scope="external" format="html"/>
   <keydef keys="changelog_32" href="https://impala.apache.org/docs/changelog-3.2.html" scope="external" format="html"/>
@@ -11050,6 +11064,7 @@ under the License.
 
   <keydef href="topics/impala_s3.xml" keys="s3"/>
   <keydef href="topics/impala_isilon.xml" keys="impala_isilon"/>
+  <keydef href="topics/impala_ozone.xml" keys="impala_ozone"/>
 
   <keydef href="topics/impala_logging.xml" keys="logging"/>
   <keydef href="topics/impala_logging.xml#logs_details" keys="logs_details"/>

@@ -20,7 +20,6 @@
 #include <ostream>
 #include <sstream>
 
-#include "gen-cpp/TCLIService_constants.h"
 #include "codegen/llvm-codegen.h"
 
 #include "common/names.h"
@@ -37,6 +36,12 @@ const int ColumnType::MAX_DECIMAL4_PRECISION;
 const int ColumnType::MAX_DECIMAL8_PRECISION;
 
 const char* ColumnType::LLVM_CLASS_NAME = "struct.impala::ColumnType";
+
+AuxColumnType::AuxColumnType(const TColumnType& col_type) {
+  if (col_type.types.size() != 1 || !col_type.types[0].__isset.scalar_type) return;
+  TPrimitiveType::type primitive_type = col_type.types[0].scalar_type.type;
+  if (primitive_type == TPrimitiveType::BINARY) string_subtype = StringSubtype::BINARY;
+}
 
 ColumnType::ColumnType(const std::vector<TTypeNode>& types, int* idx)
   : len(-1), precision(-1), scale(-1) {
@@ -66,6 +71,7 @@ ColumnType::ColumnType(const std::vector<TTypeNode>& types, int* idx)
         ++(*idx);
         children.push_back(ColumnType(types, idx));
         field_names.push_back(node.struct_fields[i].name);
+        field_ids.push_back(node.struct_fields[i].field_id);
       }
       break;
     case TTypeNodeType::ARRAY:
@@ -105,7 +111,8 @@ PrimitiveType ThriftToType(TPrimitiveType::type ttype) {
     case TPrimitiveType::TIMESTAMP: return TYPE_TIMESTAMP;
     case TPrimitiveType::STRING: return TYPE_STRING;
     case TPrimitiveType::VARCHAR: return TYPE_VARCHAR;
-    case TPrimitiveType::BINARY: return TYPE_BINARY;
+    // BINARY is generally handled the same way as STRING by the backend.
+    case TPrimitiveType::BINARY: return TYPE_STRING;
     case TPrimitiveType::DECIMAL: return TYPE_DECIMAL;
     case TPrimitiveType::CHAR: return TYPE_CHAR;
     case TPrimitiveType::FIXED_UDA_INTERMEDIATE: return TYPE_FIXED_UDA_INTERMEDIATE;
@@ -129,7 +136,9 @@ TPrimitiveType::type ToThrift(PrimitiveType ptype) {
     case TYPE_TIMESTAMP: return TPrimitiveType::TIMESTAMP;
     case TYPE_STRING: return TPrimitiveType::STRING;
     case TYPE_VARCHAR: return TPrimitiveType::VARCHAR;
-    case TYPE_BINARY: return TPrimitiveType::BINARY;
+    case TYPE_BINARY:
+      DCHECK(false) << "STRING should be used instead of BINARY in the backend.";
+      return TPrimitiveType::INVALID_TYPE;
     case TYPE_DECIMAL: return TPrimitiveType::DECIMAL;
     case TYPE_CHAR: return TPrimitiveType::CHAR;
     case TYPE_FIXED_UDA_INTERMEDIATE: return TPrimitiveType::FIXED_UDA_INTERMEDIATE;
@@ -168,9 +177,15 @@ string TypeToString(PrimitiveType t) {
   return "";
 }
 
-string TypeToOdbcString(PrimitiveType t) {
+string TypeToOdbcString(const TColumnType& type) {
+  DCHECK_EQ(1, type.types.size());
+  DCHECK_EQ(TTypeNodeType::SCALAR, type.types[0].type);
+  DCHECK(type.types[0].__isset.scalar_type);
+  TPrimitiveType::type col_type = type.types[0].scalar_type.type;
+  PrimitiveType primitive_type = ThriftToType(col_type);
+  AuxColumnType aux_type(type);
   // ODBC driver requires types in lower case
-  switch (t) {
+  switch (primitive_type) {
     case INVALID_TYPE: return "invalid";
     case TYPE_NULL: return "null";
     case TYPE_BOOLEAN: return "boolean";
@@ -183,14 +198,20 @@ string TypeToOdbcString(PrimitiveType t) {
     case TYPE_DATE: return "date";
     case TYPE_DATETIME: return "datetime";
     case TYPE_TIMESTAMP: return "timestamp";
-    case TYPE_STRING: return "string";
+    case TYPE_STRING:
+      if(aux_type.IsBinaryStringSubtype()) {
+        return "binary";
+      } else {
+        return "string";
+      }
     case TYPE_VARCHAR: return "string";
-    case TYPE_BINARY: return "binary";
+
     case TYPE_DECIMAL: return "decimal";
     case TYPE_CHAR: return "char";
     case TYPE_STRUCT: return "struct";
     case TYPE_ARRAY: return "array";
     case TYPE_MAP: return "map";
+    case TYPE_BINARY:
     case TYPE_FIXED_UDA_INTERMEDIATE:
       // This type is not exposed to clients and should not be returned.
       DCHECK(false);
@@ -211,9 +232,11 @@ void ColumnType::ToThrift(TColumnType* thrift_type) const {
       DCHECK_EQ(type, TYPE_STRUCT);
       node.type = TTypeNodeType::STRUCT;
       node.__set_struct_fields(vector<TStructField>());
-      for (const string& field_name: field_names) {
+      DCHECK_EQ(field_names.size(), field_ids.size());
+      for (int i=0; i<field_names.size(); i++) {
         node.struct_fields.push_back(TStructField());
-        node.struct_fields.back().name = field_name;
+        node.struct_fields.back().name = field_names[i];
+        node.struct_fields.back().field_id = field_ids[i];
       }
     }
     for (const ColumnType& child: children) {
@@ -235,84 +258,6 @@ void ColumnType::ToThrift(TColumnType* thrift_type) const {
       scalar_type.__set_scale(scale);
     }
   }
-}
-
-TTypeEntry ColumnType::ToHs2Type() const {
-  TPrimitiveTypeEntry type_entry;
-  switch (type) {
-    // Map NULL_TYPE to BOOLEAN, otherwise Hive's JDBC driver won't
-    // work for queries like "SELECT NULL" (IMPALA-914).
-    case TYPE_NULL:
-      type_entry.__set_type(TTypeId::BOOLEAN_TYPE);
-      break;
-    case TYPE_BOOLEAN:
-      type_entry.__set_type(TTypeId::BOOLEAN_TYPE);
-      break;
-    case TYPE_TINYINT:
-      type_entry.__set_type(TTypeId::TINYINT_TYPE);
-      break;
-    case TYPE_SMALLINT:
-      type_entry.__set_type(TTypeId::SMALLINT_TYPE);
-      break;
-    case TYPE_INT:
-      type_entry.__set_type(TTypeId::INT_TYPE);
-      break;
-    case TYPE_BIGINT:
-      type_entry.__set_type(TTypeId::BIGINT_TYPE);
-      break;
-    case TYPE_FLOAT:
-      type_entry.__set_type(TTypeId::FLOAT_TYPE);
-      break;
-    case TYPE_DOUBLE:
-      type_entry.__set_type(TTypeId::DOUBLE_TYPE);
-      break;
-    case TYPE_DATE:
-      type_entry.__set_type(TTypeId::DATE_TYPE);
-      break;
-    case TYPE_TIMESTAMP:
-      type_entry.__set_type(TTypeId::TIMESTAMP_TYPE);
-      break;
-    case TYPE_STRING:
-      type_entry.__set_type(TTypeId::STRING_TYPE);
-      break;
-    case TYPE_BINARY:
-      type_entry.__set_type(TTypeId::BINARY_TYPE);
-      break;
-    case TYPE_DECIMAL: {
-      TTypeQualifierValue tprecision;
-      tprecision.__set_i32Value(precision);
-      TTypeQualifierValue tscale;
-      tscale.__set_i32Value(scale);
-
-      TTypeQualifiers type_quals;
-      type_quals.qualifiers[g_TCLIService_constants.PRECISION] = tprecision;
-      type_quals.qualifiers[g_TCLIService_constants.SCALE] = tscale;
-      type_entry.__set_typeQualifiers(type_quals);
-      type_entry.__set_type(TTypeId::DECIMAL_TYPE);
-      break;
-    }
-    case TYPE_CHAR:
-    case TYPE_VARCHAR: {
-      TTypeQualifierValue tmax_len;
-      tmax_len.__set_i32Value(len);
-
-      TTypeQualifiers type_quals;
-      type_quals.qualifiers[g_TCLIService_constants.CHARACTER_MAXIMUM_LENGTH] = tmax_len;
-      type_entry.__set_typeQualifiers(type_quals);
-      type_entry.__set_type(
-          (type == TYPE_CHAR) ? TTypeId::CHAR_TYPE : TTypeId::VARCHAR_TYPE);
-      break;
-    }
-    default:
-      // HiveServer2 does not have a type for invalid, date, datetime or
-      // fixed_uda_intermediate.
-      DCHECK(false) << "bad TypeToTValueType() type: " << DebugString();
-      type_entry.__set_type(TTypeId::STRING_TYPE);
-  };
-
-  TTypeEntry result;
-  result.__set_primitiveEntry(type_entry);
-  return result;
 }
 
 string ColumnType::DebugString() const {
@@ -362,14 +307,17 @@ llvm::ConstantStruct* ColumnType::ToIR(LlvmCodeGen* codegen) const {
   // Create empty 'children' and 'field_names' vectors
   DCHECK(children.empty()) << "Nested types NYI";
   DCHECK(field_names.empty()) << "Nested types NYI";
+  DCHECK(field_ids.empty()) << "Nested types NYI";
   llvm::Constant* children_field =
       llvm::Constant::getNullValue(column_type_type->getElementType(4));
   llvm::Constant* field_names_field =
       llvm::Constant::getNullValue(column_type_type->getElementType(5));
+  llvm::Constant* field_ids_field =
+      llvm::Constant::getNullValue(column_type_type->getElementType(6));
 
   return llvm::cast<llvm::ConstantStruct>(
       llvm::ConstantStruct::get(column_type_type, type_field, len_field, precision_field,
-          scale_field, children_field, field_names_field));
+          scale_field, children_field, field_names_field, field_ids_field));
 }
 
 }

@@ -15,9 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-
-cmake_minimum_required(VERSION 2.6)
-
 # generate CTest input files
 enable_testing()
 
@@ -35,21 +32,41 @@ PROJECT(ASSEMBLER)
 #   -fno-strict-aliasing: disable optimizations that assume strict aliasing. This
 #       is unsafe to do if the code uses casts (which we obviously do).
 #  -Wno-unknown-pragmas: suppress warnings for unknown (compiler specific) pragmas
+#  -fsigned-char: on aarch64 platform, type of char default is unsigned char, here
+#        set it to signed-char to be compatible with x86-64
 #  -Wno-deprecated: gutil contains deprecated headers
 #  -Wno-vla: we use C99-style variable-length arrays
 #  -pthread: enable multithreaded malloc
 #  -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG: enable nanosecond precision for boost
 #  -fno-omit-frame-pointers: Keep frame pointer for functions in register
+if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+  SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -march=armv8-a+crc")
+endif()
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wall -Wno-sign-compare -Wno-unknown-pragmas -pthread")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fno-strict-aliasing -fno-omit-frame-pointer")
-SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -std=c++14")
+SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fsigned-char")
+SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -std=c++17")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-deprecated -Wno-vla")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_SYSTEM_NO_DEPRECATED")
-SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -B $ENV{IMPALA_TOOLCHAIN}/binutils-$ENV{IMPALA_BINUTILS_VERSION}/bin/")
+SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_BIND_GLOBAL_PLACEHOLDERS")
+SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_ALLOW_DEPRECATED_HEADERS")
+#  -DBOOST_UUID_RANDOM_PROVIDER_FORCE_POSIX
+#      For higher portability of the built binaries, switch to /dev/[u]random
+#      even if getrandom(2) is available. This is to allow for running binaries
+#      built at OS where getrandom(2) is available at OSes where getrandom(2)
+#      isn't supported (e.g., that might happen in containerized deployments).
+SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_UUID_RANDOM_PROVIDER_FORCE_POSIX")
+SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -B $ENV{IMPALA_TOOLCHAIN_PACKAGES_HOME}/binutils-$ENV{IMPALA_BINUTILS_VERSION}/bin/")
 IF($ENV{USE_GOLD_LINKER} STREQUAL "true")
   SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fuse-ld=gold")
 ENDIF()
+
+if(BUILD_SHARED_LIBS)
+  # There is some logic in be/src/kudu/util/debug/unwind_safeness.cc that needs to adapt
+  # when using shared libraries. See IMPALA-11640.
+  SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DIMPALA_SHARED_LIBRARY")
+endif()
 
 # On Apple we build with clang and need libstdc++ instead of libc++
 if (APPLE)
@@ -73,38 +90,53 @@ SET(CXX_COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage -DCODE_COVERAGE_ENABLED")
 #        destructors with 'override' which is enforced by clang by not recommended by c++
 #        core guidelines (read C.128).
 SET(CXX_CLANG_FLAGS "-Qunused-arguments -fcolor-diagnostics -Wno-unused-local-typedef")
+SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -fsigned-char")
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+  SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -march=armv8-a+crc")
+endif()
 SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-zero-as-null-pointer-constant")
 SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-c++17-extensions")
 SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-inconsistent-missing-destructor-override")
 SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-return-type-c-linkage")
+SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -DCALLONCEHACK")
 # For any gcc builds:
 #   -g: Enable symbols for profiler tools
 #   -Wno-unused-local-typedefs: Do not warn for local typedefs that are unused.
-SET(CXX_GCC_FLAGS "-g -Wno-unused-local-typedefs")
-if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 7.0)
-  # We need to add additional arguments for GCC 7+. We go down this branch if building
-  # with a non-GCC compiler of version 7+, but in that case CXX_GCC_FLAGS is not used,
-  # so it is inconsequential. TODO: IMPALA-5490: make this non-conditional when we
-  # upgrade GCC.
-  #  -faligned-new: new will automatically align types. Otherwise "new Counter()" in the
-  #       Kudu util code produces a warning (see KUDU-2094).
-  #   TODO: -faligned-new is part of C++17, remove flag when we bump language version.
-  SET(CXX_GCC_FLAGS "${CXX_GCC_FLAGS} -faligned-new")
-endif()
+#   -gdwarf-4: Set the appropriate DWARF version. Later versions of DWARF have better
+#    support for newer C++ language features and better compression, but require newer
+#    versions of GDB. DWARF 4 requires GDB 7.0 or above.
+#   -Wno-maybe-unitialized: Do not warn for variables that might be uninitialized
+SET(CXX_GCC_FLAGS "-g -Wno-unused-local-typedefs -gdwarf-4 -Wno-maybe-uninitialized")
+# There are some GCC warnings added in recent versions that current code hits.
+# These can be addressed over time, because they also appear in the headers of
+# some of our dependencies:
+#   -Wno-class-memaccess: This warning was added in GCC 8. This impacts a lot of
+#    locations (e.g. Tuple and TimestampValue) as well as rapidjson. This warning
+#    doesn't seem particularly useful for us.
+#   -Wno-init-list-lifetime: This warning was added in GCC 9, and several code pieces
+#    are not clean yet (including some LLVM code).
+# TODO: These should be cleaned up and reenabled.
+SET(CXX_GCC_FLAGS "${CXX_GCC_FLAGS} -Wno-class-memaccess -Wno-init-list-lifetime")
 
 # compiler flags for different build types (run 'cmake -DCMAKE_BUILD_TYPE=<type> .')
-# For CMAKE_BUILD_TYPE=Debug
+# For CMAKE_BUILD_TYPE=DEBUG_NOOPT
 #   -ggdb: Enable gdb debugging
+# For CMAKE_BUILD_TYPE=Debug
+#   (Same as CMAKE_BUILD_TYPE=DEBUG_NOOPT) +
+#   -Og: Enable basic optimizations
 # For CMAKE_BUILD_TYPE=Release
 #   -O3: Enable all compiler optimizations
 #   -DNDEBUG: Turn off dchecks/asserts/debug only code.
-#
-# Debug information is stored as dwarf2 to be as compatible as possible
-SET(CXX_FLAGS_DEBUG "${CXX_GCC_FLAGS} -ggdb -gdwarf-2")
+SET(CXX_FLAGS_DEBUG_NOOPT "${CXX_GCC_FLAGS} -ggdb")
 # -Werror: compile warnings should be errors when using the toolchain compiler.
 #   Enabled for DEBUG, ASAN, TSAN and UBSAN builds which are built pre-commit.
-SET(CXX_FLAGS_DEBUG "${CXX_FLAGS_DEBUG} -Werror")
-SET(CXX_FLAGS_RELEASE "${CXX_GCC_FLAGS} -O3 -DNDEBUG -gdwarf-2")
+SET(CXX_FLAGS_DEBUG_NOOPT "${CXX_FLAGS_DEBUG_NOOPT} -Werror")
+# The legacy debug mode built without optimizations, as optimizations can interfere with
+# debuggability. The DEBUG_NOOPT mode maintains this old behavior, while the default
+# Debug mode now applies basic optimizations (-Og) to speed up test runs.
+SET(CXX_FLAGS_DEBUG "${CXX_FLAGS_DEBUG_NOOPT} -Og")
+
+SET(CXX_FLAGS_RELEASE "${CXX_GCC_FLAGS} -O3 -DNDEBUG")
 SET(CXX_FLAGS_ADDRESS_SANITIZER
   "${CXX_CLANG_FLAGS} -Werror -O1 -g -fsanitize=address -fno-omit-frame-pointer -DADDRESS_SANITIZER")
 
@@ -130,7 +162,8 @@ SET(CXX_FLAGS_UBSAN "${CXX_FLAGS_UBSAN} -O0")
 # Set the flags to the thread sanitizer, also known as "tsan"
 # Turn on sanitizer and debug symbols to get stack traces:
 SET(CXX_FLAGS_TSAN "${CXX_CLANG_FLAGS} -Werror -O1 -ggdb3 -fno-omit-frame-pointer")
-SET(CXX_FLAGS_TSAN "${CXX_FLAGS_TSAN} -fsanitize=thread -DTHREAD_SANITIZER")
+SET(CXX_FLAGS_TSAN "${CXX_FLAGS_TSAN} -fsanitize=thread -DTHREAD_SANITIZER -DDYNAMIC_ANNOTATIONS_ENABLED")
+SET(CXX_FLAGS_TSAN "${CXX_FLAGS_TSAN} -DTHREAD_SANITIZER_SUPPRESSIONS=\\\"$ENV{IMPALA_HOME}/bin/tsan-suppressions.txt\\\"")
 
 SET(CXX_FLAGS_TIDY "${CXX_CLANG_FLAGS}")
 # Catching unused variables requires an optimization level greater than 0
@@ -140,8 +173,9 @@ SET(CXX_FLAGS_TIDY "${CXX_FLAGS_TIDY} -O1")
 SET(CXX_FLAGS_TIDY "${CXX_FLAGS_TIDY} -DNDEBUG")
 # Turn all warnings back on. Some will be ignored via .clang-tidy's "Checks" value, but
 # this allows different "Checks" settings to be used in different clang-tidy runs without
-# recompiling.
-SET(CXX_FLAGS_TIDY "${CXX_FLAGS_TIDY} -Wall -W -Weverything")
+# recompiling. There are two exceptions: C++98 compatibility and padding are not interesting
+# and excluding them dramatically reduces the output.
+SET(CXX_FLAGS_TIDY "${CXX_FLAGS_TIDY} -Wall -W -Weverything -Wno-c++98-compat -Wno-padded")
 # The Tidy build is so verbose (becasue of -Weverything) that it is unlikely to be viewed
 # in a terminal and most likely will be redirecto to less, a log file, or /dev/null. In
 # those places color codes just make the output harder to read.
@@ -150,6 +184,8 @@ SET(CXX_FLAGS_TIDY "${CXX_FLAGS_TIDY} -fno-color-diagnostics")
 # Set compile flags based on the build type.
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
   SET(CMAKE_CXX_FLAGS ${CXX_FLAGS_DEBUG})
+elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG_NOOPT")
+  SET(CMAKE_CXX_FLAGS ${CXX_FLAGS_DEBUG_NOOPT})
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
   SET(CMAKE_CXX_FLAGS ${CXX_FLAGS_RELEASE})
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER")
@@ -163,6 +199,9 @@ elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL")
   SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUNDEFINED_SANITIZER_FULL")
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
   SET(CMAKE_CXX_FLAGS "${CXX_FLAGS_TSAN}")
+elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "TSAN_FULL")
+  SET(CMAKE_CXX_FLAGS "${CXX_FLAGS_TSAN}")
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTHREAD_SANITIZER_FULL")
 else()
   message(FATAL_ERROR "Unknown build type: ${CMAKE_BUILD_TYPE}")
 endif()
@@ -179,6 +218,33 @@ SET(CMAKE_CXX_FLAGS "${CXX_COMMON_FLAGS} ${CMAKE_CXX_FLAGS}")
 SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fverbose-asm")
 SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${LLVM_CFLAGS}")
 
+# The IMPALA_MINIMAL_DEBUG_INFO option saves diskspace by reducing the debug info
+# in binaries to the minimal level that can do backtraces. The "-g1" option
+# keeps line number tables, but it does not keep variable information. This
+# can reduce the size of binaries by >%60. This is appended to the end of arguments
+# so that it overrides other "-g" arguments.
+if ($ENV{IMPALA_MINIMAL_DEBUG_INFO} STREQUAL "true")
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g1")
+  # The choice of CMAKE_BUILD_TYPE specifies a set of flags that are added
+  # after the flags in CMAKE_CXX_FLAGS. CMAKE_BUILD_TYPE=Debug adds "-g", which
+  # overrides our "-g1" because it is later in the argument list. To fix this,
+  # this overrides CMake's flags for CMAKE_BUILD_TYPE=Debug to use "-g1" rather
+  # than "-g". CMAKE_BUILD_TYPE=Release and other CMAKE_BUILD_TYPEs that we use
+  # don't include a "-g" flag, so they don't need similar treatment.
+  SET(CMAKE_CXX_FLAGS_DEBUG "-g1")
+endif()
+
+# The IMPALA_COMPRESSED_DEBUG_INFO option saves diskspace by compressing the
+# debug info in the executable. This can reduce the size of binaries by >50%
+# without changing the amount of debug information. gdb is known to work
+# with compressed debug info, but other tools may not know how to use it.
+# TODO: The current version of Clang does not handles this flag correctly and
+# simply produces binaries with uncompressed debug info. This needs further
+# debugging.
+if ($ENV{IMPALA_COMPRESSED_DEBUG_INFO} STREQUAL "true")
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -gz")
+endif()
+
 # Use ccache when found and not explicitly disabled by setting the DISABLE_CCACHE envvar.
 find_program(CCACHE ccache)
 set(RULE_LAUNCH_PREFIX)
@@ -188,7 +254,8 @@ if (CCACHE AND NOT DEFINED ENV{DISABLE_CCACHE})
       OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY"
       OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN"
       OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL"
-      OR "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
+      OR "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN"
+      OR "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN_FULL")
     # Need to set CCACHE_CPP so that ccache calls clang with the original source file for
     # both preprocessing and compilation. Otherwise, ccache will use clang to preprocess
     # the file and then call clang with the preprocessed output if not cached. However,
@@ -199,17 +266,22 @@ if (CCACHE AND NOT DEFINED ENV{DISABLE_CCACHE})
   endif()
 endif()
 
-set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ${RULE_LAUNCH_PREFIX})
-set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ${RULE_LAUNCH_PREFIX})
+# There can be RULE_LAUNCH_COMPILE / RULE_LAUNCH_LINK settings already at the parent
+# level. The parent layer should wrap any launcher used here.
+get_property(PARENT_RULE_LAUNCH_COMPILE GLOBAL PROPERTY RULE_LAUNCH_COMPILE)
+get_property(PARENT_RULE_LAUNCH_LINK GLOBAL PROPERTY RULE_LAUNCH_LINK)
+
+set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE
+  "${PARENT_RULE_LAUNCH_COMPILE} ${RULE_LAUNCH_PREFIX}")
+set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK
+  "${PARENT_RULE_LAUNCH_LINK} ${RULE_LAUNCH_PREFIX}")
 
 # Thrift requires these definitions for some types that we use
 add_definitions(-DHAVE_INTTYPES_H -DHAVE_NETINET_IN_H -DHAVE_NETDB_H)
 
-# Kudu flags. 1. Enable non KUDU_* prefixes for status macros to allow Kudu code to
-# compile without changing the macro. 2. Enable full support for all backing types of
-# kudu::Slices. 3. Don't include stubs.h
-add_definitions(-DKUDU_HEADERS_USE_SHORT_STATUS_MACROS -DKUDU_HEADERS_USE_RICH_SLICE
-  -DKUDU_HEADERS_NO_STUBS)
+# Kudu flags. 1. Enable full support for all backing types of kudu::Slices.
+# 2. Don't include stubs.h
+add_definitions(-DKUDU_HEADERS_USE_RICH_SLICE -DKUDU_HEADERS_NO_STUBS)
 
 # Set clang flags for cross-compiling to IR.
 # IR_COMPILE is #defined for the cross compile to remove code that bloats the IR.
@@ -220,9 +292,17 @@ add_definitions(-DKUDU_HEADERS_USE_SHORT_STATUS_MACROS -DKUDU_HEADERS_USE_RICH_S
 #  -Wno-return-type-c-linkage: UDFs return C++ classes but use C linkage to prevent
 #       mangling
 #  -DBOOST_NO_EXCEPTIONS: call a custom error handler for exceptions in codegen'd code.
-set(CLANG_IR_CXX_FLAGS "-emit-llvm" "-c" "-std=c++14" "-DIR_COMPILE" "-DHAVE_INTTYPES_H"
+set(CLANG_IR_CXX_FLAGS "-emit-llvm" "-c" "-std=c++17" "-DIR_COMPILE" "-DHAVE_INTTYPES_H"
   "-DHAVE_NETINET_IN_H" "-DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG" "-DBOOST_NO_EXCEPTIONS"
-  "-fcolor-diagnostics" "-Wno-deprecated" "-Wno-return-type-c-linkage" "-O1")
+  "-DBOOST_BIND_GLOBAL_PLACEHOLDERS" "-DBOOST_ALLOW_DEPRECATED_HEADERS"
+  "-DKUDU_HEADERS_NO_STUBS" "-fcolor-diagnostics" "-Wno-deprecated"
+  "-Wno-return-type-c-linkage" "-fsigned-char" "-O1")
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+  set(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-march=armv8-a+crc"
+    "-DCACHELINESIZE_AARCH64=${CACHELINESIZE_AARCH64}")
+endif()
+
 # -Werror: compile warnings should be errors when using the toolchain compiler.
 set(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-Werror")
 
@@ -306,16 +386,18 @@ set(CLANG_INCLUDE_FLAGS
   ${CLANG_INCLUDE_FLAGS}
   "-I${CMAKE_CURRENT_SOURCE_DIR}/src"
   "-I${CMAKE_CURRENT_SOURCE_DIR}/generated-sources"
-  "-I${THRIFT_INCLUDE_DIR}"
+  "-I${THRIFT_CPP_INCLUDE_DIR}"
   "-I${SQUEASEL_INCLUDE_DIR}"
   "-I${GLOG_INCLUDE_DIR}"
   "-I${GFLAGS_INCLUDE_DIR}"
   "-I${GTEST_INCLUDE_DIR}"
+  "-I${JWT_CPP_INCLUDE_DIR}"
   "-I${RAPIDJSON_INCLUDE_DIR}"
   "-I${AVRO_INCLUDE_DIR}"
   "-I${ORC_INCLUDE_DIR}"
   # Include Boost as a system directory to suppress warnings from headers.
   "-isystem${BOOST_INCLUDEDIR}"
+  "-I${KUDU_CLIENT_INCLUDE_DIR}"
   # Required so that jni.h can be found during Clang compilation
   "-I${JAVA_INCLUDE_PATH}"
   "-I${JAVA_INCLUDE_PATH2}"
@@ -327,6 +409,7 @@ set(CLANG_INCLUDE_FLAGS
   "-I${LDAP_INCLUDE_DIR}"
   "-I${PROTOBUF_INCLUDE_DIR}"
   "-I${CCTZ_INCLUDE_DIR}"
+  "-I${CURL_INCLUDE_DIR}"
 )
 
 # allow linking of static libs into dynamic lib
@@ -334,10 +417,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # set compile output directory
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG" OR
+    "${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG_NOOPT" OR
     "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER" OR
     "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN" OR
     "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL" OR
-    "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
+    "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN" OR
+    "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN_FULL")
   set(BUILD_OUTPUT_ROOT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build/debug/")
 else()
   set(BUILD_OUTPUT_ROOT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build/release/")
@@ -387,13 +472,25 @@ set (IMPALA_LIBS
   Catalog
   CodeGen
   Common
-  Parquet
   Exec
+  ExecIr
+  ExecAvro
+  ExecAvroIr
+  ExecHBase
+  ExecKudu
+  ExecKuduIr
+  ExecOrc
+  ExecParquet
+  ExecRcfile
+  ExecSequence
+  ExecText
   Exprs
+  ExprsIr
   GlobalFlags
   histogram_proto
   ImpalaThrift
   Io
+  kudu_curl_util
   kudu_util
   krpc
   Rpc
@@ -401,6 +498,7 @@ set (IMPALA_LIBS
   rpc_introspection_proto
   pb_util_proto
   Runtime
+  RuntimeIr
   Scheduling
   security
   Service
@@ -409,7 +507,10 @@ set (IMPALA_LIBS
   ThriftSaslTransport
   token_proto
   Udf
+  UdfIr
   Util
+  UtilIr
+  UtilCache
 )
 
 set (IMPALA_LINK_LIBS
@@ -439,15 +540,17 @@ set (UNIFIED_TEST_LIBS
   CodeGenTests
   CommonTests
   ExecTests
+  ExecAvroTests
+  ExecParquetTests
   ExprsTests
   GUtilTests
   IoTests
-  ParquetTests
   RpcTests
   RuntimeTests
   SchedulingTests
   ServiceTests
   UtilTests
+  UtilCacheTests
 )
 set (UNIFIED_TEST_LINK_LIBS
   ${WL_START_GROUP}
@@ -466,8 +569,15 @@ if (BUILD_SHARED_LIBS)
     BufferPool
     Io
     Runtime
-    Parquet
     Exec
+    ExecAvro
+    ExecHBase
+    ExecKudu
+    ExecOrc
+    ExecParquet
+    ExecRcfile
+    ExecSequence
+    ExecText
     CodeGen
     Exprs
     Rpc
@@ -513,7 +623,25 @@ set (IMPALA_DEPENDENCIES
   orc
   java_jvm
   kudu_client
-  cctz)
+  cctz
+  curl)
+
+# When building with Clang, linking fails because it is trying to
+# use a symbol in kudu_client, but that symbol is discarded. To
+# hack around this error, the calloncehack shared library defines the
+# same symbol publicly. Placing calloncehack ahead of kudu_client
+# causes the linker to use its definition rather than kudu_client's.
+# The underlying issue is some incompatibility when building with
+# Clang while having libraries built with GCC, so this only applies
+# to Clang compilation.
+if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+  message(STATUS "C++ compiler is Clang, enabling calloncehack")
+  # Put calloncehack at the start of the dependencies. The important thing
+  # is that it is ahead of kudu_client.
+  set(IMPALA_DEPENDENCIES calloncehack ${IMPALA_DEPENDENCIES})
+else()
+  message(STATUS "C++ compiler is not Clang, skipping calloncehack")
+endif()
 
 # Add all external dependencies. They should come after the impala libs.
 set (IMPALA_LINK_LIBS ${IMPALA_LINK_LIBS}
@@ -542,7 +670,8 @@ endif()
 # malloc/free)
 set (IMPALA_LINK_LIBS_NO_TCMALLOC ${IMPALA_LINK_LIBS})
 if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER" AND
-    NOT "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
+    NOT "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN" AND
+    NOT "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN_FULL")
   set (IMPALA_LINK_LIBS ${IMPALA_LINK_LIBS} tcmallocstatic)
   set (UNIFIED_TEST_LINK_LIBS ${UNIFIED_TEST_LINK_LIBS} tcmallocstatic)
 endif()
@@ -597,8 +726,10 @@ FUNCTION(ADD_BE_TEST TEST_NAME)
   ADD_EXECUTABLE(${TEST_NAME} ${TEST_NAME}.cc)
   TARGET_LINK_LIBRARIES(${TEST_NAME} ${IMPALA_TEST_LINK_LIBS})
   set(CMAKE_EXE_LINKER_FLAGS "--start-group")
-  ADD_TEST(${TEST_NAME} "${BUILD_OUTPUT_ROOT_DIRECTORY}/${DIR_NAME}/${TEST_NAME}"
-    -log_dir=$ENV{IMPALA_BE_TEST_LOGS_DIR})
+  ADD_TEST(NAME ${TEST_NAME}
+    COMMAND "${CMAKE_SOURCE_DIR}/bin/run-jvm-binary.sh"
+            "${BUILD_OUTPUT_ROOT_DIRECTORY}/${DIR_NAME}/${TEST_NAME}"
+            -log_dir=$ENV{IMPALA_BE_TEST_LOGS_DIR})
   ADD_DEPENDENCIES(be-test ${TEST_NAME})
 ENDFUNCTION()
 
@@ -617,8 +748,9 @@ FUNCTION(ADD_UNIFIED_BE_TEST TEST_NAME TEST_FILTER_PATTERN)
   set(tmp "${TEST_FILTER_PATTERN}:${tmp}")
   set_property(GLOBAL PROPERTY AGG_UNIFIED_FILTER_PATTERN "${tmp}")
   ADD_TEST(NAME ${TEST_NAME}
-    COMMAND "${BUILD_OUTPUT_ROOT_DIRECTORY}/${DIR_NAME}/${TEST_NAME}"
-    -log_dir=$ENV{IMPALA_BE_TEST_LOGS_DIR})
+    COMMAND  "${CMAKE_SOURCE_DIR}/bin/run-jvm-binary.sh"
+             "${BUILD_OUTPUT_ROOT_DIRECTORY}/${DIR_NAME}/${TEST_NAME}"
+             -log_dir=$ENV{IMPALA_BE_TEST_LOGS_DIR})
   ADD_DEPENDENCIES(unified-be-test ${TEST_NAME})
   ADD_DEPENDENCIES(${TEST_NAME} unified-be-test-validated-executable)
 ENDFUNCTION()
@@ -655,8 +787,10 @@ FUNCTION(ADD_UDF_TEST TEST_NAME)
   # the Runtime method implementations will be linked. See IMPALA-3132.
   TARGET_LINK_LIBRARIES(${TEST_NAME} ImpalaUdf ${IMPALA_TEST_LINK_LIBS})
   set(CMAKE_EXE_LINKER_FLAGS "--start-group")
-  ADD_TEST(${TEST_NAME} "${BUILD_OUTPUT_ROOT_DIRECTORY}/${DIR_NAME}/${TEST_NAME}"
-    -log_dir=$ENV{IMPALA_BE_TEST_LOGS_DIR})
+  ADD_TEST(NAME ${TEST_NAME}
+    COMMAND "${CMAKE_SOURCE_DIR}/bin/run-jvm-binary.sh"
+            "${BUILD_OUTPUT_ROOT_DIRECTORY}/${DIR_NAME}/${TEST_NAME}"
+            -log_dir=$ENV{IMPALA_BE_TEST_LOGS_DIR})
   ADD_DEPENDENCIES(be-test ${TEST_NAME})
   ENABLE_LSAN_FOR_TEST(${TEST_NAME})
 ENDFUNCTION()

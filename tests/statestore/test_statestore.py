@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from collections import defaultdict
 import json
 import logging
@@ -23,8 +25,12 @@ import socket
 import threading
 import traceback
 import time
-import urllib2
 import uuid
+
+try:
+  from urllib.request import urlopen
+except ImportError:
+  from urllib2 import urlopen
 
 from Types.ttypes import TNetworkAddress
 from thrift.protocol import TBinaryProtocol
@@ -61,7 +67,7 @@ LOG = logging.getLogger('test_statestore')
 #    Test that topic deletions take effect correctly.
 
 def get_statestore_subscribers(host='localhost', port=25010):
-  response = urllib2.urlopen("http://{0}:{1}/subscribers?json".format(host, port))
+  response = urlopen("http://{0}:{1}/subscribers?json".format(host, port))
   page = response.read()
   return json.loads(page)
 
@@ -114,22 +120,22 @@ class KillableThreadedServer(TServer):
     self.processor = None
 
   def wait_until_up(self, num_tries=10):
-    for i in xrange(num_tries):
+    for i in range(num_tries):
       cnxn = TSocket.TSocket('localhost', self.port)
       try:
         cnxn.open()
         return
-      except Exception, e:
+      except Exception as e:
         if i == num_tries - 1: raise
       time.sleep(0.1)
 
   def wait_until_down(self, num_tries=10):
-    for i in xrange(num_tries):
+    for i in range(num_tries):
       cnxn = TSocket.TSocket('localhost', self.port)
       try:
         cnxn.open()
         time.sleep(0.1)
-      except Exception, e:
+      except Exception as e:
         return
     raise Exception("Server did not stop")
 
@@ -152,10 +158,10 @@ class KillableThreadedServer(TServer):
     try:
       while not self.is_shutdown:
         self.processor.process(iprot, oprot)
-    except TTransport.TTransportException, tx:
+    except TTransport.TTransportException as tx:
       pass
-    except Exception, x:
-      print x
+    except Exception as x:
+      print(x)
 
     itrans.close()
     otrans.close()
@@ -203,7 +209,7 @@ class StatestoreSubscriber(object):
       if self.heartbeat_cb is not None and self.exception is None:
         try:
           response = self.heartbeat_cb(self, args)
-        except Exception, e:
+        except Exception as e:
           self.exception = e
       self.heartbeat_event.notify()
     finally:
@@ -219,7 +225,7 @@ class StatestoreSubscriber(object):
       if self.update_cb is not None and self.exception is None:
         try:
           response = self.update_cb(self, args)
-        except Exception, e:
+        except Exception as e:
           # Print the original backtrace so it doesn't get lost.
           traceback.print_exc()
           self.exception = e
@@ -348,7 +354,7 @@ class TestStatestore():
                         num_updates=1, clear_topic_entries=False):
     topic_entries = [
       Subscriber.TTopicItem(key=key_template + str(x), value=value_template + str(x))
-      for x in xrange(num_updates)]
+      for x in range(num_updates)]
     return Subscriber.TTopicDelta(topic_name=topic_name,
                                   topic_entries=topic_entries,
                                   is_delta=False,

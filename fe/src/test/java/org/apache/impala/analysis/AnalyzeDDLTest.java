@@ -40,6 +40,7 @@ import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.ColumnStats;
 import org.apache.impala.catalog.DataSource;
 import org.apache.impala.catalog.DataSourceTable;
+import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
@@ -47,16 +48,15 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.Pair;
-import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.common.PrintUtils;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TDescribeTableParams;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.util.MetaStoreUtil;
-import org.junit.AfterClass;
 import org.junit.Assert;
-import org.junit.BeforeClass;
+import org.junit.Assume;
 import org.junit.Test;
 
 import com.google.common.base.Joiner;
@@ -442,8 +442,12 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Cannot ALTER ADD COLUMN primary key on Kudu table.
     AnalysisError("alter table functional_kudu.alltypes add column " +
         "new_col int primary key",
-        "Cannot add a primary key using an ALTER TABLE ADD COLUMNS statement: " +
+        "Cannot add a PRIMARY KEY using an ALTER TABLE ADD COLUMNS statement: " +
         "new_col INT PRIMARY KEY");
+    AnalysisError("alter table functional_kudu.alltypes add column " +
+        "new_col int non unique primary key",
+        "Cannot add a NON UNIQUE PRIMARY KEY using an ALTER TABLE ADD COLUMNS " +
+        "statement: new_col INT NON UNIQUE PRIMARY KEY");
 
     // A non-null column must have a default on Kudu table.
     AnalysisError("alter table functional_kudu.alltypes add column new_col int not null",
@@ -518,8 +522,12 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Cannot ALTER ADD COLUMNS primary key on Kudu table.
     AnalysisError("alter table functional_kudu.alltypes add columns " +
         "(new_col int primary key)",
-        "Cannot add a primary key using an ALTER TABLE ADD COLUMNS statement: " +
+        "Cannot add a PRIMARY KEY using an ALTER TABLE ADD COLUMNS statement: " +
         "new_col INT PRIMARY KEY");
+    AnalysisError("alter table functional_kudu.alltypes add columns " +
+        "(new_col int non unique primary key)",
+        "Cannot add a NON UNIQUE PRIMARY KEY using an ALTER TABLE ADD COLUMNS " +
+        "statement: new_col INT NON UNIQUE PRIMARY KEY");
 
     // A non-null column must have a default on Kudu table.
     AnalysisError("alter table functional_kudu.alltypes add columns" +
@@ -717,6 +725,9 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("alter table functional.alltypes set location '/a/b'");
     AnalyzesOk("alter table functional.alltypes set tblproperties('a'='1')");
     AnalyzesOk("alter table functional.alltypes set serdeproperties('a'='2')");
+    AnalyzesOk("alter table functional.alltypes unset serdeproperties('a', 'b')");
+    AnalyzesOk("alter table functional.alltypes unset serdeproperties" +
+            " if exists('a', 'b')");
     AnalyzesOk("alter table functional.alltypes PARTITION (Year=2010, month=11) " +
                "set location '/a/b'");
     AnalyzesOk("alter table functional.alltypes PARTITION (month=11, year=2010) " +
@@ -731,6 +742,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
                "set tblproperties('a'='1')");
     AnalyzesOk("alter table functional.alltypes PARTITION (year<=2010, month=11) " +
                "set tblproperties('a'='1')");
+    AnalyzesOk("alter table functional.alltypes PARTITION (year=2010, month=11) " +
+            "unset tblproperties('a')");
+    AnalyzesOk("alter table functional.alltypes PARTITION (year=2010, month=11) " +
+            "unset tblproperties if exists ('a')");
     AnalyzesOk("alter table functional.alltypes PARTITION (year=2010, month=11) " +
                "set serdeproperties ('a'='2')");
     AnalyzesOk("alter table functional.alltypes PARTITION (year<=2010, month=11) " +
@@ -793,6 +808,11 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           "Property key length must be <= " + MetaStoreUtil.MAX_PROPERTY_KEY_LENGTH + ": "
               + (MetaStoreUtil.MAX_PROPERTY_KEY_LENGTH + 1));
 
+      AnalysisError("alter table functional.alltypes unset "
+              + "tblproperties ('" + long_property_key + "')",
+              "Property key length must be <= " + MetaStoreUtil.MAX_PROPERTY_KEY_LENGTH
+              + ": " + (MetaStoreUtil.MAX_PROPERTY_KEY_LENGTH + 1));
+
       AnalysisError("alter table functional.alltypes set "
               + "tblproperties ('key'='" + long_property_value + "')",
           "Property value length must be <= " + MetaStoreUtil.MAX_PROPERTY_VALUE_LENGTH
@@ -803,6 +823,11 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           "Property key length must be <= " + MetaStoreUtil.MAX_PROPERTY_KEY_LENGTH + ": "
               + (MetaStoreUtil.MAX_PROPERTY_KEY_LENGTH + 1));
 
+      AnalysisError("alter table functional.alltypes unset "
+              + "serdeproperties ('" + long_property_key + "')",
+              "Property key length must be <= " + MetaStoreUtil.MAX_PROPERTY_KEY_LENGTH
+              + ": " + (MetaStoreUtil.MAX_PROPERTY_KEY_LENGTH + 1));
+
       AnalysisError("alter table functional.alltypes set "
               + "serdeproperties ('key'='" + long_property_value + "')",
           "Property value length must be <= " + MetaStoreUtil.MAX_PROPERTY_VALUE_LENGTH
@@ -810,6 +835,11 @@ public class AnalyzeDDLTest extends FrontendTestBase {
 
       AnalysisError(
           "alter table functional.alltypes set tblproperties('storage_handler'='1')",
+          "Changing the 'storage_handler' table property is not supported to protect " +
+          "against metadata corruption.");
+
+      AnalysisError(
+          "alter table functional.alltypes unset tblproperties('storage_handler')",
           "Changing the 'storage_handler' table property is not supported to protect " +
           "against metadata corruption.");
     }
@@ -1045,10 +1075,8 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "int_col ('numNulls'='2')");
     AnalyzesOk("alter table functional.alltypes_datasource set column stats " +
         "int_col ('numDVs'='2')");
-    if (RuntimeEnv.INSTANCE.isKuduSupported()) {
-      AnalyzesOk("alter table functional_kudu.testtbl set column stats " +
-          "name ('numNulls'='2')");
-    }
+    AnalyzesOk("alter table functional_kudu.testtbl set column stats " +
+        "name ('numNulls'='2')");
 
     // Table does not exist.
     AnalysisError("alter table bad_tbl set column stats int_col ('numNulls'='2')",
@@ -1129,6 +1157,21 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError(
         "alter table functional.alltypes set column stats string_col ('avgSize'='inf')",
         "Invalid stats value 'inf' for column stats key: avgSize");
+  }
+
+  @Test
+  public void TestAlterTableUnSetAvroProperties() {
+    //Test unset tblproperties with avro.schema.url and avro.schema.literal
+    for (String propertyType : Lists.newArrayList("tblproperties", "serdeproperties")) {
+      AnalysisError(String.format("alter table functional.alltypes unset %s " +
+          "('avro.schema.url')", propertyType),
+          "Unsetting the 'avro.schema.url' table property is not supported for" +
+          " Avro table.");
+      AnalysisError(String.format("alter table functional.alltypes unset %s " +
+          "('avro.schema.literal')", propertyType),
+          "Unsetting the 'avro.schema.literal' table property is not supported for" +
+          " Avro table.");
+    }
   }
 
   @Test
@@ -1294,11 +1337,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
 
   @Test
   public void TestAlterTableSortByZOrder() {
-
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
-
     AnalyzesOk("alter table functional.alltypes sort by zorder (int_col,id)");
     AnalyzesOk("alter table functional.alltypes sort by zorder (bool_col,int_col,id)");
+    AnalyzesOk(
+      "alter table functional.alltypes sort by zorder (timestamp_col, string_col)");
     AnalyzesOk("alter table functional.alltypes sort by zorder ()");
     AnalysisError("alter table functional.alltypes sort by zorder (id)",
         "SORT BY ZORDER with 1 column is equivalent to SORT BY. Please, use the " +
@@ -1309,11 +1351,25 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "not find SORT BY column 'foo' in table.");
     AnalysisError("alter table functional_hbase.alltypes sort by zorder (id, foo)",
         "ALTER TABLE SORT BY not supported on HBase tables.");
-    AnalysisError("alter table functional.alltypes sort by zorder (bool_col,string_col)",
-        "SORT BY ZORDER does not support column types: STRING, VARCHAR(*), FLOAT, " +
-        "DOUBLE");
+  }
 
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+  @Test
+  public void TestAlterBucketedTable() throws AnalysisException {
+    AnalyzesOk("alter table functional.bucketed_table rename to bucketed_table_test");
+    AnalyzesOk("drop table functional.bucketed_table");
+
+    AnalysisError("alter table functional.bucketed_table add columns (a int)",
+        "functional.bucketed_table is a bucketed table. " +
+        "Only read operations are supported on such tables.");
+    AnalysisError("alter table functional.bucketed_table change col1 default bigint",
+        "functional.bucketed_table is a bucketed table. " +
+        "Only read operations are supported on such tables.");
+    AnalysisError("alter table functional.bucketed_table replace columns (a int)",
+        "functional.bucketed_table is a bucketed table. " +
+        "Only read operations are supported on such tables.");
+    AnalysisError("alter table functional.bucketed_table drop col1",
+        "functional.bucketed_table is a bucketed table. " +
+        "Only read operations are supported on such tables.");
   }
 
   @Test
@@ -1464,6 +1520,34 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "as select null as new_col", "Unable to infer the column type for " +
         "column 'new_col'. Use cast() to explicitly specify the column type for " +
         "column 'new_col'.");
+  }
+
+  @Test
+  public void TestAlterViewSetTblProperties() throws AnalysisException {
+    AnalyzesOk("ALTER VIEW functional.alltypes_view SET TBLPROPERTIES " +
+        " ('pro1' = 'test1', 'pro2' = 'test2')");
+    AnalyzesOk("ALTER VIEW functional.alltypes_view UNSET TBLPROPERTIES " +
+        " ('pro1', 'pro2')");
+
+    AnalysisError("ALTER VIEW Foo.Bar SET TBLPROPERTIES " +
+        " ('pro1' = 'test1', 'pro2' = 'test2')",
+        "Database does not exist: Foo");
+    AnalysisError("ALTER VIEW Foo.Bar UNSET TBLPROPERTIES ('pro1', 'pro2')",
+        "Database does not exist: Foo");
+    AnalysisError("alter view functional_orc_def.mv1_alltypes_jointbl " +
+        "set TBLPROPERTIES('a' = 'a')",
+        "ALTER VIEW not allowed on a materialized view: " +
+        "functional_orc_def.mv1_alltypes_jointbl");
+    AnalysisError("alter view functional.alltypes " +
+        "set TBLPROPERTIES('a' = 'a')",
+        "ALTER VIEW not allowed on a table: functional.alltypes");
+    AnalysisError("alter view functional_orc_def.mv1_alltypes_jointbl " +
+        "unset TBLPROPERTIES('a')",
+        "ALTER VIEW not allowed on a materialized view: " +
+        "functional_orc_def.mv1_alltypes_jointbl");
+    AnalysisError("alter view functional.alltypes " +
+        "unset TBLPROPERTIES('a')",
+        "ALTER VIEW not allowed on a table: functional.alltypes");
   }
 
   @Test
@@ -1766,6 +1850,49 @@ public class AnalyzeDDLTest extends FrontendTestBase {
 
     AnalysisError("compute incremental stats functional.view_view",
         "COMPUTE STATS not supported for view: functional.view_view");
+
+    checkComputeStatsStmt("compute incremental stats functional.alltypes " +
+        "(tinyint_col, smallint_col)");
+    checkComputeStatsStmt(
+        "compute incremental stats functional.alltypes partition(year=2010, month=10)" +
+        "(tinyint_col, smallint_col)");
+    checkComputeStatsStmt(
+        "compute incremental stats functional.alltypes partition(year<=2010)" +
+        "(tinyint_col, smallint_col)");
+
+    long bytes = BackendConfig.INSTANCE.getBackendCfg().getInc_stats_size_limit_bytes();
+    // functional.alltypes has 24 partitions and 13 columns.
+    long statsBytes = 24 * 13 * HdfsTable.STATS_SIZE_PER_COLUMN_BYTES - 1;
+    // Change the value of inc_stats_size_limit_bytes to a small value for unit test
+    BackendConfig.INSTANCE.getBackendCfg().setInc_stats_size_limit_bytes(statsBytes);
+
+    // Calculate all partitions, the Incremental stats size exceeds the limit
+    AnalysisError("compute incremental stats functional.alltypes",
+        "Incremental stats size estimate exceeds "
+        + PrintUtils.printBytes(statsBytes)
+        + ". Please try COMPUTE STATS instead.");
+
+    // All partitions of functional.alltypes have no incremental statistics,
+    // so if only one partition is calculated,
+    // "Incremental stats size estimate exceeds " should not be reported
+    checkComputeStatsStmt(
+        "compute incremental stats functional.alltypes partition(year=2010, month=10)");
+
+    //functional.alltypes has 13 columns.
+    statsBytes = 12 * 13 * HdfsTable.STATS_SIZE_PER_COLUMN_BYTES - 1;
+    BackendConfig.INSTANCE.getBackendCfg().setInc_stats_size_limit_bytes(statsBytes);
+
+    // Calculate 12 partitions, the Incremental stats size exceeds the limit
+    AnalysisError("compute incremental stats functional.alltypes partition(year=2009)",
+        "Incremental stats size estimate exceeds "
+        + PrintUtils.printBytes(statsBytes)
+        + ". Please try COMPUTE STATS instead.");
+
+    // Calculate 11 partitions,
+    checkComputeStatsStmt(
+        "compute incremental stats functional.alltypes partition(year=2009, month<12)");
+
+    BackendConfig.INSTANCE.getBackendCfg().setInc_stats_size_limit_bytes(bytes);
   }
 
 
@@ -1858,7 +1985,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "DROP VIEW not allowed on a table: functional.alltypes");
 
     // No analysis error for tables that can't be loaded.
-    AnalyzesOk("drop table functional.unsupported_partition_types");
+    AnalyzesOk("drop table functional.unsupported_binary_partition");
   }
 
   @Test
@@ -1946,13 +2073,19 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create database new_db location " +
         "'blah://bucket/test-warehouse/new_db'",
         "No FileSystem for scheme: blah");
+
+    // URIs for managedlocation.
+    AnalyzesOk("create database new_db managedlocation '/test-warehouse/new_db'");
+    AnalyzesOk("create database new_db location " +
+        "'/test-warehouse/new_db' managedlocation " +
+        "'/test-warehouse/new_db'");
+    AnalysisError("create database new_db managedlocation " +
+        "'blah://bucket/test-warehouse/new_db'",
+        "No FileSystem for scheme: blah");
   }
 
   @Test
   public void TestCreateTableLikeFile() throws AnalysisException {
-
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
-
     // check that we analyze all of the CREATE TABLE options
     AnalyzesOk("create table if not exists newtbl_DNE like parquet "
         + "'/test-warehouse/schemas/alltypestiny.parquet'");
@@ -1972,10 +2105,6 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         + "'/test-warehouse/schemas/zipcode_incomes.parquet' sort by (id,zip)");
     AnalyzesOk("create table newtbl_DNE like parquet "
         + "'/test-warehouse/schemas/decimal.parquet' sort by zorder (d32, d11)");
-    AnalysisError("create table newtbl_DNE like parquet "
-        + "'/test-warehouse/schemas/zipcode_incomes.parquet' sort by  zorder (id,zip)",
-        "SORT BY ZORDER does not support column types: STRING, VARCHAR(*), FLOAT, " +
-        "DOUBLE");
     AnalyzesOk("create table if not exists functional.zipcode_incomes like parquet "
         + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
     AnalyzesOk("create table if not exists newtbl_DNE like parquet "
@@ -1994,36 +2123,77 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "Database does not exist: database_DNE");
 
     // check invalid paths
-    AnalysisError("create table if not exists functional.zipcode_incomes like parquet "
-        + "'/test-warehouse'",
+    AnalysisError("create table if not exists functional.zipcode_incomes like parquet " +
+        "'/test-warehouse'",
         "Cannot infer schema, path is not a file: hdfs://localhost:20500/test-warehouse");
     AnalysisError("create table newtbl_DNE like parquet 'foobar'",
         "URI path must be absolute: foobar");
     AnalysisError("create table newtbl_DNE like parquet '/not/a/file/path'",
-        "Cannot infer schema, path is not a file: "
-        + "hdfs://localhost:20500/not/a/file/path");
-    AnalysisError("create table if not exists functional.zipcode_incomes like parquet "
-        + "'file:///tmp/foobar'",
-        "Cannot infer schema, path is not a file: file:/tmp/foobar");
+        "Cannot infer schema, path does not exist: " +
+        "hdfs://localhost:20500/not/a/file/path");
+    AnalysisError("create table if not exists functional.zipcode_incomes like parquet " +
+        "'file:///tmp/foobar'",
+        "Cannot infer schema, path does not exist: file:/tmp/foobar");
 
     // check valid paths with bad file contents
-    AnalysisError("create table database_DNE.newtbl_DNE like parquet "
-        + "'/test-warehouse/zipcode_incomes_rc/000000_0'",
-        "File is not a parquet file: "
-        + "hdfs://localhost:20500/test-warehouse/zipcode_incomes_rc/000000_0");
+    AnalysisError("create table database_DNE.newtbl_DNE like parquet " +
+        "'/test-warehouse/zipcode_incomes_rc/000000_0'",
+        "File is not a parquet file: " +
+        "hdfs://localhost:20500/test-warehouse/zipcode_incomes_rc/000000_0");
 
     // this is a decimal file without annotations
-    AnalysisError("create table if not exists functional.zipcode_incomes like parquet "
-        + "'/test-warehouse/schemas/malformed_decimal_tiny.parquet'",
+    AnalysisError("create table if not exists functional.zipcode_incomes like parquet " +
+        "'/test-warehouse/schemas/malformed_decimal_tiny.parquet'",
         "Unsupported parquet type FIXED_LEN_BYTE_ARRAY for field c1");
 
     // Invalid file format
     AnalysisError("create table newtbl_kudu like parquet " +
         "'/test-warehouse/schemas/alltypestiny.parquet' stored as kudu",
         "CREATE TABLE LIKE FILE statement is not supported for Kudu tables.");
+  }
 
+  @Test
+  public void TestCreateTableLikeFileOrc() throws AnalysisException {
+    Assume.assumeTrue(
+        "Skipping this test; CREATE TABLE LIKE ORC is only supported when running " +
+            "against Hive-3 or greater", TestUtils.getHiveMajorVersion() >= 3);
 
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+    AnalysisError("create table database_DNE.newtbl_DNE like ORC " +
+        "'/test-warehouse/schemas/alltypestiny.parquet'",
+        "Failed to open file as an ORC file: org.apache.orc.FileFormatException: " +
+        "Malformed ORC file " +
+        "hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet" +
+        ". Invalid postscript.");
+
+    // Inferring primitive and complex types
+    AnalyzesOk("create table if not exists newtbl_DNE like orc " +
+        "'/test-warehouse/schemas/alltypes_non_acid.orc'");
+    AnalyzesOk("create table if not exists newtbl_DNE like orc " +
+        "'/test-warehouse/complextypestbl_non_transactional_orc_def/nullable.orc'");
+
+    // check invalid paths
+    AnalysisError("create table if not exists functional.zipcode_incomes like ORC " +
+        "'/test-warehouse'",
+        "Cannot infer schema, path is not a file: hdfs://localhost:20500/test-warehouse");
+    AnalysisError("create table newtbl_DNE like ORC 'foobar'",
+        "URI path must be absolute: foobar");
+    AnalysisError("create table newtbl_DNE like ORC '/not/a/file/path'",
+        "Cannot infer schema, path does not exist: " +
+        "hdfs://localhost:20500/not/a/file/path");
+    AnalysisError("create table if not exists functional.zipcode_incomes like ORC " +
+        "'file:///tmp/foobar'",
+        "Cannot infer schema, path does not exist: file:/tmp/foobar");
+  }
+
+  @Test
+  public void TestCreateTableLikeFileOrcWithHive2() throws AnalysisException {
+    // Testing if error is thrown when trying to create table like orc file with Hive-2.
+    Assume.assumeTrue(TestUtils.getHiveMajorVersion() < 3);
+
+    // Inferring primitive and complex types
+    AnalysisError("create table if not exists newtbl_DNE like orc " +
+        "'/test-warehouse/alltypestiny_orc_def/year=2009/month=1/000000_0'",
+        "Creating table like ORC file is unsupported for Hive with version < 3");
   }
 
   @Test
@@ -2076,10 +2246,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Unsupported file formats
     AnalysisError("create table foo stored as sequencefile as select 1",
         "CREATE TABLE AS SELECT does not support the (SEQUENCEFILE) file format. " +
-         "Supported formats are: (PARQUET, TEXTFILE, KUDU)");
+         "Supported formats are: (PARQUET, TEXTFILE, KUDU, ICEBERG)");
     AnalysisError("create table foo stored as RCFILE as select 1",
         "CREATE TABLE AS SELECT does not support the (RCFILE) file format. " +
-         "Supported formats are: (PARQUET, TEXTFILE, KUDU)");
+         "Supported formats are: (PARQUET, TEXTFILE, KUDU, ICEBERG)");
 
     // CTAS with a WITH clause and inline view (IMPALA-1100)
     AnalyzesOk("create table test_with as with with_1 as (select 1 as int_col from " +
@@ -2133,6 +2303,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         " stored as kudu as select id, bool_col, tinyint_col, smallint_col, int_col, " +
         "bigint_col, float_col, double_col, date_string_col, string_col " +
         "from functional.alltypestiny");
+    AnalyzesOk("create table t non unique primary key (id) partition by hash (id) " +
+        "partitions 3 stored as kudu as select id, bool_col, tinyint_col, " +
+        "smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, " +
+        "string_col from functional.alltypestiny");
     AnalyzesOk("create table t primary key (id) partition by range (id) " +
         "(partition values < 10, partition 20 <= values < 30, partition value = 50) " +
         "stored as kudu as select id, bool_col, tinyint_col, smallint_col, int_col, " +
@@ -2160,6 +2334,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("create table t primary key (id) partition by hash partitions 3" +
         " stored as kudu as select c1 as id from functional.decimal_tiny");
 
+    // CTAS into Kudu with varchar type
+    AnalyzesOk("create table t primary key (vc) partition by hash partitions 3" +
+        " stored as kudu as select vc from functional.chars_tiny");
+
     // CTAS in an external Kudu table
     AnalysisError("create external table t stored as kudu " +
         "tblproperties('kudu.table_name'='t') as select id, int_col from " +
@@ -2170,21 +2348,12 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table t primary key (cs) partition by hash partitions 3" +
         " stored as kudu as select cs from functional.chars_tiny",
         "Cannot create table 't': Type CHAR(5) is not supported in Kudu");
-    AnalysisError("create table t primary key (vc) partition by hash partitions 3" +
-        " stored as kudu as select vc from functional.chars_tiny",
-        "Cannot create table 't': Type VARCHAR(32) is not supported in Kudu");
-    AnalysisError("create table t primary key (id) partition by hash partitions 3" +
-        " stored as kudu as select id, s from functional.complextypes_fileformat",
-        "Expr 's' in select list returns a complex type 'STRUCT<f1:STRING,f2:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
     AnalysisError("create table t primary key (id) partition by hash partitions 3" +
         " stored as kudu as select id, m from functional.complextypes_fileformat",
-        "Expr 'm' in select list returns a complex type 'MAP<STRING,BIGINT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+        "Cannot create table 't': Type MAP<STRING,BIGINT> is not supported in Kudu");
     AnalysisError("create table t primary key (id) partition by hash partitions 3" +
         " stored as kudu as select id, a from functional.complextypes_fileformat",
-        "Expr 'a' in select list returns a complex type 'ARRAY<INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+        "Cannot create table 't': Type ARRAY<INT> is not supported in Kudu");
 
     // IMPALA-6454: CTAS into Kudu tables with primary key specified in upper case.
     AnalyzesOk("create table part_kudu_tbl primary key(INT_COL, SMALLINT_COL, ID)" +
@@ -2192,6 +2361,21 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         " stored as kudu as SELECT INT_COL, SMALLINT_COL, ID, BIGINT_COL," +
         " DATE_STRING_COL, STRING_COL, TIMESTAMP_COL, YEAR, MONTH FROM " +
         " functional.alltypes");
+    AnalyzesOk("create table part_kudu_tbl non unique primary key(INT_COL, " +
+        "SMALLINT_COL, ID) partition by hash(INT_COL, SMALLINT_COL, ID) " +
+        "PARTITIONS 2 stored as kudu as SELECT INT_COL, SMALLINT_COL, ID, " +
+        "BIGINT_COL, DATE_STRING_COL, STRING_COL, TIMESTAMP_COL, YEAR, " +
+        "MONTH FROM functional.alltypes");
+    AnalyzesOk("create table part_kudu_tbl non unique primary key(INT_COL, " +
+        "SMALLINT_COL, ID, BIGINT_COL, DATE_STRING_COL, STRING_COL, TIMESTAMP_COL, " +
+        "YEAR, MONTH) partition by hash(INT_COL, SMALLINT_COL, ID) " +
+        "PARTITIONS 2 stored as kudu as SELECT INT_COL, SMALLINT_COL, ID, " +
+        "BIGINT_COL, DATE_STRING_COL, STRING_COL, TIMESTAMP_COL, YEAR, " +
+        "MONTH FROM functional.alltypes");
+    AnalyzesOk("create table no_part_kudu_tbl non unique primary key(INT_COL, " +
+        "SMALLINT_COL, ID) stored as kudu as SELECT INT_COL, SMALLINT_COL, ID, " +
+        "BIGINT_COL, DATE_STRING_COL, STRING_COL, TIMESTAMP_COL, YEAR, " +
+        "MONTH FROM functional.alltypes");
 
     // IMPALA-7679: Inserting a null column type without an explicit type should
     // throw an error.
@@ -2200,6 +2384,33 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table t as select null as new_col",
         "Unable to infer the column type for column 'new_col'. Use cast() to " +
         "explicitly specify the column type for column 'new_col'.");
+
+    // IMPALA-11268: Allow STORED BY as well for storage engines
+    AnalyzesOk("create table t primary key (id) " +
+        " stored by kudu as select id, bool_col, tinyint_col, smallint_col, " +
+        "int_col, bigint_col, float_col, double_col, date_string_col, string_col " +
+        "from functional.alltypestiny");
+    AnalyzesOk("create table t primary key (id) stored by iceberg as select id, " +
+        "bool_col, int_col, float_col, double_col, date_string_col, string_col " +
+        "from functional.alltypestiny");
+
+    // IMPALA-9822 Row Format Delimited is valid only for Text Files
+    String[] fileFormats = {"TEXTFILE", "PARQUET", "ICEBERG"};
+    for (int i = 0; i < fileFormats.length; ++i) {
+      String format = fileFormats[i];
+      for (String rowFormat : ImmutableList.of(
+               "FIELDS TERMINATED BY ','", "LINES TERMINATED BY ','", "ESCAPED BY ','")) {
+        String stmt = String.format(
+            "create table new_table row format delimited %s stored as %s as select *"
+                + " from functional.child_table", rowFormat, format);
+        if (i == 0) {
+          // No warrnings for TEXT tables
+          AnalyzesOkWithoutWarnings(stmt);
+        } else {
+          AnalyzesOk(stmt, "'ROW FORMAT DELIMITED " + rowFormat + "' is ignored.");
+        }
+      }
+    }
   }
 
   @Test
@@ -2295,28 +2506,40 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table functional.baz like functional.alltypes location '  '",
         "URI path cannot be empty.");
 
-    // CREATE TABLE LIKE is not currently supported for Kudu tables (see IMPALA-4052)
+    // CREATE TABLE LIKE is only implements cloning between Kudu tables (see IMPALA-4052)
     AnalysisError("create table kudu_tbl like functional.alltypestiny stored as kudu",
-        "CREATE TABLE LIKE is not supported for Kudu tables");
-    AnalysisError("create table tbl like functional_kudu.dimtbl", "Cloning a Kudu " +
-        "table using CREATE TABLE LIKE is not supported.");
+        "functional.alltypestiny cannot be cloned into a KUDU table: " +
+        "CREATE TABLE LIKE is not supported between Kudu tables and non-Kudu tables.");
+    AnalysisError(
+        "create table kudu_to_parquet like functional_kudu.alltypes stored as parquet",
+        "functional_kudu.alltypes cannot be cloned into a PARQUET table: CREATE "
+            + "TABLE LIKE is not supported between Kudu tables and non-Kudu tables.");
+    AnalysisError("create table kudu_decimal_tbl_clone sort by (d1, d2) like "
+            + "functional_kudu.decimal_tbl",
+        "functional_kudu.decimal_tbl cannot be cloned "
+            + "because SORT BY is not supported for Kudu tables.");
+    AnalysisError(
+        "create table alltypestiny_clone sort by (d1, d2) like functional.alltypestiny " +
+        "stored as kudu", "functional.alltypestiny cannot be cloned into a KUDU table: " +
+        "CREATE TABLE LIKE is not supported between Kudu tables and non-Kudu tables.");
+    // Kudu tables with range partitions cannot be cloned
+    AnalysisError("create table kudu_jointbl_clone like functional_kudu.jointbl",
+        "CREATE TABLE LIKE is not supported for Kudu tables having range partitions.");
 
     // Test sort columns.
     AnalyzesOk("create table tbl sort by (int_col,id) like functional.alltypes");
     AnalysisError("create table tbl sort by (int_col,foo) like functional.alltypes",
         "Could not find SORT BY column 'foo' in table.");
 
-    // Test zsort columns.
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
-
+    // Test sort by zorder columns.
     AnalyzesOk("create table tbl sort by zorder (int_col,id) like functional.alltypes");
+    AnalyzesOk("create table tbl sort by zorder (float_col,id) like functional.alltypes");
+    AnalyzesOk("create table tbl sort by zorder (double_col,id) like " +
+        "functional.alltypes");
+    AnalyzesOk("create table tbl sort by zorder (string_col,timestamp_col) like " +
+        "functional.alltypes");
     AnalysisError("create table tbl sort by zorder (int_col,foo) like " +
         "functional.alltypes", "Could not find SORT BY column 'foo' in table.");
-    AnalysisError("create table tbl sort by zorder (string_col,id) like " +
-        "functional.alltypes", "SORT BY ZORDER does not support column types: STRING, " +
-        "VARCHAR(*), FLOAT, DOUBLE");
-
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
   }
 
   @Test
@@ -2439,10 +2662,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     }
 
     // Supported file formats. Exclude Avro since it is tested separately.
-    String [] fileFormats =
-        {"TEXTFILE", "SEQUENCEFILE", "PARQUET", "PARQUETFILE", "RCFILE"};
-    String [] fileFormatsStr =
-        {"TEXT", "SEQUENCE_FILE", "PARQUET", "PARQUET", "RC_FILE"};
+    String[] fileFormats = {
+        "TEXTFILE", "SEQUENCEFILE", "PARQUET", "PARQUETFILE", "RCFILE", "JSONFILE"};
+    String[] fileFormatsStr = {
+        "TEXT", "SEQUENCE_FILE", "PARQUET", "PARQUET", "RC_FILE", "JSON"};
     int formatIndx = 0;
     for (String format: fileFormats) {
       for (String create: ImmutableList.of("create table", "create external table")) {
@@ -2457,6 +2680,21 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           format), String.format("Unsupported column options for file format " +
               "'%s': 'i INT PRIMARY KEY'", fileFormatsStr[formatIndx]));
       formatIndx++;
+    }
+
+    for (formatIndx = 0; formatIndx < fileFormats.length; formatIndx++) {
+      for (String rowFormat : ImmutableList.of(
+               "FIELDS TERMINATED BY ','", "LINES TERMINATED BY ','", "ESCAPED BY ','")) {
+        String stmt = String.format(
+            "create table new_table (i int) row format delimited %s stored as %s",
+            rowFormat, fileFormats[formatIndx]);
+        if (formatIndx < 2) {
+          // No warrnings for TEXT and SEQUENCE tables
+          AnalyzesOkWithoutWarnings(stmt);
+        } else {
+          AnalyzesOk(stmt, "'ROW FORMAT DELIMITED " + rowFormat + "' is ignored");
+        }
+      }
     }
 
     // Note: Backslashes need to be escaped twice - once for Java and once for Impala.
@@ -2522,6 +2760,8 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Unsupported partition-column types.
     AnalysisError("create table new_table (i int) PARTITIONED BY (t timestamp)",
         "Type 'TIMESTAMP' is not supported as partition-column type in column: t");
+    AnalysisError("create table new_table (i int) PARTITIONED BY (t binary)",
+        "Type 'BINARY' is not supported as partition-column type in column: t");
 
     // Caching ops
     AnalyzesOk("create table cached_tbl(i int) partitioned by(j int) " +
@@ -2606,8 +2846,6 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           type.name());
     }
 
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
-
     // Tables with sort columns
     AnalyzesOk("create table functional.new_table (i int, j int) sort by (i)");
     AnalyzesOk("create table functional.new_table (i int, j int) sort by (i, j)");
@@ -2650,21 +2888,38 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table functional.new_table (i int) PARTITIONED BY (d decimal)" +
         "sort by zorder (i, d)", "SORT BY column list must not contain partition " +
         "column: 'd'");
-    // For Z-Order, string, varchar, float and double columns are not supported.
-    AnalysisError("create table functional.new_table (i int, s string) sort by zorder " +
-        "(i, s)", "SORT BY ZORDER does not support column types: STRING, VARCHAR(*), " +
-        "FLOAT, DOUBLE");
-    AnalysisError("create table functional.new_table (i int, s varchar(32)) sort by " +
-        "zorder (i, s)", "SORT BY ZORDER does not support column types: STRING, " +
-        "VARCHAR(*), FLOAT, DOUBLE");
-    AnalysisError("create table functional.new_table (i int, s double) sort by zorder " +
-        "(i, s)", "SORT BY ZORDER does not support column types: STRING, VARCHAR(*), " +
-        "FLOAT, DOUBLE");
-    AnalysisError("create table functional.new_table (i int, s float) sort by zorder " +
-        "(i, s)", "SORT BY ZORDER does not support column types: STRING, VARCHAR(*), " +
-        "FLOAT, DOUBLE");
+  }
 
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+  @Test
+  public void TestCreateBucketedTable() throws AnalysisException {
+    AnalyzesOk("CREATE TABLE functional.bucket (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY(i) INTO 24 BUCKETS");
+    AnalyzesOk("CREATE TABLE functional.bucket (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY(i) SORT BY (s) INTO 24 BUCKETS");
+
+    // Bucketed table not supported for Kudu and ICEBERG table
+    AnalysisError("CREATE TABLE functional.bucket (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) INTO 24 BUCKETS STORED BY KUDU", "CLUSTERED BY not " +
+        "support fileformat: 'KUDU'");
+    AnalysisError("CREATE TABLE functional.bucket (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) INTO 24 BUCKETS STORED BY ICEBERG",
+        "CLUSTERED BY not support fileformat: 'ICEBERG'");
+    // Bucketed columns must not contain partition column and don't duplicate
+    AnalysisError("CREATE TABLE functional.bucket (i int COMMENT 'hello', s string) " +
+        "PARTITIONED BY(dt string) CLUSTERED BY (dt) INTO 24 BUCKETS",
+        "CLUSTERED BY column list must not contain partition column: 'dt'");
+    AnalysisError("CREATE TABLE functional.bucket (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i, i) INTO 24 BUCKETS",
+        "Duplicate column in CLUSTERED BY list: i");
+    AnalysisError("CREATE TABLE functional.bucket (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (a) INTO 24 BUCKETS",
+        "Could not find CLUSTERED BY column 'a' in table.");
+    AnalysisError("CREATE TABLE functional.bucket (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) INTO 0 BUCKETS",
+        "Bucket's number must be greater than 0.");
+    AnalysisError("CREATE TABLE functional.bucket (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY () INTO 12 BUCKETS",
+        "Bucket columns must be not null.");
   }
 
   @Test
@@ -2940,7 +3195,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Table/view already exists.
     AnalysisError("create view functional.alltypes as " +
         "select * from functional.alltypessmall ",
-        "Table already exists: functional.alltypes");
+        "View already exists: functional.alltypes");
     // Target database does not exist.
     AnalysisError("create view wrongdb.test as " +
         "select * from functional.alltypessmall ",
@@ -2960,13 +3215,16 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "Incompatible return types 'INT' and 'STRING' of exprs " +
         "'int_col' and 'string_col'.");
 
-    // View cannot have complex-typed columns because complex-typed exprs are
-    // not supported in the select list.
-    AnalysisError("create view functional.foo (a, b, c) as " +
-        "select int_array_col, int_map_col, int_struct_col " +
-        "from functional.allcomplextypes",
-        "Expr 'int_array_col' in select list returns a complex type 'ARRAY<INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+    AnalyzesOk("create view functional.foo (a) as " +
+        "select int_array_col " +
+        "from functional.allcomplextypes");
+    AnalyzesOk("create view functional.foo (a) as " +
+        "select int_map_col " +
+        "from functional.allcomplextypes");
+    // It's allowed to do the same with struct as it is supported in the select list.
+    AnalysisContext ctx = createAnalysisCtx();
+    AnalyzesOk("create view functional.foo (a) as " +
+        "select tiny_struct from functional_orc_def.complextypes_structs", ctx);
 
     // IMPALA-7679: Inserting a null column type without an explicit type should
     // throw an error.
@@ -2975,6 +3233,14 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create view v as select null as new_col",
         "Unable to infer the column type for column 'new_col'. Use cast() to " +
             "explicitly specify the column type for column 'new_col'.");
+
+    AnalyzesOk("create view v_tblproperties TBLPROPERTIES ('a' = 'a')" +
+        "as select cast(null as int) as new_col");
+    AnalyzesOk("create view v_tblproperties TBLPROPERTIES ('a' = 'a', 'b' = 'b')" +
+        "as select cast(null as int) as new_col");
+    AnalysisError("create view functional.view_view TBLPROPERTIES ('a' = 'a')" +
+        "as select cast(null as int) as new_col",
+        "View already exists: functional.view_view");
   }
 
   @Test
@@ -3190,7 +3456,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("create function identity(string) RETURNS int " +
         "LOCATION '/test-warehouse/libTestUdfs.so' " + "SYMBOL='Identity'");
     AnalyzesOk("create function all_types_fn(string, boolean, tinyint, " +
-        "smallint, int, bigint, float, double, decimal, date) returns int " +
+        "smallint, int, bigint, float, double, decimal, date, binary) returns int " +
         "location '/test-warehouse/libTestUdfs.so' symbol='AllTypes'");
 
     // Try creating functions with illegal function names.
@@ -3505,6 +3771,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     TypeDefsAnalyzeOk("DECIMAL");
     TypeDefsAnalyzeOk("TIMESTAMP");
     TypeDefsAnalyzeOk("DATE");
+    TypeDefsAnalyzeOk("BINARY");
 
     // Test decimal.
     TypeDefsAnalyzeOk("DECIMAL");
@@ -3743,7 +4010,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("show partitions functional.view_view",
         "SHOW PARTITIONS not applicable to a view: functional.view_view");
     AnalysisError("show partitions functional_hbase.alltypes",
-        "SHOW PARTITIONS must target an HDFS table: functional_hbase.alltypes");
+        "SHOW PARTITIONS must target an HDFS or Kudu table: functional_hbase.alltypes");
   }
 
   @Test
@@ -3999,6 +4266,75 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           "set owner %s foo", ownerType), "ALTER VIEW not allowed on a table: " +
           "functional.alltypes");
     }
+  }
+
+  @Test
+  public void TestAlterExecuteExpireSnapshots() {
+    AnalyzesOk("alter table functional_parquet.iceberg_partitioned execute " +
+        "expire_snapshots(now() - interval 20 years);");
+    AnalyzesOk("alter table functional_parquet.iceberg_partitioned execute " +
+        "expire_snapshots('2022-01-04 10:00:00');");
+
+    // Negative tests
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "unsupported_operation(123456789);", "'unsupported_operation' is not supported " +
+        "by ALTER TABLE <table> EXECUTE. Supported operations are: " +
+        "EXPIRE_SNAPSHOTS(<expression>), ROLLBACK(<expression>)");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "expire_snapshots(now(), 3);", "EXPIRE_SNAPSHOTS(<expression>) must have one " +
+        "parameter: expire_snapshots(now(), 3)");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "expire_snapshots(id);", "EXPIRE_SNAPSHOTS(<expression>) must be a constant " +
+        "expression: expire_snapshots(id)");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "expire_snapshots(42);", "EXPIRE_SNAPSHOTS(<expression>) must be a timestamp " +
+        "type but is 'TINYINT': 42");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "expire_snapshots('2021-02-32 15:52:45');", "Invalid TIMESTAMP expression has" +
+        " been given to EXPIRE_SNAPSHOTS(<expression>)");
+  }
+
+  @Test
+  public void TestAlterExecuteRollback() {
+    AnalyzesOk("alter table functional_parquet.iceberg_partitioned execute " +
+        "rollback('2022-01-04 10:00:00');");
+    AnalyzesOk("alter table functional_parquet.iceberg_partitioned execute " +
+        "rollback(123456);");
+    // Timestamp can be an expression.
+    AnalyzesOk("alter table functional_parquet.iceberg_partitioned execute " +
+        "rollback(cast('2021-08-09 15:52:45' as timestamp) - interval 2 days + " +
+        "interval 3 hours);");
+
+    // Negative tests
+    AnalysisError("alter table nodb.alltypes execute " +
+        "rollback('2022-01-04 10:00:00');",
+       "Could not resolve table reference: 'nodb.alltypes'");
+    AnalysisError("alter table functional.alltypes execute " +
+        "rollback('2022-01-04 10:00:00');",
+       "ALTER TABLE EXECUTE ROLLBACK is only supported for Iceberg tables: " +
+           "functional.alltypes");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "rollback(id);", "EXECUTE ROLLBACK(<expression>): " +
+        "<expression> must be a constant expression: EXECUTE rollback(id)");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "rollback(3.14);", "EXECUTE ROLLBACK(<expression>): <expression> " +
+        "must be an integer type or a timestamp, but is 'DECIMAL(3,2)': " +
+        "EXECUTE rollback(3.14)");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "rollback('2021-02-32 15:52:45');", "An invalid TIMESTAMP expression has been " +
+        "given to EXECUTE ROLLBACK(<expression>): the expression " +
+        "'2021-02-32 15:52:45' cannot be converted to a TIMESTAMP");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "rollback('the beginning');", "An invalid TIMESTAMP expression has been " +
+        "given to EXECUTE ROLLBACK(<expression>): the expression " +
+        "'the beginning' cannot be converted to a TIMESTAMP");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "rollback(1111,2222);",
+        "EXECUTE ROLLBACK(<expression>): must have one parameter");
+    AnalysisError("alter table functional_parquet.iceberg_partitioned execute " +
+        "rollback('1111');", "An invalid TIMESTAMP expression has been " +
+        "given to EXECUTE ROLLBACK(<expression>): the expression " +
+        "'1111' cannot be converted to a TIMESTAMP");
   }
 
   private static String buildLongOwnerName() {

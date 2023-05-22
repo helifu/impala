@@ -22,7 +22,7 @@
 #include "rpc/TAcceptQueueServer.h"
 
 #include <gutil/walltime.h>
-#include <thrift/concurrency/PlatformThreadFactory.h>
+#include <thrift/concurrency/ThreadFactory.h>
 #include <thrift/transport/TSocket.h>
 
 #include "util/histogram-metric.h"
@@ -43,11 +43,13 @@ DEFINE_int32(accepted_cnxn_setup_thread_pool_size, 2,
     "post-accept, pre-setup connection queue in each thrift server set up to service "
     "Impala internal and external connections.");
 
+DECLARE_int32(thrift_rpc_max_message_size);
+
 namespace apache {
 namespace thrift {
 namespace server {
 
-using boost::shared_ptr;
+using std::shared_ptr;
 using namespace std;
 using namespace apache::thrift;
 using namespace apache::thrift::protocol;
@@ -69,7 +71,7 @@ class TAcceptQueueServer::Task : public Runnable {
   ~Task() override = default;
 
   void run() override {
-    boost::shared_ptr<TServerEventHandler> eventHandler = server_.getEventHandler();
+    shared_ptr<TServerEventHandler> eventHandler = server_.getEventHandler();
     void* connectionContext = nullptr;
     if (eventHandler != nullptr) {
       connectionContext = eventHandler->createContext(input_, output_);
@@ -137,7 +139,7 @@ class TAcceptQueueServer::Task : public Runnable {
   // due to inactivity. If so, it will return false and the connection
   // will be closed by the caller.
   bool Peek(shared_ptr<TProtocol> input, void* connectionContext,
-      boost::shared_ptr<TServerEventHandler> eventHandler) {
+      shared_ptr<TServerEventHandler> eventHandler) {
     // Set a timeout on input socket if idle_poll_period_ms_ is non-zero.
     TSocket* socket = static_cast<TSocket*>(transport_.get());
     if (server_.idle_poll_period_ms_ > 0) {
@@ -155,6 +157,9 @@ class TAcceptQueueServer::Task : public Runnable {
         // read() or peek() of the socket.
         if (eventHandler != nullptr && server_.idle_poll_period_ms_ > 0 &&
             (IsReadTimeoutTException(ttx) || IsPeekTimeoutTException(ttx))) {
+          VLOG(2) << Substitute("Socket read or peek timeout encountered "
+                                "(idle_poll_period_ms_=$0). $1",
+              server_.idle_poll_period_ms_, ttx.what());
           ThriftServer::ThriftServerEventProcessor* thriftServerHandler =
               static_cast<ThriftServer::ThriftServerEventProcessor*>(eventHandler.get());
           if (thriftServerHandler->IsIdleContext(connectionContext)) {
@@ -184,11 +189,11 @@ class TAcceptQueueServer::Task : public Runnable {
   shared_ptr<TTransport> transport_;
 };
 
-TAcceptQueueServer::TAcceptQueueServer(const boost::shared_ptr<TProcessor>& processor,
-    const boost::shared_ptr<TServerTransport>& serverTransport,
-    const boost::shared_ptr<TTransportFactory>& transportFactory,
-    const boost::shared_ptr<TProtocolFactory>& protocolFactory,
-    const boost::shared_ptr<ThreadFactory>& threadFactory, const string& name,
+TAcceptQueueServer::TAcceptQueueServer(const shared_ptr<TProcessor>& processor,
+    const shared_ptr<TServerTransport>& serverTransport,
+    const shared_ptr<TTransportFactory>& transportFactory,
+    const shared_ptr<TProtocolFactory>& protocolFactory,
+    const shared_ptr<ThreadFactory>& threadFactory, const string& name,
     int32_t maxTasks, int64_t queue_timeout_ms, int64_t idle_poll_period_ms)
     : TServer(processor, serverTransport, transportFactory, protocolFactory),
       threadFactory_(threadFactory), name_(name), maxTasks_(maxTasks),
@@ -198,18 +203,14 @@ TAcceptQueueServer::TAcceptQueueServer(const boost::shared_ptr<TProcessor>& proc
 
 void TAcceptQueueServer::init() {
   if (!threadFactory_) {
-    threadFactory_.reset(new PlatformThreadFactory);
+    threadFactory_.reset(new ThreadFactory);
   }
 }
 
 void TAcceptQueueServer::CleanupAndClose(const string& error,
-    shared_ptr<TTransport> input, shared_ptr<TTransport> output,
-    shared_ptr<TTransport> client) {
-  if (input != nullptr) {
-    input->close();
-  }
-  if (output != nullptr) {
-    output->close();
+    shared_ptr<TTransport> io_transport, shared_ptr<TTransport> client) {
+  if (io_transport != nullptr) {
+    io_transport->close();
   }
   if (client != nullptr) {
     client->close();
@@ -220,29 +221,43 @@ void TAcceptQueueServer::CleanupAndClose(const string& error,
 // New.
 void TAcceptQueueServer::SetupConnection(shared_ptr<TAcceptQueueEntry> entry) {
   if (metrics_enabled_) queue_size_metric_->Increment(-1);
-  shared_ptr<TTransport> inputTransport;
-  shared_ptr<TTransport> outputTransport;
+  shared_ptr<TTransport> io_transport;
   shared_ptr<TTransport> client = entry->client_;
+  SetMaxMessageSize(client.get());
   const string& socket_info = reinterpret_cast<TSocket*>(client.get())->getSocketInfo();
-  VLOG(1) << Substitute("TAcceptQueueServer: $0 started connection setup for client $1",
+  VLOG(2) << Substitute("TAcceptQueueServer: $0 started connection setup for client $1",
       name_, socket_info);
   try {
     MonotonicStopWatch timer;
     // Start timing for connection setup.
     timer.Start();
-    inputTransport = inputTransportFactory_->getTransport(client);
-    outputTransport = outputTransportFactory_->getTransport(client);
+
+    // Since THRIFT-5237, it is necessary for Impala to have the same TTransport object
+    // for both input and output transport. The detailed reasoning on why this TTransport
+    // object sharing requirement is as follow:
+    // - Thrift decrements the max message size counter as messages arrive.
+    // - Thrift resets the max message size counter with a flush.
+    // - If the input and output transport are distinct, the decrement is happening on
+    //   one object while the reset is happening on a different object, so it eventually
+    //   throws an error.
+    // Using same transport fixes the counter logic. This also helps with simplifying
+    // Impala's custom TSaslTransport since its caching algorithm in
+    // TSaslServerTransport::Factory is not required anymore.
+    DCHECK(inputTransportFactory_ == outputTransportFactory_);
+    io_transport = inputTransportFactory_->getTransport(client);
+    SetMaxMessageSize(io_transport.get());
+
     shared_ptr<TProtocol> inputProtocol =
-        inputProtocolFactory_->getProtocol(inputTransport);
+        inputProtocolFactory_->getProtocol(io_transport);
     shared_ptr<TProtocol> outputProtocol =
-        outputProtocolFactory_->getProtocol(outputTransport);
+        outputProtocolFactory_->getProtocol(io_transport);
     shared_ptr<TProcessor> processor =
         getProcessor(inputProtocol, outputProtocol, client);
 
     if (metrics_enabled_) {
       cnxns_setup_time_us_metric_->Update(timer.ElapsedTime() / NANOS_PER_MICRO);
     }
-    VLOG(1) << Substitute("TAcceptQueueServer: $0 finished connection setup for "
+    VLOG(2) << Substitute("TAcceptQueueServer: $0 finished connection setup for "
         "client $1", name_, socket_info);
 
     TAcceptQueueServer::Task* task = new TAcceptQueueServer::Task(
@@ -278,7 +293,7 @@ void TAcceptQueueServer::SetupConnection(shared_ptr<TAcceptQueueEntry> entry) {
           }
           LOG(INFO) << name_ << ": Server busy. Timing out connection request.";
           string errStr = "TAcceptQueueServer: " + name_ + " server busy";
-          CleanupAndClose(errStr, inputTransport, outputTransport, client);
+          CleanupAndClose(errStr, io_transport, client);
           return;
         }
       }
@@ -293,11 +308,11 @@ void TAcceptQueueServer::SetupConnection(shared_ptr<TAcceptQueueEntry> entry) {
   } catch (const TException& tx) {
     string errStr = Substitute("TAcceptQueueServer: $0 connection setup failed for "
         "client $1. Caught TException: $2", name_, socket_info, string(tx.what()));
-    CleanupAndClose(errStr, inputTransport, outputTransport, client);
+    CleanupAndClose(errStr, io_transport, client);
   } catch (const string& s) {
     string errStr = Substitute("TAcceptQueueServer: $0 connection setup failed for "
         "client $1. Unknown exception: $2", name_, socket_info, s);
-    CleanupAndClose(errStr, inputTransport, outputTransport, client);
+    CleanupAndClose(errStr, io_transport, client);
   }
 }
 

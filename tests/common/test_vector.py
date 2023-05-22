@@ -56,6 +56,7 @@
 #
 # Additional examples of usage can be found within the test suites.
 
+from __future__ import absolute_import, division, print_function
 from itertools import product
 
 # A list of test dimension values.
@@ -70,6 +71,12 @@ class ImpalaTestDimension(list):
 class ImpalaTestVector(object):
   def __init__(self, vector_values):
     self.vector_values = vector_values
+
+  def get_value_with_default(self, name, default_value):
+    for vector_value in self.vector_values:
+      if vector_value.name == name:
+        return vector_value.value
+    return default_value
 
   def get_value(self, name):
     for vector_value in self.vector_values:
@@ -123,15 +130,15 @@ class ImpalaTestMatrix(object):
     elif exploration_strategy in ['core', 'pairwise']:
       return self.__generate_pairwise_combinations()
     else:
-      raise ValueError, 'Unknown exploration strategy: %s' % exploration_strategy
+      raise ValueError('Unknown exploration strategy: %s' % exploration_strategy)
 
   def __generate_exhaustive_combinations(self):
     return [ImpalaTestVector(vec) for vec in product(*self.__extract_vector_values())
               if self.is_valid(vec)]
 
   def __generate_pairwise_combinations(self):
-    import metacomm.combinatorics.all_pairs2
-    all_pairs = metacomm.combinatorics.all_pairs2.all_pairs2
+    from allpairspy import AllPairs
+    all_pairs = AllPairs
 
     # Pairwise fails if the number of inputs == 1. Use exhaustive in this case the
     # results will be the same.

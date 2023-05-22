@@ -21,17 +21,19 @@
 #include <boost/bind.hpp>
 
 #include "exec/data-source-scan-node.h"
-#include "exec/hbase-scan-node.h"
-#include "exec/kudu-scan-node-mt.h"
-#include "exec/kudu-scan-node.h"
+#include "exec/hbase/hbase-scan-node.h"
+#include "exec/kudu/kudu-scan-node-mt.h"
+#include "exec/kudu/kudu-scan-node.h"
 #include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "runtime/blocking-row-batch-queue.h"
+#include "runtime/fragment-state.h"
 #include "runtime/io/disk-io-mgr.h"
-#include "runtime/query-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-filter.inline.h"
 #include "runtime/runtime-state.h"
 #include "runtime/scanner-mem-limiter.h"
+#include "util/debug-util.h"
 #include "util/disk-info.h"
 #include "util/pretty-printer.h"
 #include "util/runtime-profile-counters.h"
@@ -96,7 +98,7 @@ PROFILE_DEFINE_HIGH_WATER_MARK_COUNTER(PeakScannerThreadConcurrency, STABLE_LOW,
 
 const string ScanNode::SCANNER_THREAD_COUNTERS_PREFIX = "ScannerThreads";
 
-Status ScanPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+Status ScanPlanNode::Init(const TPlanNode& tnode, FragmentState* state) {
   RETURN_IF_ERROR(PlanNode::Init(tnode, state));
   const TQueryOptions& query_options = state->query_options();
   for (const TRuntimeFilterDesc& filter_desc : tnode.runtime_filters) {
@@ -126,11 +128,10 @@ Status ScanPlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const 
       break;
     case TPlanNodeType::KUDU_SCAN_NODE:
       if (tnode_->kudu_scan_node.use_mt_scan_node) {
-        DCHECK_GT(state->query_options().mt_dop, 0);
+        DCHECK(is_mt_fragment());
         *node = pool->Add(new KuduScanNodeMt(pool, *this, state->desc_tbl()));
       } else {
-        DCHECK(state->query_options().mt_dop == 0
-            || state->query_options().num_scanner_threads == 1);
+        DCHECK(!is_mt_fragment() || state->query_options().num_scanner_threads == 1);
         *node = pool->Add(new KuduScanNode(pool, *this, state->desc_tbl()));
       }
       break;
@@ -152,17 +153,14 @@ Status ScanNode::Prepare(RuntimeState* state) {
   for (const TRuntimeFilterDesc& filter_desc : plan_node_.tnode_->runtime_filters) {
     filter_ctxs_.emplace_back();
     FilterContext& filter_ctx = filter_ctxs_.back();
-    filter_ctx.filter = state->filter_bank()->RegisterFilter(filter_desc, false);
-    // TODO: Enable stats for min-max filters when Kudu exposes info about filters
-    // (KUDU-2162).
-    if (filter_ctx.filter->is_bloom_filter()) {
-      string filter_profile_title = Substitute("Filter $0 ($1)", filter_desc.filter_id,
-          PrettyPrinter::Print(filter_ctx.filter->filter_size(), TUnit::BYTES));
-      RuntimeProfile* profile =
-          RuntimeProfile::Create(state->obj_pool(), filter_profile_title);
-      runtime_profile_->AddChild(profile);
-      filter_ctx.stats = state->obj_pool()->Add(new FilterStats(profile));
-    }
+    filter_ctx.filter = state->filter_bank()->RegisterConsumer(filter_desc);
+    string filter_profile_title =
+        Substitute("$0$1 ($2)", RuntimeProfile::PREFIX_FILTER, filter_desc.filter_id,
+            PrettyPrinter::Print(filter_ctx.filter->filter_size(), TUnit::BYTES));
+    RuntimeProfile* profile =
+        RuntimeProfile::Create(state->obj_pool(), filter_profile_title, false);
+    runtime_profile_->AddChild(profile);
+    filter_ctx.stats = state->obj_pool()->Add(new FilterStats(profile));
   }
 
   rows_read_counter_ = PROFILE_RowsRead.Instantiate(runtime_profile());
@@ -201,7 +199,6 @@ void ScanNode::Close(RuntimeState* state) {
   for (auto& filter_ctx : filter_ctxs_) {
     if (filter_ctx.expr_eval != nullptr) filter_ctx.expr_eval->Close(state);
   }
-  ScalarExpr::Close(filter_exprs_);
   // ScanNode::Prepare() started periodic counters including 'total_throughput_counter_'
   // and 'bytes_read_timeseries_counter_'. Subclasses may also have started counters.
   runtime_profile_->StopPeriodicCounters();
@@ -234,7 +231,8 @@ bool ScanNode::WaitForRuntimeFilters() {
     runtime_profile()->AddInfoString("Runtime filters",
         Substitute("All filters arrived. Waited $0. Maximum arrival delay: $1.",
                                          wait_time, arrival_delay));
-    VLOG(2) << "Filters arrived. Waited " << wait_time;
+    VLOG(2) << "Filters arrived. Waited " << wait_time
+            << ". Current time since reboot(ms) " << end;
     return true;
   }
 
@@ -274,30 +272,40 @@ void ScanNode::ScannerThreadState::Open(
     ScanNode* parent, int64_t max_row_batches_override) {
   RuntimeState* state = parent->runtime_state_;
   max_num_scanner_threads_ = CpuInfo::num_cores();
-  if (state->query_options().num_scanner_threads > 0) {
-    max_num_scanner_threads_ = state->query_options().num_scanner_threads;
-  }
-  DCHECK_GT(max_num_scanner_threads_, 0);
-
   int max_row_batches = max_row_batches_override;
-  if (max_row_batches_override <= 0) {
-    // Legacy heuristic to determine the size, based on the idea that more disks means a
-    // faster producer. Also used for Kudu under the assumption that the scan runs
-    // co-located with a Kudu tablet server and that the tablet server is using disks
-    // similarly as a datanode would.
-    // TODO: IMPALA-7096: re-evaluate this heuristic to get a tighter bound on memory
-    // consumption, we could do something better.
-    max_row_batches = max(1, min(
-        10 * (DiskInfo::num_disks() + io::DiskIoMgr::REMOTE_NUM_DISKS),
-        max_num_scanner_threads_ * FLAGS_max_queued_row_batches_per_scanner_thread));
-  }
-  if (state->query_options().__isset.mt_dop && state->query_options().mt_dop > 0) {
-    // To avoid a significant memory increase when running the multithreaded scans
-    // with mt_dop > 0 (if mt_dop is not supported for this scan), then adjust the number
-    // of maximally queued row batches per scan instance based on MT_DOP. The max
-    // materialized row batches is at least 2 to allow for some parallelism between
-    // the producer/consumer.
-    max_row_batches = max(2, max_row_batches / state->query_options().mt_dop);
+
+  if (state->query_options().compute_processing_cost) {
+    // If COMPUTE_PROCESSING_COST=true, we fix the maximum num scanner threads to 1 per
+    // instance and maximum row batches to 2.
+    max_num_scanner_threads_ = 1;
+    max_row_batches = 2;
+  } else {
+    if (state->query_options().num_scanner_threads > 0) {
+      max_num_scanner_threads_ = state->query_options().num_scanner_threads;
+    }
+    DCHECK_GT(max_num_scanner_threads_, 0);
+
+    if (max_row_batches_override <= 0) {
+      // Legacy heuristic to determine the size, based on the idea that more disks means a
+      // faster producer. Also used for Kudu under the assumption that the scan runs
+      // co-located with a Kudu tablet server and that the tablet server is using disks
+      // similarly as a datanode would.
+      // TODO: IMPALA-7096: re-evaluate this heuristic to get a tighter bound on memory
+      // consumption, we could do something better.
+      max_row_batches = max(1,
+          min(10 * (DiskInfo::num_disks() + io::DiskIoMgr::REMOTE_NUM_DISKS),
+              max_num_scanner_threads_
+                  * FLAGS_max_queued_row_batches_per_scanner_thread));
+    }
+    if (parent->plan_node().is_mt_fragment()) {
+      // To avoid a significant memory increase when running the multithreaded scans
+      // (if multithreaded fragment is not supported for this scan), then adjust the
+      // number of maximally queued row batches per scan instance based on
+      // num_instances_per_node(). The max materialized row batches is at least 2 to allow
+      // for some parallelism between the producer/consumer.
+      max_row_batches =
+          max(2, max_row_batches / parent->plan_node().num_instances_per_node());
+    }
   }
   VLOG(2) << "Max row batch queue size for scan node '" << parent->id()
           << "' in fragment instance '" << PrintId(state->fragment_instance_id())

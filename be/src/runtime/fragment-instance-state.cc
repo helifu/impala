@@ -19,38 +19,44 @@
 #include "runtime/fragment-instance-state.h"
 
 #include <sstream>
-#include <thrift/protocol/TDebugProtocol.h>
-#include <boost/thread/locks.hpp>
-#include <boost/thread/thread_time.hpp>
-#include <boost/thread/lock_guard.hpp>
+#include <boost/bind.hpp>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
+#include <boost/thread/thread_time.hpp>
+#include <thrift/protocol/TDebugProtocol.h>
 
-#include "common/names.h"
 #include "codegen/llvm-codegen.h"
-#include "exec/plan-root-sink.h"
+#include "exec/exchange-node.h"
 #include "exec/exec-node.h"
 #include "exec/hdfs-scan-node-base.h"
-#include "exec/exchange-node.h"
+#include "exec/join-builder.h"
+#include "exec/nested-loop-join-builder.h"
+#include "exec/partitioned-hash-join-builder.h"
+#include "exec/plan-root-sink.h"
 #include "exec/scan-node.h"
-#include "runtime/exec-env.h"
-#include "runtime/backend-client.h"
+#include "gen-cpp/ImpalaInternalService_types.h"
+#include "kudu/rpc/rpc_context.h"
 #include "runtime/client-cache.h"
-#include "runtime/krpc-data-stream-mgr.h"
-#include "runtime/query-state.h"
-#include "runtime/query-state.h"
+#include "runtime/exec-env.h"
+#include "runtime/fragment-state.h"
+#include "runtime/krpc-data-stream-sender.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/query-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-filter-bank.h"
 #include "runtime/runtime-state.h"
 #include "runtime/thread-resource-mgr.h"
-#include "scheduling/query-schedule.h"
-#include "util/debug-util.h"
 #include "util/container-util.h"
+#include "util/debug-util.h"
 #include "util/periodic-counter-updater.h"
-#include "gen-cpp/ImpalaInternalService_types.h"
+#include "util/uid-util.h"
 
-using namespace impala;
+#include "common/names.h"
+
+using google::protobuf::RepeatedPtrField;
+using kudu::rpc::RpcContext;
 using namespace apache::thrift;
+
+namespace impala {
 
 const string FragmentInstanceState::PER_HOST_PEAK_MEM_COUNTER = "PerHostPeakMemUsage";
 const string FragmentInstanceState::FINST_THREAD_GROUP_NAME = "fragment-execution";
@@ -60,13 +66,18 @@ static const string OPEN_TIMER_NAME = "OpenTime";
 static const string PREPARE_TIMER_NAME = "PrepareTime";
 static const string EXEC_TIMER_NAME = "ExecTime";
 
-FragmentInstanceState::FragmentInstanceState(
-    QueryState* query_state, const TPlanFragmentCtx& fragment_ctx,
-    const TPlanFragmentInstanceCtx& instance_ctx)
+PROFILE_DECLARE_COUNTER(ScanRangesComplete);
+PROFILE_DECLARE_COUNTER(BytesRead);
+
+FragmentInstanceState::FragmentInstanceState(QueryState* query_state,
+    FragmentState* fragment_state, const TPlanFragmentInstanceCtx& instance_ctx,
+    const PlanFragmentInstanceCtxPB& instance_ctx_pb)
   : query_state_(query_state),
-    fragment_ctx_(fragment_ctx),
-    instance_ctx_(instance_ctx) {
-}
+    fragment_state_(fragment_state),
+    fragment_(fragment_state->fragment()),
+    instance_ctx_(instance_ctx),
+    fragment_ctx_(fragment_state->fragment_ctx()),
+    instance_ctx_pb_(instance_ctx_pb) {}
 
 Status FragmentInstanceState::Exec() {
   bool is_prepared = false;
@@ -98,22 +109,31 @@ done:
   // logged in RuntimeState:error_log_.
   Close();
 
-  // Must update the fragment instance state first before updating the 'Query State'.
-  // Otherwise, there is a race when reading the 'done' flag with GetStatusReport().
-  // This may lead to the "final" profile being sent with the 'done' flag as false.
   DCHECK_EQ(is_prepared,
       current_state_.Load() > FInstanceExecStatePB::WAITING_FOR_PREPARE);
-  UpdateState(StateEvent::EXEC_END);
 
   if (!status.ok()) {
+    exec_failed_.Store(true);
     if (!is_prepared) {
+      UpdateState(StateEvent::EXEC_END);
+
       // Tell the managing 'QueryState' that we hit an error during Prepare().
       query_state_->ErrorDuringPrepare(status, instance_id());
     } else {
+      // Must set exec_failed_ first, then update the 'Query State' before updating the
+      // fragment instance state. Otherwise, there is a race when reading the 'done' flag
+      // with GetStatusReport(). This may lead to report the instance as "completed"
+      // without error, or the "final" profile being sent with the 'done' flag as false.
+
       // Tell the managing 'QueryState' that we hit an error during execution.
       query_state_->ErrorDuringExecute(status, instance_id());
+
+      UpdateState(StateEvent::EXEC_END);
+      query_state_->DoneRemainingExecuting();
     }
   } else {
+    UpdateState(StateEvent::EXEC_END);
+
     // Tell the managing 'QueryState' that we're done with executing.
     query_state_->DoneExecuting();
   }
@@ -125,7 +145,6 @@ void FragmentInstanceState::Cancel() {
   runtime_state_->Cancel();
   PlanRootSink* root_sink = GetRootSink();
   if (root_sink != nullptr) root_sink->Cancel(runtime_state_);
-  ExecEnv::GetInstance()->stream_mgr()->Cancel(runtime_state_->fragment_instance_id());
 }
 
 Status FragmentInstanceState::Prepare() {
@@ -134,13 +153,13 @@ Status FragmentInstanceState::Prepare() {
 
   // Do not call RETURN_IF_ERROR or explicitly return before this line,
   // runtime_state_ != nullptr is a postcondition of this function.
-  runtime_state_ = obj_pool()->Add(new RuntimeState(
-      query_state_, fragment_ctx_, instance_ctx_, ExecEnv::GetInstance()));
+  runtime_state_ = obj_pool()->Add(new RuntimeState(query_state_, fragment_,
+      instance_ctx_, fragment_ctx_, instance_ctx_pb_, ExecEnv::GetInstance()));
 
   // total_time_counter() is in the runtime_state_ so start it up now.
   SCOPED_TIMER(profile()->total_time_counter());
-  timings_profile_ =
-      RuntimeProfile::Create(obj_pool(), "Fragment Instance Lifecycle Timings");
+  timings_profile_ = RuntimeProfile::Create(
+      obj_pool(), RuntimeProfile::FRAGMENT_INSTANCE_LIFECYCLE_TIMINGS, false);
   profile()->AddChild(timings_profile_);
   SCOPED_TIMER(ADD_TIMER(timings_profile_, PREPARE_TIMER_NAME));
 
@@ -157,9 +176,6 @@ Status FragmentInstanceState::Prepare() {
   // Exercise debug actions at the first point where errors are possible in Prepare().
   RETURN_IF_ERROR(DebugAction(query_state_->query_options(), "FIS_IN_PREPARE"));
 
-  RETURN_IF_ERROR(runtime_state_->InitFilterBank(
-      fragment_ctx_.fragment.runtime_filters_reservation_bytes));
-
   avg_thread_tokens_ = profile()->AddSamplingCounter("AverageThreadTokens",
       bind<int64_t>(mem_fn(&ThreadResourcePool::num_threads),
           runtime_state_->resource_pool()));
@@ -172,13 +188,11 @@ Status FragmentInstanceState::Prepare() {
       bind<int64_t>(mem_fn(&ThreadResourcePool::num_threads),
           runtime_state_->resource_pool()));
 
-  PlanNode* plan_tree = nullptr;
-  RETURN_IF_ERROR(
-      PlanNode::CreateTree(runtime_state_, fragment_ctx_.fragment.plan, &plan_tree));
-  plan_tree_ = plan_tree;
-  // set up plan
+  // Create the exec tree.
+  const PlanNode* plan_tree = fragment_state_->plan_tree();
+  DCHECK(plan_tree != nullptr);
   RETURN_IF_ERROR(ExecNode::CreateTree(
-      runtime_state_, *plan_tree_, query_state_->desc_tbl(), &exec_tree_));
+      runtime_state_, *plan_tree, query_state_->desc_tbl(), &exec_tree_));
   runtime_state_->set_fragment_root_id(exec_tree_->id());
   if (instance_ctx_.__isset.debug_options) {
     ExecNode::SetDebugOptions(instance_ctx_.debug_options, exec_tree_);
@@ -191,18 +205,18 @@ Status FragmentInstanceState::Prepare() {
     DCHECK_EQ(exch_node->type(), TPlanNodeType::EXCHANGE_NODE);
     int num_senders =
         FindWithDefault(instance_ctx_.per_exch_num_senders, exch_node->id(), 0);
-    DCHECK_GT(num_senders, 0);
+    DCHECK_GT(num_senders, 0) << exch_node->id();
     static_cast<ExchangeNode*>(exch_node)->set_num_senders(num_senders);
   }
 
   // set scan ranges
   vector<ExecNode*> scan_nodes;
-  vector<TScanRangeParams> no_scan_ranges;
+  ScanRangesPB no_scan_ranges;
   exec_tree_->CollectScanNodes(&scan_nodes);
   for (ExecNode* scan_node: scan_nodes) {
-    const vector<TScanRangeParams>& scan_ranges = FindWithDefault(
-        instance_ctx_.per_node_scan_ranges, scan_node->id(), no_scan_ranges);
-    static_cast<ScanNode*>(scan_node)->SetScanRanges(scan_ranges);
+    const ScanRangesPB& scan_ranges = FindWithDefault(
+        instance_ctx_pb_.per_node_scan_ranges(), scan_node->id(), no_scan_ranges);
+    static_cast<ScanNode*>(scan_node)->SetScanRanges(scan_ranges.scan_ranges());
   }
 
   RuntimeProfile::Counter* prepare_timer =
@@ -214,9 +228,9 @@ Status FragmentInstanceState::Prepare() {
   PrintVolumeIds();
 
   // prepare sink_
-  DCHECK(fragment_ctx_.fragment.__isset.output_sink);
-  RETURN_IF_ERROR(DataSink::Create(fragment_ctx_, instance_ctx_, exec_tree_->row_desc(),
-      runtime_state_, &sink_));
+  const DataSinkConfig* sink_config = fragment_state_->sink_config();
+  DCHECK(sink_config != nullptr);
+  sink_ = sink_config->CreateSink(runtime_state_);
   RETURN_IF_ERROR(sink_->Prepare(runtime_state_, runtime_state_->instance_mem_tracker()));
   RuntimeProfile* sink_profile = sink_->profile();
   if (sink_profile != nullptr) profile()->AddChild(sink_profile);
@@ -252,7 +266,9 @@ Status FragmentInstanceState::Prepare() {
 }
 
 void FragmentInstanceState::GetStatusReport(FragmentInstanceExecStatusPB* instance_status,
-    TRuntimeProfileTree* thrift_profile) {
+    TRuntimeProfileTree* unagg_profile, AggregatedRuntimeProfile* agg_profile,
+    const Status& overall_status) {
+  DCHECK_NE(unagg_profile == nullptr, agg_profile == nullptr);
   DFAKE_SCOPED_LOCK(report_status_lock_);
   DCHECK(!final_report_sent_);
   // Update the counter for the peak per host mem usage.
@@ -268,11 +284,77 @@ void FragmentInstanceState::GetStatusReport(FragmentInstanceExecStatusPB* instan
   }
   const TUniqueId& finstance_id = instance_id();
   TUniqueIdToUniqueIdPB(finstance_id, instance_status->mutable_fragment_instance_id());
-  const bool done = IsDone();
+  // For failed fragment instance, report it as "done" when overall_statue is reported
+  // with error. This avoid coordinator to ignore the last status report.
+  const bool done = (IsDone() && !ExecFailed()) || (ExecFailed() && !overall_status.ok());
   instance_status->set_done(done);
   instance_status->set_current_state(current_state());
   DCHECK(profile() != nullptr);
-  profile()->ToThrift(thrift_profile);
+  if (agg_profile != nullptr) {
+    // Figure out the index of this instance relative to other instances of this fragment
+    // on the backend.
+    int instance_idx = instance_ctx_.per_fragment_instance_idx -
+        fragment_state_->min_per_fragment_instance_idx();
+    agg_profile->UpdateAggregatedFromInstance(profile(), instance_idx);
+  } else {
+    DCHECK(unagg_profile != nullptr);
+    profile()->ToThrift(unagg_profile);
+  }
+
+  // Pull out and aggregate counters from the profile.
+  RuntimeProfile::Counter* user_time = profile()->GetCounter("TotalThreadsUserTime");
+  if (user_time != nullptr) cpu_user_ns_ = user_time->value();
+
+  RuntimeProfile::Counter* system_time = profile()->GetCounter("TotalThreadsSysTime");
+  if (system_time != nullptr) cpu_sys_ns_ = system_time->value();
+
+  // Compute local_time for use below.
+  profile()->ComputeTimeInProfile();
+  vector<RuntimeProfileBase*> nodes;
+  profile()->GetAllChildren(&nodes);
+  int64_t bytes_read = 0;
+  int64_t scan_ranges_complete = 0;
+  int64_t total_bytes_sent = 0;
+  std::map<int32_t, int64_t> per_join_rows_produced;
+  for (RuntimeProfileBase* node : nodes) {
+    RuntimeProfile::Counter* c = node->GetCounter(PROFILE_BytesRead.name());
+    if (c != nullptr) bytes_read += c->value();
+    c = node->GetCounter(PROFILE_ScanRangesComplete.name());
+    if (c != nullptr) scan_ranges_complete += c->value();
+    c = node->GetCounter(KrpcDataStreamSender::TOTAL_BYTES_SENT_COUNTER);
+    if (c != nullptr) total_bytes_sent += c->value();
+
+    bool is_plan_node = node->metadata().__isset.plan_node_id;
+    bool is_data_sink = node->metadata().__isset.data_sink_id;
+    // Plan Nodes and data sinks get an entry in the exec summary.
+    if (is_plan_node || is_data_sink) {
+      ExecSummaryDataPB* summary_data = instance_status->add_exec_summary_data();
+      if (is_plan_node) {
+        summary_data->set_plan_node_id(node->metadata().plan_node_id);
+      } else {
+        summary_data->set_data_sink_id(node->metadata().data_sink_id);
+      }
+      RuntimeProfile::Counter* rows_counter = node->GetCounter("RowsReturned");
+      RuntimeProfile::Counter* mem_counter = node->GetCounter("PeakMemoryUsage");
+      if (rows_counter != nullptr) {
+        summary_data->set_rows_returned(rows_counter->value());
+        // row count stats for a join node
+        string hash_type = PrintValue(TPlanNodeType::HASH_JOIN_NODE);
+        string nested_loop_type = PrintValue(TPlanNodeType::NESTED_LOOP_JOIN_NODE);
+        if (node->name().rfind(hash_type, 0) == 0
+            || node->name().rfind(nested_loop_type, 0) == 0) {
+          per_join_rows_produced[node->metadata().plan_node_id] = rows_counter->value();
+        }
+      }
+      if (mem_counter != nullptr) summary_data->set_peak_mem_usage(mem_counter->value());
+      summary_data->set_local_time_ns(node->local_time());
+    }
+  }
+  bytes_read_ = bytes_read;
+  scan_ranges_complete_ = scan_ranges_complete;
+  total_bytes_sent_  = total_bytes_sent;
+  per_join_rows_produced_ = per_join_rows_produced;
+
   // Send the DML stats if this is the final report.
   if (done) {
     runtime_state()->dml_exec_state()->ToProto(
@@ -284,15 +366,20 @@ void FragmentInstanceState::GetStatusReport(FragmentInstanceExecStatusPB* instan
     *instance_status->mutable_stateful_report() =
         {prev_stateful_reports_.begin(), prev_stateful_reports_.end()};
   }
+  StatefulStatusPB* stateful_report = nullptr;
   if (runtime_state()->HasErrors()) {
     // Add any new errors.
-    StatefulStatusPB* stateful_report = instance_status->add_stateful_report();
+    stateful_report = instance_status->add_stateful_report();
     stateful_report->set_report_seq_no(report_seq_no_);
     runtime_state()->GetUnreportedErrors(stateful_report->mutable_error_log());
   }
   // If set in the RuntimeState, set the AuxErrorInfoPB field.
   if (runtime_state()->HasAuxErrorInfo()) {
-    runtime_state()->GetAuxErrorInfo(instance_status->mutable_aux_error_info());
+    if (stateful_report == nullptr) {
+      stateful_report = instance_status->add_stateful_report();
+      stateful_report->set_report_seq_no(report_seq_no_);
+    }
+    runtime_state()->GetUnreportedAuxErrorInfo(stateful_report->mutable_aux_error_info());
   }
 }
 
@@ -325,26 +412,9 @@ Status FragmentInstanceState::Open() {
       ADD_TIMER(timings_profile_, OPEN_TIMER_NAME));
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
 
-  if (runtime_state_->ShouldCodegen()) {
+  if (fragment_state_->ShouldCodegen()) {
     UpdateState(StateEvent::CODEGEN_START);
-    RETURN_IF_ERROR(runtime_state_->CreateCodegen());
-    {
-      SCOPED_TIMER2(runtime_state_->codegen()->ir_generation_timer(),
-          runtime_state_->codegen()->runtime_profile()->total_time_counter());
-      SCOPED_THREAD_COUNTER_MEASUREMENT(
-          runtime_state_->codegen()->llvm_thread_counters());
-      exec_tree_->Codegen(runtime_state_);
-      sink_->Codegen(runtime_state_->codegen());
-
-      // It shouldn't be fatal to fail codegen. However, until IMPALA-4233 is fixed,
-      // ScalarFnCall has no fall back to interpretation when codegen fails so propagates
-      // the error status for now.
-      RETURN_IF_ERROR(runtime_state_->CodegenScalarExprs());
-    }
-
-    LlvmCodeGen* codegen = runtime_state_->codegen();
-    DCHECK(codegen != nullptr);
-    RETURN_IF_ERROR(codegen->FinalizeModule());
+    RETURN_IF_ERROR(fragment_state_->InvokeCodegen(event_sequence_));
   }
 
   {
@@ -382,8 +452,16 @@ Status FragmentInstanceState::ExecInternal() {
     RETURN_IF_ERROR(sink_->Send(runtime_state_, row_batch_.get()));
     UpdateState(StateEvent::BATCH_SENT);
   } while (!exec_tree_complete);
+  // Release resources from final row batch.
+  row_batch_->Reset();
 
   UpdateState(StateEvent::LAST_BATCH_SENT);
+
+  // Close the tree before the sink is flushed to release 'exec_tree_' resources.
+  // This can significantly reduce resource consumption if 'sink_' is a join
+  // build, where FlushFinal() blocks until the consuming fragment is finished.
+  exec_tree_->Close(runtime_state_);
+
   // Flush the sink as a final step.
   RETURN_IF_ERROR(sink_->FlushFinal(runtime_state()));
   return Status::OK();
@@ -400,7 +478,7 @@ void FragmentInstanceState::Close() {
 
   // If we haven't already released this thread token in Prepare(), release
   // it before calling Close().
-  if (fragment_ctx_.fragment.output_sink.type != TDataSinkType::PLAN_ROOT_SINK) {
+  if (fragment_.output_sink.type != TDataSinkType::PLAN_ROOT_SINK) {
     ReleaseThreadToken();
   }
 
@@ -410,11 +488,7 @@ void FragmentInstanceState::Close() {
   // Stop updating profile counters in background.
   profile()->StopPeriodicCounters();
 
-  // We need to delete row_batch_ here otherwise we can't delete the instance_mem_tracker_
-  // in runtime_state_->ReleaseResources().
-  // TODO: do not delete mem trackers in Close()/ReleaseResources(), they are part of
-  // the control structures we need to preserve until the underlying QueryState
-  // disappears.
+  // Delete row_batch_ to free resources associated with it.
   row_batch_.reset();
   if (exec_tree_ != nullptr) exec_tree_->Close(runtime_state_);
   runtime_state_->ReleaseResources();
@@ -521,12 +595,6 @@ Status FragmentInstanceState::WaitForOpen() {
   return opened_promise_.Get();
 }
 
-void FragmentInstanceState::PublishFilter(const TPublishFilterParams& params) {
-  VLOG_FILE << "PublishFilter(): instance_id=" << PrintId(instance_id())
-            << " filter_id=" << params.filter_id;
-  runtime_state_->filter_bank()->PublishGlobalFilter(params);
-}
-
 const string& FragmentInstanceState::ExecStateToString(FInstanceExecStatePB state) {
   // Labels to send to the debug webpages to display the current state to the user.
   static const string finstance_state_labels[] = {
@@ -550,9 +618,17 @@ const string& FragmentInstanceState::ExecStateToString(FInstanceExecStatePB stat
 }
 
 PlanRootSink* FragmentInstanceState::GetRootSink() const {
-  return fragment_ctx_.fragment.output_sink.type == TDataSinkType::PLAN_ROOT_SINK ?
+  return fragment_.output_sink.type == TDataSinkType::PLAN_ROOT_SINK ?
       static_cast<PlanRootSink*>(sink_) :
       nullptr;
+}
+
+bool FragmentInstanceState::HasJoinBuildSink() const {
+  return IsJoinBuildSink(fragment_.output_sink.type);
+}
+
+JoinBuilder* FragmentInstanceState::GetJoinBuildSink() const {
+  return HasJoinBuildSink() ? static_cast<JoinBuilder*>(sink_) : nullptr;
 }
 
 const TQueryCtx& FragmentInstanceState::query_ctx() const {
@@ -568,11 +644,11 @@ RuntimeProfile* FragmentInstanceState::profile() const {
 }
 
 void FragmentInstanceState::PrintVolumeIds() {
-  if (instance_ctx_.per_node_scan_ranges.empty()) return;
+  if (instance_ctx_pb_.per_node_scan_ranges().empty()) return;
 
   HdfsScanNodeBase::PerVolumeStats per_volume_stats;
-  for (const PerNodeScanRanges::value_type& entry: instance_ctx_.per_node_scan_ranges) {
-    HdfsScanNodeBase::UpdateHdfsSplitStats(entry.second, &per_volume_stats);
+  for (const auto& entry : instance_ctx_pb_.per_node_scan_ranges()) {
+    HdfsScanNodeBase::UpdateHdfsSplitStats(entry.second.scan_ranges(), &per_volume_stats);
   }
 
   stringstream str;
@@ -581,4 +657,5 @@ void FragmentInstanceState::PrintVolumeIds() {
   VLOG_FILE
       << "Hdfs split stats (<volume id>:<# splits>/<split lengths>) for query="
       << PrintId(query_id()) << ":\n" << str.str();
+}
 }

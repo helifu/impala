@@ -67,14 +67,17 @@ bool ParquetBoolDecoder::DecodeValues(
 }
 
 bool ParquetBoolDecoder::SkipValues(int num_values) {
-  DCHECK_GT(num_values, 0);
+  DCHECK_GE(num_values, 0);
   int skip_cached = min(num_unpacked_values_ - unpacked_value_idx_, num_values);
   unpacked_value_idx_ += skip_cached;
   if (skip_cached == num_values) return true;
   int num_remaining = num_values - skip_cached;
   if (encoding_ == parquet::Encoding::PLAIN) {
     int num_to_skip = BitUtil::RoundDownToPowerOf2(num_remaining, 32);
-    if (num_to_skip > 0) bool_values_.SkipBatch(1, num_to_skip);
+    if (num_to_skip > 0) {
+      bool skipped = bool_values_.SkipBatch(1, num_to_skip);
+      DCHECK(skipped);
+    }
     num_remaining -= num_to_skip;
     if (num_remaining > 0) {
       DCHECK_LE(num_remaining, UNPACKED_BUFFER_LEN);

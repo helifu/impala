@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import java.util.Optional;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function.CompareMode;
 import org.apache.impala.catalog.ScalarFunction;
@@ -25,7 +26,7 @@ import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -36,7 +37,7 @@ public class ArithmeticExpr extends Expr {
     UNARY_POSTFIX,
   }
 
-  enum Operator {
+  public enum Operator {
     MULTIPLY("*", "multiply", OperatorPosition.BINARY_INFIX),
     DIVIDE("/", "divide", OperatorPosition.BINARY_INFIX),
     MOD("%", "mod", OperatorPosition.BINARY_INFIX),
@@ -75,6 +76,9 @@ public class ArithmeticExpr extends Expr {
   }
 
   private final Operator op_;
+  // cache prior shouldConvertToCNF checks to avoid repeat tree walking
+  // omitted from clone in case cloner plans to mutate the expr
+  protected Optional<Boolean> shouldConvertToCNF_ = Optional.empty();
 
   public Operator getOp() { return op_; }
 
@@ -126,7 +130,7 @@ public class ArithmeticExpr extends Expr {
 
   @Override
   public String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("op", op_)
         .addValue(super.debugString())
         .toString();
@@ -265,6 +269,26 @@ public class ArithmeticExpr extends Expr {
   @Override
   protected float computeEvalCost() {
     return hasChildCosts() ? getChildCosts() + ARITHMETIC_OP_COST : UNKNOWN_COST;
+  }
+
+  private boolean lookupShouldConvertToCNF() {
+    for (int i = 0; i < children_.size(); ++i) {
+      if (!getChild(i).shouldConvertToCNF()) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Return true if this expression's children should be converted to CNF.
+   */
+  @Override
+  public boolean shouldConvertToCNF() {
+    if (shouldConvertToCNF_.isPresent()) {
+      return shouldConvertToCNF_.get();
+    }
+    boolean result = lookupShouldConvertToCNF();
+    shouldConvertToCNF_ = Optional.of(result);
+    return result;
   }
 
   @Override

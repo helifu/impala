@@ -21,6 +21,7 @@
 # We do not use Impala's python environment here, nor do we depend on
 # non-standard python libraries to avoid needing extra build steps before
 # triggering this.
+from __future__ import absolute_import, division, print_function
 import argparse
 import datetime
 import itertools
@@ -184,11 +185,6 @@ def main():
                       default=os.path.expanduser("~/.ccache"))
   parser.add_argument('--tail', action="store_true",
       help="Run tail on all container log files.")
-  parser.add_argument('--impala-lzo-repo',
-      default="https://github.com/cloudera/impala-lzo.git",
-      help="Git repo for Impala-lzo repo")
-  parser.add_argument('--impala-lzo-ref', default='master',
-      help="Branch name for Impala-lzo repo.")
   parser.add_argument('--env', metavar='K=V', default=[], action='append',
       help="""Passes given environment variables (expressed as KEY=VALUE)
            through containers.
@@ -210,8 +206,6 @@ def main():
       suite_concurrency=args.suite_concurrency,
       impalad_mem_limit_bytes=args.impalad_mem_limit_bytes,
       tail=args.tail,
-      impala_lzo_repo=args.impala_lzo_repo,
-      impala_lzo_ref=args.impala_lzo_ref,
       env=args.env, base_image=args.base_image)
 
   fh = logging.FileHandler(os.path.join(_make_dir_if_not_exist(t.log_dir), "log.txt"))
@@ -257,8 +251,12 @@ def _compute_defaults():
   parallel_test_concurrency = min(cpus, 8)
   memlimit_gb = 8
 
-  if total_memory_gb >= 95:
-    suite_concurrency = 4
+  if total_memory_gb >= 140:
+    suite_concurrency = 6
+    memlimit_gb = 11
+    parallel_test_concurrency = min(cpus, 12)
+  elif total_memory_gb >= 95:
+    suite_concurrency = 5
     memlimit_gb = 11
     parallel_test_concurrency = min(cpus, 12)
   elif total_memory_gb >= 65:
@@ -353,11 +351,11 @@ cluster_test_exhaustive = cluster_test.exhaustive()
 # Default supported suites. These are organized slowest-to-fastest, so that,
 # when parallelism is limited, the total time is least impacted.
 DEFAULT_SUITES = [
-    ee_test_serial,
-    ee_test_parallel,
     cluster_test,
-    Suite("BE_TEST"),
     Suite("FE_TEST"),
+    ee_test_parallel,
+    ee_test_serial,
+    Suite("BE_TEST"),
     Suite("JDBC_TEST")
 ]
 
@@ -398,7 +396,7 @@ def _call(args, check=True):
 def _check_output(*args, **kwargs):
   """Wrapper for subprocess.check_output, with logging."""
   logging.info("Running: %s, %s; cmdline: %s.", args, kwargs, " ".join(*args))
-  return subprocess.check_output(*args, **kwargs)
+  return subprocess.check_output(*args, universal_newlines=True, **kwargs)
 
 
 def _make_dir_if_not_exist(*parts):
@@ -446,7 +444,7 @@ class TestWithDocker(object):
                cleanup_image, ccache_dir, test_mode,
                suite_concurrency, parallel_test_concurrency,
                impalad_mem_limit_bytes, tail,
-               impala_lzo_repo, impala_lzo_ref, env, base_image):
+               env, base_image):
     self.build_image = build_image
     self.name = name
     self.containers = []
@@ -482,8 +480,6 @@ class TestWithDocker(object):
     self.parallel_test_concurrency = parallel_test_concurrency
     self.impalad_mem_limit_bytes = impalad_mem_limit_bytes
     self.tail = tail
-    self.impala_lzo_repo = impala_lzo_repo
-    self.impala_lzo_ref = impala_lzo_ref
     self.env = env
     self.base_image = base_image
 
@@ -558,7 +554,7 @@ class TestWithDocker(object):
           # Label with the git root directory for easier cleanup
           "--label=pwd=" + self.git_root,
           # Consistent locales
-          "-e", "LC_ALL=C",
+          "-e", "LC_ALL=C.UTF-8",
           "-e", "IMPALAD_MEM_LIMIT_BYTES=" +
           str(self.impalad_mem_limit_bytes),
           # Mount the git directory so that clones can be local.
@@ -568,8 +564,6 @@ class TestWithDocker(object):
           "-v", self.git_root + ":/repo:ro",
           "-v", self.git_common_dir + ":/git_common_dir:ro",
           "-e", "GIT_HEAD_REV=" + self.git_head_rev,
-          "-e", "IMPALA_LZO_REPO=" + self.impala_lzo_repo,
-          "-e", "IMPALA_LZO_REF=" + self.impala_lzo_ref,
           # Share timezone between host and container
           "-e", "LOCALTIME_LINK_TARGET=" + localtime_link_target,
           "-v", self.ccache_dir + ":/ccache",
@@ -788,7 +782,7 @@ class TestSuiteRunner(object):
     test_with_docker = self.test_with_docker
     suite = self.suite
     envs = ["-e", "NUM_CONCURRENT_TESTS=" + str(test_with_docker.parallel_test_concurrency)]
-    for k, v in sorted(suite.envs.iteritems()):
+    for k, v in sorted(suite.envs.items()):
       envs.append("-e")
       envs.append("%s=%s" % (k, v))
 
@@ -797,7 +791,7 @@ class TestSuiteRunner(object):
     # io-file-mgr-test expects a real-ish file system at /tmp;
     # we mount a temporary directory into the container to appease it.
     tmpdir = tempfile.mkdtemp(prefix=test_with_docker.name + "-" + self.name)
-    os.chmod(tmpdir, 01777)
+    os.chmod(tmpdir, 0o1777)
     # Container names are sometimes used as hostnames, and DNS names shouldn't
     # have underscores.
     container_name = test_with_docker.name + "-" + self.name.replace("_", "-")

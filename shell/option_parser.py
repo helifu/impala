@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -26,9 +27,15 @@
 # [impala.query_options]
 # EXPLAIN_LEVEL=2
 # MT_DOP=2
+from __future__ import print_function, unicode_literals
 
-import ConfigParser
 import sys
+
+try:
+  from configparser import ConfigParser  # python3
+except ImportError:
+  from ConfigParser import ConfigParser  # python2
+
 from impala_shell_config_defaults import impala_shell_defaults
 from optparse import OptionParser, SUPPRESS_HELP
 
@@ -78,8 +85,11 @@ def parse_shell_options(options, defaults, option_list):
   for option, value in options:
     opt = option_dests.get(option)
     if opt is None:
-        print >> sys.stderr, "WARNING: Unable to read configuration file correctly. " \
-          "Ignoring unrecognized config option: '%s'\n" % option
+      warn_msg = (
+        "WARNING: Unable to read configuration file correctly. "
+        "Ignoring unrecognized config option: '%s'" % option
+      )
+      print('\n{0}'.format(warn_msg), file=sys.stderr)
     elif isinstance(defaults.get(option), bool) or \
         opt.action == "store_true" or opt.action == "store_false":
       result[option] = parse_bool_option(value)
@@ -115,12 +125,16 @@ def get_config_from_file(config_filename, option_list):
   Returns a pair of dictionaries (shell_options, query_options), with option names
   as keys and option values as values.
   """
-  config = ConfigParser.ConfigParser()
+  try:
+    config = ConfigParser(strict=False)  # python3
+  except TypeError:
+    config = ConfigParser()  # python2
+
   # Preserve case-sensitivity since flag names are case sensitive.
   config.optionxform = str
   try:
     config.read(config_filename)
-  except Exception, e:
+  except Exception as e:
     raise ConfigFileFormatError(
       "Unable to read configuration file correctly. Check formatting: %s" % e)
 
@@ -129,15 +143,9 @@ def get_config_from_file(config_filename, option_list):
     shell_options = parse_shell_options(config.items("impala"), impala_shell_defaults,
                                         option_list)
     if "config_file" in shell_options:
-      print >> sys.stderr, "WARNING: Option 'config_file' can be only set from shell."
+      warn_msg = "WARNING: Option 'config_file' can be only set from shell."
+      print('\n{0}'.format(warn_msg), file=sys.stderr)
       shell_options["config_file"] = config_filename
-
-  config = ConfigParser.ConfigParser()
-  try:
-    config.read(config_filename)
-  except Exception, e:
-    raise ConfigFileFormatError(
-      "Unable to read configuration file correctly. Check formatting: %s" % e)
 
   query_options = {}
   if config.has_section("impala.query_options"):
@@ -183,6 +191,10 @@ def get_option_parser(defaults):
                     action="store_true",
                     help="Print column names in delimited mode"
                          " when pretty-printed.")
+  parser.add_option("-E", "--vertical",
+                    dest="vertical",
+                    action="store_true",
+                    help="Print the output of a query (rows) vertically.")
   parser.add_option("--output_delimiter", dest="output_delimiter",
                     help="Field delimiter to use for output in delimited mode")
   parser.add_option("-s", "--kerberos_service_name",
@@ -194,6 +206,14 @@ def get_option_parser(defaults):
   parser.add_option("-p", "--show_profiles", dest="show_profiles",
                     action="store_true",
                     help="Always display query profiles after execution")
+  parser.add_option("--rpc_stdout", dest="rpc_stdout",
+                    action="store_true",
+                    help="Output hs2 rpc details to stdout. "
+                    "Ignored if protocol is beeswax.")
+  parser.add_option("--rpc_file", dest="rpc_file",
+                    help="Write hs2 rpc call details to the given file. "
+                    "If the file exists, rpc call details will be appended to the "
+                    "file. Ignored if protocol is beeswax.")
   parser.add_option("--quiet", dest="verbose",
                     action="store_false",
                     help="Disable verbose output")
@@ -208,6 +228,10 @@ def get_option_parser(defaults):
                     action="store_true",
                     help="Use LDAP to authenticate with Impala. Impala must be configured"
                     " to allow LDAP authentication. \t\t")
+  parser.add_option("-j", "--jwt", dest="use_jwt",
+                    action="store_true",
+                    help="Use JWT to authenticate with Impala. Impala must be configured"
+                    " to allow JWT authentication. \t\t")
   parser.add_option("-u", "--user", dest="user",
                     help="User to authenticate with.")
   parser.add_option("--ssl", dest="ssl",
@@ -230,10 +254,16 @@ def get_option_parser(defaults):
   parser.add_option("--history_file", dest="history_file",
                     help=("The file in which to store shell history. This may also be "
                           "configured using the IMPALA_HISTFILE environment variable."))
-  parser.add_option("--live_summary", dest="print_summary", action="store_true",
+  parser.add_option("--live_summary", dest="live_summary", action="store_true",
                     help="Print a query summary every 1s while the query is running.")
-  parser.add_option("--live_progress", dest="print_progress", action="store_true",
-                    help="Print a query progress every 1s while the query is running.")
+  parser.add_option("--live_progress", dest="live_progress", action="store_true",
+                    help="Print a query progress every 1s while the query is running."
+                         " The default value of the flag is True in the interactive mode."
+                         " If live_progress is set to False in a config file, this flag"
+                         " will override it")
+  parser.add_option("--disable_live_progress", dest="live_progress", action="store_false",
+                    help="A command line flag allows users to disable live_progress in"
+                         " the interactive mode.")
   parser.add_option("--auth_creds_ok_in_clear", dest="creds_ok_in_clear",
                     action="store_true", help="If set, LDAP authentication " +
                     "may be used with an insecure connection to Impala. " +
@@ -241,6 +271,8 @@ def get_option_parser(defaults):
                     "unencrypted, and may be vulnerable to attack.")
   parser.add_option("--ldap_password_cmd", dest="ldap_password_cmd",
                     help="Shell command to run to retrieve the LDAP password")
+  parser.add_option("--jwt_cmd", dest="jwt_cmd",
+                    help="Shell command to run to retrieve the JWT")
   parser.add_option("--var", dest="keyval", action="append",
                     help="Defines a variable to be used within the Impala session."
                          " Can be used multiple times to set different variables."
@@ -257,12 +289,30 @@ def get_option_parser(defaults):
                     help="Timeout in milliseconds after which impala-shell will time out"
                     " if it fails to connect to Impala server. Set to 0 to disable any"
                     " timeout.")
-  parser.add_option("--protocol", dest="protocol", default="beeswax",
+  parser.add_option("--http_socket_timeout_s",
+                    help="Timeout in seconds after which the socket will time out"
+                    " if the associated operation cannot be completed. Set to None to"
+                    " disable any timeout. Only supported for hs2-http mode.")
+  parser.add_option("--connect_max_tries", type="int",
+                    dest="connect_max_tries", default=4,
+                    help="Maximum number of times that an idempotent RPC connection to "
+                         "the Impala coordinator will be retried in hs2-http mode.")
+  parser.add_option("--protocol", dest="protocol", default="hs2",
                     help="Protocol to use for client/server connection. Valid inputs are "
                          "['hs2', 'hs2-http', 'beeswax']. 'hs2-http' uses HTTP transport "
                          "to speak to the coordinator while 'hs2' and 'beeswax' use the "
                          "binary TCP based transport. Beeswax support is deprecated "
                          "and will be removed in the future.")
+  parser.add_option("--strict_hs2_protocol", dest="strict_hs2_protocol",
+                    action="store_true",
+                    help="True if the hs2 connection is using the strict hs2 protocol."
+                         "Only useful if connecting straight to hs2 instead of Impala."
+                         "The default hs2 port is 11050 and the default hs2 http port "
+                         "is 10001.")
+  parser.add_option("--use_ldap_test_password", dest="use_ldap_test_password",
+                    action="store_true",
+                    help="True if need to use the default LDAP password. This is needed "
+                         "when running tests in strict mode.")
   parser.add_option("--http_path", dest="http_path", default="cliservice",
                     help="Default http path on the coordinator to connect to. The final "
                     "connection URL looks like <http(s)>://<coordinator-host>:<port>/"
@@ -270,6 +320,36 @@ def get_option_parser(defaults):
                     "enforce any http path for the incoming requests, deployments could "
                     "still put it behind a loadbalancer that can expect the traffic at a "
                     "certain path.")
+  parser.add_option("--fetch_size", type="int", dest="fetch_size", default=10240,
+                    help="The fetch size when fetching rows from the Impala coordinator. "
+                    "The fetch size controls how many rows a single fetch RPC request "
+                    "(RPC from the Impala shell to the Impala coordinator) reads at a "
+                    "time. This option is most effective when result spooling is enabled "
+                    "('spool_query_results'=true). When result spooling is enabled "
+                    "values over the batch_size are honored. When result spooling is "
+                    "disabled, values over the batch_size have no affect. By default, "
+                    "the fetch_size is set to 10240 which is equivalent to 10 row "
+                    "batches (assuming the default batch size). Note that if result "
+                    "spooling is disabled only a single row batch can be fetched at a "
+                    "time regardless of the specified fetch_size.")
+  parser.add_option("--http_cookie_names", dest="http_cookie_names",
+                    default="impala.auth,impala.session.id",
+                    help="A comma-separated list of HTTP cookie names that are supported "
+                    "by the impala-shell. If a cookie with one of these names is "
+                    "returned in an http response by the server or an intermediate proxy "
+                    "then it will be included in each subsequent request for the same "
+                    "connection.")
+  parser.add_option("--no_http_tracing", dest="no_http_tracing",
+                    action="store_true",
+                    help="Tracing http headers 'X-Request-Id', 'X-Impala-Session-Id', "
+                    "and 'X-Impala-Query-Id' will not be added to each http request "
+                    "(hs2-http protocol only).")
+  parser.add_option("--hs2_fp_format", type="str",
+                    dest="hs2_fp_format", default=None,
+                    help="Sets the printing format specification for floating point "
+                    "values when using the HS2 protocol. The default behaviour makes the "
+                    "values handled by Python's str() built-in method. Use '16G' to "
+                    "match the Beeswax protocol's floating-point output format.")
 
   # add default values to the help text
   for option in parser.option_list:
@@ -298,9 +378,28 @@ def get_option_parser(defaults):
     # (print quiet is false since verbose is true)
     if option == parser.get_option('--quiet'):
       option.help += " [default: %s]" % (not defaults['verbose'])
+    # print default value of disable_live_progress in the help messages as opposite
+    # value for default value of live_progress
+    # (print disable_live_progress is false since live_progress is true)
+    elif option == parser.get_option('--disable_live_progress'):
+      option.help += " [default: %s]" % (not defaults['live_progress'])
     elif option != parser.get_option('--help') and option.help is not SUPPRESS_HELP:
       # don't want to print default value for help or options without help text
       option.help += " [default: %default]"
+
+  # mutually exclusive flags should not be used in the same time
+  if '--live_progress' in sys.argv and '--disable_live_progress' in sys.argv:
+    parser.error("options --live_progress and --disable_live_progress are mutually "
+                 "exclusive")
+
+  if '--strict_hs2_protocol' in sys.argv:
+    if '--live_progress' in sys.argv:
+      parser.error("options --strict_hs2_protocol does not support --live_progress")
+    if '--live_summary' in sys.argv:
+      parser.error("options --strict_hs2_protocol does not support --live_summary")
+
+  if '--verbose' in sys.argv and '--quiet' in sys.argv:
+    parser.error("options --verbose and --quiet are mutually exclusive")
 
   parser.set_defaults(**defaults)
 

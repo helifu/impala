@@ -31,7 +31,13 @@
 #include <Shlwapi.h>
 #endif
 
+#include "gen-cpp/Frontend_types.h"
 #include "util/metrics.h"
+#include "common/logging.h"
+
+DECLARE_bool(trusted_domain_use_xff_header);
+DECLARE_bool(saml2_ee_test_mode);
+DECLARE_string(trusted_auth_header);
 
 namespace apache {
 namespace thrift {
@@ -41,10 +47,16 @@ using namespace std;
 using strings::Substitute;
 
 THttpServerTransportFactory::THttpServerTransportFactory(const std::string server_name,
-    impala::MetricGroup* metrics, bool has_ldap, bool has_kerberos, bool use_cookies)
+    impala::MetricGroup* metrics, bool has_ldap, bool has_kerberos, bool use_cookies,
+    bool check_trusted_domain, bool check_trusted_auth_header, bool has_saml,
+    bool has_jwt)
   : has_ldap_(has_ldap),
     has_kerberos_(has_kerberos),
     use_cookies_(use_cookies),
+    check_trusted_domain_(check_trusted_domain),
+    check_trusted_auth_header_(check_trusted_auth_header),
+    has_saml_(has_saml),
+    has_jwt_(has_jwt),
     metrics_enabled_(metrics != nullptr) {
   if (metrics_enabled_) {
     if (has_ldap_) {
@@ -65,15 +77,41 @@ THttpServerTransportFactory::THttpServerTransportFactory(const std::string serve
       http_metrics_.total_cookie_auth_failure_ =
           metrics->AddCounter(Substitute("$0.total-cookie-auth-failure", server_name), 0);
     }
+    if (check_trusted_domain_) {
+      http_metrics_.total_trusted_domain_check_success_ = metrics->AddCounter(
+          Substitute("$0.total-trusted-domain-check-success", server_name), 0);
+    }
+    if (check_trusted_auth_header_) {
+      http_metrics_.total_trusted_auth_header_check_success_ = metrics->AddCounter(
+          Substitute("$0.total-trusted-auth-header-check-success", server_name), 0);
+    }
+    if (has_saml_) {
+      http_metrics_.total_saml_auth_success_ =
+          metrics->AddCounter(Substitute("$0.total-saml-auth-success", server_name), 0);
+      http_metrics_.total_saml_auth_failure_ =
+          metrics->AddCounter(Substitute("$0.total-saml-auth-failure", server_name), 0);
+    }
+    if (has_jwt_) {
+      http_metrics_.total_jwt_token_auth_success_ = metrics->AddCounter(
+          Substitute("$0.total-jwt-token-auth-success", server_name), 0);
+      http_metrics_.total_jwt_token_auth_failure_ = metrics->AddCounter(
+          Substitute("$0.total-jwt-token-auth-failure", server_name), 0);
+    }
   }
 }
 
-THttpServer::THttpServer(boost::shared_ptr<TTransport> transport, bool has_ldap,
-    bool has_kerberos, bool use_cookies, bool metrics_enabled, HttpMetrics* http_metrics)
+THttpServer::THttpServer(std::shared_ptr<TTransport> transport, bool has_ldap,
+    bool has_kerberos, bool has_saml, bool use_cookies, bool check_trusted_domain,
+    bool check_trusted_auth_header, bool has_jwt, bool metrics_enabled,
+    HttpMetrics* http_metrics)
   : THttpTransport(transport),
     has_ldap_(has_ldap),
     has_kerberos_(has_kerberos),
+    has_saml_(has_saml),
     use_cookies_(use_cookies),
+    check_trusted_domain_(check_trusted_domain),
+    check_trusted_auth_header_(check_trusted_auth_header),
+    has_jwt_(has_jwt),
     metrics_enabled_(metrics_enabled),
     http_metrics_(http_metrics) {}
 
@@ -88,6 +126,10 @@ THttpServer::~THttpServer() {
   #define THRIFT_strcasestr(haystack, needle) strcasestr(haystack, needle)
 #endif
 
+const std::string THttpServer::HEADER_REQUEST_ID = "X-Request-Id";
+const std::string THttpServer::HEADER_IMPALA_SESSION_ID = "X-Impala-Session-Id";
+const std::string THttpServer::HEADER_IMPALA_QUERY_ID = "X-Impala-Query-Id";
+
 void THttpServer::parseHeader(char* header) {
   char* colon = strchr(header, ':');
   if (colon == NULL) {
@@ -96,6 +138,8 @@ void THttpServer::parseHeader(char* header) {
   size_t sz = colon - header;
   char* value = colon + 1;
 
+  static const char* SAML2_TOKEN_RESPONSE_PORT = "X-Hive-Token-Response-Port";
+  static const char* SAML2_CLIENT_IDENTIFIER = "X-Hive-Client-Identifier";
   if (THRIFT_strncasecmp(header, "Transfer-Encoding", sz) == 0) {
     if (THRIFT_strcasestr(value, "chunked") != NULL) {
       chunked_ = true;
@@ -103,19 +147,47 @@ void THttpServer::parseHeader(char* header) {
   } else if (THRIFT_strncasecmp(header, "Content-length", sz) == 0) {
     chunked_ = false;
     contentLength_ = atoi(value);
-  } else if (strncmp(header, "X-Forwarded-For", sz) == 0) {
+  } else if (THRIFT_strncasecmp(header, "X-Forwarded-For", sz) == 0) {
     origin_ = value;
-  } else if ((has_ldap_ || has_kerberos_)
+  } else if ((has_ldap_ || has_kerberos_ || has_saml_ || has_jwt_)
       && THRIFT_strncasecmp(header, "Authorization", sz) == 0) {
     auth_value_ = string(value);
   } else if (use_cookies_ && THRIFT_strncasecmp(header, "Cookie", sz) == 0) {
     cookie_value_ = string(value);
+  } else if (THRIFT_strncasecmp(header, "Expect", sz) == 0) {
+    if (THRIFT_strcasestr(value, "100-continue")){
+      continue_ = true;
+    }
+  } else if (has_saml_
+        && THRIFT_strncasecmp(header, SAML2_TOKEN_RESPONSE_PORT, sz) == 0) {
+    saml_port_ = atoi(value);
+    string port_str = string(value);
+    StripWhiteSpace(&port_str);
+    DCHECK(wrapped_request_ != nullptr);
+    wrapped_request_->headers[SAML2_TOKEN_RESPONSE_PORT] = port_str;
+  } else if (has_saml_
+        && THRIFT_strncasecmp(header, SAML2_CLIENT_IDENTIFIER, sz) == 0) {
+    DCHECK(wrapped_request_ != nullptr);
+    string client_id = string(value);
+    StripWhiteSpace(&client_id);
+    wrapped_request_->headers[SAML2_CLIENT_IDENTIFIER] = client_id;
+  } else if (check_trusted_auth_header_
+      && THRIFT_strncasecmp(header, FLAGS_trusted_auth_header.c_str(), sz) == 0) {
+    found_trusted_auth_header_ = true;
+  } else if (THRIFT_strncasecmp(header, HEADER_REQUEST_ID.c_str(), sz) == 0) {
+    header_x_request_id_ = string(value);
+    StripWhiteSpace(&header_x_request_id_);
+  } else if (THRIFT_strncasecmp(header, HEADER_IMPALA_SESSION_ID.c_str(), sz) == 0) {
+    header_x_session_id_ = string(value);
+    StripWhiteSpace(&header_x_session_id_);
+  } else if (THRIFT_strncasecmp(header, HEADER_IMPALA_QUERY_ID.c_str(), sz) == 0) {
+    header_x_query_id_ = string(value);
+    StripWhiteSpace(&header_x_query_id_);
   }
 }
 
 bool THttpServer::parseStatusLine(char* status) {
   char* method = status;
-
   char* path = strchr(method, ' ');
   if (path == NULL) {
     throw TTransportException(string("Bad Status: ") + status);
@@ -132,8 +204,13 @@ bool THttpServer::parseStatusLine(char* status) {
   *http = '\0';
 
   if (strcmp(method, "POST") == 0) {
+    // First time filling a field in wrapped_request_, so initialize
+    // it first. Should be only non-null in case of SAML authentication.
+    wrapped_request_ = callbacks_.init_wrapped_http_request_fn();
+    if (wrapped_request_) wrapped_request_->method = "POST";
+
     string err_msg;
-    if (!callbacks_.path_fn(string(path), &err_msg)) {
+    if (!callbacks_.path_fn(string(path), &err_msg, &readWholeBodyForAuth_)) {
       throw TTransportException(err_msg);
     }
     // POST method ok, looking for content.
@@ -166,9 +243,26 @@ bool THttpServer::parseStatusLine(char* status) {
 }
 
 void THttpServer::headersDone() {
-  if (!has_ldap_ && !has_kerberos_) {
+  if (!header_x_request_id_.empty() || !header_x_session_id_.empty() ||
+      !header_x_query_id_.empty()) {
+    VLOG_RPC << "HTTP Connection Tracing Headers"
+        << (header_x_request_id_.empty() ? "" : " x-request-id=" + header_x_request_id_)
+        << (header_x_session_id_.empty() ? "" : " x-session-id=" + header_x_session_id_)
+        << (header_x_query_id_.empty() ? "" : " x-query-id=" + header_x_query_id_);
+  }
+
+  if (!has_ldap_ && !has_kerberos_ && !has_saml_ && !has_jwt_) {
     // We don't need to authenticate.
-    auth_value_ = "";
+    resetAuthState();
+    return;
+  }
+
+  if (readWholeBodyForAuth_) {
+    DCHECK(has_saml_);
+    // 2nd SAML message in browser mode, get authNResponse from IP.
+    // Will be handled in bodyDone. Must return before processing
+    // cookies, as the cookies from the IdP server can confuse our
+    // logic.
     return;
   }
 
@@ -184,6 +278,96 @@ void THttpServer::headersDone() {
         if (metrics_enabled_) http_metrics_->total_cookie_auth_success_->Increment(1);
       } else if (metrics_enabled_) {
         http_metrics_->total_cookie_auth_failure_->Increment(1);
+      }
+    }
+  }
+
+  if (!authorized && has_jwt_ && !auth_value_.empty()
+      && auth_value_.find('.') != string::npos) {
+    // Check Authorization header with the Bearer authentication scheme as:
+    // Authorization: Bearer <token>
+    // JWT contains at least one period ('.'). A well-formed JWT consists of three
+    // concatenated Base64url-encoded strings, separated by dots (.).
+    StripWhiteSpace(&auth_value_);
+    string jwt_token;
+    bool got_bearer_auth = TryStripPrefixString(auth_value_, "Bearer ", &jwt_token);
+    if (got_bearer_auth) {
+      if (callbacks_.jwt_token_auth_fn(jwt_token)) {
+        authorized = true;
+        if (metrics_enabled_) http_metrics_->total_jwt_token_auth_success_->Increment(1);
+      } else {
+        if (metrics_enabled_) http_metrics_->total_jwt_token_auth_failure_->Increment(1);
+      }
+    }
+  }
+
+  if (!authorized && has_saml_) {
+    bool fallback_to_other_auths = true;
+    if (saml_port_ != -1) {
+      fallback_to_other_auths = false;
+      // 1st SAML message in browser mode, redirect SSO.
+      impala::TWrappedHttpResponse* response = callbacks_.get_saml_redirect_fn();
+      if (response != nullptr) {
+        returnWrappedResponse(*response);
+        resetAuthState();
+        throw TTransportException("HTTP auth - SAML redirection.");
+      }
+    } else if (!auth_value_.empty()) {
+      StripWhiteSpace(&auth_value_);
+      string stripped_bearer_auth_token;
+      bool got_bearer_auth =
+          TryStripPrefixString(auth_value_, "Bearer ", &stripped_bearer_auth_token);
+      if (got_bearer_auth) {
+        fallback_to_other_auths = false;
+        // Final SAML message in browser mode, check bearer and replace it with a cookie.
+        DCHECK(wrapped_request_ != nullptr);
+        wrapped_request_->headers["Authorization"] = auth_value_;
+        if (callbacks_.validate_saml2_bearer_fn()) {
+          // During EE tests it makes things easier to return 401-Unauthorized here.
+          // This hack can be removed once there is a Python client that
+          // supports SAML (IMPALA-10496).
+          if (!FLAGS_saml2_ee_test_mode) authorized = true;
+          if (metrics_enabled_) http_metrics_->total_saml_auth_success_->Increment(1);
+        }
+      }
+    }
+
+    if (!authorized && !fallback_to_other_auths) {
+      // Do not fallback to other auth mechanisms, as the client probably expects
+      // only SAML related respsonses.
+      if (metrics_enabled_) http_metrics_->total_saml_auth_failure_->Increment(1);
+      resetAuthState();
+      returnUnauthorized();
+      throw TTransportException("HTTP auth failed.");
+    }
+  }
+
+  // Bypass auth for connections from trusted domains. Returns a cookie on the first
+  // successful auth attempt. This check is performed after checking for cookie to avoid
+  // subsequent reverse DNS lookups which can be unpredictably costly.
+  // This is also done after SAML related authentication, because it is assumed that if
+  // the client started the SAML workflow then it doesn't expect Impala to succeed with
+  // another mechanism.
+  if (!authorized && check_trusted_domain_) {
+    string origin =
+        FLAGS_trusted_domain_use_xff_header ? origin_ : transport_->getOrigin();
+    StripWhiteSpace(&origin);
+    if (!origin.empty()) {
+      if (callbacks_.trusted_domain_check_fn(origin, auth_value_)) {
+        authorized = true;
+        if (metrics_enabled_) {
+          http_metrics_->total_trusted_domain_check_success_->Increment(1);
+        }
+      }
+    }
+  }
+
+  // Bypass auth for connections if trusted auth header was found in connection string.
+  if (!authorized && found_trusted_auth_header_ && !auth_value_.empty()) {
+    if (callbacks_.trusted_auth_header_handle_fn(auth_value_)) {
+      authorized = true;
+      if (metrics_enabled_) {
+        http_metrics_->total_trusted_auth_header_check_success_->Increment(1);
       }
     }
   }
@@ -236,11 +420,36 @@ void THttpServer::headersDone() {
     }
   }
 
-  auth_value_ = "";
-  cookie_value_ = "";
+  resetAuthState();
   if (!authorized) {
     returnUnauthorized();
     throw TTransportException("HTTP auth failed.");
+  }
+}
+
+void THttpServer::bodyDone(uint32_t size) {
+  DCHECK(has_saml_);
+  // assume a SAML authnResponse
+  if (chunked_) {
+    returnUnauthorized();
+    throw TTransportException("Chunked mode not supported for SAML authnResponse");
+  }
+  if (size != contentLength_) {
+    returnUnauthorized();
+    throw TTransportException("HTTP auth failed.");
+  }
+  if (has_saml_) {
+    DCHECK(wrapped_request_ != nullptr);
+    string content = readBuffer_.readAsString(size);
+    wrapped_request_->__set_content(content);
+    impala::TWrappedHttpResponse* response =
+        callbacks_.validate_saml2_authn_response_fn();
+    if (response == nullptr) {
+      returnUnauthorized();
+      throw TTransportException("HTTP SAML auth failed.");
+    }
+    returnWrappedResponse(*response);
+    throw TTransportException("HTTP auth - SAML redirection.");
   }
 }
 
@@ -253,7 +462,8 @@ void THttpServer::flush() {
   // Construct the HTTP header
   std::ostringstream h;
   h << "HTTP/1.1 200 OK" << CRLF << "Date: " << getTimeRFC1123() << CRLF
-    << "Server: Thrift/" << VERSION << CRLF << "Access-Control-Allow-Origin: *" << CRLF
+    << "Server: Thrift/" << PACKAGE_VERSION << CRLF
+    << "Access-Control-Allow-Origin: *" << CRLF
     << "Content-Type: application/x-thrift" << CRLF << "Content-Length: " << len << CRLF
     << "Connection: Keep-Alive" << CRLF;
   vector<string> return_headers = callbacks_.return_headers_fn();
@@ -307,6 +517,31 @@ void THttpServer::returnUnauthorized() {
   transport_->write((const uint8_t*)header.c_str(), static_cast<uint32_t>(header.size()));
   transport_->flush();
 }
+
+void THttpServer::returnWrappedResponse(const impala::TWrappedHttpResponse& response) {
+  int code = response.status_code;
+  string status = response.status_text;
+  std::ostringstream h;
+  h << "HTTP/1.1 "<< code << " " << status << CRLF << "Date: " << getTimeRFC1123() << CRLF;
+  vector<string> return_headers = callbacks_.return_headers_fn();
+  for (const auto& header : response.headers) {
+    h << header.first << ": " << header.second << CRLF;
+  }
+  // TODO: response type is not added
+  // TODO: cookies are not added, but are not needed right now
+  h << CRLF;
+  h << response.content;
+  string header = h.str();
+  transport_->write((const uint8_t*)header.c_str(), static_cast<uint32_t>(header.size()));
+  transport_->flush();
+}
+
+void THttpServer::resetAuthState() {
+  auth_value_ = "";
+  cookie_value_ = "";
+  saml_port_ = -1;
+}
+
 }
 }
 } // apache::thrift::transport

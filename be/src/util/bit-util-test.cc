@@ -22,43 +22,47 @@
 #include <algorithm>
 #include <iostream>
 #include <numeric>
+#include <type_traits>
 
 #include <boost/utility.hpp>
 
+#include "runtime/multi-precision.h"
 #include "testutil/gtest-util.h"
+#include "util/arithmetic-util.h"
 #include "util/bit-util.h"
 #include "util/cpu-info.h"
 
 #include "common/names.h"
-#include "runtime/multi-precision.h"
 
 namespace impala {
 
 TEST(BitUtil, UnsignedWidth) {
-  EXPECT_EQ(BitUtil::UnsignedWidth<signed char>(), 7);
-  EXPECT_EQ(BitUtil::UnsignedWidth<unsigned char>(), 8);
-  EXPECT_EQ(BitUtil::UnsignedWidth<volatile long long>(), 63);
-  EXPECT_EQ(BitUtil::UnsignedWidth<unsigned long long&>(), 64);
-  EXPECT_EQ(BitUtil::UnsignedWidth<const int128_t&>(), 127);
-  EXPECT_EQ(BitUtil::UnsignedWidth<const volatile unsigned __int128&>(), 128);
+  // UnsignedWidth was originally in BitUtil. The unit test is kept here for convenience.
+  EXPECT_EQ(ArithmeticUtil::UnsignedWidth<signed char>(), 7);
+  EXPECT_EQ(ArithmeticUtil::UnsignedWidth<unsigned char>(), 8);
+  EXPECT_EQ(ArithmeticUtil::UnsignedWidth<volatile long long>(), 63);
+  EXPECT_EQ(ArithmeticUtil::UnsignedWidth<unsigned long long&>(), 64);
+  EXPECT_EQ(ArithmeticUtil::UnsignedWidth<const int128_t&>(), 127);
+  EXPECT_EQ(ArithmeticUtil::UnsignedWidth<const volatile unsigned __int128&>(), 128);
 }
 
 TEST(BitUtil, Sign) {
-  EXPECT_EQ(BitUtil::Sign<int>(0), 1);
-  EXPECT_EQ(BitUtil::Sign<int>(1), 1);
-  EXPECT_EQ(BitUtil::Sign<int>(-1), -1);
-  EXPECT_EQ(BitUtil::Sign<int>(200), 1);
-  EXPECT_EQ(BitUtil::Sign<int>(-200), -1);
-  EXPECT_EQ(BitUtil::Sign<unsigned int>(0), 1);
-  EXPECT_EQ(BitUtil::Sign<unsigned int>(1), 1);
-  EXPECT_EQ(BitUtil::Sign<unsigned int>(-1U), 1);
-  EXPECT_EQ(BitUtil::Sign<unsigned int>(200), 1);
-  EXPECT_EQ(BitUtil::Sign<unsigned int>(-200), 1);
-  EXPECT_EQ(BitUtil::Sign<int128_t>(0), 1);
-  EXPECT_EQ(BitUtil::Sign<int128_t>(1), 1);
-  EXPECT_EQ(BitUtil::Sign<int128_t>(-1), -1);
-  EXPECT_EQ(BitUtil::Sign<int128_t>(200), 1);
-  EXPECT_EQ(BitUtil::Sign<int128_t>(-200), -1);
+  // Sign was originally in BitUtil. The unit test is kept here for convenience.
+  EXPECT_EQ(Sign<int>(0), 1);
+  EXPECT_EQ(Sign<int>(1), 1);
+  EXPECT_EQ(Sign<int>(-1), -1);
+  EXPECT_EQ(Sign<int>(200), 1);
+  EXPECT_EQ(Sign<int>(-200), -1);
+  EXPECT_EQ(Sign<unsigned int>(0), 1);
+  EXPECT_EQ(Sign<unsigned int>(1), 1);
+  EXPECT_EQ(Sign<unsigned int>(-1U), 1);
+  EXPECT_EQ(Sign<unsigned int>(200), 1);
+  EXPECT_EQ(Sign<unsigned int>(-200), 1);
+  EXPECT_EQ(Sign<int128_t>(0), 1);
+  EXPECT_EQ(Sign<int128_t>(1), 1);
+  EXPECT_EQ(Sign<int128_t>(-1), -1);
+  EXPECT_EQ(Sign<int128_t>(200), 1);
+  EXPECT_EQ(Sign<int128_t>(-200), -1);
 }
 
 TEST(BitUtil, Ceil) {
@@ -131,7 +135,7 @@ TEST(BitUtil, TrailingBits) {
 void TestByteSwapSimd_Unit(const int64_t CpuFlag) {
   void (*bswap_fptr)(const uint8_t* src, uint8_t* dst) = NULL;
   int buf_size = 0;
-  if (CpuFlag == CpuInfo::SSSE3) {
+  if (IS_AARCH64 || CpuFlag == CpuInfo::SSSE3) {
     buf_size = 16;
     bswap_fptr = SimdByteSwap::ByteSwap128;
   } else {
@@ -176,7 +180,7 @@ void TestByteSwapSimd(const int64_t CpuFlag, const int buf_size) {
   std::iota(src_buf, src_buf + buf_size, 0);
 
   int start_size = 0;
-  if (CpuFlag == CpuInfo::SSSE3) {
+  if (IS_AARCH64 || CpuFlag == CpuInfo::SSSE3) {
     start_size = 16;
   } else if (CpuFlag == CpuInfo::AVX2) {
     start_size = 32;
@@ -185,7 +189,7 @@ void TestByteSwapSimd(const int64_t CpuFlag, const int buf_size) {
   for (int i = start_size; i < buf_size; ++i) {
     // Initialize dst buffer and swap i bytes.
     memset(dst_buf, 0, buf_size);
-    if (CpuFlag == CpuInfo::SSSE3) {
+    if (IS_AARCH64 || CpuFlag == CpuInfo::SSSE3) {
       SimdByteSwap::ByteSwapSimd<16>(src_buf, i, dst_buf);
     } else if (CpuFlag == CpuInfo::AVX2) {
       SimdByteSwap::ByteSwapSimd<32>(src_buf, i, dst_buf);
@@ -228,6 +232,10 @@ TEST(BitUtil, ByteSwap) {
   EXPECT_EQ(BitUtil::ByteSwap(static_cast<uint16_t>(0)), 0);
   EXPECT_EQ(BitUtil::ByteSwap(static_cast<uint16_t>(0x1122)), 0x2211);
 
+  #ifdef __aarch64__
+  TestByteSwapSimd_Unit(0);
+  TestByteSwapSimd(0, 64);
+  #else
   // Tests for ByteSwap SIMD functions
   if (CpuInfo::IsSupported(CpuInfo::SSSE3)) {
     // Test SSSE3 functionality unit
@@ -242,9 +250,48 @@ TEST(BitUtil, ByteSwap) {
     // Test ByteSwapSimd() using AVX2;
     TestByteSwapSimd(CpuInfo::AVX2, 64);
   }
+  #endif
 
   // Test BitUtil::ByteSwap(Black Box Testing)
   for (int i = 0; i <= 32; ++i) TestByteSwapSimd(0, i);
+}
+
+template <class INT_T>
+void TestCountLeadingZeros() {
+  constexpr int BITWIDTH = sizeof(INT_T) * 8;
+  using UINT_T = typename MakeUnsigned<INT_T>::type;
+  // Unsigned constant 1 with bit width of BITWIDTH.
+  constexpr UINT_T ONE = 1;
+
+  // Test 0.
+  EXPECT_EQ(BITWIDTH, BitUtil::CountLeadingZeros<INT_T>(0));
+
+  // Test 1.
+  EXPECT_EQ(BITWIDTH - 1, BitUtil::CountLeadingZeros<INT_T>(ONE));
+
+  for (int i = 2; i < BITWIDTH - 1; ++i) {
+    INT_T smallest_with_bit_width = ONE << (i - 1);
+    EXPECT_EQ(BITWIDTH - i, BitUtil::CountLeadingZeros(smallest_with_bit_width));
+
+    INT_T largest_with_bit_width = (ONE << i) - 1;
+    EXPECT_EQ(BITWIDTH - i, BitUtil::CountLeadingZeros(largest_with_bit_width));
+  }
+
+  // Test max value for unsigned int types - for signed types they are negative which we
+  // don't allow.
+  if (std::is_same_v<INT_T, UINT_T>) {
+    UINT_T max = std::numeric_limits<UINT_T>::max();
+    EXPECT_EQ(0, BitUtil::CountLeadingZeros(max));
+  }
+}
+
+TEST(BitUtil, CountLeadingZeros) {
+  TestCountLeadingZeros<int32_t>();
+  TestCountLeadingZeros<uint32_t>();
+  TestCountLeadingZeros<int64_t>();
+  TestCountLeadingZeros<uint64_t>();
+  TestCountLeadingZeros<__int128>();
+  TestCountLeadingZeros<unsigned __int128>();
 }
 
 TEST(BitUtil, Log2) {
@@ -304,6 +351,7 @@ TEST(BitUtil, RoundUpDown) {
   EXPECT_EQ(BitUtil::RoundDownNumi64(65), 1);
 }
 
+#ifndef __aarch64__
 // Prevent inlining so that the compiler can't optimize out the check.
 __attribute__((noinline))
 int CpuInfoIsSupportedHoistHelper(int64_t cpu_info_flag, int arg) {
@@ -325,6 +373,77 @@ TEST(BitUtil, CpuInfoIsSupportedHoist) {
   constexpr int64_t CPU_INFO_FLAG = CpuInfo::SSSE3;
   CpuInfo::TempDisable disable_sssse3(CPU_INFO_FLAG);
   EXPECT_EQ(12345, CpuInfoIsSupportedHoistHelper(CPU_INFO_FLAG, 0));
+}
+#endif
+
+template<typename T>
+void RunIntToByteArrayTest(const T& input, const std::vector<char>& expected) {
+  std::string result = BitUtil::IntToByteBuffer(input);
+  EXPECT_EQ(expected.size(), result.size()) << input;
+  for (int i = 0; i < std::min(expected.size(), result.size()); ++i) {
+    EXPECT_EQ(expected[i], result[i]) << input;
+  }
+}
+
+// __int128_t has no support for << operator. This is a specialized function for this
+// type where in case of an EXPECT check failing we don't print the original input.
+template<>
+void RunIntToByteArrayTest(const __int128_t& input, const std::vector<char>& expected) {
+  std::string result = BitUtil::IntToByteBuffer(input);
+  EXPECT_EQ(expected.size(), result.size());
+  for (int i = 0; i < std::min(expected.size(), result.size()); ++i) {
+    EXPECT_EQ(expected[i], result[i]);
+  }
+}
+
+// The expected results come from running Java's BigInteger.toByteArray().
+TEST(BitUtil, IntToByteArray) {
+  // Test int32 inputs.
+  RunIntToByteArrayTest(0, {0});
+  RunIntToByteArrayTest(127, {127});
+  RunIntToByteArrayTest(128, {0, -128});
+  RunIntToByteArrayTest(255, {0, -1});
+  RunIntToByteArrayTest(256, {1, 0});
+  RunIntToByteArrayTest(65500, {0, -1, -36});
+  RunIntToByteArrayTest(123456123, {7, 91, -54, 123});
+  RunIntToByteArrayTest(2147483647, {127, -1, -1, -1});
+  RunIntToByteArrayTest(-1, {-1});
+  RunIntToByteArrayTest(-128, {-128});
+  RunIntToByteArrayTest(-129, {-1, 127});
+  RunIntToByteArrayTest(-1024, {-4, 0});
+  RunIntToByteArrayTest(-1025, {-5, -1});
+  RunIntToByteArrayTest(-40000, {-1, 99, -64});
+  RunIntToByteArrayTest(-68000, {-2, -10, 96});
+  RunIntToByteArrayTest(-654321321, {-40, -1, -39, 87});
+  RunIntToByteArrayTest(-2147483647, {-128, 0, 0, 1});
+  RunIntToByteArrayTest(-2147483648, {-128, 0, 0, 0});
+
+  // Test int64 inputs.
+  RunIntToByteArrayTest(2147483648, {0, -128, 0, 0, 0});
+  RunIntToByteArrayTest(2147489999, {0, -128, 0, 24, -49});
+  RunIntToByteArrayTest(123498764226421, {112, 82, 75, -8, -49, 117});
+  RunIntToByteArrayTest(45935528764226421, {0, -93, 50, 30, -70, -113, -69, 117});
+  RunIntToByteArrayTest(9223372036854775807, {127, -1, -1, -1, -1, -1, -1, -1});
+  RunIntToByteArrayTest(-2147483649, {-1, 127, -1, -1, -1});
+  RunIntToByteArrayTest(-2147483650, {-1, 127, -1, -1, -2});
+  RunIntToByteArrayTest(-226103951038195, {-1, 50, 92, 18, 80, -23, 13});
+  RunIntToByteArrayTest(-18237603371852591, {-65, 52, -1, 17, 119, 92, -47});
+  RunIntToByteArrayTest(-48227503771052199, {-1, 84, -87, 87, 65, 82, -105, 89});
+  RunIntToByteArrayTest(-9223372036854775807, {-128, 0, 0, 0, 0, 0, 0, 1});
+  // C++ compiler doesn't accept -9223372036854775808 (int64_t min) as a valid constant.
+  RunIntToByteArrayTest(-9223372036854775807 - 1, {-128, 0, 0, 0, 0, 0, 0, 0});
+
+  // Test int128 inputs.
+  RunIntToByteArrayTest(__int128_t(9223372036854775807) + 1,
+      {0, -128, 0, 0, 0, 0, 0, 0, 0});
+  RunIntToByteArrayTest(__int128_t(9223372036854775807) + 2,
+      {0, -128, 0, 0, 0, 0, 0, 0, 1});
+  RunIntToByteArrayTest(__int128_t(123321456654789987) * 1000,
+      {6, -81, 109, -45, 113, 68, 125, 74, -72});
+  RunIntToByteArrayTest(__int128_t(7255211462147863907) * 120000,
+      {0, -72, 92, -78, 56, 127, -30, 94, 113, 6, 64});
+  RunIntToByteArrayTest(__int128_t(7255211462147863907) * 180000,
+      {1, 20, -117, 11, 84, -65, -45, -115, -87, -119, 96});
 }
 
 }

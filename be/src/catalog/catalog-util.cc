@@ -71,7 +71,7 @@ Status JniCatalogCacheUpdateIterator::createPair(JNIEnv* env, bool deleted,
 
 jobject TopicItemSpanIterator::next(JNIEnv* env) {
   while (begin_ != end_) {
-    jobject result;
+    jobject result = nullptr;
     Status s;
     const TTopicItem* current = begin_++;
     if (decompress_) {
@@ -146,6 +146,7 @@ TCatalogObjectType::type TCatalogObjectTypeFromName(const string& name) {
   } else if (upper == "PRIVILEGE") {
     return TCatalogObjectType::PRIVILEGE;
   }
+  // TODO(IMPALA-9935): support HDFS_PARTITION
   return TCatalogObjectType::UNKNOWN;
 }
 
@@ -174,6 +175,7 @@ Status TCatalogObjectFromObjectName(const TCatalogObjectType::type& object_type,
       catalog_object->table.__set_tbl_name(object_name.substr(pos + 1));
       break;
     }
+    // TODO(IMPALA-9935): support HDFS_PARTITION
     case TCatalogObjectType::FUNCTION: {
       // The key looks like: <db>.fn(<args>). We need to parse out the
       // db, fn and signature.

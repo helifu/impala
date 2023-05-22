@@ -20,12 +20,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include "gen-cpp/StatestoreService_types.h"
+#include "gen-cpp/statestore_service.pb.h"
+#include "util/container-util.h"
 #include "util/network-util.h"
+#include "util/unique-id-hash.h"
 
 namespace impala {
-
-class TBackendDescriptor;
 
 /// Class to maintain a local blacklist of executors.
 ///
@@ -64,14 +64,15 @@ class ExecutorBlacklist {
 
   /// Adds an executor to the blacklist, if it is not already blacklisted. If the executor
   /// was on probation, updates its entry in 'executor_list_' accordingly. Should only be
-  /// called if BlacklistingEnabled() is true.
-  void Blacklist(const TBackendDescriptor& be_desc);
+  /// called if BlacklistingEnabled() is true. 'cause' is an error status indicating why
+  /// the executor is being blacklisted.
+  void Blacklist(const BackendDescriptorPB& be_desc, const Status& cause);
 
   /// Removes an executor from the blacklist or probation, if it is in 'executor_list_'.
   /// Does not put blacklisted executors on probation. Returns the executor's state prior
   /// to this call. Will return 'BLACKLISTED' for an executor that has passed the
   /// blacklist timeout if Maintenance() wasn't called since the timeout.
-  State FindAndRemove(const TBackendDescriptor& be_desc);
+  State FindAndRemove(const BackendDescriptorPB& be_desc);
 
   /// Returns true if there are executors that have passed the blacklist timeout and can
   /// be removed from the blacklist. Note that this does not consider executors that can
@@ -85,10 +86,13 @@ class ExecutorBlacklist {
   /// probation, and its descriptor will be returned in 'probation_list'. If an executor
   /// has been on probation for longer than the probation timeout, it will be taken off
   /// probation.
-  void Maintenance(std::list<TBackendDescriptor>* probation_list);
+  void Maintenance(std::list<BackendDescriptorPB>* probation_list);
 
-  /// Returns true if 'be_desc' is blacklisted.
-  bool IsBlacklisted(const TBackendDescriptor& be_desc) const;
+  /// If 'be_desc' is blacklisted, sets 'cause' to the error Status that caused this
+  /// executor to be blacklisted, sets 'time_remaining_ms' to the amount of time the
+  /// executor has left on the blacklist, and returns true.
+  bool IsBlacklisted(const BackendDescriptorPB& be_desc, Status* cause = nullptr,
+      int64_t* time_remaining_ms = nullptr) const;
 
   /// Returns a space-separated string of the addresses of executors that are currently
   /// blacklisted.
@@ -100,13 +104,15 @@ class ExecutorBlacklist {
  private:
   /// Info about an executor that is either blacklisted or on probabtion.
   struct Entry {
-    Entry(const TBackendDescriptor& be_desc, int64_t blacklist_time_ms)
+    Entry(const BackendDescriptorPB& be_desc, int64_t blacklist_time_ms,
+        const Status& cause)
       : be_desc(be_desc),
         blacklist_time_ms(blacklist_time_ms),
         state(State::BLACKLISTED),
-        num_consecutive_blacklistings(1) {}
+        num_consecutive_blacklistings(1),
+        cause(cause) {}
 
-    TBackendDescriptor be_desc;
+    BackendDescriptorPB be_desc;
 
     /// The UnixMillis() of the last time this executor was blacklisted.
     int64_t blacklist_time_ms;
@@ -117,6 +123,9 @@ class ExecutorBlacklist {
     /// Number of times that this executor has been blacklisted since the last time it was
     /// off probation.
     int32_t num_consecutive_blacklistings;
+
+    /// Error status representing the reason the executor was blacklisted.
+    Status cause;
   };
 
   /// Returns the base blacklist timeout in ms. This should be multiplied by
@@ -124,16 +133,10 @@ class ExecutorBlacklist {
   /// passed the timeout.
   int64_t GetBlacklistTimeoutMs() const;
 
-  /// Predicate that returns true if the port number in 'be_desc' matches that in
-  /// 'existing.be_desc'. Assumes that they have the same 'ip_address'. Used to do find()
-  /// on the values of 'executor_list_'.
-  static bool eqBePort(const TBackendDescriptor& be_desc, const Entry& exiting);
-
-  /// Map from node ip address to a list of executors for that node that have been
-  /// blacklisted. Note that in normal operation there will be a single impalad per node
-  /// all executor lists will be length one. Contains both executors that are blacklisted
-  /// ones that are on probation.
-  std::unordered_map<IpAddr, std::vector<Entry>> executor_list_;
+  /// Map from executor backend_id to executor entry for those nodes which have been
+  /// blacklisted. Note that the map contains executors that are either blacklisted or
+  /// on probation.
+  std::unordered_map<UniqueIdPB, Entry> executor_list_;
 
   /// The amount to multiply the blacklist timeout by for the probation timeout.
   static const int32_t PROBATION_TIMEOUT_MULTIPLIER;

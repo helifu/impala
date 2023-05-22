@@ -25,31 +25,41 @@ import java.util.Map;
 import java.util.Map.Entry;
 
 import org.antlr.runtime.ANTLRStringStream;
+import org.antlr.runtime.RecognitionException;
 import org.antlr.runtime.Token;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang.ObjectUtils;
 import org.apache.commons.lang.StringEscapeUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
-import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.ql.parse.HiveLexer;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.HdfsCompression;
 import org.apache.impala.catalog.HdfsFileFormat;
-import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.IcebergColumn;
+import org.apache.impala.catalog.IcebergTable;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.RowFormat;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.common.Pair;
+import org.apache.impala.thrift.TBucketInfo;
+import org.apache.impala.thrift.TBucketType;
+import org.apache.impala.thrift.TIcebergCatalog;
 import org.apache.impala.thrift.TSortingOrder;
+import org.apache.impala.util.AcidUtils;
+import org.apache.impala.util.BucketUtils;
+import org.apache.impala.util.IcebergUtil;
 import org.apache.impala.util.KuduUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
@@ -65,6 +75,8 @@ import com.google.common.collect.Maps;
  * for creating identifier strings that are compatible with Hive or Impala.
  */
 public class ToSqlUtils {
+  private final static Logger LOG = LoggerFactory.getLogger(ToSqlUtils.class);
+
   // Table properties to hide when generating the toSql() statement
   // EXTERNAL, SORT BY [order], and comment are hidden because they are part of the
   // toSql result, e.g.,
@@ -141,7 +153,16 @@ public class ToSqlUtils {
     // So, do the check on an upper-case version of the identifier.
     // Hive uses ANTLRNoCaseStringStream to upper-case text, but that
     // class is a non-static inner class so we can't use it here.
-    HiveLexer hiveLexer = new HiveLexer(new ANTLRStringStream(ident.toUpperCase()));
+    // Overrides HiveLexer to print error messages to TRACE level logs (see IMPALA-9921).
+    HiveLexer hiveLexer = new HiveLexer(new ANTLRStringStream(ident.toUpperCase())) {
+      @Override
+      public void displayRecognitionError(String[] tokenNames, RecognitionException e) {
+        if (LOG.isTraceEnabled()) {
+          LOG.trace("Error in checking needsQuotes using HiveLexer {}: {}",
+              getErrorHeader(e), getErrorMessage(e, tokenNames));
+        }
+      }
+    };
     try {
       Token t = hiveLexer.nextToken();
       // Check that the lexer recognizes an identifier and then EOF.
@@ -232,6 +253,20 @@ public class ToSqlUtils {
   }
 
   /**
+   * Gets the single IcebergPartitionSpec from a CreateTableStmt and returns its
+   * toSql(). If there is no IcebergPartitionSpec in the statement then returns null.
+   */
+  private static String getIcebergPartitionSpecsSql(CreateTableStmt stmt) {
+    List<IcebergPartitionSpec> partitionSpecs = stmt.getIcebergPartitionSpecs();
+    // It's safe to get the first element from 'partitionSpecs' as in create table
+    // statement only one is allowed.
+    if (!partitionSpecs.isEmpty() && partitionSpecs.get(0).hasPartitionFields()) {
+      return partitionSpecs.get(0).toSql();
+    }
+    return null;
+  }
+
+  /**
    * Returns the "CREATE TABLE" SQL string corresponding to the given CreateTableStmt
    * statement.
    */
@@ -252,13 +287,16 @@ public class ToSqlUtils {
     removeHiddenKuduTableProperties(generatedProperties);
     properties.putAll(generatedProperties);
     String kuduParamsSql = getKuduPartitionByParams(stmt);
+    String icebergPartitionSpecs = getIcebergPartitionSpecsSql(stmt);
     // TODO: Pass the correct compression, if applicable.
     return getCreateTableSql(stmt.getDb(), stmt.getTbl(), stmt.getComment(), colsSql,
-        partitionColsSql, stmt.getTblPrimaryKeyColumnNames(), stmt.getForeignKeysSql(),
+        partitionColsSql, stmt.isPrimaryKeyUnique(),
+        stmt.getTblPrimaryKeyColumnNames(), stmt.getForeignKeysSql(),
         kuduParamsSql, new Pair<>(stmt.getSortColumns(), stmt.getSortingOrder()),
         properties, stmt.getSerdeProperties(), stmt.isExternal(), stmt.getIfNotExists(),
         stmt.getRowFormat(), HdfsFileFormat.fromThrift(stmt.getFileFormat()),
-        HdfsCompression.NONE, null, stmt.getLocation());
+        HdfsCompression.NONE, null, stmt.getLocation(),
+        icebergPartitionSpecs, stmt.geTBucketInfo());
   }
 
   /**
@@ -286,15 +324,16 @@ public class ToSqlUtils {
     removeHiddenKuduTableProperties(generatedProperties);
     properties.putAll(generatedProperties);
     String kuduParamsSql = getKuduPartitionByParams(innerStmt);
+    String icebergPartitionSpecs = getIcebergPartitionSpecsSql(innerStmt);
     // TODO: Pass the correct compression, if applicable.
     String createTableSql = getCreateTableSql(innerStmt.getDb(), innerStmt.getTbl(),
-        innerStmt.getComment(), null, partitionColsSql,
+        innerStmt.getComment(), null, partitionColsSql, innerStmt.isPrimaryKeyUnique(),
         innerStmt.getTblPrimaryKeyColumnNames(), innerStmt.getForeignKeysSql(),
         kuduParamsSql, new Pair<>(innerStmt.getSortColumns(),
         innerStmt.getSortingOrder()), properties, innerStmt.getSerdeProperties(),
         innerStmt.isExternal(), innerStmt.getIfNotExists(), innerStmt.getRowFormat(),
         HdfsFileFormat.fromThrift(innerStmt.getFileFormat()), HdfsCompression.NONE, null,
-        innerStmt.getLocation());
+        innerStmt.getLocation(), icebergPartitionSpecs, innerStmt.geTBucketInfo());
     return createTableSql + " AS " + stmt.getQueryStmt().toSql(options);
   }
 
@@ -320,11 +359,17 @@ public class ToSqlUtils {
     List<String> colsSql = new ArrayList<>();
     List<String> partitionColsSql = new ArrayList<>();
     boolean isHbaseTable = table instanceof FeHBaseTable;
+    boolean isFullAcid = AcidUtils.isFullAcidTable(
+        table.getMetaStoreTable().getParameters());
     for (int i = 0; i < table.getColumns().size(); i++) {
+      Column col = table.getColumns().get(i);
       if (!isHbaseTable && i < table.getNumClusteringCols()) {
-        partitionColsSql.add(columnToSql(table.getColumns().get(i)));
+        partitionColsSql.add(columnToSql(col));
+      } else if (isFullAcid && i == table.getNumClusteringCols()) {
+        Preconditions.checkState(col.getName().equals("row__id"));
+        continue;
       } else {
-        colsSql.add(columnToSql(table.getColumns().get(i)));
+        colsSql.add(columnToSql(col));
       }
     }
     RowFormat rowFormat = RowFormat.fromStorageDescriptor(msTable.getSd());
@@ -332,11 +377,14 @@ public class ToSqlUtils {
     HdfsCompression compression = null;
     String location = isHbaseTable ? null : msTable.getSd().getLocation();
     Map<String, String> serdeParameters = msTable.getSd().getSerdeInfo().getParameters();
+    TBucketInfo bucketInfo = BucketUtils.fromStorageDescriptor(msTable.getSd());
 
     String storageHandlerClassName = table.getStorageHandlerClassName();
+    boolean isPrimaryKeyUnique = true;
     List<String> primaryKeySql = new ArrayList<>();
     List<String> foreignKeySql = new ArrayList<>();
     String kuduPartitionByParams = null;
+    String icebergPartitions = null;
     if (table instanceof FeKuduTable) {
       FeKuduTable kuduTable = (FeKuduTable) table;
       // Kudu tables don't use LOCATION syntax
@@ -357,6 +405,7 @@ public class ToSqlUtils {
       // Internal property, should not be exposed to the user.
       properties.remove(StatsSetupConst.DO_NOT_UPDATE_STATS);
 
+      isPrimaryKeyUnique = kuduTable.isPrimaryKeyUnique();
       if (KuduTable.isSynchronizedTable(msTable)) {
         primaryKeySql.addAll(kuduTable.getPrimaryKeyColumnNames());
 
@@ -371,20 +420,43 @@ public class ToSqlUtils {
         colsSql = null;
       }
     } else if (table instanceof FeFsTable) {
+      if (table instanceof FeIcebergTable) {
+        storageHandlerClassName = null;
+        // Internal properties, should not be exposed to the user.
+        properties.remove(IcebergTable.KEY_STORAGE_HANDLER);
+        properties.remove(StatsSetupConst.DO_NOT_UPDATE_STATS);
+        properties.remove(IcebergTable.METADATA_LOCATION);
+
+        // Fill "PARTITIONED BY SPEC" part if the Iceberg table is partitioned.
+        FeIcebergTable feIcebergTable= (FeIcebergTable)table;
+        if (!feIcebergTable.getPartitionSpecs().isEmpty()) {
+          IcebergPartitionSpec latestPartitionSpec =
+              feIcebergTable.getDefaultPartitionSpec();
+          if (latestPartitionSpec.hasPartitionFields()) {
+            icebergPartitions = feIcebergTable.getDefaultPartitionSpec().toSql();
+          }
+        }
+      }
+
       String inputFormat = msTable.getSd().getInputFormat();
-      format = HdfsFileFormat.fromHdfsInputFormatClass(inputFormat);
+      String serDeLib = msTable.getSd().getSerdeInfo().getSerializationLib();
+      format = HdfsFileFormat.fromHdfsInputFormatClass(inputFormat, serDeLib);
       compression = HdfsCompression.fromHdfsInputFormatClass(inputFormat);
-      if (table instanceof HdfsTable) {
-        primaryKeySql = ((HdfsTable) table).getPrimaryKeysSql();
-        foreignKeySql = ((HdfsTable) table).getForeignKeysSql();
+      try {
+        primaryKeySql = ((FeFsTable) table).getPrimaryKeyColumnNames();
+        foreignKeySql = ((FeFsTable) table).getForeignKeysSql();
+      } catch (Exception e) {
+        throw new CatalogException("Could not get primary key/foreign keys sql.", e);
       }
     }
+
     HdfsUri tableLocation = location == null ? null : new HdfsUri(location);
-    return getCreateTableSql(table.getDb().getName(), table.getName(), comment, colsSql,
-        partitionColsSql, primaryKeySql, foreignKeySql, kuduPartitionByParams,
+    return getCreateTableSql(
+        table.getDb().getName(), table.getName(), comment, colsSql, partitionColsSql,
+        isPrimaryKeyUnique, primaryKeySql, foreignKeySql, kuduPartitionByParams,
         new Pair<>(sortColsSql, sortingOrder), properties, serdeParameters,
         isExternal, false, rowFormat, format, compression,
-        storageHandlerClassName, tableLocation);
+        storageHandlerClassName, tableLocation, icebergPartitions, bucketInfo);
   }
 
   /**
@@ -394,12 +466,13 @@ public class ToSqlUtils {
    */
   public static String getCreateTableSql(String dbName, String tableName,
       String tableComment, List<String> columnsSql, List<String> partitionColumnsSql,
-      List<String> primaryKeysSql, List<String> foreignKeysSql,
-      String kuduPartitionByParams, Pair<List<String>, TSortingOrder> sortProperties,
-      Map<String, String> tblProperties, Map<String, String> serdeParameters,
-      boolean isExternal, boolean ifNotExists, RowFormat rowFormat,
-      HdfsFileFormat fileFormat, HdfsCompression compression,
-      String storageHandlerClass, HdfsUri location) {
+      boolean isPrimaryKeyUnique, List<String> primaryKeysSql,
+      List<String> foreignKeysSql, String kuduPartitionByParams, Pair<List<String>,
+      TSortingOrder> sortProperties, Map<String, String> tblProperties,
+      Map<String, String> serdeParameters, boolean isExternal, boolean ifNotExists,
+      RowFormat rowFormat, HdfsFileFormat fileFormat, HdfsCompression compression,
+      String storageHandlerClass, HdfsUri location, String icebergPartitions,
+      TBucketInfo bucketInfo) {
     Preconditions.checkNotNull(tableName);
     StringBuilder sb = new StringBuilder("CREATE ");
     if (isExternal) sb.append("EXTERNAL ");
@@ -411,7 +484,8 @@ public class ToSqlUtils {
       sb.append(" (\n  ");
       sb.append(Joiner.on(",\n  ").join(columnsSql));
       if (CollectionUtils.isNotEmpty(primaryKeysSql)) {
-        sb.append(",\n  PRIMARY KEY (");
+        sb.append(",\n  ");
+        sb.append(KuduUtil.getPrimaryKeyString(isPrimaryKeyUnique)).append(" (");
         Joiner.on(", ").appendTo(sb, primaryKeysSql).append(")");
       }
       if (CollectionUtils.isNotEmpty(foreignKeysSql)) {
@@ -422,7 +496,8 @@ public class ToSqlUtils {
     } else {
       // CTAS for Kudu tables still print the primary key
       if (primaryKeysSql != null && !primaryKeysSql.isEmpty()) {
-        sb.append("\n PRIMARY KEY (");
+        sb.append("\n ");
+        sb.append(KuduUtil.getPrimaryKeyString(isPrimaryKeyUnique)).append(" (");
         Joiner.on(", ").appendTo(sb, primaryKeysSql).append(")");
       }
     }
@@ -436,9 +511,23 @@ public class ToSqlUtils {
     if (kuduPartitionByParams != null && !kuduPartitionByParams.equals("")) {
       sb.append("PARTITION BY " + kuduPartitionByParams + "\n");
     }
-    if (sortProperties.first != null) {
+    if (bucketInfo != null && bucketInfo.getBucket_type() != TBucketType.NONE) {
+      sb.append(String.format("CLUSTERED BY (\n %s\n)\n",
+          Joiner.on(", \n  ").join(bucketInfo.getBucket_columns())));
+      if (sortProperties.first != null) {
+        sb.append(String.format("SORT BY %s (\n  %s\n)\n",
+            sortProperties.second.toString(),
+            Joiner.on(", \n  ").join(sortProperties.first)));
+      }
+      sb.append(String.format("INTO %s BUCKETS\n", bucketInfo.getNum_bucket()));
+    } else if (sortProperties.first != null) {
       sb.append(String.format("SORT BY %s (\n  %s\n)\n", sortProperties.second.toString(),
           Joiner.on(", \n  ").join(sortProperties.first)));
+    }
+    if (icebergPartitions != null && !icebergPartitions.isEmpty()) {
+      sb.append("PARTITIONED BY SPEC\n");
+      sb.append(icebergPartitions);
+      sb.append("\n");
     }
 
     if (tableComment != null) sb.append(" COMMENT '" + tableComment + "'\n");
@@ -461,8 +550,7 @@ public class ToSqlUtils {
     }
 
     if (storageHandlerClass == null) {
-      // TODO: Remove this special case when we have the LZO_TEXT writer
-      // We must handle LZO_TEXT specially because Impala does not yet support creating
+      // We must handle LZO_TEXT specially because Impala does not support creating
       // tables with this row format. In this case, we cannot output "WITH
       // SERDEPROPERTIES" because Hive does not support it with "STORED AS". For any
       // other HdfsFileFormat we want to output the serdeproperties because it is
@@ -486,7 +574,14 @@ public class ToSqlUtils {
             "WITH SERDEPROPERTIES " + propertyMapToSql(serdeParameters) + "\n");
       }
     }
-    if (location != null) {
+
+    // Iceberg table with 'hadoop.catalog' do not display table LOCATION when using
+    // 'show create table', user can use 'describe formatted/extended' to get location
+    TIcebergCatalog icebergCatalog =
+        IcebergUtil.getTIcebergCatalog(tblProperties.get(IcebergTable.ICEBERG_CATALOG));
+    boolean isHadoopCatalog = fileFormat == HdfsFileFormat.ICEBERG &&
+        icebergCatalog == TIcebergCatalog.HADOOP_CATALOG;
+    if (location != null && !isHadoopCatalog) {
       sb.append("LOCATION '" + location.toString() + "'\n");
     }
     if (tblProperties != null && !tblProperties.isEmpty()) {
@@ -533,6 +628,10 @@ public class ToSqlUtils {
       if (kuduCol.getBlockSize() != 0) {
         sb.append(String.format(" BLOCK_SIZE %d", kuduCol.getBlockSize()));
       }
+    } else if (col instanceof IcebergColumn) {
+      IcebergColumn icebergCol = (IcebergColumn) col;
+      Boolean isNullable = icebergCol.isNullable();
+      if (isNullable != null) sb.append(isNullable ? " NULL" : " NOT NULL");
     }
     if (!Strings.isNullOrEmpty(col.getComment())) {
       sb.append(String.format(" COMMENT '%s'", col.getComment()));
@@ -540,7 +639,7 @@ public class ToSqlUtils {
     return sb.toString();
   }
 
-  private static String propertyMapToSql(Map<String, String> propertyMap) {
+  public static String propertyMapToSql(Map<String, String> propertyMap) {
     // Sort entries on the key to ensure output is deterministic for tests (IMPALA-5757).
     List<Entry<String, String>> mapEntries = Lists.newArrayList(propertyMap.entrySet());
     Collections.sort(mapEntries, new Comparator<Entry<String, String>>() {

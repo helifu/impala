@@ -16,14 +16,14 @@
 // under the License.
 
 #include "codegen/llvm-codegen.h"
+#include "codegen/llvm-codegen-cache.h"
 
 #include <fstream>
-#include <iostream>
+#include <mutex>
 #include <sstream>
 #include <unordered_set>
-
 #include <boost/algorithm/string.hpp>
-#include <boost/thread/mutex.hpp>
+#include <boost/assert/source_location.hpp>
 #include <gutil/strings/substitute.h>
 
 #include <llvm/ADT/Triple.h>
@@ -31,6 +31,7 @@
 #include <llvm/Analysis/Passes.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/ExecutionEngine/MCJIT.h>
 #include <llvm/IR/Constants.h>
@@ -58,15 +59,19 @@
 
 #include "codegen/codegen-anyval.h"
 #include "codegen/codegen-callgraph.h"
+#include "codegen/codegen-fn-ptr.h"
 #include "codegen/codegen-symbol-emitter.h"
 #include "codegen/impala-ir-data.h"
 #include "codegen/instruction-counter.h"
 #include "codegen/mcjit-mem-mgr.h"
 #include "common/logging.h"
 #include "exprs/anyval-util.h"
+#include "gutil/sysinfo.h"
 #include "impala-ir/impala-ir-names.h"
 #include "runtime/collection-value.h"
 #include "runtime/descriptors.h"
+#include "runtime/exec-env.h"
+#include "runtime/fragment-state.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
 #include "runtime/mem-pool.h"
@@ -75,11 +80,14 @@
 #include "runtime/string-value.h"
 #include "runtime/timestamp-value.h"
 #include "util/cpu-info.h"
+#include "util/debug-util.h"
 #include "util/hdfs-util.h"
 #include "util/path-builder.h"
 #include "util/runtime-profile-counters.h"
 #include "util/symbols-util.h"
 #include "util/test-info.h"
+#include "util/thread.h"
+#include "util/thrift-debug-util.h"
 
 #include "common/names.h"
 
@@ -108,6 +116,12 @@ DECLARE_string(local_library_dir);
 // avx512ifma,avx512pf,avx512vbmi,avx512vl,clflushopt,clwb,fma4,mwaitx.1.2,pcommit,pku,
 // prefetchwt1,sgx,sha,sse4a,tbm,xop,xsavec,xsaves. If new attrs are added to LLVM,
 // they will be disabled until added to this whitelist.
+#ifdef __aarch64__
+DEFINE_string_hidden(llvm_cpu_attr_whitelist, "crc,neon,fp-armv8,crypto",
+    "(Experimental) a comma-separated list of LLVM CPU attribute flags that are enabled "
+    "for runtime code generation. This flag is provided to enable additional LLVM CPU "
+    "attribute flags for testing.");
+#else
 DEFINE_string_hidden(llvm_cpu_attr_whitelist, "adx,aes,avx,avx2,bmi,bmi2,cmov,cx16,f16c,"
     "fma,fsgsbase,hle,invpcid,lzcnt,mmx,movbe,pclmul,popcnt,prfchw,rdrnd,rdseed,rtm,smap,"
     "sse,sse2,sse3,sse4.1,sse4.2,ssse3,xsave,xsaveopt",
@@ -115,9 +129,12 @@ DEFINE_string_hidden(llvm_cpu_attr_whitelist, "adx,aes,avx,avx2,bmi,bmi2,cmov,cx
     "for runtime code generation. The default flags are a known-good set that are "
     "routinely tested. This flag is provided to enable additional LLVM CPU attribute "
     "flags for testing.");
+#endif
+DECLARE_bool(enable_legacy_avx_support);
 
 namespace impala {
 
+const string LlvmCodeGen::ASYNC_CODEGEN_THREAD_COUNTERS_PREFIX = "CodegenCompileThread";
 bool LlvmCodeGen::llvm_initialized_ = false;
 string LlvmCodeGen::cpu_name_;
 std::unordered_set<string> LlvmCodeGen::cpu_attrs_;
@@ -194,7 +211,7 @@ Status LlvmCodeGen::InitializeLlvm(bool load_backend) {
   return Status::OK();
 }
 
-LlvmCodeGen::LlvmCodeGen(RuntimeState* state, ObjectPool* pool,
+LlvmCodeGen::LlvmCodeGen(FragmentState* state, ObjectPool* pool,
     MemTracker* parent_mem_tracker, const string& id)
   : state_(state),
     id_(id),
@@ -212,16 +229,23 @@ LlvmCodeGen::LlvmCodeGen(RuntimeState* state, ObjectPool* pool,
   context_->setDiagnosticHandler(&DiagnosticHandler::DiagnosticHandlerFn, this);
   load_module_timer_ = ADD_TIMER(profile_, "LoadTime");
   prepare_module_timer_ = ADD_TIMER(profile_, "PrepareTime");
+  codegen_cache_lookup_timer_ = ADD_TIMER(profile_, "CodegenCacheLookupTime");
+  codegen_cache_save_timer_ = ADD_TIMER(profile_, "CodegenCacheSaveTime");
+  module_bitcode_gen_timer_ = ADD_TIMER(profile_, "ModuleBitcodeGenTime");
   module_bitcode_size_ = ADD_COUNTER(profile_, "ModuleBitcodeSize", TUnit::BYTES);
   ir_generation_timer_ = ADD_TIMER(profile_, "IrGenerationTime");
   optimization_timer_ = ADD_TIMER(profile_, "OptimizationTime");
   compile_timer_ = ADD_TIMER(profile_, "CompileTime");
+  main_thread_timer_ = ADD_TIMER(profile_, "MainThreadCodegenTime");
+  compile_thread_counters_ = ADD_THREAD_COUNTERS(profile_,
+      ASYNC_CODEGEN_THREAD_COUNTERS_PREFIX);
   num_functions_ = ADD_COUNTER(profile_, "NumFunctions", TUnit::UNIT);
   num_instructions_ = ADD_COUNTER(profile_, "NumInstructions", TUnit::UNIT);
+  num_cached_functions_ = ADD_COUNTER(profile_, "NumCachedFunctions", TUnit::UNIT);
   llvm_thread_counters_ = ADD_THREAD_COUNTERS(profile_, "Codegen");
 }
 
-Status LlvmCodeGen::CreateFromFile(RuntimeState* state, ObjectPool* pool,
+Status LlvmCodeGen::CreateFromFile(FragmentState* state, ObjectPool* pool,
     MemTracker* parent_mem_tracker, const string& file, const string& id,
     scoped_ptr<LlvmCodeGen>* codegen) {
   codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
@@ -239,26 +263,42 @@ error:
   return status;
 }
 
-Status LlvmCodeGen::CreateFromMemory(RuntimeState* state, ObjectPool* pool,
+Status LlvmCodeGen::CreateFromMemory(FragmentState* state, ObjectPool* pool,
     MemTracker* parent_mem_tracker, const string& id, scoped_ptr<LlvmCodeGen>* codegen) {
   codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_->total_time_counter());
   SCOPED_TIMER((*codegen)->prepare_module_timer_);
   SCOPED_THREAD_COUNTER_MEASUREMENT((*codegen)->llvm_thread_counters());
 
-  // Select the appropriate IR version. We cannot use LLVM IR with SSE4.2 instructions on
-  // a machine without SSE4.2 support.
   llvm::StringRef module_ir;
   string module_name;
-  if (IsCPUFeatureEnabled(CpuInfo::SSE4_2)) {
+
+#if __x86_64__
+  // By default, Impala now requires AVX2 support, but the enable_legacy_avx_support
+  // flag can allow running on AVX machines. The minimum requirement must have already
+  // been enforced prior to this call, so this only needs to select the appropriate
+  // LLVM IR to use.
+  if (IsCPUFeatureEnabled(CpuInfo::AVX2)) {
+    // Use the default IR that supports AVX2
     module_ir = llvm::StringRef(
-        reinterpret_cast<const char*>(impala_sse_llvm_ir), impala_sse_llvm_ir_len);
-    module_name = "Impala IR with SSE 4.2 support";
+        reinterpret_cast<const char*>(impala_llvm_ir), impala_llvm_ir_len);
+    module_name = "Impala IR with AVX2 support";
+  } else if (FLAGS_enable_legacy_avx_support && IsCPUFeatureEnabled(CpuInfo::AVX)) {
+    // If there is no AVX but legacy mode is enabled, use legacy IR with AVX support
+    module_ir = llvm::StringRef(
+        reinterpret_cast<const char*>(impala_legacy_avx_llvm_ir),
+        impala_legacy_avx_llvm_ir_len);
+    module_name = "Legacy Impala IR with AVX support";
   } else {
-    module_ir = llvm::StringRef(
-        reinterpret_cast<const char*>(impala_no_sse_llvm_ir), impala_no_sse_llvm_ir_len);
-    module_name = "Impala IR with no SSE 4.2 support";
+    // This should have been enforced earlier.
+    CHECK(false) << "CPU is missing AVX/AVX2 support";
   }
+#else
+  // Non-x86_64 always use the default IR
+  module_ir = llvm::StringRef(
+      reinterpret_cast<const char*>(impala_llvm_ir), impala_llvm_ir_len);
+  module_name = "Impala IR";
+#endif
 
   unique_ptr<llvm::MemoryBuffer> module_ir_buf(
       llvm::MemoryBuffer::getMemBuffer(module_ir, "", false));
@@ -369,7 +409,7 @@ void LlvmCodeGen::StripGlobalCtorsDtors(llvm::Module* module) {
   if (destructors != NULL) destructors->eraseFromParent();
 }
 
-Status LlvmCodeGen::CreateImpalaCodegen(RuntimeState* state,
+Status LlvmCodeGen::CreateImpalaCodegen(FragmentState* state,
     MemTracker* parent_mem_tracker, const string& id,
     scoped_ptr<LlvmCodeGen>* codegen_ret) {
   DCHECK(state != nullptr);
@@ -470,6 +510,8 @@ LlvmCodeGen::~LlvmCodeGen() {
 }
 
 void LlvmCodeGen::Close() {
+  if (async_compile_thread_ != nullptr) async_compile_thread_->Join();
+
   if (memory_manager_ != nullptr) {
     mem_tracker_->Release(memory_manager_->bytes_tracked());
     memory_manager_ = nullptr;
@@ -478,6 +520,7 @@ void LlvmCodeGen::Close() {
 
   // Execution engine executes callback on event listener, so tear down engine first.
   execution_engine_.reset();
+  execution_engine_cached_.reset();
   symbol_emitter_.reset();
   module_ = nullptr;
 }
@@ -585,13 +628,6 @@ llvm::PointerType* LlvmCodeGen::GetNamedPtrPtrType(const string& name) {
   return llvm::PointerType::get(GetNamedPtrType(name), 0);
 }
 
-// Llvm doesn't let you create a PointerValue from a c-side ptr.  Instead
-// cast it to an int and then to 'type'.
-llvm::Value* LlvmCodeGen::CastPtrToLlvmPtr(llvm::Type* type, const void* ptr) {
-  llvm::Constant* const_int = GetI64Constant((int64_t)ptr);
-  return llvm::ConstantExpr::getIntToPtr(const_int, type);
-}
-
 llvm::Constant* LlvmCodeGen::GetIntConstant(
     int num_bytes, uint64_t low_bits, uint64_t high_bits) {
   DCHECK_GE(num_bytes, 1);
@@ -601,7 +637,8 @@ llvm::Constant* LlvmCodeGen::GetIntConstant(
   return llvm::ConstantInt::get(context(), llvm::APInt(8 * num_bytes, vals));
 }
 
-llvm::Value* LlvmCodeGen::GetStringConstant(LlvmBuilder* builder, char* data, int len) {
+llvm::Value* LlvmCodeGen::GetStringConstant(
+    LlvmBuilder* builder, const char* data, int len) {
   // Create a global string with private linkage.
   llvm::Constant* const_string =
       llvm::ConstantDataArray::getString(context(), llvm::StringRef(data, len), false);
@@ -645,6 +682,19 @@ void LlvmCodeGen::CreateIfElseBlocks(llvm::Function* fn, const string& if_name,
     llvm::BasicBlock* insert_before) {
   *if_block = llvm::BasicBlock::Create(context(), if_name, fn, insert_before);
   *else_block = llvm::BasicBlock::Create(context(), else_name, fn, insert_before);
+}
+
+llvm::PHINode* LlvmCodeGen::CreateBinaryPhiNode(LlvmBuilder* builder, llvm::Value* value1,
+    llvm::Value* value2, llvm::BasicBlock* incoming_block1,
+    llvm::BasicBlock* incoming_block2, std::string name) {
+  std::string node_name = name == "" ? (value1->getName().str() + "_phi") : name;
+
+  llvm::PHINode* res = builder->CreatePHI(value1->getType(), 2, node_name);
+
+  res->addIncoming(value1, incoming_block1);
+  res->addIncoming(value2, incoming_block2);
+
+  return res;
 }
 
 Status LlvmCodeGen::MaterializeFunction(llvm::Function* fn) {
@@ -876,10 +926,27 @@ Status LlvmCodeGen::LoadFunction(const TFunction& fn, const string& symbol,
     // declaration, not a definition, since we do not create any basic blocks or
     // instructions in it.
     *llvm_fn = prototype.GeneratePrototype(nullptr, nullptr);
-
+#ifdef __aarch64__
+    if (is_decimal) {
+      // Mark first argument as sret
+      (*llvm_fn)->addAttribute(1, llvm::Attribute::StructRet);
+    }
+#endif
     // Associate the dynamically loaded function pointer with the Function* we defined.
     // This tells LLVM where the compiled function definition is located in memory.
     execution_engine_->addGlobalMapping(*llvm_fn, fn_ptr);
+    // Disable the codegen cache because codegen cache uses the llvm module bitcode as
+    // the key while the bitcode doesn't contain the global function mapping of the
+    // execution engine. If the mapping is changed during running, like udf recreation,
+    // the function mapping in the cache could point to an old address and lead to a
+    // crash while calling the udf,  so block the codegen cache for native udfs.
+    // Builtin functions should not have the issue, because they should not change
+    // during runtime.
+    if (fn.binary_type == TFunctionBinaryType::NATIVE) {
+      // Should be before compilation.
+      DCHECK(!is_compiled_);
+      codegen_cache_enabled_ = false;
+    }
   } else if (fn.binary_type == TFunctionBinaryType::BUILTIN) {
     // In this path, we're running a builtin with the UDF interface. The IR is
     // in the llvm module. Builtin functions may use Expr::GetConstant(). Clone the
@@ -993,8 +1060,9 @@ int LlvmCodeGen::InlineConstFnAttrs(const FunctionContext::TypeDesc& ret_type,
     int i_val = static_cast<int>(i_arg->getSExtValue());
     DCHECK(state_ != nullptr);
     // All supported constants are currently integers.
-    call_instr->replaceAllUsesWith(GetI32Constant(
-        FunctionContextImpl::GetConstFnAttr(state_, ret_type, arg_types, t_val, i_val)));
+    call_instr->replaceAllUsesWith(GetI32Constant(FunctionContextImpl::GetConstFnAttr(
+        state_->query_options().decimal_v2, state_->query_options().utf8_mode, ret_type,
+        arg_types, t_val, i_val)));
     call_instr->eraseFromParent();
     ++replaced;
   }
@@ -1077,6 +1145,124 @@ Status LlvmCodeGen::FinalizeLazyMaterialization() {
   return MaterializeModule();
 }
 
+bool LlvmCodeGen::LookupCache(CodeGenCacheKey& cache_key) {
+  DCHECK(!cache_key.empty());
+  CodeGenCacheEntry entry;
+  CodeGenCache* cache = ExecEnv::GetInstance()->codegen_cache();
+  DCHECK(cache != nullptr);
+  Status lookup_status = cache->Lookup(cache_key,
+      state_->query_options().codegen_cache_mode, &entry, &execution_engine_cached_);
+  bool entry_exist = lookup_status.ok() && !entry.Empty();
+  LOG(INFO) << DebugCacheEntryString(cache_key, true /*is_lookup*/,
+      CodeGenCacheModeAnalyzer::is_debug(state_->query_options().codegen_cache_mode),
+      entry_exist);
+  if (entry_exist) {
+    // Fallback to normal procedure if function names hashcode is not expected.
+    // The names hashcode should be the same unless there is a collision on the
+    // key, we expect this case is very rare.
+    if (function_names_hashcode_ != entry.function_names_hashcode) {
+      LOG(WARNING)
+          << "The codegen cache entry contains a different function names hashcode: "
+          << " function names hashcode expected: " << function_names_hashcode_
+          << " actual: " << entry.function_names_hashcode
+          << " key hash_code=" << cache_key.hash_code();
+      cache->IncHitOrMissCount(/*hit*/ false);
+      return false;
+    }
+
+    // execution_engine_cached_ is used to keep the life of the jitted functions in
+    // case the engine is evicted in the global cache.
+    DCHECK(execution_engine_cached_ != nullptr);
+    vector<void*> jitted_funcs;
+    // Get pointers to all codegen'd functions.
+    for (int i = 0; i < fns_to_jit_compile_.size(); ++i) {
+      llvm::Function* function = fns_to_jit_compile_[i].first;
+      DCHECK(function != nullptr);
+      // Using the function getFunctionAddress() with a non-existent function name
+      // would hit an assertion during the test, could be a bug in llvm 5, need to
+      // review after upgrade llvm. But because we already checked the names hashcode
+      // for key collision cases, we expect all the functions should be in the
+      // cached execution engine.
+      void* jitted_function = reinterpret_cast<void*>(
+          execution_engine_cached_->getFunctionAddress(function->getName()));
+      if (jitted_function == nullptr) {
+        LOG(WARNING) << "Failed to get a jitted function from cache: "
+                     << function->getName().data()
+                     << " key hash_code=" << cache_key.hash_code();
+        cache->IncHitOrMissCount(/*hit*/ false);
+        return false;
+      }
+      jitted_funcs.emplace_back(jitted_function);
+    }
+    DCHECK_EQ(jitted_funcs.size(), fns_to_jit_compile_.size());
+    for (int i = 0; i < jitted_funcs.size(); i++) {
+      fns_to_jit_compile_[i].second->store(jitted_funcs[i]);
+    }
+
+    // Because we cache the entire execution engine, the cached number of functions should
+    // be the same as the total function number.
+    COUNTER_SET(num_cached_functions_, entry.num_functions);
+    COUNTER_SET(num_functions_, entry.num_functions);
+    COUNTER_SET(num_instructions_, entry.num_instructions);
+  }
+  cache->IncHitOrMissCount(/*hit*/ entry_exist);
+  return entry_exist;
+}
+
+string LlvmCodeGen::GetAllFunctionNames() {
+  stringstream result;
+  // The way to concat would be like "function1,function2".
+  const char separator = ',';
+  for (int i = 0; i < fns_to_jit_compile_.size(); ++i) {
+    llvm::Function* function = fns_to_jit_compile_[i].first;
+    DCHECK(function != nullptr);
+    result << function->getName().data() << separator;
+  }
+  return result.str();
+}
+
+void LlvmCodeGen::GenerateFunctionNamesHashCode() {
+  string function_names = GetAllFunctionNames();
+  // Use the same hash seed as the codegen cache key.
+  function_names_hashcode_ = HashUtil::MurmurHash2_64(function_names.c_str(),
+      function_names.length(), CodeGenCacheKeyConstructor::CODEGEN_CACHE_HASH_SEED_CONST);
+}
+
+Status LlvmCodeGen::StoreCache(CodeGenCacheKey& cache_key) {
+  DCHECK(!cache_key.empty());
+  Status store_status = ExecEnv::GetInstance()->codegen_cache()->Store(
+      cache_key, this, state_->query_options().codegen_cache_mode);
+  LOG(INFO) << DebugCacheEntryString(cache_key, false /*is_lookup*/,
+      CodeGenCacheModeAnalyzer::is_debug(state_->query_options().codegen_cache_mode),
+      store_status.ok());
+  return store_status;
+}
+
+void LlvmCodeGen::PruneModule() {
+  SCOPED_TIMER(optimization_timer_);
+  llvm::TargetIRAnalysis target_analysis =
+      execution_engine_->getTargetMachine()->getTargetIRAnalysis();
+
+  // Before running any other optimization passes, run the internalize pass, giving it
+  // the names of all functions registered by AddFunctionToJit(), followed by the
+  // global dead code elimination pass. This causes all functions not registered to be
+  // JIT'd to be marked as internal, and any internal functions that are not used are
+  // deleted by DCE pass. This greatly decreases compile time by removing unused code.
+  unordered_set<string> exported_fn_names;
+  for (auto& entry : fns_to_jit_compile_) {
+    exported_fn_names.insert(entry.first->getName().str());
+  }
+  unique_ptr<llvm::legacy::PassManager> module_pass_manager(
+      new llvm::legacy::PassManager());
+  module_pass_manager->add(llvm::createTargetTransformInfoWrapperPass(target_analysis));
+  module_pass_manager->add(
+      llvm::createInternalizePass([&exported_fn_names](const llvm::GlobalValue& gv) {
+        return exported_fn_names.find(gv.getName().str()) != exported_fn_names.end();
+      }));
+  module_pass_manager->add(llvm::createGlobalDCEPass());
+  module_pass_manager->run(*module_);
+}
+
 Status LlvmCodeGen::FinalizeModule() {
   DCHECK(!is_compiled_);
   is_compiled_ = true;
@@ -1089,6 +1275,7 @@ Status LlvmCodeGen::FinalizeModule() {
     } else {
       f << GetIR(true);
       f.close();
+      LOG(INFO) << "Saved unoptimized IR to " << path;
     }
   }
 
@@ -1122,6 +1309,27 @@ Status LlvmCodeGen::FinalizeModule() {
   }
 
   RETURN_IF_ERROR(FinalizeLazyMaterialization());
+  PruneModule();
+
+  bool codegen_cache_enabled = state_->codegen_cache_enabled() && codegen_cache_enabled_;
+  CodeGenCacheKey cache_key;
+  if (codegen_cache_enabled) {
+    string bitcode;
+    SCOPED_TIMER(codegen_cache_lookup_timer_);
+    {
+      SCOPED_TIMER(module_bitcode_gen_timer_);
+      llvm::raw_string_ostream bitcode_stream(bitcode);
+      llvm::WriteBitcodeToFile(module_, bitcode_stream);
+      bitcode_stream.flush();
+    }
+    CodeGenCacheKeyConstructor::construct(bitcode, &cache_key);
+    // Generate the function names hashcode no matter the look up result, will be used
+    // in the cache store process if look up failed.
+    GenerateFunctionNamesHashCode();
+    DCHECK(!cache_key.empty());
+    if (LookupCache(cache_key)) return Status::OK();
+  }
+
   if (optimizations_enabled_ && !FLAGS_disable_optimization_passes) {
     RETURN_IF_ERROR(OptimizeModule());
   }
@@ -1134,6 +1342,7 @@ Status LlvmCodeGen::FinalizeModule() {
     } else {
       f << GetIR(true);
       f.close();
+      LOG(INFO) << "Saved optimized IR to " << path;
     }
   }
 
@@ -1143,27 +1352,55 @@ Status LlvmCodeGen::FinalizeModule() {
     execution_engine_->finalizeObject();
   }
 
-  // Get pointers to all codegen'd functions
-  for (int i = 0; i < fns_to_jit_compile_.size(); ++i) {
-    llvm::Function* function = fns_to_jit_compile_[i].first;
-    void* jitted_function = execution_engine_->getPointerToFunction(function);
-    DCHECK(jitted_function != NULL) << "Failed to jit " << function->getName().data();
-    *fns_to_jit_compile_[i].second = jitted_function;
+  SetFunctionPointers();
+  Status store_cache_status;
+  if (codegen_cache_enabled) {
+    SCOPED_TIMER(codegen_cache_save_timer_);
+    store_cache_status = StoreCache(cache_key);
   }
-
+  // If the codegen is stored to the cache successfully, the cache will be responsible to
+  // track the memory consumption instead.
+  if (!codegen_cache_enabled || !store_cache_status.ok()) {
+    // Track the memory consumed by the compiled code.
+    int64_t bytes_allocated = memory_manager_->bytes_allocated();
+    if (!mem_tracker_->TryConsume(bytes_allocated)) {
+      const string& msg = Substitute(
+          "Failed to allocate '$0' bytes for compiled code module", bytes_allocated);
+      return mem_tracker_->MemLimitExceeded(NULL, msg, bytes_allocated);
+    }
+    memory_manager_->set_bytes_tracked(bytes_allocated);
+  }
   DestroyModule();
-
-  // Track the memory consumed by the compiled code.
-  int64_t bytes_allocated = memory_manager_->bytes_allocated();
-  if (!mem_tracker_->TryConsume(bytes_allocated)) {
-    const string& msg = Substitute(
-        "Failed to allocate '$0' bytes for compiled code module", bytes_allocated);
-    return mem_tracker_->MemLimitExceeded(NULL, msg, bytes_allocated);
-  }
-  memory_manager_->set_bytes_tracked(bytes_allocated);
   return Status::OK();
 }
 
+Status LlvmCodeGen::FinalizeModuleAsync(RuntimeProfile::EventSequence* event_sequence) {
+  DCHECK(event_sequence != nullptr);
+  Status thread_start_status = Thread::Create("async-codegen", "async-codegen",
+      [this, event_sequence]() {
+        SCOPED_THREAD_COUNTER_MEASUREMENT(compile_thread_counters_);
+        VLOG(2) << "Starting async code generation.";
+
+        Status status = DebugAction(state_->query_options(),
+            "BEFORE_CODEGEN_IN_ASYNC_CODEGEN_THREAD");
+        if (status.ok()) {
+          status = this->FinalizeModule();
+        }
+
+        const std::string status_msg = status.ok() ? "OK." : status.msg().msg();
+        auto log_level = status.ok() ? 2 : 1;
+        event_sequence->MarkEvent("AsyncCodegenFinished");
+        VLOG(log_level) << "Finished async code generation with result: " << status;
+      }, &async_compile_thread_);
+
+  event_sequence->MarkEvent("AsyncCodegenStarted");
+
+  RETURN_IF_ERROR(DebugAction(state_->query_options(),
+        "AFTER_STARTING_ASYNC_CODEGEN_IN_FRAGMENT_THREAD"));
+  return thread_start_status;
+}
+
+/// TODO: In asynchronous mode, return early if the query is cancelled or finished.
 Status LlvmCodeGen::OptimizeModule() {
   SCOPED_TIMER(optimization_timer_);
 
@@ -1187,25 +1424,8 @@ Status LlvmCodeGen::OptimizeModule() {
   // machine to optimisation passes, e.g. the cost model.
   llvm::TargetIRAnalysis target_analysis =
       execution_engine_->getTargetMachine()->getTargetIRAnalysis();
-
-  // Before running any other optimization passes, run the internalize pass, giving it
-  // the names of all functions registered by AddFunctionToJit(), followed by the
-  // global dead code elimination pass. This causes all functions not registered to be
-  // JIT'd to be marked as internal, and any internal functions that are not used are
-  // deleted by DCE pass. This greatly decreases compile time by removing unused code.
-  unordered_set<string> exported_fn_names;
-  for (auto& entry : fns_to_jit_compile_) {
-    exported_fn_names.insert(entry.first->getName().str());
-  }
   unique_ptr<llvm::legacy::PassManager> module_pass_manager(
       new llvm::legacy::PassManager());
-  module_pass_manager->add(llvm::createTargetTransformInfoWrapperPass(target_analysis));
-  module_pass_manager->add(
-      llvm::createInternalizePass([&exported_fn_names](const llvm::GlobalValue& gv) {
-        return exported_fn_names.find(gv.getName().str()) != exported_fn_names.end();
-      }));
-  module_pass_manager->add(llvm::createGlobalDCEPass());
-  module_pass_manager->run(*module_);
 
   // Update counters before final optimization, but after removing unused functions. This
   // gives us a rough measure of how much work the optimization and compilation must do.
@@ -1252,6 +1472,17 @@ Status LlvmCodeGen::OptimizeModule() {
   return Status::OK();
 }
 
+void LlvmCodeGen::SetFunctionPointers() {
+  // Get pointers to all codegen'd functions.
+  for (const std::pair<llvm::Function*, CodegenFnPtrBase*>& fn_pair
+      : fns_to_jit_compile_) {
+    llvm::Function* function = fn_pair.first;
+    void* jitted_function = execution_engine_->getPointerToFunction(function);
+    DCHECK(jitted_function != nullptr) << "Failed to jit " << function->getName().data();
+    fn_pair.second->store(jitted_function);
+  }
+}
+
 void LlvmCodeGen::DestroyModule() {
   // Clear all references to LLVM objects owned by the module.
   cross_compiled_functions_.clear();
@@ -1265,7 +1496,7 @@ void LlvmCodeGen::DestroyModule() {
   module_ = NULL;
 }
 
-void LlvmCodeGen::AddFunctionToJit(llvm::Function* fn, void** fn_ptr) {
+void LlvmCodeGen::AddFunctionToJit(llvm::Function* fn, CodegenFnPtrBase* fn_ptr) {
   DCHECK(finalized_functions_.find(fn) != finalized_functions_.end())
       << "Attempted to add a non-finalized function to Jit: " << fn->getName().str();
   llvm::Type* decimal_val_type = GetNamedType(CodegenAnyVal::LLVM_DECIMALVAL_NAME);
@@ -1303,7 +1534,7 @@ void LlvmCodeGen::AddFunctionToJit(llvm::Function* fn, void** fn_ptr) {
   AddFunctionToJitInternal(fn, fn_ptr);
 }
 
-void LlvmCodeGen::AddFunctionToJitInternal(llvm::Function* fn, void** fn_ptr) {
+void LlvmCodeGen::AddFunctionToJitInternal(llvm::Function* fn, CodegenFnPtrBase* fn_ptr) {
   DCHECK(!is_compiled_);
   fns_to_jit_compile_.push_back(make_pair(fn, fn_ptr));
 }
@@ -1312,19 +1543,15 @@ void LlvmCodeGen::CodegenDebugTrace(
     LlvmBuilder* builder, const char* str, llvm::Value* v1) {
   LOG(ERROR) << "Remove IR codegen debug traces before checking in.";
 
-  // Make a copy of str into memory owned by this object.  This is no guarantee that str is
-  // still around when the debug printf is executed.
-  debug_strings_.push_back(Substitute("LLVM Trace: $0", str));
-  str = debug_strings_.back().c_str();
+  // Call printf by embedding the string into the module and getting a pointer to it.
+  llvm::Value* const llvm_str =
+      GetStringConstant(builder, Substitute("LLVM Trace: $0", str));
 
   llvm::Function* printf = module_->getFunction("printf");
-  DCHECK(printf != NULL);
-
-  // Call printf by turning 'str' into a constant ptr value
-  llvm::Value* str_ptr = CastPtrToLlvmPtr(ptr_type_, const_cast<char*>(str));
+  DCHECK(printf != nullptr);
 
   vector<llvm::Value*> calling_args;
-  calling_args.push_back(str_ptr);
+  calling_args.push_back(llvm_str);
   if (v1 != NULL) calling_args.push_back(v1);
   builder->CreateCall(printf, calling_args);
 }
@@ -1436,10 +1663,17 @@ Status LlvmCodeGen::LoadIntrinsics() {
     llvm::Intrinsic::ID id;
     const char* error;
   } non_overloaded_intrinsics[] = {
+#ifdef __aarch64__
+      {llvm::Intrinsic::aarch64_crc32cb, "aarch64 crc32_u8"},
+      {llvm::Intrinsic::aarch64_crc32ch, "aarch64 crc32_u16"},
+      {llvm::Intrinsic::aarch64_crc32cw, "aarch64 crc32_u32"},
+      {llvm::Intrinsic::aarch64_crc32cx, "aarch64 crc32_u64"},
+#else
       {llvm::Intrinsic::x86_sse42_crc32_32_8, "sse4.2 crc32_u8"},
       {llvm::Intrinsic::x86_sse42_crc32_32_16, "sse4.2 crc32_u16"},
       {llvm::Intrinsic::x86_sse42_crc32_32_32, "sse4.2 crc32_u32"},
       {llvm::Intrinsic::x86_sse42_crc32_64_64, "sse4.2 crc32_u64"},
+#endif
   };
   const int num_intrinsics =
       sizeof(non_overloaded_intrinsics) / sizeof(non_overloaded_intrinsics[0]);
@@ -1550,7 +1784,7 @@ void LlvmCodeGen::ClearHashFns() {
 //   ret i32 %12
 // }
 llvm::Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
-  if (IsCPUFeatureEnabled(CpuInfo::SSE4_2)) {
+  if (IS_AARCH64 || IsCPUFeatureEnabled(CpuInfo::SSE4_2)) {
     if (num_bytes == -1) {
       // -1 indicates variable length, just return the generic loop based
       // hash fn.
@@ -1575,25 +1809,39 @@ llvm::Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
     llvm::Function* fn = prototype.GeneratePrototype(&builder, &args[0]);
     llvm::Value* data = args[0];
     llvm::Value* result = args[2];
-
+#ifdef __aarch64__
+    llvm::Function* crc8_fn = llvm_intrinsics_[llvm::Intrinsic::aarch64_crc32cb];
+    llvm::Function* crc16_fn = llvm_intrinsics_[llvm::Intrinsic::aarch64_crc32ch];
+    llvm::Function* crc32_fn = llvm_intrinsics_[llvm::Intrinsic::aarch64_crc32cw];
+    llvm::Function* crc64_fn = llvm_intrinsics_[llvm::Intrinsic::aarch64_crc32cx];
+#else
     llvm::Function* crc8_fn = llvm_intrinsics_[llvm::Intrinsic::x86_sse42_crc32_32_8];
     llvm::Function* crc16_fn = llvm_intrinsics_[llvm::Intrinsic::x86_sse42_crc32_32_16];
     llvm::Function* crc32_fn = llvm_intrinsics_[llvm::Intrinsic::x86_sse42_crc32_32_32];
     llvm::Function* crc64_fn = llvm_intrinsics_[llvm::Intrinsic::x86_sse42_crc32_64_64];
+#endif
 
     // Generate the crc instructions starting with the highest number of bytes
     if (num_bytes >= 8) {
+#ifndef __aarch64__
       llvm::Value* result_64 = builder.CreateZExt(result, i64_type());
+#endif
       llvm::Value* ptr = builder.CreateBitCast(data, i64_ptr_type());
       int i = 0;
       while (num_bytes >= 8) {
         llvm::Value* index[] = {GetI32Constant(i++)};
         llvm::Value* d = builder.CreateLoad(builder.CreateInBoundsGEP(ptr, index));
+#ifdef __aarch64__
+        result = builder.CreateCall(crc64_fn, llvm::ArrayRef<llvm::Value*>({result, d}));
+#else
         result_64 =
             builder.CreateCall(crc64_fn, llvm::ArrayRef<llvm::Value*>({result_64, d}));
+#endif
         num_bytes -= 8;
       }
+#ifndef __aarch64__
       result = builder.CreateTrunc(result_64, i32_type());
+#endif
       llvm::Value* index[] = {GetI32Constant(i * 8)};
       // Update data to past the 8-byte chunks
       data = builder.CreateInBoundsGEP(data, index);
@@ -1613,6 +1861,9 @@ llvm::Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
       DCHECK_LT(num_bytes, 4);
       llvm::Value* ptr = builder.CreateBitCast(data, i16_ptr_type());
       llvm::Value* d = builder.CreateLoad(ptr);
+#ifdef __aarch64__
+      d = builder.CreateZExt(d, i32_type());
+#endif
       result = builder.CreateCall(crc16_fn, llvm::ArrayRef<llvm::Value*>({result, d}));
       llvm::Value* index[] = {GetI16Constant(2)};
       data = builder.CreateInBoundsGEP(data, index);
@@ -1622,6 +1873,9 @@ llvm::Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
     if (num_bytes > 0) {
       DCHECK_EQ(num_bytes, 1);
       llvm::Value* d = builder.CreateLoad(data);
+#ifdef __aarch64__
+      d = builder.CreateZExt(d, i32_type());
+#endif
       result = builder.CreateCall(crc8_fn, llvm::ArrayRef<llvm::Value*>({result, d}));
       --num_bytes;
     }
@@ -1745,15 +1999,49 @@ string LlvmCodeGen::DiagnosticHandler::GetErrorString() {
   }
   return "";
 }
+
+string LlvmCodeGen::DebugCacheEntryString(CodeGenCacheKey& key, bool is_lookup,
+    bool debug_mode, bool success) const {
+  stringstream out;
+  if (is_lookup) {
+    out << "Look up codegen cache ";
+  } else {
+    out << "Store to codegen cache ";
+  }
+  if (success) {
+    out << "succeeded. ";
+  } else {
+    if (is_lookup) {
+      out << "missed. ";
+    } else {
+      out << "failed. ";
+    }
+  }
+  out << "CodeGen Cache Key hash_code=" << key.hash_code();
+  if (UNLIKELY(debug_mode)) {
+    out << "\nFragment Plan: " << apache::thrift::ThriftDebugString(state_->fragment())
+        << "\n";
+    out << "CodeGen Functions: \n";
+    for (int i = 0; i < fns_to_jit_compile_.size(); ++i) {
+      out << "  " << fns_to_jit_compile_[i].first->getName().data() << "\n";
+    }
+  }
+  return out.str();
+}
 }
 
 namespace boost {
 
 /// Handler for exceptions in cross-compiled functions.
-/// When boost is configured with BOOST_NO_EXCEPTIONS, it calls this handler instead of
+/// When boost is configured with BOOST_NO_EXCEPTIONS, it calls these handlers instead of
 /// throwing the exception.
 [[noreturn]] void throw_exception(std::exception const& e) {
   LOG(FATAL) << "Cannot handle exceptions in codegen'd code " << e.what();
 }
 
+[[noreturn]] void throw_exception(
+    std::exception const& e, boost::source_location const& loc) {
+  LOG(FATAL) << loc.file_name() << ":" << loc.line() << "] " << loc.function_name()
+             << ": Cannot handle exceptions in codegen'd code " << e.what();
+}
 }

@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_dimensions import (
   create_single_exec_option_dimension,
@@ -38,6 +39,9 @@ class TestTestcaseBuilder(ImpalaTestSuite):
 
   def test_query_without_from(self):
     tmp_path = get_fs_path("/tmp")
+    # Make sure /tmp dir exists
+    if not self.filesystem_client.exists(tmp_path):
+      self.filesystem_client.make_dir(tmp_path)
     # Generate Testcase Data for query without table reference
     testcase_generate_query = """COPY TESTCASE TO '%s' SELECT 5 * 20""" % tmp_path
     result = self.execute_query_expect_success(self.client, testcase_generate_query)
@@ -45,7 +49,7 @@ class TestTestcaseBuilder(ImpalaTestSuite):
 
     # Check file exists
     testcase_path = str(result.data)[1: -1]
-    index = testcase_path.index('/tmp')
+    index = testcase_path.index(tmp_path)
     hdfs_path = testcase_path[index:-1]
     assert self.filesystem_client.exists(hdfs_path), \
         "File not generated {0}".format(hdfs_path)

@@ -15,13 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_COMMON_OBJECT_POOL_H
-#define IMPALA_COMMON_OBJECT_POOL_H
-
+#include <mutex>
 #include <vector>
-#include <boost/thread/locks.hpp>
-#include <boost/thread/mutex.hpp>
 
 #include "gutil/macros.h"
 #include "util/spinlock.h"
@@ -39,14 +36,14 @@ class ObjectPool {
   template <class T>
   T* Add(T* t) {
     // TODO: Consider using a lock-free structure.
-    boost::lock_guard<SpinLock> l(lock_);
+    std::lock_guard<SpinLock> l(lock_);
     objects_.emplace_back(
         Element{t, [](void* obj) { delete reinterpret_cast<T*>(obj); }});
     return t;
   }
 
   void Clear() {
-    boost::lock_guard<SpinLock> l(lock_);
+    std::lock_guard<SpinLock> l(lock_);
     for (Element& elem : objects_) elem.delete_fn(elem.obj);
     objects_.clear();
   }
@@ -67,5 +64,3 @@ class ObjectPool {
 };
 
 }
-
-#endif

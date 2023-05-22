@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 import re
 import time
@@ -22,6 +23,7 @@ import time
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.skip import SkipIfNotHdfsMinicluster
 from subprocess import check_call
+from tests.util.filesystem_utils import IS_OZONE
 from tests.util.shell_util import exec_process
 
 
@@ -43,7 +45,8 @@ class TestHdfsTimeouts(CustomClusterTestSuite):
 
     # Find the NameNode's pid via pgrep. This would raise an error if it did not
     # find a pid, so there is at least one match.
-    rc, pgrep_output, stderr = exec_process("pgrep -f namenode.NameNode")
+    data_api_name = 'OzoneManager' if IS_OZONE else 'namenode.NameNode'
+    rc, pgrep_output, stderr = exec_process("pgrep -f {}".format(data_api_name))
     assert rc == 0, \
         "Error finding NameNode pid\nstdout={0}\nstderr={1}".format(pgrep_output, stderr)
     # In our test environment, this should only match one pid
@@ -69,7 +72,7 @@ class TestHdfsTimeouts(CustomClusterTestSuite):
       result = self.execute_query("select count(*) from functional.alltypes",
           vector=vector)
       end_time = time.time()
-    except Exception, e:
+    except Exception as e:
       ex = e
     finally:
       end_time = time.time()

@@ -17,18 +17,25 @@
 
 #pragma once
 
-#include "util/metrics.h"
-
+#include <cstdint>
+#include <iosfwd>
+#include <set>
 #include <string>
 #include <vector>
-#include <set>
-#include <boost/algorithm/string/join.hpp>
+
 #include <boost/accumulators/accumulators.hpp>
+#include <boost/accumulators/framework/accumulator_set.hpp>
+#include <boost/accumulators/framework/features.hpp>
 #include <boost/accumulators/statistics/count.hpp>
+#include <boost/accumulators/statistics/max.hpp>
 #include <boost/accumulators/statistics/mean.hpp>
 #include <boost/accumulators/statistics/min.hpp>
-#include <boost/accumulators/statistics/max.hpp>
 #include <boost/accumulators/statistics/variance.hpp>
+#include <boost/thread/lock_guard.hpp>
+
+#include "common/logging.h"
+#include "util/metrics-fwd.h"
+#include "util/metrics.h"
 
 namespace impala {
 
@@ -52,19 +59,19 @@ class SetMetric : public Metric {
 
   /// Put an item in this set.
   void Add(const T& item) {
-    boost::lock_guard<boost::mutex> l(lock_);
+    std::lock_guard<std::mutex> l(lock_);
     value_.insert(item);
   }
 
   /// Remove an item from this set by value.
   void Remove(const T& item) {
-    boost::lock_guard<boost::mutex> l(lock_);
+    std::lock_guard<std::mutex> l(lock_);
     value_.erase(item);
   }
 
   /// Copy out value.
   std::set<T> value() {
-    boost::lock_guard<boost::mutex> l(lock_);
+    std::lock_guard<std::mutex> l(lock_);
     return value_;
   }
 
@@ -84,7 +91,7 @@ class SetMetric : public Metric {
 
  private:
   /// Lock protecting the set
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// The set of items
   std::set<T> value_;
@@ -112,13 +119,13 @@ class StatsMetric : public Metric {
   }
 
   void Update(const T& value) {
-    boost::lock_guard<boost::mutex> l(lock_);
+    std::lock_guard<std::mutex> l(lock_);
     value_ = value;
     acc_(value);
   }
 
   void Reset() {
-    boost::lock_guard<boost::mutex> l(lock_);
+    std::lock_guard<std::mutex> l(lock_);
     acc_ = Accumulator();
   }
 
@@ -136,7 +143,7 @@ class StatsMetric : public Metric {
   TUnit::type unit_;
 
   /// Lock protecting the value and the accumulator_set
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// The last value
   T value_;

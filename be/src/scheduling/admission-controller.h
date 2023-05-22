@@ -20,6 +20,7 @@
 
 #include <list>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -30,16 +31,18 @@
 #include "common/status.h"
 #include "scheduling/cluster-membership-mgr.h"
 #include "scheduling/request-pool-service.h"
-#include "scheduling/query-schedule.h"
+#include "scheduling/schedule-state.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/condition-variable.h"
 #include "util/internal-queue.h"
 #include "util/runtime-profile.h"
-#include "util/thread.h"
 
 namespace impala {
 
 class ExecEnv;
+class PoolMemTrackerRegistry;
+class Scheduler;
+class Thread;
 
 /// Represents the admission outcome of a query. It is stored in the 'admit_outcome'
 /// input variable passed to AdmissionController::AdmitQuery() if an admission decision
@@ -63,8 +66,17 @@ enum class AdmissionOutcome {
 /// queue size, incoming queries will be rejected. Requests in the queue will time out
 /// after a configurable timeout.
 ///
-/// Depending on the -is_coordinator startup flag, multiple impalads can act as a
-/// coordinator and thus also an admission controller, so some cluster state must be
+/// Admission control can be run in two possible modes:
+/// - Distributed mode: each coordinator performs admission control independently, based
+///   on eventually consistent info about the admission decisions made by other
+///   coordinators, which is distributed by the statestore. This is the traditional Impala
+///   set up.
+/// - Admission service mode: coordinators are configured with --admission_service_host to
+///   send their queries to the admissiond which performs all admission control based on
+///   its complete view of cluster load. This mode is currently considered experimental.
+///
+/// In distributed mode, depending on the -is_coordinator flag, multiple impalads can act
+/// as a coordinator and thus also an admission controller, so some cluster state must be
 /// shared between impalads in order to make admission decisions on any of them. Every
 /// coordinator maintains some per-pool and per-host statistics related to the requests it
 /// itself is servicing as the admission controller. Some of these local admission
@@ -157,11 +169,33 @@ enum class AdmissionOutcome {
 /// When queries complete they must be explicitly released from the admission controller
 /// using the methods 'ReleaseQuery' and 'ReleaseQueryBackends'. These methods release
 /// the admitted memory and decrement the number of admitted queries for the resource
-/// pool. All Backends for a query must be released via 'ReleaseQueryBackends' before the
-/// query is released using 'ReleaseQuery'. Releasing Backends releases the admitted
-/// memory used by that Backend and decrements the number of running queries on the host
-/// running that Backend. Releasing a query does not release any admitted memory, it only
-/// decrements the number of running queries in the resource pool.
+/// pool.
+///
+/// In the traditional distributed admission control mode, it is required that all
+/// backends for a query must be released via 'ReleaseQueryBackends' then the query is
+/// released using 'ReleaseQuery'. This is possible to guarantee since the coordinator
+/// and AdmissionController are running in the same process.
+///
+/// In the admission control service mode, more flexibility is allowed to maintain fault
+/// tolerance in the case of rpc failures between coordinators and the admissiond. In this
+/// case, proper resource accounting is ensured with two invariants: 1) the aggregate
+/// values of resources in use always matches the contents of 'running_queries_" 2) any
+/// query will always eventually be removed from 'running_queries_' and have all of its
+/// resources released, regardless of any failures.
+/// There are a few failure cases to consider:
+/// - ReleaseQuery rpc fails: coordinators periodically send a list of registered query
+///   ids via a heartbeat rpc, allowing the admission contoller to clean up any queries
+///   that are not in that list.
+/// - Coordinator fails: the admission control service uses the statestore to detect when
+///   a coordinator has been removed from the cluster membership and releases all queries
+///   that were running at that coordinator.
+/// - RelaseQueryBackends rpc fails: when ReleaseQuery is eventually called (as guaranteed
+///   by the above), it will automatically release any remaining backends.
+///
+/// Releasing Backends releases the admitted memory used by that Backend and decrements
+/// the number of running queries on the host running that Backend. Releasing a query does
+/// not release any admitted memory, it only decrements the number of running queries in
+/// the resource pool.
 ///
 /// Executor Groups:
 /// Executors in a cluster can be assigned to executor groups. Each executor can only be
@@ -169,9 +203,6 @@ enum class AdmissionOutcome {
 /// Each executor group belongs to a single resource pool and will only serve requests
 /// from that pool. I.e. the relationships are 1 resource pool : many executor groups and
 /// 1 executor group : many executors.
-
-
-
 ///
 /// Executors that don't specify an executor group name during startup are automatically
 /// added to a default group called DEFAULT_EXECUTOR_GROUP_NAME. The default executor
@@ -243,11 +274,11 @@ enum class AdmissionOutcome {
 /// from the default resource pool. Consider that each executor has only one admission
 /// slot i.e. --admission_control_slots=1 is specified for all executors. An incoming
 /// query with mt_dop=1 is submitted through SubmitForAdmission(), which calls
-/// FindGroupToAdmitOrReject(). From there we call ComputeGroupSchedules() which calls
-/// compute schedules for both executor groups. Then we perform rejection tests and
+/// FindGroupToAdmitOrReject(). From there we call ComputeGroupScheduleStates() which
+/// calls compute schedules for both executor groups. Then we perform rejection tests and
 /// afterwards call CanAdmitRequest() for each of the schedules. Executor groups are
-/// processed in alphanumerically sorted order, so we attempt admission to group
-/// "default-pool-group-1" first. CanAdmitRequest() calls HasAvailableSlots() to check
+/// processed in a deterministic order, see comments in ComputeGroupScheduleStates() for
+/// details. CanAdmitRequest() calls HasAvailableSlots() to check
 /// whether any of the hosts in the group can fit the new query in their available slots
 /// and since it does fit, admission succeeds. The query is admitted and 'slots_in_use'
 /// is incremented for each host in that group based on the effective parallelism of the
@@ -297,6 +328,7 @@ class AdmissionController {
   // Profile info strings
   static const std::string PROFILE_INFO_KEY_ADMISSION_RESULT;
   static const std::string PROFILE_INFO_VAL_ADMIT_IMMEDIATELY;
+  static const std::string PROFILE_INFO_VAL_ADMIT_TRIVIAL;
   static const std::string PROFILE_INFO_VAL_QUEUED;
   static const std::string PROFILE_INFO_VAL_CANCELLED_IN_QUEUE;
   static const std::string PROFILE_INFO_VAL_ADMIT_QUEUED;
@@ -312,25 +344,25 @@ class AdmissionController {
 
   AdmissionController(ClusterMembershipMgr* cluster_membership_mgr,
       StatestoreSubscriber* subscriber, RequestPoolService* request_pool_service,
-      MetricGroup* metrics, const TNetworkAddress& host_addr);
+      MetricGroup* metrics, Scheduler* scheduler,
+      PoolMemTrackerRegistry* pool_mem_trackers, const TNetworkAddress& host_addr);
   ~AdmissionController();
 
-  /// This struct contains all information needed to create a QuerySchedule and try to
+  /// This struct contains all information needed to create a schedule and try to
   /// admit it. None of the members are owned by the instances of this class (usually they
-  /// are owned by the ClientRequestState).
+  /// are owned by the ClientRequestState or AdmissionControlService).
   struct AdmissionRequest {
-    const TUniqueId& query_id;
+    const UniqueIdPB& query_id;
+    const UniqueIdPB& coord_id;
     const TQueryExecRequest& request;
     const TQueryOptions& query_options;
     RuntimeProfile* summary_profile;
-    RuntimeProfile::EventSequence* query_events;
+    std::unordered_set<NetworkAddressPB>& blacklisted_executor_addresses;
   };
 
-  /// Submits the request for admission. May returns immediately if rejected, but
-  /// otherwise blocks until the request is either admitted, times out, gets rejected
-  /// later, or cancelled by the client (by setting 'admit_outcome' to CANCELLED). When
-  /// this method returns, the following <admit_outcome, Return Status> pairs are
-  /// possible:
+  /// Submits the request for admission. If the query is queued, 'queued' will be true
+  /// and WaitOnQueued() must be called to block until a decision is made. Otherwise, when
+  /// this method returns, the following <admit_outcome, Status> pairs are possible:
   /// - Admitted: <ADMITTED, Status::OK>
   /// - Rejected or timed out: <REJECTED or TIMED_OUT, Status(msg: reason for the same)>
   /// - Cancelled: <CANCELLED, Status::CANCELLED>
@@ -338,23 +370,50 @@ class AdmissionController {
   /// cancelled to ensure that the pool statistics are updated.
   Status SubmitForAdmission(const AdmissionRequest& request,
       Promise<AdmissionOutcome, PromiseMode::MULTIPLE_PRODUCER>* admit_outcome,
-      std::unique_ptr<QuerySchedule>* schedule_result);
+      std::unique_ptr<QuerySchedulePB>* schedule_result, bool& queued,
+      std::string* request_pool = nullptr);
+
+  /// After SubmitForAdmission(), if the query was queued this must be called. If
+  /// 'timeout_ms' is 0, it will block until a decision is made. Otherwise, if the
+  /// function returns due to the timeout 'wait_timed_out' will be true.
+  Status WaitOnQueued(const UniqueIdPB& query_id,
+      std::unique_ptr<QuerySchedulePB>* schedule_result, int64_t timeout_ms = 0,
+      bool* wait_timed_out = nullptr);
 
   /// Updates the pool statistics when a query completes (either successfully,
   /// is cancelled or failed). This should be called for all requests that have
-  /// been submitted via AdmitQuery(). 'schedule' is the QuerySchedule of the completed
-  /// query and 'peak_mem_consumption' is the peak memory consumption of the query.
+  /// been submitted via AdmitQuery(). 'query_id' is the completed query, 'coord_id' is
+  /// the backend id of the coordinator for the query, and 'peak_mem_consumption' is the
+  /// peak memory consumption of the query, which may be -1 if unavailable.
+  /// If 'release_remaining_backends' is true, calls ReleaseQueryBackends() for any
+  /// backends that have not been released yet. This is only used in the context of the
+  /// admission control service to account for the possibility of failed rpcs.
   /// This does not block.
-  void ReleaseQuery(const QuerySchedule& schedule, int64_t peak_mem_consumption);
+  void ReleaseQuery(const UniqueIdPB& query_id, const UniqueIdPB& coord_id,
+      int64_t peak_mem_consumption, bool release_remaining_backends = false);
 
   /// Updates the pool statistics when a Backend running a query completes (either
   /// successfully, is cancelled or failed). This should be called for all Backends part
   /// of a query for all queries that have been submitted via AdmitQuery().
-  /// 'schedule' is the QuerySchedule of the associated query and the vector of
-  /// TNetworkAddresses identify the completed Backends.
+  /// 'query_id' is the associated query, 'coord_id' is the backend id of the coordinator
+  /// for the query, and the vector of NetworkAddressPBs identify the completed Backends.
   /// This does not block.
-  void ReleaseQueryBackends(
-      const QuerySchedule& schedule, const vector<TNetworkAddress>& host_addr);
+  void ReleaseQueryBackends(const UniqueIdPB& query_id, const UniqueIdPB& coord_id,
+      const vector<NetworkAddressPB>& host_addr);
+
+  /// Releases the resources for any queries that were scheduled for the coordinator
+  /// 'coord_id' that are not in the list 'query_ids'. Only used in the context of the
+  /// admission control service. Returns a list of the queries that had their resources
+  /// released.
+  std::vector<UniqueIdPB> CleanupQueriesForHost(
+      const UniqueIdPB& coord_id, const std::unordered_set<UniqueIdPB> query_ids);
+
+  /// Relases the resources for any queries currently running on coordinators that do not
+  /// appear in 'current_backends'. Called in response to statestore updates. Returns a
+  /// map from the backend id of any coordinator detected to have failed to a list of
+  /// queries that were released for that coordinator.
+  std::unordered_map<UniqueIdPB, std::vector<UniqueIdPB>>
+  CancelQueriesOnFailedCoordinators(std::unordered_set<UniqueIdPB> current_backends);
 
   /// Registers the request queue topic with the statestore, starts up the dequeue thread
   /// and registers a callback with the cluster membership manager to receive updates for
@@ -379,23 +438,10 @@ class AdmissionController {
   /// Calls ResetInformationalStats on all pools.
   void ResetAllPoolInformationalStats();
 
-  // This struct stores per-host statistics which are used during admission and by HTTP
-  // handlers to query admission control statistics for currently registered backends.
-  struct HostStats {
-    /// The mem reserved for a query that is currently executing is its memory limit, if
-    /// set (which should be the common case with admission control). Otherwise, if the
-    /// query has no limit or the query is finished executing, the current consumption
-    /// (tracked by its query mem tracker) is used.
-    int64_t mem_reserved = 0;
-    /// The per host mem admitted only for the queries admitted locally.
-    int64_t mem_admitted = 0;
-    /// The per host number of queries admitted only for the queries admitted locally.
-    int64_t num_admitted = 0;
-    /// The per host number of slots in use for the queries admitted locally.
-    int64_t slots_in_use = 0;
-  };
-
-  typedef std::unordered_map<std::string, HostStats> PerHostStats;
+  // This maps a backends's id(host/port id) to its host level statistics which are used
+  // during admission and by HTTP handlers to query admission control statistics for
+  // currently registered backends.
+  typedef std::unordered_map<std::string, THostStats> PerHostStats;
 
   // Populates the input map with the per host memory reserved and admitted in the
   // following format: <host_address_str, pair<mem_reserved, mem_admitted>>.
@@ -427,6 +473,10 @@ class AdmissionController {
   /// Metrics subsystem access
   MetricGroup* metrics_group_;
 
+  Scheduler* scheduler_;
+
+  PoolMemTrackerRegistry* pool_mem_trackers_;
+
   /// Maps names of executor groups to their respective query load metric.
   std::unordered_map<std::string, IntGauge*> exec_group_query_load_map_;
 
@@ -440,13 +490,23 @@ class AdmissionController {
   ThriftSerializer thrift_serializer_;
 
   /// Protects all access to all variables below.
-  boost::mutex admission_ctrl_lock_;
+  std::mutex admission_ctrl_lock_;
 
   /// The last time a topic update was processed. Time is obtained from
   /// MonotonicMillis(), or is 0 if an update was never received.
   int64_t last_topic_update_time_ms_ = 0;
 
   PerHostStats host_stats_;
+
+  /// A map from other coordinator's host_id (host/port id) -> their view of the
+  /// PerHostStats. Used to get a full view of the cluster state while making admission
+  /// decisions. Updated via statestore updates.
+  std::unordered_map<std::string, PerHostStats> remote_per_host_stats_;
+
+  /// Counter of the number of times dequeuing a query failed because of a resource
+  /// issue on the coordinator (which therefore cannot be resolved by adding more
+  /// executor groups).
+  IntCounter* total_dequeue_failed_coordinator_limited_ = nullptr;
 
   /// Contains all per-pool statistics and metrics. Accessed via GetPoolStats().
   class PoolStats {
@@ -484,38 +544,40 @@ class AdmissionController {
       IntGauge* max_query_mem_limit;
       IntGauge* min_query_mem_limit;
       BooleanProperty* clamp_mem_limit_query_option;
-      DoubleGauge* max_running_queries_multiple;
-      DoubleGauge* max_queued_queries_multiple;
-      IntGauge* max_memory_multiple;
-      /// Metrics exposing the pool's derived runtime configuration.
-      IntGauge* max_running_queries_derived;
-      IntGauge* max_queued_queries_derived;
-      IntGauge* max_memory_derived;
+      IntGauge* max_query_cpu_core_per_node_limit;
+      IntGauge* max_query_cpu_core_coordinator_limit;
     };
 
     PoolStats(AdmissionController* parent, const std::string& name)
-      : name_(name), parent_(parent), agg_num_running_(0), agg_num_queued_(0),
-        agg_mem_reserved_(0), local_mem_admitted_(0), wait_time_ms_ema_(0.0) {
+      : name_(name),
+        parent_(parent),
+        agg_num_running_(0),
+        agg_num_queued_(0),
+        agg_mem_reserved_(0),
+        local_trivial_running_(0),
+        local_mem_admitted_(0),
+        wait_time_ms_ema_(0.0) {
       peak_mem_histogram_.resize(HISTOGRAM_NUM_OF_BINS, 0);
       InitMetrics();
     }
 
     int64_t agg_num_running() const { return agg_num_running_; }
     int64_t agg_num_queued() const { return agg_num_queued_; }
+    int64_t local_trivial_running() const { return local_trivial_running_; }
     int64_t EffectiveMemReserved() const {
       return std::max(agg_mem_reserved_, local_mem_admitted_);
     }
 
     // ADMISSION LIFECYCLE METHODS
-    /// Updates the pool stats when the request represented by 'schedule' is admitted.
-    void AdmitQueryAndMemory(const QuerySchedule& schedule);
+    /// Updates the pool stats when the request represented by 'state' is admitted.
+    void AdmitQueryAndMemory(const ScheduleState& state, bool is_trivial);
     /// Updates the pool stats except the memory admitted stat.
-    void ReleaseQuery(int64_t peak_mem_consumption);
+    void ReleaseQuery(int64_t peak_mem_consumption, bool is_trivial);
     /// Releases the specified memory from the pool stats.
     void ReleaseMem(int64_t mem_to_release);
-    /// Updates the pool stats when the request represented by 'schedule' is queued.
+    /// Updates the pool stats when the request represented by 'state' is queued.
     void Queue();
-    /// Updates the pool stats when the request represented by 'schedule' is dequeued.
+    /// Updates the pool stats when the request represented by 'state is dequeued.
     void Dequeue(bool timed_out);
 
     // STATESTORE CALLBACK METHODS
@@ -544,14 +606,23 @@ class AdmissionController {
     /// aggregates when called over all pools.
     void UpdateAggregates(HostMemMap* host_mem_reserved);
 
-    const TPoolStats& local_stats() { return local_stats_; }
+    const TPoolStats& local_stats() const { return local_stats_; }
+
+    // A map from the id of a host to the TPoolStats about that host.
+    typedef boost::unordered_map<std::string, TPoolStats> RemoteStatsMap;
+    const RemoteStatsMap& remote_stats() const { return  remote_stats_; }
+
+    /// Return the TPoolStats for a remote host in remote_stats_ if it can be found.
+    /// Return nullptr otherwise.
+    TPoolStats* FindTPoolStatsForRemoteHost(const string& host_id) {
+      RemoteStatsMap::iterator it = remote_stats_.find(host_id);
+      return (it != remote_stats_.end()) ? &(it->second) : nullptr;
+    }
 
     /// Updates the metrics exposing the pool configuration to those in pool_cfg.
-    void UpdateConfigMetrics(const TPoolConfig& pool_cfg, int64_t cluster_size);
+    void UpdateConfigMetrics(const TPoolConfig& pool_cfg);
 
-    /// Updates the metrics exposing the scalable pool configuration values.
-    void UpdateDerivedMetrics(const TPoolConfig& pool_cfg, int64_t cluster_size);
-
+    const PoolMetrics* metrics() const { return &metrics_; }
     PoolMetrics* metrics() { return &metrics_; }
     std::string DebugString() const;
 
@@ -568,6 +639,9 @@ class AdmissionController {
     void ResetInformationalStats();
 
     const std::string& name() const { return name_; }
+
+    /// The max number of running trivial queries that can be allowed at the same time.
+    static const int MAX_NUM_TRIVIAL_QUERY_RUNNING;
 
    private:
     const std::string name_;
@@ -587,6 +661,13 @@ class AdmissionController {
     /// other hosts. Updated only by UpdateAggregates().
     int64_t agg_mem_reserved_;
 
+    /// Number of running trivial queries in this pool that have been admitted by this
+    /// local coordinator. The purpose of it is to control the concurrency of running
+    /// trivial queries in case they may consume too many resources because trivial
+    /// queries bypass the normal admission control procedure.
+    /// Updated only in AdmitQueryAndMemory() and ReleaseQuery().
+    int64_t local_trivial_running_;
+
     /// Memory in this pool (across all nodes) that is needed for requests that have been
     /// admitted by this local coordinator. Updated only on Admit() and Release(). Stored
     /// separately from the other 'local' stats in local_stats_ because it is not sent
@@ -602,7 +683,6 @@ class AdmissionController {
 
     /// Map of host_ids to the latest TPoolStats. Entirely generated by incoming
     /// statestore updates; updated by UpdateRemoteStats() and used by UpdateAggregates().
-    typedef boost::unordered_map<std::string, TPoolStats> RemoteStatsMap;
     RemoteStatsMap remote_stats_;
 
     /// Per-pool metrics, created by InitMetrics().
@@ -624,14 +704,37 @@ class AdmissionController {
 
     void InitMetrics();
 
+    // Return a string about the content of a TPoolStats object.
+    std::string DebugPoolStats(const TPoolStats& stats) const;
+
+    // Append a string about the memory consumption part of a TPoolStats object to 'ss'.
+    static void AppendStatsForConsumedMemory(
+      std::stringstream& ss, const TPoolStats& stats);
+
     FRIEND_TEST(AdmissionControllerTest, Simple);
     FRIEND_TEST(AdmissionControllerTest, PoolStats);
     FRIEND_TEST(AdmissionControllerTest, CanAdmitRequestMemory);
     FRIEND_TEST(AdmissionControllerTest, CanAdmitRequestCount);
     FRIEND_TEST(AdmissionControllerTest, GetMaxToDequeue);
     FRIEND_TEST(AdmissionControllerTest, QueryRejection);
+    FRIEND_TEST(AdmissionControllerTest, TopNQueryCheck);
     friend class AdmissionControllerTest;
   };
+
+ private:
+  // Return a string reporting top 5 queries with most memory consumed among all
+  // pools in a host. The string is composed of up to 5 sections, where
+  // each section is about one pool describing the following: the top queries
+  // and stats about all queries in the pool. The sum of all top queries
+  // in these secions is at most 5.
+  std::string GetLogStringForTopNQueriesOnHost(const std::string& host_id);
+
+  // Return a string reporting top 5 queries with most memory consumed among all
+  // hosts in the pool. The string is composed of up to 5 sections, where
+  // each is about one host describing the following: the top queries and
+  // and stats about them in the host. The sum of all top queries
+  // in these secions is at most 5.
+  std::string GetLogStringForTopNQueriesInPool(const std::string& pool_name);
 
   /// Map of pool names to pool stats. Accessed via GetPoolStats().
   /// Protected by admission_ctrl_lock_.
@@ -642,11 +745,11 @@ class AdmissionController {
   /// on. It is used to attempt admission without rescheduling the query in case the
   /// cluster membership has not changed. Users of the struct must make sure that
   /// executor_group stays valid.
-  struct GroupSchedule {
-    GroupSchedule(
-        std::unique_ptr<QuerySchedule> schedule, const ExecutorGroup& executor_group)
-      : schedule(std::move(schedule)), executor_group(executor_group) {}
-    std::unique_ptr<QuerySchedule> schedule;
+  struct GroupScheduleState {
+    GroupScheduleState(
+        std::unique_ptr<ScheduleState> state, const ExecutorGroup& executor_group)
+      : state(std::move(state)), executor_group(executor_group) {}
+    std::unique_ptr<ScheduleState> state;
     const ExecutorGroup& executor_group;
   };
 
@@ -671,6 +774,7 @@ class AdmissionController {
         RuntimeProfile* profile)
       : admission_request(std::move(request)),
         profile(profile),
+        not_admitted_details("Not Applicable"),
         admit_outcome(admission_outcome) {}
 
     /////////////////////////////////////////
@@ -682,6 +786,10 @@ class AdmissionController {
     /// Profile to be updated with information about admission.
     RuntimeProfile* profile;
 
+    /// Config of the pool this query will be scheduled on.
+    string pool_name;
+    TPoolConfig pool_cfg;
+
     /// END: Members that are valid for new objects after initialization
     /////////////////////////////////////////
 
@@ -690,12 +798,18 @@ class AdmissionController {
 
     /// The membership snapshot used during the last admission attempt. It can be nullptr
     /// before the first admission attempt and if any schedules have been created,
-    /// 'group_schedule' will contain the corresponding schedules and executor groups.
+    /// 'group_state' will contain the corresponding schedules and executor groups.
     ClusterMembershipMgr::SnapshotPtr membership_snapshot;
 
     /// List of schedules and executor groups that can be attempted to be admitted for
     /// this queue node.
-    std::vector<GroupSchedule> group_schedules;
+    std::vector<GroupScheduleState> group_states;
+
+    /// Info about why this query was queued.
+    string initial_queue_reason;
+
+    /// The MonotonicMillis() time when the query was queued.
+    int64_t wait_start_ms;
 
     /// END: Members that are only valid while queued, but invalid once dequeued.
     /////////////////////////////////////////
@@ -706,16 +820,29 @@ class AdmissionController {
     /// The last reason why this request could not be admitted.
     std::string not_admitted_reason;
 
+    /// Details of memory consumptions populated in HasAvailableMemResources()
+    /// when pool or host memory consumptions exceed the limit. With pool memory
+    /// exhaustion, the details contain a list of queries with most memory consumption
+    /// across all hosts. With host memory exhaustion, it contains a list of queries
+    /// with most memory consumption and aggregated stats across all pools in that host.
+    std::string not_admitted_details;
+
     /// The Admission outcome of the queued request.
     Promise<AdmissionOutcome, PromiseMode::MULTIPLE_PRODUCER>* const admit_outcome;
 
-    /// The schedule of the query if it was admitted successfully. Nullptr if it has not
-    /// been admitted or was cancelled or rejected.
-    std::unique_ptr<QuerySchedule> admitted_schedule = nullptr;
+    /// The schedule of the query if it was admitted successfully. Nullptr if it has
+    /// not been admitted or was cancelled or rejected.
+    std::unique_ptr<ScheduleState> admitted_schedule = nullptr;
 
     /// END: Members that are valid after admission / cancellation / rejection
     /////////////////////////////////////////
   };
+
+  /// Protects 'queue_nodes_'. Should not be held with 'admission_ctrl_lock_'.
+  std::mutex queue_nodes_lock_;
+
+  /// Map from query id to the info needed to make admission decisions for queued queries.
+  std::unordered_map<UniqueIdPB, QueueNode> queue_nodes_;
 
   /// Queue for the queries waiting to be admitted for execution. Once the
   /// maximum number of concurrently executing queries has been reached,
@@ -725,6 +852,40 @@ class AdmissionController {
   /// Map of pool names to request queues.
   typedef boost::unordered_map<std::string, RequestQueue> RequestQueueMap;
   RequestQueueMap request_queue_map_;
+
+  /// Container for info about the resources allocated to a query on a single backend.
+  struct BackendAllocation {
+    /// Number of admission control slots this query is using.
+    int32_t slots_to_use;
+
+    /// Amount of memory allocated to this query. This will be equal to
+    /// ScheduleState::coord_backend_mem_to_admit() if this is the coordinator backend, or
+    /// ScheduleState::per_backend_mem_to_admit() otherwise.
+    int64_t mem_to_admit;
+  };
+
+  /// Container for info about the resources allocated to a currently running query.
+  struct RunningQuery {
+    /// The request pool this query was scheduled on.
+    std::string request_pool;
+
+    /// The executor group this query was scheduled on.
+    std::string executor_group;
+
+    /// Map from backend addresses to the resouces this query was allocated on them. When
+    /// backends are released, they are removed from this map.
+    std::unordered_map<NetworkAddressPB, BackendAllocation> per_backend_resources;
+
+    /// Indicate whether the query is admitted as a trivial query.
+    bool is_trivial;
+  };
+
+  /// Map from host id to a map from query id of currently running queries to information
+  /// about the resources that were allocated to them. Used to properly account for
+  /// resources when releasing queries.
+  /// Protected by admission_ctrl_lock_.
+  std::unordered_map<UniqueIdPB, std::unordered_map<UniqueIdPB, RunningQuery>>
+      running_queries_;
 
   /// Map of pool names to the pool configs returned by request_pool_service_. Stored so
   /// that the dequeue thread does not need to access the configs via the request pool
@@ -746,7 +907,7 @@ class AdmissionController {
   /// Tracks the number of released Backends for each active query. Used purely for
   /// internal state validation. Used to ensure that all Backends are released before
   /// the query is released.
-  typedef boost::unordered_map<TUniqueId, int> NumReleasedBackends;
+  typedef boost::unordered_map<UniqueIdPB, int> NumReleasedBackends;
   NumReleasedBackends num_released_backends_;
 
   /// Resolves the resource pool name in 'query_ctx.request_pool' and stores the resulting
@@ -762,9 +923,10 @@ class AdmissionController {
       std::vector<TTopicDelta>* subscriber_topic_updates);
 
   /// Adds outgoing topic updates to subscriber_topic_updates for pools that have changed
-  /// since the last call to AddPoolUpdates(). Called by UpdatePoolStats() before
-  /// UpdateClusterAggregates(). Must hold admission_ctrl_lock_.
-  void AddPoolUpdates(std::vector<TTopicDelta>* subscriber_topic_updates);
+  /// since the last call to AddPoolUpdates(). Also adds the complete local view of
+  /// per-host statistics. Called by UpdatePoolStats() before UpdateClusterAggregates().
+  /// Must hold admission_ctrl_lock_.
+  void AddPoolAndPerHostStatsUpdates(std::vector<TTopicDelta>* subscriber_topic_updates);
 
   /// Updates the remote stats with per-host topic_updates coming from the statestore.
   /// Removes remote stats identified by topic deletions coming from the
@@ -782,9 +944,9 @@ class AdmissionController {
   /// 'membership_snapshot' has changed. Will return any errors that occur during
   /// scheduling, e.g. if the scan range generation fails. Note that this will not return
   /// an error if no executor groups are available for scheduling, but will set
-  /// 'queue_node->not_admitted_reason' and leave 'queue_node->group_schedules' empty in
+  /// 'queue_node->not_admitted_reason' and leave 'queue_node->group_states' empty in
   /// that case.
-  Status ComputeGroupSchedules(
+  Status ComputeGroupScheduleStates(
       ClusterMembershipMgr::SnapshotPtr membership_snapshot, QueueNode* queue_node);
 
   /// Reschedules the query if necessary using 'membership_snapshot' and tries to find an
@@ -794,10 +956,12 @@ class AdmissionController {
   /// true and keeps queue_node->admitted_schedule unset if the query cannot be admitted
   /// now, but also does not need to be rejected. If the query must be rejected, this
   /// method returns false and sets queue_node->not_admitted_reason.
-  bool FindGroupToAdmitOrReject(
-      int64_t cluster_size, ClusterMembershipMgr::SnapshotPtr membership_snapshot,
+  /// The is_trivial is set to true when is_trivial is not null if the query is admitted
+  /// as a trivial query.
+  bool FindGroupToAdmitOrReject(ClusterMembershipMgr::SnapshotPtr membership_snapshot,
       const TPoolConfig& pool_config, bool admit_from_queue, PoolStats* pool_stats,
-      QueueNode* queue_node);
+      QueueNode* queue_node, bool& coordinator_resource_limited,
+      bool* is_trivial = nullptr);
 
   /// Dequeues the queued queries when notified by dequeue_cv_ and admits them if they
   /// have not been cancelled yet.
@@ -806,9 +970,17 @@ class AdmissionController {
   /// Returns true if schedule can be admitted to the pool with pool_cfg.
   /// admit_from_queue is true if attempting to admit from the queue. Otherwise, returns
   /// false and not_admitted_reason specifies why the request can not be admitted
-  /// immediately. Caller owns not_admitted_reason. Must hold admission_ctrl_lock_.
-  bool CanAdmitRequest(const QuerySchedule& schedule, const TPoolConfig& pool_cfg,
-      int64_t cluster_size, bool admit_from_queue, std::string* not_admitted_reason);
+  /// immediately. When provided, not_admitted_details specifies the details of memory
+  /// consumptions including top 5 queries utilizing the memory most when there are not
+  /// enough memory resources available for the query. Caller owns not_admitted_reason and
+  /// not_admitted_details. Must hold admission_ctrl_lock_.
+  bool CanAdmitRequest(const ScheduleState& state, const TPoolConfig& pool_cfg,
+      bool admit_from_queue, string* not_admitted_reason, string* not_admitted_details,
+      bool& coordinator_resource_limited);
+
+  /// Returns true if the query can be admitted as a trivial query, therefore it can
+  /// bypass the admission control immediately.
+  bool CanAdmitTrivialRequest(const ScheduleState& state);
 
   /// Returns true if all executors can accommodate the largest initial reservation of
   /// any executor and the backend running the coordinator fragment can accommodate its
@@ -823,7 +995,7 @@ class AdmissionController {
   /// 5. If a dedicated coordinator is used and the mem_limit in query options is set
   ///    lower than what is required to support the sum of initial memory reservations of
   ///    the fragments scheduled on the coordinator.
-  static bool CanAccommodateMaxInitialReservation(const QuerySchedule& schedule,
+  static bool CanAccommodateMaxInitialReservation(const ScheduleState& state,
       const TPoolConfig& pool_cfg, std::string* mem_unavailable_reason);
 
   /// Returns true if there is enough memory available to admit the query based on the
@@ -831,35 +1003,34 @@ class AdmissionController {
   /// false and returns the reason in 'mem_unavailable_reason'. Caller owns
   /// 'mem_unavailable_reason'.
   /// Must hold admission_ctrl_lock_.
-  bool HasAvailableMemResources(const QuerySchedule& schedule,
-      const TPoolConfig& pool_cfg, int64_t cluster_size,
-      std::string* mem_unavailable_reason);
+  bool HasAvailableMemResources(const ScheduleState& state, const TPoolConfig& pool_cfg,
+      std::string* mem_unavailable_reason, bool& coordinator_resource_limited,
+      string* topN_queries = nullptr);
 
   /// Returns true if there are enough available slots on all executors in the schedule to
   /// fit the query schedule. The number of slots per executors does not change with the
   /// group or cluster size and instead always uses pool_cfg.max_requests. If a host does
   /// not have a free slot, this returns false and sets 'unavailable_reason'.
   /// Must hold admission_ctrl_lock_.
-  bool HasAvailableSlots(const QuerySchedule& schedule, const TPoolConfig& pool_cfg,
-      string* unavailable_reason);
+  bool HasAvailableSlots(const ScheduleState& state, const TPoolConfig& pool_cfg,
+      string* unavailable_reason, bool& coordinator_resource_limited);
 
   /// Updates the memory admitted and the num of queries running for each backend in
-  /// 'schedule'. Also updates the stats of its associated resource pool. Used only when
-  /// the 'schedule' is admitted.
-  void UpdateStatsOnAdmission(const QuerySchedule& schedule);
+  /// 'state'. Also updates the stats of its associated resource pool. Used only when
+  /// the 'state' is admitted.
+  void UpdateStatsOnAdmission(const ScheduleState& state, bool is_trivial);
 
   /// Updates the memory admitted and the num of queries running for each backend in
-  /// 'schedule' which have been release/completed. The list of completed backends is
+  /// 'state' which have been release/completed. The list of completed backends is
   /// specified in 'host_addrs'. Also updates the stats related to the admitted memory of
   /// its associated resource pool.
-  void UpdateStatsOnReleaseForBackends(
-      const QuerySchedule& schedule, const std::vector<TNetworkAddress>& host_addrs);
+  void UpdateStatsOnReleaseForBackends(const UniqueIdPB& query_id,
+      RunningQuery& running_query, const std::vector<NetworkAddressPB>& host_addrs);
 
   /// Updates the memory admitted and the num of queries running on the specified host by
   /// adding the specified mem, num_queries and slots to the host stats.
-  void UpdateHostStats(
-      const TNetworkAddress& host_addr, int64_t mem_to_admit, int num_queries_to_admit,
-      int num_slots_to_admit);
+  void UpdateHostStats(const NetworkAddressPB& host_addr, int64_t mem_to_admit,
+      int num_queries_to_admit, int num_slots_to_admit);
 
   /// Rejection happens in several stages
   /// 1) Based on static pool configuration
@@ -891,7 +1062,7 @@ class AdmissionController {
   /// disabled, or the queue is already full.
   /// Must hold admission_ctrl_lock_.
   bool RejectForCluster(const std::string& pool_name, const TPoolConfig& pool_cfg,
-      bool admit_from_queue, int64_t cluster_size, std::string* rejection_reason);
+      bool admit_from_queue, std::string* rejection_reason);
 
   /// Returns true if a request must be rejected immediately based on the pool
   /// configuration and a particular schedule, e.g. because the memory requirements of the
@@ -899,15 +1070,15 @@ class AdmissionController {
   /// pool are uniform and that a query rejected for one group will not be able to run on
   /// other groups, either.
   /// Must hold admission_ctrl_lock_.
-  bool RejectForSchedule(const QuerySchedule& schedule, const TPoolConfig& pool_cfg,
-      int64_t cluster_size, int64_t group_size, std::string* rejection_reason);
+  bool RejectForSchedule(const ScheduleState& state, const TPoolConfig& pool_cfg,
+      std::string* rejection_reason);
 
   /// Gets or creates the PoolStats for pool_name. Must hold admission_ctrl_lock_.
   PoolStats* GetPoolStats(const std::string& pool_name, bool dcheck_exists = false);
 
-  /// Gets or creates the PoolStats for query schedule 'schedule'. Scheduling must be done
+  /// Gets or creates the PoolStats for query schedule 'state'. Scheduling must be done
   /// already and the schedule must have an associated executor_group.
-  PoolStats* GetPoolStats(const QuerySchedule& schedule);
+  PoolStats* GetPoolStats(const ScheduleState& state);
 
   /// Log the reason for dequeuing of 'node' failing and add the reason to the query's
   /// profile. Must hold admission_ctrl_lock_.
@@ -916,7 +1087,7 @@ class AdmissionController {
   /// Sets the per host mem limit and mem admitted in the schedule and does the necessary
   /// accounting and logging on successful submission.
   /// Caller must hold 'admission_ctrl_lock_'.
-  void AdmitQuery(QuerySchedule* schedule, bool was_queued);
+  void AdmitQuery(QueueNode* node, bool was_queued, bool is_trivial);
 
   /// Same as PoolToJson() but requires 'admission_ctrl_lock_' to be held by the caller.
   /// Is a helper method used by both PoolToJson() and AllPoolsToJson()
@@ -933,20 +1104,10 @@ class AdmissionController {
       const std::string& pool_name, const std::string& backend_id);
 
   /// Returns the maximum memory for the pool.
-  static int64_t GetMaxMemForPool(const TPoolConfig& pool_config, int64_t cluster_size);
-
-  /// Returns a description of how the maximum memory for the pool is configured.
-  static std::string GetMaxMemForPoolDescription(
-      const TPoolConfig& pool_config, int64_t cluster_size);
+  static int64_t GetMaxMemForPool(const TPoolConfig& pool_config);
 
   /// Returns the maximum number of requests that can run in the pool.
-  static int64_t GetMaxRequestsForPool(
-      const TPoolConfig& pool_config, int64_t cluster_size);
-
-  /// Returns a description of how the maximum number of requests that can run in the pool
-  /// is configured.
-  static std::string GetMaxRequestsForPoolDescription(
-      const TPoolConfig& pool_config, int64_t cluster_size);
+  static int64_t GetMaxRequestsForPool(const TPoolConfig& pool_config);
 
   /// Returns the effective queue timeout for the pool in milliseconds.
   static int64_t GetQueueTimeoutForPoolMs(const TPoolConfig& pool_config);
@@ -957,8 +1118,8 @@ class AdmissionController {
   /// is returned.
   /// Uses a heuristic to limit the number of requests we dequeue locally to avoid all
   /// impalads dequeuing too many requests at the same time.
-  int64_t GetMaxToDequeue(RequestQueue& queue, PoolStats* stats,
-      const TPoolConfig& pool_config, int64_t cluster_size);
+  int64_t GetMaxToDequeue(
+      RequestQueue& queue, PoolStats* stats, const TPoolConfig& pool_config);
 
   /// Returns true if the pool has been disabled through configuration.
   static bool PoolDisabled(const TPoolConfig& pool_config);
@@ -966,22 +1127,20 @@ class AdmissionController {
   /// Returns true if the pool is configured to limit the number of running queries.
   static bool PoolLimitsRunningQueriesCount(const TPoolConfig& pool_config);
 
-  /// Returns true if the pool has a fixed (i.e. not scalable) maximum memory limit.
-  static bool PoolHasFixedMemoryLimit(const TPoolConfig& pool_config);
-
   /// Returns the maximum number of requests that can be queued in the pool.
-  static int64_t GetMaxQueuedForPool(
-      const TPoolConfig& pool_config, int64_t cluster_size);
+  static int64_t GetMaxQueuedForPool(const TPoolConfig& pool_config);
 
-  /// Returns a description of how the maximum number of requests that can run be queued
-  /// in the pool is configured.
-  static std::string GetMaxQueuedForPoolDescription(
-      const TPoolConfig& pool_config, int64_t cluster_size);
+  /// Returns available memory and slots of the executor group.
+  const std::pair<int64_t, int64_t> GetAvailableMemAndSlots(
+      const ExecutorGroup& group) const;
 
-  /// Return all executor groups from 'all_groups' that can be used to run queries in
-  /// 'pool_name'.
-  void GetExecutorGroupsForPool(const ClusterMembershipMgr::ExecutorGroups& all_groups,
-      const std::string& pool_name, std::vector<const ExecutorGroup*>* matching_groups);
+  /// Return all executor groups from 'all_groups' that can be used to run the query. If
+  /// the query is a coordinator only query then a reserved empty group is returned
+  /// otherwise returns all healthy groups that can be used to run queries for the
+  /// resource pool associated with the query.
+  std::vector<const ExecutorGroup*> GetExecutorGroupsForQuery(
+      const ClusterMembershipMgr::ExecutorGroups& all_groups,
+      const AdmissionRequest& request);
 
   /// Returns the current size of the cluster.
   int64_t GetClusterSize(const ClusterMembershipMgr::Snapshot& membership_snapshot);
@@ -990,11 +1149,11 @@ class AdmissionController {
   int64_t GetExecutorGroupSize(const ClusterMembershipMgr::Snapshot& membership_snapshot,
       const std::string& group_name);
 
-  /// Get the amount of memory to admit for the Backend with the given BackendExecParams.
-  /// This method may return different values depending on if the Backend is an Executor
-  /// or a Coordinator.
+  /// Get the amount of memory to admit for the Backend with the given
+  /// BackendScheduleState. This method may return different values depending on if the
+  /// Backend is an Executor or a Coordinator.
   static int64_t GetMemToAdmit(
-      const QuerySchedule& schedule, const BackendExecParams& backend_exec_params);
+      const ScheduleState& state, const BackendScheduleState& backend_schedule_state);
 
   /// Updates the list of executor groups for which we maintain the query load metrics.
   /// Removes the metrics of the groups that no longer exist from the metric group and
@@ -1007,6 +1166,43 @@ class AdmissionController {
   /// admitted or released.
   void UpdateExecGroupMetric(const string& grp_name, int64_t delta);
 
+  /// A helper type to glue information together to compute the topN queries out of <n>
+  /// topM queries through a priority queue. Each object of the type represents a query.
+  ///
+  /// Each field in the type is defined as follows.
+  ///   field 0: memory consumed;
+  ///   field 1: the name of a pool or a host;
+  ///   field 2: query id;
+  ///   field 3: a pointer to TPoolStats.
+
+  typedef std::tuple<int64_t, string, TUniqueId, const TPoolStats*> Item;
+  /// Get the memory consumed.
+  const int64_t& getMemConsumed(const Item& item) const { return std::get<0>(item); }
+  /// Get either the pool or host name.
+  const string& getName(const Item& item) const { return std::get<1>(item); }
+  /// Get the query Id.
+  const TUniqueId& getTUniqueId(const Item& item) const { return std::get<2>(item); }
+  /// Get the pointer to TPoolStats.
+  const TPoolStats* getTPoolStats(const Item& item) const { return std::get<3>(item); }
+
+  // Append a new string to 'ss' describing queries running in a pool on a host.
+  // These queries are a subset of items in listOfTopNs whose indices are in 'indices'.
+  // 'indent' specifies the number of spaces prefixing all lines in the resultant string.
+  void AppendHeavyMemoryQueriesForAPoolInHostAtIndices(std::stringstream& ss,
+      std::vector<Item>& listOfTopNs, std::vector<int>& indices, int indent) const;
+
+  // Report the topN queries in a string and append it to 'ss'. These queries are
+  // a subset of items in listOfTopNs whose indices are in 'indices'. One query Id
+  // together its mem consumed is reported per line. 'indent' provides the initial
+  // value of indentation. 'total_mem_consumed' contains the total memory consumed,
+  // from which a fraction of mem consumed by the topN queries can be reported.
+  void ReportTopNQueriesAtIndices(std::stringstream& ss, std::vector<Item>& listOfTopNs,
+      std::vector<int>& indices, int indent, int64_t total_mem_consumed) const;
+
+  /// Performs the work of ReleaseQueryBackends(). 'admission_ctrl_lock_' must be held.
+  void ReleaseQueryBackendsLocked(const UniqueIdPB& query_id, const UniqueIdPB& coord_id,
+      const vector<NetworkAddressPB>& host_addr);
+
   FRIEND_TEST(AdmissionControllerTest, Simple);
   FRIEND_TEST(AdmissionControllerTest, PoolStats);
   FRIEND_TEST(AdmissionControllerTest, CanAdmitRequestMemory);
@@ -1014,8 +1210,9 @@ class AdmissionController {
   FRIEND_TEST(AdmissionControllerTest, CanAdmitRequestSlots);
   FRIEND_TEST(AdmissionControllerTest, GetMaxToDequeue);
   FRIEND_TEST(AdmissionControllerTest, QueryRejection);
-  FRIEND_TEST(AdmissionControllerTest, DedicatedCoordQuerySchedule);
+  FRIEND_TEST(AdmissionControllerTest, DedicatedCoordScheduleState);
   FRIEND_TEST(AdmissionControllerTest, DedicatedCoordAdmissionChecks);
+  FRIEND_TEST(AdmissionControllerTest, TopNQueryCheck);
   friend class AdmissionControllerTest;
 };
 

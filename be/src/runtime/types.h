@@ -23,7 +23,6 @@
 
 #include "common/logging.h"
 #include "gen-cpp/Types_types.h"  // for TPrimitiveType
-#include "gen-cpp/TCLIService_types.h"  // for HiveServer2 Type
 
 namespace llvm {
   class ConstantStruct;
@@ -48,7 +47,7 @@ enum PrimitiveType {
   TYPE_STRING,
   TYPE_DATE,
   TYPE_DATETIME,    // Not implemented
-  TYPE_BINARY,      // Not implemented
+  TYPE_BINARY,      // Not used, see AuxColumnType::StringSubtype
   TYPE_DECIMAL,
   TYPE_CHAR,
   TYPE_VARCHAR,
@@ -62,7 +61,30 @@ enum PrimitiveType {
 PrimitiveType ThriftToType(TPrimitiveType::type ttype);
 TPrimitiveType::type ToThrift(PrimitiveType ptype);
 std::string TypeToString(PrimitiveType t);
-std::string TypeToOdbcString(PrimitiveType t);
+
+// Contains information about a type that generally doesn't affect how it should be
+// handled by backend, but can affect encoding / decoding.
+struct AuxColumnType {
+  // Differentiates between STRING and BINARY.
+  // As STRING is just a byte array in Impala (no UTF-8 encoding), the two types are
+  // practically the same in the backend - only some file format readers/writers
+  // differentiate between the two. Instead of using PrimitiveType::TYPE_BINARY BINARY
+  // uses TYPE_STRING to ensure that everything that works for STRING also works for
+  // BINARY.
+  enum class StringSubtype {
+    STRING,
+    BINARY
+  };
+  StringSubtype string_subtype = StringSubtype::STRING;
+
+  AuxColumnType(const TColumnType& thrift_type);
+
+  inline bool IsBinaryStringSubtype() const {
+    return string_subtype == StringSubtype::BINARY;
+  }
+};
+
+std::string TypeToOdbcString(const TColumnType& type);
 
 // Describes a type. Includes the enum, children types, and any type-specific metadata
 // (e.g. precision and scale for decimals).
@@ -92,13 +114,16 @@ struct ColumnType {
 
   /// Only set if type == TYPE_STRUCT. The field name of each child.
   std::vector<std::string> field_names;
+  /// Only set if type == TYPE_STRUCT. The field id of each child for Iceberg tables.
+  std::vector<int> field_ids;
 
   static const char* LLVM_CLASS_NAME;
 
-  ColumnType(PrimitiveType type = INVALID_TYPE)
+  explicit ColumnType(PrimitiveType type = INVALID_TYPE)
     : type(type), len(-1), precision(-1), scale(-1) {
     DCHECK_NE(type, TYPE_CHAR);
     DCHECK_NE(type, TYPE_VARCHAR);
+    DCHECK_NE(type, TYPE_BINARY);
     DCHECK_NE(type, TYPE_DECIMAL);
     DCHECK_NE(type, TYPE_STRUCT);
     DCHECK_NE(type, TYPE_ARRAY);
@@ -213,17 +238,83 @@ struct ColumnType {
     return type == TYPE_STRUCT || type == TYPE_ARRAY || type == TYPE_MAP;
   }
 
+  inline bool IsStructType() const {
+    return type == TYPE_STRUCT;
+  }
+
   inline bool IsCollectionType() const {
     return type == TYPE_ARRAY || type == TYPE_MAP;
   }
 
-  inline bool IsVarLenType() const {
-    return IsVarLenStringType() || IsCollectionType();
-  }
+  inline bool IsArrayType() const { return type == TYPE_ARRAY; }
+  inline bool IsMapType() const { return type == TYPE_MAP; }
 
   /// Returns the byte size of this type.  Returns 0 for variable length types.
-  inline int GetByteSize() const {
-    switch (type) {
+  inline int GetByteSize() const { return GetByteSize(*this); }
+
+  /// Returns the size of a slot for this type.
+  inline int GetSlotSize() const { return GetSlotSize(*this); }
+
+  static inline int GetDecimalByteSize(int precision) {
+    DCHECK_GT(precision, 0);
+    if (precision <= MAX_DECIMAL4_PRECISION) return 4;
+    if (precision <= MAX_DECIMAL8_PRECISION) return 8;
+    return 16;
+  }
+
+  /// Returns the IR version of this ColumnType. Only implemented for scalar types. LLVM
+  /// optimizer can pull out fields of the returned ConstantStruct for constant folding.
+  llvm::ConstantStruct* ToIR(LlvmCodeGen* codegen) const;
+
+  std::string DebugString() const;
+
+  /// Used to create a possibly nested type from the flattened Thrift representation.
+  ///
+  /// 'idx' is an in/out parameter that is initially set to the index of the type in
+  /// 'types' being constructed, and is set to the index of the next type in 'types' that
+  /// needs to be processed (or the size 'types' if all nodes have been processed).
+  ColumnType(const std::vector<TTypeNode>& types, int* idx);
+
+ private:
+  /// Recursive implementation of ToThrift() that populates 'thrift_type' with the
+  /// TTypeNodes for this type and its children.
+  void ToThrift(TColumnType* thrift_type) const;
+
+  /// Helper function for GetSlotSize() so that struct size could be calculated
+  /// recursively.
+  static inline int GetSlotSize(const ColumnType& col_type) {
+    switch (col_type.type) {
+      case TYPE_STRUCT: {
+        int struct_size = 0;
+        for (ColumnType child_type : col_type.children) {
+          struct_size += GetSlotSize(child_type);
+        }
+        return struct_size;
+      }
+      case TYPE_STRING:
+      case TYPE_VARCHAR:
+        return 12;
+      case TYPE_CHAR:
+      case TYPE_FIXED_UDA_INTERMEDIATE:
+        return col_type.len;
+      case TYPE_ARRAY:
+      case TYPE_MAP:
+        return 12;
+      default:
+        return GetByteSize(col_type);
+    }
+  }
+
+  /// Helper function for GetByteSize()
+  static inline int GetByteSize(const ColumnType& col_type) {
+    switch (col_type.type) {
+      case TYPE_STRUCT: {
+        int struct_size = 0;
+        for (ColumnType child_type : col_type.children) {
+          struct_size += GetByteSize(child_type);
+        }
+        return struct_size;
+      }
       case TYPE_ARRAY:
       case TYPE_MAP:
       case TYPE_STRING:
@@ -231,7 +322,7 @@ struct ColumnType {
         return 0;
       case TYPE_CHAR:
       case TYPE_FIXED_UDA_INTERMEDIATE:
-        return len;
+        return col_type.len;
       case TYPE_NULL:
       case TYPE_BOOLEAN:
       case TYPE_TINYINT:
@@ -249,58 +340,13 @@ struct ColumnType {
         // This is the size of the slot, the actual size of the data is 12.
         return 16;
       case TYPE_DECIMAL:
-        return GetDecimalByteSize(precision);
+        return GetDecimalByteSize(col_type.precision);
       case INVALID_TYPE:
       default:
-        DCHECK(false) << "NYI: " << type;
+        DCHECK(false) << "NYI: " << col_type.type;
     }
     return 0;
   }
-
-  /// Returns the size of a slot for this type.
-  inline int GetSlotSize() const {
-    switch (type) {
-      case TYPE_STRING:
-      case TYPE_VARCHAR:
-        return 12;
-      case TYPE_CHAR:
-      case TYPE_FIXED_UDA_INTERMEDIATE:
-        return len;
-      case TYPE_ARRAY:
-      case TYPE_MAP:
-        return 12;
-      case TYPE_STRUCT:
-        DCHECK(false) << "TYPE_STRUCT slot not possible";
-      default:
-        return GetByteSize();
-    }
-  }
-
-  static inline int GetDecimalByteSize(int precision) {
-    DCHECK_GT(precision, 0);
-    if (precision <= MAX_DECIMAL4_PRECISION) return 4;
-    if (precision <= MAX_DECIMAL8_PRECISION) return 8;
-    return 16;
-  }
-
-  /// Returns the IR version of this ColumnType. Only implemented for scalar types. LLVM
-  /// optimizer can pull out fields of the returned ConstantStruct for constant folding.
-  llvm::ConstantStruct* ToIR(LlvmCodeGen* codegen) const;
-
-  apache::hive::service::cli::thrift::TTypeEntry ToHs2Type() const;
-  std::string DebugString() const;
-
- private:
-  /// Used to create a possibly nested type from the flattened Thrift representation.
-  ///
-  /// 'idx' is an in/out parameter that is initially set to the index of the type in
-  /// 'types' being constructed, and is set to the index of the next type in 'types' that
-  /// needs to be processed (or the size 'types' if all nodes have been processed).
-  ColumnType(const std::vector<TTypeNode>& types, int* idx);
-
-  /// Recursive implementation of ToThrift() that populates 'thrift_type' with the
-  /// TTypeNodes for this type and its children.
-  void ToThrift(TColumnType* thrift_type) const;
 };
 
 std::ostream& operator<<(std::ostream& os, const ColumnType& type);

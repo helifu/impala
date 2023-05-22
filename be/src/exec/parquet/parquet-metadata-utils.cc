@@ -19,6 +19,7 @@
 
 #include <strings.h>
 #include <sstream>
+#include <stack>
 #include <string>
 #include <vector>
 
@@ -94,6 +95,7 @@ static bool IsEncodingSupported(parquet::Encoding::type e) {
     case parquet::Encoding::PLAIN_DICTIONARY:
     case parquet::Encoding::BIT_PACKED:
     case parquet::Encoding::RLE:
+    case parquet::Encoding::RLE_DICTIONARY:
       return true;
     default:
       return false;
@@ -151,12 +153,12 @@ void SetDecimalConvertedAndLogicalType(
 /// normalization, and older readers that do not use logical types would incorrectly
 /// interpret TIMESTAMP_MILLIS/MICROS as UTC normalized.
 /// Leaves logical type empty for int96 timestamps.
-void SetTimestampLogicalType(const TQueryOptions& query_options,
+void SetTimestampLogicalType(TParquetTimestampType::type parquet_timestamp_type,
     parquet::SchemaElement* col_schema) {
-  if(query_options.parquet_timestamp_type == TParquetTimestampType::INT96_NANOS) return;
+  if (parquet_timestamp_type == TParquetTimestampType::INT96_NANOS) return;
 
   parquet::TimeUnit time_unit;
-  switch (query_options.parquet_timestamp_type) {
+  switch (parquet_timestamp_type) {
     case TParquetTimestampType::INT64_MILLIS:
       time_unit.__set_MILLIS(parquet::MilliSeconds());
       break;
@@ -177,6 +179,41 @@ void SetTimestampLogicalType(const TQueryOptions& query_options,
   parquet::LogicalType logical_type;
   logical_type.__set_TIMESTAMP(timestamp_type);
   col_schema->__set_logicalType(logical_type);
+}
+
+bool IsScaleSet(const parquet::SchemaElement& schema_element) {
+  // Scale is required in DecimalType
+  return (schema_element.__isset.logicalType
+             && schema_element.logicalType.__isset.DECIMAL)
+      || schema_element.__isset.scale;
+}
+
+bool IsPrecisionSet(const parquet::SchemaElement& schema_element) {
+  // Precision is required in DecimalType
+  return (schema_element.__isset.logicalType
+             && schema_element.logicalType.__isset.DECIMAL)
+      || schema_element.__isset.precision;
+}
+
+int32_t GetScale(const parquet::SchemaElement& schema_element) {
+  if (schema_element.__isset.logicalType && schema_element.logicalType.__isset.DECIMAL) {
+    return schema_element.logicalType.DECIMAL.scale;
+  }
+
+  if (schema_element.__isset.scale) return schema_element.scale;
+
+  // If not specified, the scale is 0
+  return 0;
+}
+
+// Precision is required, this should be called after checking IsPrecisionSet()
+int32_t GetPrecision(const parquet::SchemaElement& schema_element) {
+  DCHECK(IsPrecisionSet(schema_element));
+  if (schema_element.__isset.logicalType && schema_element.logicalType.__isset.DECIMAL) {
+    return schema_element.logicalType.DECIMAL.precision;
+  }
+
+  return schema_element.precision;
 }
 
 /// Mapping of impala's internal types to parquet storage types. This is indexed by
@@ -216,7 +253,7 @@ const std::vector<ParquetSchemaResolver::ArrayEncoding>
 
 Status ParquetMetadataUtils::ValidateFileVersion(
     const parquet::FileMetaData& file_metadata, const char* filename) {
-  if (file_metadata.version > PARQUET_CURRENT_VERSION) {
+  if (file_metadata.version > PARQUET_MAX_SUPPORTED_VERSION) {
     stringstream ss;
     ss << "File: " << filename << " is of an unsupported version. "
        << "file version: " << file_metadata.version;
@@ -245,7 +282,7 @@ Status ParquetMetadataUtils::ValidateColumnOffsets(const string& filename,
     }
     int64_t col_len = col_chunk.meta_data.total_compressed_size;
     int64_t col_end = col_start + col_len;
-    if (col_end <= 0 || col_end > file_length) {
+    if (col_end <= 0 || col_end >= file_length) {
       return Status(Substitute("Parquet file '$0': metadata is corrupt. Column $1 has "
           "invalid column offsets (offset=$2, size=$3, file_size=$4).", filename, i,
           col_start, col_len, file_length));
@@ -267,6 +304,7 @@ Status ParquetMetadataUtils::ValidateOffsetInFile(const string& filename, int co
 Status ParquetMetadataUtils::ValidateRowGroupColumn(
     const parquet::FileMetaData& file_metadata, const char* filename, int row_group_idx,
     int col_idx, const parquet::SchemaElement& schema_element, RuntimeState* state) {
+  DCHECK_GE(col_idx, 0);
   const parquet::ColumnMetaData& col_chunk_metadata =
       file_metadata.row_groups[row_group_idx].columns[col_idx].meta_data;
 
@@ -275,7 +313,7 @@ Status ParquetMetadataUtils::ValidateRowGroupColumn(
   for (int i = 0; i < encodings.size(); ++i) {
     if (!IsEncodingSupported(encodings[i])) {
       return Status(Substitute("File '$0' uses an unsupported encoding: $1 for column "
-          "'$2'.", filename, PrintThriftEnum(encodings[i]), schema_element.name));
+          "'$2'.", filename, PrintValue(encodings[i]), schema_element.name));
     }
   }
 
@@ -317,55 +355,35 @@ Status ParquetMetadataUtils::ValidateColumn(const char* filename,
   bool is_converted_type_decimal = schema_element.__isset.converted_type
       && schema_element.converted_type == parquet::ConvertedType::DECIMAL;
   if (slot_desc->type().type == TYPE_DECIMAL) {
-    // TODO: allow converting to wider type (IMPALA-2515)
-    if (schema_element.type == parquet::Type::INT32 &&
-        sizeof(int32_t) != slot_desc->type().GetByteSize()) {
-      return Status(Substitute("File '$0' decimal column '$1' is stored as INT32, but "
-          "based on the precision in the table metadata, another type would needed.",
-          filename, schema_element.name));
-    }
-    if (schema_element.type == parquet::Type::INT64 &&
-        sizeof(int64_t) != slot_desc->type().GetByteSize()) {
-      return Status(Substitute("File '$0' decimal column '$1' is stored as INT64, but "
-          "based on the precision in the table metadata, another type would needed.",
-          filename, schema_element.name));
-    }
     // We require that the scale and byte length be set.
     if (schema_element.type == parquet::Type::FIXED_LEN_BYTE_ARRAY) {
       if (!schema_element.__isset.type_length) {
         return Status(Substitute("File '$0' column '$1' does not have type_length set.",
             filename, schema_element.name));
       }
-
-      int expected_len = ParquetPlainEncoder::DecimalSize(slot_desc->type());
-      if (schema_element.type_length != expected_len) {
-        return Status(Substitute("File '$0' column '$1' has an invalid type length. "
-            "Expecting: $2 len in file: $3", filename, schema_element.name, expected_len,
-            schema_element.type_length));
+      if (schema_element.type_length <= 0) {
+        return Status(Substitute("File '$0' column '$1' has invalid type length: $2",
+            filename, schema_element.name, schema_element.type_length));
       }
     }
-    if (!schema_element.__isset.scale) {
-      return Status(Substitute("File '$0' column '$1' does not have the scale set.",
-          filename, schema_element.name));
-    }
 
-    if (schema_element.scale != slot_desc->type().scale) {
-      // TODO: we could allow a mismatch and do a conversion at this step.
-      return Status(Substitute("File '$0' column '$1' has a scale that does not match "
-          "the table metadata scale. File metadata scale: $2 Table metadata scale: $3",
-          filename, schema_element.name, schema_element.scale, slot_desc->type().scale));
-    }
-
-    // The other decimal metadata should be there but we don't need it.
-    if (!schema_element.__isset.precision) {
+    // We require that the precision be a positive value, and not larger than the
+    // precision in table schema.
+    if (!IsPrecisionSet(schema_element)) {
       ErrorMsg msg(TErrorCode::PARQUET_MISSING_PRECISION, filename, schema_element.name);
-      RETURN_IF_ERROR(state->LogOrReturnError(msg));
+      return Status(msg);
     } else {
-      if (schema_element.precision != slot_desc->type().precision) {
-        // TODO: we could allow a mismatch and do a conversion at this step.
+      int32_t precision = GetPrecision(schema_element);
+      if (precision > slot_desc->type().precision || precision <= 0) {
         ErrorMsg msg(TErrorCode::PARQUET_WRONG_PRECISION, filename, schema_element.name,
-            schema_element.precision, slot_desc->type().precision);
-        RETURN_IF_ERROR(state->LogOrReturnError(msg));
+            precision, slot_desc->type().precision);
+        return Status(msg);
+      }
+      int32_t scale = GetScale(schema_element);
+      if (scale < 0 || scale > precision) {
+        return Status(
+            Substitute("File '$0' column '$1' has invalid scale: $2. Precision is $3.",
+                filename, schema_element.name, scale, precision));
       }
     }
 
@@ -376,7 +394,7 @@ Status ParquetMetadataUtils::ValidateColumn(const char* filename,
           schema_element.name);
       RETURN_IF_ERROR(state->LogOrReturnError(msg));
     }
-  } else if (schema_element.__isset.scale || schema_element.__isset.precision
+  } else if (IsScaleSet(schema_element) || IsPrecisionSet(schema_element)
       || is_converted_type_decimal) {
     ErrorMsg msg(TErrorCode::PARQUET_INCOMPATIBLE_DECIMAL, filename, schema_element.name,
         slot_desc->type().DebugString());
@@ -386,19 +404,20 @@ Status ParquetMetadataUtils::ValidateColumn(const char* filename,
 }
 
 parquet::Type::type ParquetMetadataUtils::ConvertInternalToParquetType(
-    PrimitiveType type, const TQueryOptions& query_options) {
+    PrimitiveType type, TParquetTimestampType::type timestamp_type) {
   DCHECK_GE(type, 0);
   DCHECK_LT(type, INTERNAL_TO_PARQUET_TYPES_SIZE);
-  if (type == TYPE_TIMESTAMP &&
-      query_options.parquet_timestamp_type != TParquetTimestampType::INT96_NANOS) {
+  if (type == TYPE_TIMESTAMP && timestamp_type != TParquetTimestampType::INT96_NANOS) {
     return parquet::Type::INT64;
   }
   return INTERNAL_TO_PARQUET_TYPES[type];
 }
 
 void ParquetMetadataUtils::FillSchemaElement(const ColumnType& col_type,
-    const TQueryOptions& query_options, parquet::SchemaElement* col_schema) {
-  col_schema->__set_type(ConvertInternalToParquetType(col_type.type, query_options));
+    bool string_utf8, TParquetTimestampType::type timestamp_type,
+    const AuxColumnType& aux_type,
+    parquet::SchemaElement* col_schema) {
+  col_schema->__set_type(ConvertInternalToParquetType(col_type.type, timestamp_type));
   col_schema->__set_repetition_type(parquet::FieldRepetitionType::OPTIONAL);
 
   switch (col_type.type) {
@@ -412,7 +431,7 @@ void ParquetMetadataUtils::FillSchemaElement(const ColumnType& col_type,
     case TYPE_STRING:
       // By default STRING has no logical type, see IMPALA-5982.
       // VARCHAR and CHAR are always set to UTF8.
-      if (query_options.parquet_annotate_strings_utf8) {
+      if (string_utf8 && !aux_type.IsBinaryStringSubtype()) {
         SetUtf8ConvertedAndLogicalType(col_schema);
       }
       break;
@@ -433,7 +452,7 @@ void ParquetMetadataUtils::FillSchemaElement(const ColumnType& col_type,
       SetIntLogicalType(64, col_schema);
       break;
     case TYPE_TIMESTAMP:
-      SetTimestampLogicalType(query_options, col_schema);
+      SetTimestampLogicalType(timestamp_type, col_schema);
       break;
     case TYPE_DATE:
       SetDateLogicalType(col_schema);
@@ -693,7 +712,7 @@ Status ParquetSchemaResolver::ResolvePathHelper(ArrayEncoding array_encoding,
       if (*missing_field) return Status::OK();
     } else if (col_type->type == TYPE_STRUCT) {
       DCHECK_GT(col_type->children.size(), 0);
-      // Nothing to do for structs
+      RETURN_IF_ERROR(ResolveStruct(**node, *col_type, path, i));
     } else {
       DCHECK(!col_type->IsComplexType());
       DCHECK_EQ(i, path.size() - 1);
@@ -712,7 +731,7 @@ SchemaNode* ParquetSchemaResolver::NextSchemaNode(
 
   int file_idx;
   int table_idx = path[next_idx];
-  if (fallback_schema_resolution_ == TParquetFallbackSchemaResolution::type::NAME) {
+  if (fallback_schema_resolution_ == TSchemaResolutionStrategy::type::NAME) {
     if (next_idx == 0) {
       // Resolve top-level table column by name.
       DCHECK_LT(table_idx, tbl_desc_.col_descs().size());
@@ -743,10 +762,35 @@ SchemaNode* ParquetSchemaResolver::NextSchemaNode(
         file_idx = table_idx;
       }
     }
+  } else if (fallback_schema_resolution_ ==
+        TSchemaResolutionStrategy::type::FIELD_ID) {
+    // Resolution by field id for Iceberg table.
+    if (next_idx == 0) {
+      // Resolve top-level table column by field id.
+      DCHECK_LT(table_idx, tbl_desc_.col_descs().size());
+      const int& field_id = tbl_desc_.col_descs()[table_idx].field_id();
+      file_idx = FindChildWithFieldId(node, field_id);
+    } else if (col_type->type == TYPE_STRUCT) {
+      // Resolve struct field by field id.
+      DCHECK_LT(table_idx, col_type->field_ids.size());
+      const int& field_id = col_type->field_ids[table_idx];
+      file_idx = FindChildWithFieldId(node, field_id);
+    } else if (col_type->type == TYPE_ARRAY) {
+      // Arrays have only one child in the file.
+      DCHECK_EQ(table_idx, SchemaPathConstants::ARRAY_ITEM);
+      file_idx = table_idx;
+    } else {
+      DCHECK_EQ(col_type->type, TYPE_MAP);
+      DCHECK(table_idx == SchemaPathConstants::MAP_KEY ||
+             table_idx == SchemaPathConstants::MAP_VALUE);
+      // At this point we've found a MAP with a matching field id. It's safe to resolve
+      // the child (key or value) by position.
+      file_idx = table_idx;
+    }
   } else {
     // Resolution by position.
     DCHECK_EQ(fallback_schema_resolution_,
-        TParquetFallbackSchemaResolution::type::POSITION);
+        TSchemaResolutionStrategy::type::POSITION);
     if (next_idx == 0) {
       // For top-level columns, the first index in a path includes the table's partition
       // keys.
@@ -758,9 +802,9 @@ SchemaNode* ParquetSchemaResolver::NextSchemaNode(
 
   if (file_idx >= node->children.size()) {
     string schema_resolution_mode = "unknown";
-    auto entry = _TParquetFallbackSchemaResolution_VALUES_TO_NAMES.find(
+    auto entry = _TSchemaResolutionStrategy_VALUES_TO_NAMES.find(
         fallback_schema_resolution_);
-    if (entry != _TParquetFallbackSchemaResolution_VALUES_TO_NAMES.end()) {
+    if (entry != _TSchemaResolutionStrategy_VALUES_TO_NAMES.end()) {
       schema_resolution_mode = entry->second;
     }
     VLOG_FILE << Substitute(
@@ -769,6 +813,13 @@ SchemaNode* ParquetSchemaResolver::NextSchemaNode(
     *missing_field = true;
     return NULL;
   }
+
+  if (UNLIKELY(file_idx == INVALID_ID)) {
+    VLOG_FILE << Substitute("File '$0' is corrupted", filename_);
+    *missing_field = true;
+    return NULL;
+  }
+
   return &node->children[file_idx];
 }
 
@@ -777,6 +828,25 @@ int ParquetSchemaResolver::FindChildWithName(SchemaNode* node,
   int idx;
   for (idx = 0; idx < node->children.size(); ++idx) {
     if (strcasecmp(node->children[idx].element->name.c_str(), name.c_str()) == 0) break;
+  }
+  return idx;
+}
+
+int ParquetSchemaResolver::FindChildWithFieldId(SchemaNode* node,
+    const int& field_id) const {
+  int idx;
+  for (idx = 0; idx < node->children.size(); ++idx) {
+    SchemaNode* child = &node->children[idx];
+
+    int child_field_id = 0;
+
+    if (LIKELY(child->element->__isset.field_id)) {
+      child_field_id = child->element->field_id;
+    } else {
+      child_field_id = GetGeneratedFieldID(child);
+    }
+    if (child_field_id == field_id) return idx;
+    if (UNLIKELY(child_field_id == INVALID_ID)) return INVALID_ID;
   }
   return idx;
 }
@@ -885,6 +955,16 @@ Status ParquetSchemaResolver::ResolveMap(const SchemaPath& path, int idx,
   return Status::OK();
 }
 
+Status ParquetSchemaResolver::ResolveStruct(const SchemaNode& node,
+    const ColumnType& col_type, const SchemaPath& path, int idx) const {
+  if (node.children.size() < 1) {
+    ErrorMsg msg(TErrorCode::PARQUET_UNRECOGNIZED_SCHEMA, filename_,
+        PrintSubPath(tbl_desc_, path, idx), "struct", node.DebugString());
+    return Status::Expected(msg);
+  }
+  return Status::OK();
+}
+
 Status ParquetSchemaResolver::ValidateScalarNode(const SchemaNode& node,
     const ColumnType& col_type, const SchemaPath& path, int idx) const {
   if (!node.children.empty()) {
@@ -900,4 +980,53 @@ Status ParquetSchemaResolver::ValidateScalarNode(const SchemaNode& node,
   return Status::OK();
 }
 
+void ParquetSchemaResolver::GenerateFieldIDs() {
+  std::stack<SchemaNode*> nodes;
+
+  nodes.push(&schema_);
+
+  int fieldID = 1;
+
+  while (!nodes.empty()) {
+    SchemaNode* current = nodes.top();
+    nodes.pop();
+
+    uint64_t size = current->children.size();
+
+    for (uint64_t i = 0; i < size; i++) {
+      auto retval = schema_node_to_field_id_.emplace(&current->children[i], fieldID++);
+
+      // Emplace has to be successful, otherwise we visited the same node twice
+      DCHECK(retval.second);
+
+      // Push children in reverse order to the stack so they are processed in the original
+      // order
+      const uint64_t reverse_idx = size - i - 1;
+
+      SchemaNode& current_child = current->children[reverse_idx];
+
+      const parquet::ConvertedType::type child_type =
+          current_child.element->converted_type;
+
+      if (child_type == parquet::ConvertedType::type::LIST
+          || child_type == parquet::ConvertedType::type::MAP) {
+        // Skip middle level
+        DCHECK(current_child.children.size() == 1);
+
+        nodes.push(&current_child.children[0]);
+      } else {
+        nodes.push(&current_child);
+      }
+    }
+  }
+}
+
+int ParquetSchemaResolver::GetGeneratedFieldID(SchemaNode* node) const {
+  auto it = schema_node_to_field_id_.find(node);
+
+  // First column has field ID, this one does not, file is corrupted
+  if (UNLIKELY(it == schema_node_to_field_id_.end())) return INVALID_ID;
+
+  return it->second;
+}
 }

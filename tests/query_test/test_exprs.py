@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 import re
 from random import randint
@@ -39,8 +41,8 @@ class TestExprs(ImpalaTestSuite):
         ImpalaTestDimension('enable_expr_rewrites', *[0,1]))
     if cls.exploration_strategy() == 'core':
       # Test with file format that supports codegen
-      cls.ImpalaTestMatrix.add_constraint(lambda v:\
-          v.get_value('table_format').file_format == 'text' and\
+      cls.ImpalaTestMatrix.add_constraint(lambda v:
+          v.get_value('table_format').file_format == 'parquet' and
           v.get_value('table_format').compression_codec == 'none')
 
   def test_exprs(self, vector):
@@ -101,7 +103,7 @@ class TestExprLimits(ImpalaTestSuite):
   def test_expr_child_limit(self, vector):
     # IN predicate
     in_query = "select 1 IN("
-    for i in xrange(0, self.EXPR_CHILDREN_LIMIT - 1):
+    for i in range(0, self.EXPR_CHILDREN_LIMIT - 1):
       in_query += str(i)
       if (i + 1 != self.EXPR_CHILDREN_LIMIT - 1):
         in_query += ","
@@ -110,7 +112,7 @@ class TestExprLimits(ImpalaTestSuite):
 
     # CASE expr
     case_query = "select case "
-    for i in xrange(0, self.EXPR_CHILDREN_LIMIT/2):
+    for i in range(0, self.EXPR_CHILDREN_LIMIT // 2):
       case_query += " when true then 1"
     case_query += " end"
     self.__exec_query(case_query)
@@ -164,6 +166,9 @@ class TestExprLimits(ImpalaTestSuite):
     err = self.execute_query_expect_failure(self.client, invalid_sql)
     assert re.search(expected_err_tmpl.format(len(invalid_sql), size_16mb), str(err))
 
+  # This test can take ~2GB memory while it takes only ~10 seconds. It caused OOM
+  # in the past, so it is safer to run it serially.
+  @pytest.mark.execute_serially
   def test_statement_expression_limit(self):
     """Generate a huge case statement that barely fits within the 16MB limit but exceeds
        the statement expression limit. Verify that it fails."""
@@ -177,7 +182,7 @@ class TestExprLimits(ImpalaTestSuite):
 
   def __gen_huge_case(self, col_name, fanout, depth, indent):
     toks = ["case\n"]
-    for i in xrange(fanout):
+    for i in range(fanout):
       add = randint(1, 1000000)
       divisor = randint(1, 10000000)
       mod = randint(0, divisor)
@@ -196,16 +201,16 @@ class TestExprLimits(ImpalaTestSuite):
 
   def __gen_deep_infix_expr(self, prefix, repeat_suffix):
     expr = prefix
-    for i in xrange(self.EXPR_DEPTH_LIMIT - 1):
+    for i in range(self.EXPR_DEPTH_LIMIT - 1):
       expr += repeat_suffix
     return expr
 
   def __gen_deep_func_expr(self, open_func, base_arg, close_func):
     expr = ""
-    for i in xrange(self.EXPR_DEPTH_LIMIT - 1):
+    for i in range(self.EXPR_DEPTH_LIMIT - 1):
       expr += open_func
     expr += base_arg
-    for i in xrange(self.EXPR_DEPTH_LIMIT - 1):
+    for i in range(self.EXPR_DEPTH_LIMIT - 1):
       expr += close_func
     return expr
 
@@ -243,3 +248,45 @@ class TestUtcTimestampFunctions(ImpalaTestSuite):
     vector.get_value('exec_option')['enable_expr_rewrites'] = \
         vector.get_value('enable_expr_rewrites')
     self.run_test_case('QueryTest/utc-timestamp-functions', vector)
+
+
+class TestConstantFoldingNoTypeLoss(ImpalaTestSuite):
+  """"Regression tests for IMPALA-11462."""
+
+  @classmethod
+  def get_workload(self):
+    return "functional-query"
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestConstantFoldingNoTypeLoss, cls).add_test_dimensions()
+    # Test with and without expr rewrites to verify that constant folding does not change
+    # the behaviour.
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('enable_expr_rewrites', *[0,1]))
+    # We don't actually use a table so one file format is enough.
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format in ['parquet'])
+
+  def test_shiftleft(self, vector):
+    """ Tests that the return values of the 'shiftleft' functions are correct for the
+    input types (the return type should be the same as the first argument)."""
+    types_and_widths = [
+      ("TINYINT", 8),
+      ("SMALLINT", 16),
+      ("INT", 32),
+      ("BIGINT", 64)
+    ]
+    query_template = ("select shiftleft(cast(1 as {typename}), z) c "
+        "from (select {shift_val} z ) x")
+    for (typename, width) in types_and_widths:
+      shift_val = width - 2  # Valid and positive for signed types.
+      expected_value = 1 << shift_val
+      result = self.execute_query_expect_success(self.client,
+          query_template.format(typename=typename, shift_val=shift_val))
+      assert result.data == [str(expected_value)]
+
+  def test_addition(self, vector):
+    query = "select typeof(cast(1 as bigint) + cast(rand() as tinyint))"
+    result = self.execute_query_expect_success(self.client, query)
+    assert result.data == ["BIGINT"]

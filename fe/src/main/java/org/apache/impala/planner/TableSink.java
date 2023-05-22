@@ -27,6 +27,7 @@ import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TSinkAction;
 import org.apache.impala.thrift.TSortingOrder;
+import org.apache.impala.util.ExprUtil;
 
 import com.google.common.base.Preconditions;
 
@@ -102,17 +103,28 @@ public abstract class TableSink extends DataSink {
       List<Integer> referencedColumns, boolean overwrite,
       boolean inputIsClustered, Pair<List<Integer>, TSortingOrder> sortProperties) {
     return create(table, sinkAction, partitionKeyExprs, outputExprs, referencedColumns,
-        overwrite, inputIsClustered, sortProperties, -1);
+        overwrite, inputIsClustered, sortProperties, -1, null, 0, false);
   }
 
   /**
-   * Same as above, plus it takes an ACID write id in parameter 'writeId'.
+   * Same as above, plus it takes an ACID write id 'writeId' and Kudu transaction token
+   * 'kuduTxnToken' in parameter.
    */
   public static TableSink create(FeTable table, Op sinkAction,
       List<Expr> partitionKeyExprs, List<Expr> outputExprs,
-      List<Integer> referencedColumns,
-      boolean overwrite, boolean inputIsClustered,
-      Pair<List<Integer>, TSortingOrder> sortProperties, long writeId) {
+      List<Integer> referencedColumns, boolean overwrite, boolean inputIsClustered,
+      Pair<List<Integer>, TSortingOrder> sortProperties, long writeId,
+      java.nio.ByteBuffer kuduTxnToken, int maxTableSinks) {
+    return create(table, sinkAction, partitionKeyExprs, outputExprs, referencedColumns,
+        overwrite, inputIsClustered, sortProperties, writeId, kuduTxnToken, maxTableSinks,
+        false);
+  }
+
+  public static TableSink create(FeTable table, Op sinkAction,
+      List<Expr> partitionKeyExprs, List<Expr> outputExprs,
+      List<Integer> referencedColumns, boolean overwrite, boolean inputIsClustered,
+      Pair<List<Integer>, TSortingOrder> sortProperties, long writeId,
+      java.nio.ByteBuffer kuduTxnToken, int maxTableSinks, boolean isResultSink) {
     Preconditions.checkNotNull(partitionKeyExprs);
     Preconditions.checkNotNull(referencedColumns);
     Preconditions.checkNotNull(sortProperties.first);
@@ -122,7 +134,7 @@ public abstract class TableSink extends DataSink {
       // Referenced columns don't make sense for an Hdfs table.
       Preconditions.checkState(referencedColumns.isEmpty());
       return new HdfsTableSink(table, partitionKeyExprs,outputExprs, overwrite,
-          inputIsClustered, sortProperties, writeId);
+          inputIsClustered, sortProperties, writeId, maxTableSinks, isResultSink);
     } else if (table instanceof FeHBaseTable) {
       // HBase only supports inserts.
       Preconditions.checkState(sinkAction == Op.INSERT);
@@ -141,10 +153,17 @@ public abstract class TableSink extends DataSink {
       Preconditions.checkState(overwrite == false);
       // Sort columns are not supported for Kudu tables.
       Preconditions.checkState(sortProperties.first.isEmpty());
-      return new KuduTableSink(table, sinkAction, referencedColumns, outputExprs);
+      return new KuduTableSink(
+          table, sinkAction, referencedColumns, outputExprs, kuduTxnToken);
     } else {
       throw new UnsupportedOperationException(
           "Cannot create data sink into table of type: " + table.getClass().getName());
     }
+  }
+
+  protected ProcessingCost computeDefaultProcessingCost() {
+    // TODO: consider including materialization cost into the returned cost.
+    return ProcessingCost.basicCost(getLabel(), fragment_.getPlanRoot().getCardinality(),
+        ExprUtil.computeExprsTotalCost(outputExprs_));
   }
 }

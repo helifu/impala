@@ -19,7 +19,6 @@ package org.apache.impala.analysis;
 
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.common.FrontendTestBase;
-import org.apache.impala.service.BackendConfig;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.kudu.ColumnSchema.CompressionAlgorithm;
 import org.apache.kudu.ColumnSchema.Encoding;
@@ -72,7 +71,6 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
   }
 
   private void testDDlsOnKuduTable(boolean isExternalPurgeTbl) {
-    TestUtils.assumeKuduIsSupported();
     // Test primary keys and partition by clauses
     AnalyzesOk("create table tab (x int primary key) partition by hash(x) " +
         "partitions 8 stored as kudu", isExternalPurgeTbl);
@@ -86,6 +84,32 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
         "partition by hash(y) partitions 8 stored as kudu", isExternalPurgeTbl);
     AnalyzesOk("create table tab (x timestamp, y timestamp, primary key(x)) " +
         "partition by hash(x) partitions 8 stored as kudu", isExternalPurgeTbl);
+    // Test non unique primary key
+    AnalyzesOk("create table tab (x int non unique primary key) partition by hash(x) " +
+        "partitions 8 stored as kudu", isExternalPurgeTbl);
+    AnalyzesOk("create table tab (x int, non unique primary key(x)) " +
+        "partition by hash(x) partitions 8 stored as kudu", isExternalPurgeTbl);
+    AnalyzesOk("create table tab (x int, y int, non unique primary key (x, y)) " +
+        "partition by hash(x, y) partitions 8 stored as kudu", isExternalPurgeTbl);
+    AnalyzesOk("create table tab (x int, y int, non unique primary key (x)) " +
+        "partition by range (partition values < 10, partition 10 <= values < 30, " +
+        "partition 30 <= values) stored as kudu tblproperties(" +
+        "'kudu.num_tablet_replicas' = '3')", isExternalPurgeTbl);
+    AnalyzesOk("create table tab (x int, y int, non unique primary key(x, y)) " +
+        "stored as kudu", isExternalPurgeTbl);
+    AnalyzesOk("create table tab (x timestamp, y timestamp, non unique primary key(x))" +
+        " partition by hash(x) partitions 8 stored as kudu", isExternalPurgeTbl);
+    // Promote all partition columns as non unique primary key columns if primary keys
+    // are not declared, but partition columns must be the first columns in the table.
+    AnalyzesOk("create table tab (x int, y int) partition by hash(x) partitions 8 " +
+        "stored as kudu", isExternalPurgeTbl);
+    AnalyzesOk("create table tab (x int, y int) partition by hash(x, y) partitions 8 " +
+        "stored as kudu", isExternalPurgeTbl);
+    AnalysisError("create table tab (x int, y int) partition by hash(y) partitions 8 " +
+        "stored as kudu", "Specify primary key or non unique primary key for the Kudu " +
+        "table, or create partitions with the beginning columns of the table.",
+        isExternalPurgeTbl);
+
     AnalyzesOk("create table tab (x int, y string, primary key (x)) partition by " +
         "hash (x) partitions 3, range (x) (partition values < 1, partition " +
         "1 <= values < 10, partition 10 <= values < 20, partition value = 30) " +
@@ -120,8 +144,20 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
         "(partition values < 'aa', partition 'aa' <= values < 'bb', " +
         "partition 'bb' <= values < 'cc', partition 'cc' <= values) " +
         "stored as kudu", isExternalPurgeTbl);
+    // Swapped RANGE and HASH
+    AnalyzesOk("create table tab (x int, y string, primary key(x, y)) " +
+        "partition by range(y) (partition values < 'aa', partition 'aa' " +
+        "<= values < 'bb', partition 'bb' <= values < 'cc', partition 'cc' <= values), " +
+        "hash(x) partitions 3 stored as kudu", isExternalPurgeTbl);
+    // RANGE followed by multiple HASH
+    AnalyzesOk("create table tab (x int, y string, primary key(x, y)) " +
+        "partition by range(y) (partition values < 'aa', partition 'aa' " +
+        "<= values < 'bb', partition 'bb' <= values < 'cc', partition 'cc' <= values), " +
+        "hash(x) partitions 3, hash(y) partitions 2 stored as kudu", isExternalPurgeTbl);
     // Key column in upper case
     AnalyzesOk("create table tab (x int, y int, primary key (X)) " +
+        "partition by hash (x) partitions 8 stored as kudu", isExternalPurgeTbl);
+    AnalyzesOk("create table tab (x int, y int, non unique primary key (X)) " +
         "partition by hash (x) partitions 8 stored as kudu", isExternalPurgeTbl);
     // Flexible Partitioning
     AnalyzesOk("create table tab (a int, b int, c int, d int, primary key (a, b, c))" +
@@ -156,19 +192,47 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
     AnalysisError("create table tab (x int, y int, primary key (z)) " +
         "partition by hash (x) partitions 8 stored as kudu",
         "PRIMARY KEY column 'z' does not exist in the table", isExternalPurgeTbl);
+    AnalysisError("create table tab (x int, y int, non unique primary key (z)) " +
+        "partition by hash (x) partitions 8 stored as kudu",
+        "NON UNIQUE PRIMARY KEY column 'z' does not exist in the table",
+        isExternalPurgeTbl);
     // Invalid composite primary key
     AnalysisError("create table tab (x int primary key, primary key(x)) stored " +
-        "as kudu", "Multiple primary keys specified. Composite primary keys can " +
+        "as kudu", "Multiple PRIMARY KEYS specified. Composite PRIMARY KEY can " +
         "be specified using the PRIMARY KEY (col1, col2, ...) syntax at the end " +
         "of the column definition.", isExternalPurgeTbl);
     AnalysisError("create table tab (x int primary key, y int primary key) stored " +
-        "as kudu", "Multiple primary keys specified. Composite primary keys can " +
+        "as kudu", "Multiple PRIMARY KEYS specified. Composite PRIMARY KEY can " +
         "be specified using the PRIMARY KEY (col1, col2, ...) syntax at the end " +
         "of the column definition.", isExternalPurgeTbl);
+    // Invalid composite non unique primary key
+    AnalysisError("create table tab (x int non unique primary key, " +
+        "non unique primary key(x)) stored as kudu",
+        "Multiple NON UNIQUE PRIMARY KEYS specified. Composite NON UNIQUE PRIMARY KEY " +
+        "can be specified using the NON UNIQUE PRIMARY KEY (col1, col2, ...) syntax at " +
+        "the end of the column definition.", isExternalPurgeTbl);
+    AnalysisError("create table tab (x int non unique primary key, " +
+        "y int non unique primary key) stored as kudu",
+        "Multiple NON UNIQUE PRIMARY KEYS specified. Composite NON UNIQUE PRIMARY KEY " +
+        "can be specified using the NON UNIQUE PRIMARY KEY (col1, col2, ...) syntax at " +
+        "the end of the column definition.", isExternalPurgeTbl);
+    AnalysisError("create table tab (x int non unique primary key, " +
+        "y int primary key) stored as kudu",
+        "Multiple NON UNIQUE PRIMARY KEYS specified. Composite NON UNIQUE PRIMARY KEY " +
+        "can be specified using the NON UNIQUE PRIMARY KEY (col1, col2, ...) syntax at " +
+        "the end of the column definition.", isExternalPurgeTbl);
+    AnalysisError("create table tab (x int primary key, y int non unique primary key) " +
+        "stored as kudu", "Multiple PRIMARY KEYS specified. Composite PRIMARY KEY " +
+        "can be specified using the PRIMARY KEY (col1, col2, ...) syntax at " +
+        "the end of the column definition.", isExternalPurgeTbl);
     // Specifying the same primary key column multiple times
     AnalysisError("create table tab (x int, primary key (x, x)) partition by hash (x) " +
         "partitions 8 stored as kudu",
         "Column 'x' is listed multiple times as a PRIMARY KEY.", isExternalPurgeTbl);
+    AnalysisError("create table tab (x int, non unique primary key (x, x)) " +
+        "partition by hash (x) partitions 8 stored as kudu",
+        "Column 'x' is listed multiple times as a NON UNIQUE PRIMARY KEY.",
+        isExternalPurgeTbl);
     // Number of range partition boundary values should be equal to the number of range
     // columns.
     AnalysisError("create table tab (a int, b int, c int, d int, primary key(a, b, c)) " +
@@ -288,7 +352,7 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
 
 
     // Test unsupported Kudu types
-    List<String> unsupportedTypes = Lists.newArrayList("VARCHAR(20)", "CHAR(20)",
+    List<String> unsupportedTypes = Lists.newArrayList("CHAR(20)",
         "STRUCT<f1:INT,f2:STRING>", "ARRAY<INT>", "MAP<STRING,STRING>");
     for (String t: unsupportedTypes) {
       String expectedError = String.format(
@@ -326,7 +390,17 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
                   "%s encoding %s compression %s %s %s) partition by hash (x) " +
                   "partitions 3 stored as kudu", nul, enc, comp, def, block);
               if (nul.equals("null")) {
-                AnalysisError(createTblStr, "Primary key columns cannot be nullable",
+                AnalysisError(createTblStr, "PRIMARY KEY columns cannot be nullable",
+                    isExternalPurgeTbl);
+              } else {
+                AnalyzesOk(createTblStr, isExternalPurgeTbl);
+              }
+              createTblStr = String.format("create table tab (x int non unique primary " +
+                  "key %s encoding %s compression %s %s %s) partition by hash (x) " +
+                  "partitions 3 stored as kudu", nul, enc, comp, def, block);
+              if (nul.equals("null")) {
+                AnalysisError(
+                    createTblStr, "NON UNIQUE PRIMARY KEY columns cannot be nullable",
                     isExternalPurgeTbl);
               } else {
                 AnalyzesOk(createTblStr, isExternalPurgeTbl);
@@ -340,7 +414,8 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
     AnalyzesOk("create table tab (x int primary key, i1 tinyint default null, " +
         "i2 smallint default null, i3 int default null, i4 bigint default null, " +
         "vals string default null, valf float default null, vald double default null, " +
-        "valb boolean default null, valdec decimal(10, 5) default null) " +
+        "valb boolean default null, valdec decimal(10, 5) default null, " +
+        "valdate date default null, valvc varchar(10) default null) " +
         "partition by hash (x) partitions 3 stored as kudu", isExternalPurgeTbl);
     // Use NULL as a default value on a non-nullable column
     AnalysisError("create table tab (x int primary key, y int not null default null) " +
@@ -351,13 +426,25 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
         "compression snappy block_size 1, y int null encoding rle compression lz4 " +
         "default 1, primary key(x)) partition by hash (x) partitions 3 " +
         "stored as kudu", isExternalPurgeTbl);
+    AnalyzesOk("create table tab (x int not null encoding plain_encoding " +
+        "compression snappy block_size 1, y int null encoding rle compression lz4 " +
+        "default 1, non unique primary key(x)) partition by hash (x) partitions 3 " +
+        "stored as kudu", isExternalPurgeTbl);
     // Primary keys can't be null
     AnalysisError("create table tab (x int primary key null, y int not null) " +
-        "partition by hash (x) partitions 3 stored as kudu", "Primary key columns " +
+        "partition by hash (x) partitions 3 stored as kudu", "PRIMARY KEY columns " +
         "cannot be nullable: x INT PRIMARY KEY NULL", isExternalPurgeTbl);
     AnalysisError("create table tab (x int not null, y int null, primary key (x, y)) " +
-        "partition by hash (x) partitions 3 stored as kudu", "Primary key columns " +
+        "partition by hash (x) partitions 3 stored as kudu", "PRIMARY KEY columns " +
         "cannot be nullable: y INT NULL", isExternalPurgeTbl);
+    AnalysisError("create table tab (x int non unique primary key null, " +
+        "y int not null) partition by hash (x) partitions 3 stored as kudu",
+        "NON UNIQUE PRIMARY KEY columns cannot be nullable: " +
+        "x INT NON UNIQUE PRIMARY KEY NULL", isExternalPurgeTbl);
+    AnalysisError("create table tab (x int not null, y int null, " +
+        "non unique primary key (x, y)) partition by hash (x) partitions 3 " +
+        "stored as kudu", "NON UNIQUE PRIMARY KEY columns cannot be nullable: " +
+        "y INT NULL", isExternalPurgeTbl);
     // Unsupported encoding value
     AnalysisError("create table tab (x int primary key, y int encoding invalid_enc) " +
         "partition by hash (x) partitions 3 stored as kudu", "Unsupported encoding " +
@@ -375,6 +462,8 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
         "valf float default cast(1.2 as float), vald double default " +
         "cast(3.1452 as double), valb boolean default true, " +
         "valdec decimal(10, 5) default 3.14159, " +
+        "valdate date default date '1970-01-01', " +
+        "valvc varchar(10) default cast('test' as varchar(10)), " +
         "primary key (i1, i2, i3, i4, vals)) partition by hash (i1) partitions 3 " +
         "stored as kudu", isExternalPurgeTbl);
     AnalyzesOk("create table tab (i int primary key default 1+1+1) " +
@@ -419,14 +508,10 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
         "partitions 8 sort by(i) stored as kudu", "SORT BY is not supported for Kudu " +
         "tables.", isExternalPurgeTbl);
 
-    // Z-Sort columns are not supported for Kudu tables.
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
-
+    // Z-Order sorted columns are not supported for Kudu tables.
     AnalysisError("create table tab (i int, x int primary key) partition by hash(x) " +
         "partitions 8 sort by zorder(i) stored as kudu", "SORT BY is not " +
         "supported for Kudu tables.", isExternalPurgeTbl);
-
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
 
     // Range partitions with TIMESTAMP
     AnalyzesOk("create table ts_ranges (ts timestamp primary key) " +
@@ -473,8 +558,7 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
     AnalysisError("create table tdefault (id int primary key, " +
         "ts timestamp not null default cast('00:00:00' as timestamp)) " +
         "partition by hash(id) partitions 3 stored as kudu",
-        "CAST('00:00:00' AS TIMESTAMP) cannot be cast to a TIMESTAMP literal.",
-        isExternalPurgeTbl);
+        "Default value of NULL not allowed on non-nullable column:", isExternalPurgeTbl);
     AnalysisError("create table tdefault (id int primary key, " +
         "ts timestamp not null default '2009-1 foo') " +
         "partition by hash(id) partitions 3 stored as kudu",
@@ -511,7 +595,6 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
 
   @Test
   public void TestCreateExternalKuduTable() {
-    TestUtils.assumeKuduIsSupported();
     final String kuduMasters = catalog_.getDefaultKuduMasterHosts();
     AnalyzesOk("create external table t stored as kudu " +
         "tblproperties('kudu.table_name'='t')");
@@ -579,7 +662,6 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
 
   @Test
   public void TestAlterKuduTable() {
-    TestUtils.assumeKuduIsSupported();
     // ALTER TABLE ADD/DROP range partitions
     String[] addDrop = {"add if not exists", "add", "drop if exists", "drop"};
     for (String kw: addDrop) {
@@ -621,7 +703,7 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
     // Columns with different supported data types
     AnalyzesOk("alter table functional_kudu.testtbl add columns (a1 tinyint null, a2 " +
         "smallint null, a3 int null, a4 bigint null, a5 string null, a6 float null, " +
-        "a7 double null, a8 boolean null comment 'boolean')");
+        "a7 double null, a8 boolean null comment 'boolean', a9 date null)");
     // Decimal types
     AnalyzesOk("alter table functional_kudu.testtbl add columns (d1 decimal null, d2 " +
         "decimal(9, 2) null, d3 decimal(15, 15) null, d4 decimal(38, 0) null)");
@@ -631,8 +713,11 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
         "a STRUCT<f1:INT>");
     // Add primary key
     AnalysisError("alter table functional_kudu.testtbl add columns (a int primary key)",
-        "Cannot add a primary key using an ALTER TABLE ADD COLUMNS statement: " +
+        "Cannot add a PRIMARY KEY using an ALTER TABLE ADD COLUMNS statement: " +
         "a INT PRIMARY KEY");
+    AnalysisError("alter table functional_kudu.testtbl add columns (a int non unique " +
+        "primary key)", "Cannot add a NON UNIQUE PRIMARY KEY using an ALTER TABLE ADD " +
+        "COLUMNS statement: a INT NON UNIQUE PRIMARY KEY");
     // Columns requiring a default value
     AnalyzesOk("alter table functional_kudu.testtbl add columns (a1 int not null " +
         "default 10)");
@@ -644,6 +729,11 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
     AnalyzesOk("alter table functional_kudu.testtbl add columns (a int encoding rle)");
     AnalyzesOk("alter table functional_kudu.testtbl add columns (a int compression lz4)");
     AnalyzesOk("alter table functional_kudu.testtbl add columns (a int block_size 10)");
+    // Test 'if not exists'
+    AnalyzesOk("alter table functional_kudu.testtbl add if not exists columns " +
+        "(name string null)");
+    AnalyzesOk("alter table functional_kudu.testtbl add if not exists columns " +
+        "(a string null, b int, c string null)");
 
     // REPLACE columns is not supported for Kudu tables
     AnalysisError("alter table functional_kudu.testtbl replace columns (a int null)",
@@ -680,6 +770,17 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
         "TBLPROPERTIES ('kudu.table_id' = '1234')",
         "Property 'kudu.table_id' cannot be altered for Kudu tables");
 
+    // Unsetting kudu.table_id is not allowed for Kudu tables.
+    AnalysisError("ALTER TABLE functional_kudu.testtbl UNSET " +
+        "TBLPROPERTIES ('kudu.table_id')",
+        "Unsetting the 'kudu.table_id' table property is not supported for Kudu table");
+
+    // Unsetting kudu.master_addresses is not allowed for Kudu tables.
+    AnalysisError("ALTER TABLE functional_kudu.testtbl UNSET " +
+        "TBLPROPERTIES ('kudu.master_addresses')",
+        "Unsetting the 'kudu.master_addresses' table property is not supported for " +
+        "Kudu table");
+
     // Setting 'external.table.purge' is allowed for Kudu tables.
     AnalyzesOk("ALTER TABLE functional_kudu.testtbl SET " +
         "TBLPROPERTIES ('external.table.purge' = 'true')");
@@ -691,6 +792,13 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
     AnalysisError("ALTER TABLE functional_kudu.testtbl SET " +
         "TBLPROPERTIES ('kudu.table_name' = 'Hans')",
         "Not allowed to set 'kudu.table_name' manually for synchronized Kudu tables");
+
+    // Unsetting the underlying Kudu table is not supported for managed Kudu tables
+    // as setting them is not allowed
+    AnalysisError("ALTER TABLE functional_kudu.testtbl UNSET " +
+        "TBLPROPERTIES ('kudu.table_name')",
+        "Unsetting the 'kudu.table_name' table property is not supported for " +
+        "synchronized Kudu table.");
 
     // TODO IMPALA-6375: Allow setting kudu.table_name for managed Kudu tables
     // if the 'EXTERNAL' property is set to TRUE in the same step.
@@ -704,8 +812,6 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
     // ALTER TABLE SORT BY
     AnalysisError("alter table functional_kudu.alltypes sort by (int_col)",
         "ALTER TABLE SORT BY not supported on Kudu tables.");
-
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
 
     // ALTER TABLE SORT BY ZORDER
     AnalysisError("alter table functional_kudu.alltypes sort by zorder (int_col)",
@@ -721,6 +827,7 @@ public class AnalyzeKuduDDLTest extends FrontendTestBase {
         + "'sort.order'='true')",
         "'sort.*' table properties are not supported for Kudu tables.");
 
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+    // ALTER TABLE SET OWNER USER
+    AnalyzesOk("ALTER TABLE functional_kudu.testtbl SET OWNER USER new_owner");
   }
 }

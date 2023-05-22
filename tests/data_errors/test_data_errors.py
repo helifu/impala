@@ -19,14 +19,16 @@
 #
 # Tests Impala properly handles errors when reading and writing data.
 
+from __future__ import absolute_import, division, print_function
 import pytest
-import random
 import subprocess
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIf, SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfLocal
+from tests.common.skip import SkipIf, SkipIfFS
 from tests.common.test_dimensions import create_exec_option_dimension
+from tests.util.filesystem_utils import get_fs_path
+
 
 class TestDataErrors(ImpalaTestSuite):
   # batch_size of 1 can expose some interesting corner cases at row batch boundaries.
@@ -43,12 +45,13 @@ class TestDataErrors(ImpalaTestSuite):
   def get_workload(self):
     return 'functional-query'
 
+
 # Regression test for IMP-633. Added as a part of IMPALA-5198.
-@SkipIf.not_hdfs
+@SkipIf.not_dfs
 class TestHdfsFileOpenFailErrors(ImpalaTestSuite):
   @pytest.mark.execute_serially
   def test_hdfs_file_open_fail(self):
-    absolute_location = "/test-warehouse/file_open_fail"
+    absolute_location = get_fs_path("/test-warehouse/file_open_fail")
     create_stmt = \
         "create table file_open_fail (x int) location '" + absolute_location + "'"
     insert_stmt = "insert into file_open_fail values(1)"
@@ -64,6 +67,7 @@ class TestHdfsFileOpenFailErrors(ImpalaTestSuite):
     except ImpalaBeeswaxException as e:
       assert "Failed to open HDFS file" in str(e)
     self.client.execute(drop_stmt)
+
 
 # Test for IMPALA-5331 to verify that the libHDFS API hdfsGetLastExceptionRootCause()
 # works.
@@ -105,9 +109,8 @@ class TestHdfsUnknownErrors(ImpalaTestSuite):
       assert error is "", "Couldn't turn Safe mode OFF. Error: %s" % (error)
       assert "Safe mode is OFF" in output
 
-@SkipIfS3.qualified_path
-@SkipIfABFS.qualified_path
-@SkipIfADLS.qualified_path
+
+@SkipIfFS.qualified_path
 class TestHdfsScanNodeErrors(TestDataErrors):
   @classmethod
   def add_test_dimensions(cls):
@@ -124,10 +127,8 @@ class TestHdfsScanNodeErrors(TestDataErrors):
       pytest.xfail("Expected results differ across file formats")
     self.run_test_case('DataErrorsTest/hdfs-scan-node-errors', vector)
 
-@SkipIfS3.qualified_path
-@SkipIfABFS.qualified_path
-@SkipIfADLS.qualified_path
-@SkipIfLocal.qualified_path
+
+@SkipIfFS.qualified_path
 class TestHdfsSeqScanNodeErrors(TestHdfsScanNodeErrors):
   @classmethod
   def add_test_dimensions(cls):
@@ -140,9 +141,7 @@ class TestHdfsSeqScanNodeErrors(TestHdfsScanNodeErrors):
     self.run_test_case('DataErrorsTest/hdfs-sequence-scan-errors', vector)
 
 
-@SkipIfS3.qualified_path
-@SkipIfABFS.qualified_path
-@SkipIfADLS.qualified_path
+@SkipIfFS.qualified_path
 class TestHdfsRcFileScanNodeErrors(TestHdfsScanNodeErrors):
   @classmethod
   def add_test_dimensions(cls):
@@ -166,6 +165,7 @@ class TestAvroErrors(TestDataErrors):
   def test_avro_errors(self, vector):
     vector.get_value('exec_option')['abort_on_error'] = 0
     self.run_test_case('DataErrorsTest/avro-errors', vector)
+
 
 class TestHBaseDataErrors(TestDataErrors):
   @classmethod
@@ -224,6 +224,6 @@ class TestTimestampErrors(TestDataErrors):
     result = self.client.execute("SELECT * FROM " + FQ_TBL_NAME + " ORDER BY col")
     assert len(result.data) == 7
     assert result.data == ['1954-12-03 15:10:02', '1999-03-24 07:21:02', \
-        '12:10:02', '15:03:09', 'NULL', 'NULL', 'NULL']
+        'NULL', 'NULL', 'NULL', 'NULL', 'NULL']
     result = self.client.execute("SELECT COUNT(DISTINCT col) FROM " + FQ_TBL_NAME)
-    assert result.data == ['4']
+    assert result.data == ['2']

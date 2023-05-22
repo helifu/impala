@@ -184,12 +184,13 @@ void TestTimestampTokens(vector<TimestampToken>* toks, int year, int month,
       }
       string fmt_val = "Format: " + fmt + ", Val: " + val;
       DateTimeFormatContext dt_ctx(fmt.c_str());
-      ASSERT_TRUE(SimpleDateFormatTokenizer::Tokenize(&dt_ctx)) << fmt_val;
+      ASSERT_TRUE(SimpleDateFormatTokenizer::Tokenize(&dt_ctx, PARSE)) << fmt_val;
       TimestampValue tv =
           TimestampValue::ParseSimpleDateFormat(val.c_str(), val.length(), dt_ctx);
       ValidateTimestamp(tv, fmt, val, fmt_val, year, month, day, hours, mins, secs,
           frac);
-      string buff = tv.Format(dt_ctx);
+      string buff;
+      tv.Format(dt_ctx, buff);
       EXPECT_TRUE(!buff.empty()) << fmt_val;
       EXPECT_LE(buff.length(), dt_ctx.fmt_len) << fmt_val;
       EXPECT_EQ(buff, val) << fmt_val <<  " " << buff;
@@ -212,12 +213,13 @@ void TestTimestampTokens(vector<TimestampToken>* toks, int year, int month,
         }
         string fmt_val = "Format: " + fmt + ", Val: " + val;
         DateTimeFormatContext dt_ctx(fmt.c_str());
-        ASSERT_TRUE(SimpleDateFormatTokenizer::Tokenize(&dt_ctx)) << fmt_val;
+        ASSERT_TRUE(SimpleDateFormatTokenizer::Tokenize(&dt_ctx, PARSE)) << fmt_val;
         TimestampValue tv =
             TimestampValue::ParseSimpleDateFormat(val.c_str(), val.length(), dt_ctx);
         ValidateTimestamp(tv, fmt, val, fmt_val, year, month, day, hours, mins, secs,
             frac);
-        string buff = tv.Format(dt_ctx);
+        string buff;
+        tv.Format(dt_ctx, buff);
         EXPECT_TRUE(!buff.empty()) << fmt_val;
         EXPECT_LE(buff.length(), dt_ctx.fmt_len) << fmt_val;
         EXPECT_EQ(buff, val) << fmt_val <<  " " << buff;
@@ -234,12 +236,12 @@ void TestTimestampTokens(vector<TimestampToken>* toks, int year, int month,
 // truncate to the next whole nanosecond (towards 0).
 void TestFromDoubleUnixTime(
     int64_t seconds, int64_t millis, double nanos, const TimestampValue& expected) {
-  auto tz = TimezoneDatabase::GetUtcTimezone();
   TimestampValue from_double = TimestampValue::FromSubsecondUnixTime(
-      1.0 * seconds + 0.001 * millis + nanos / NANOS_PER_SEC, tz);
+      1.0 * seconds + 0.001 * millis + nanos / NANOS_PER_SEC, UTCPTR);
 
-  if (!expected.HasDate()) EXPECT_FALSE(from_double.HasDate());
-  else {
+  if (!expected.HasDate()) {
+    EXPECT_FALSE(from_double.HasDate());
+  } else {
     // Conversion to double is lossy so the timestamp can be a bit different.
     int64_t expected_rounded_to_micros, from_double_rounded_to_micros;
     EXPECT_TRUE(expected.UtcToUnixTimeMicros(&expected_rounded_to_micros));
@@ -255,17 +257,18 @@ void TestFromDoubleUnixTime(
 // is the same as 'expected'.
 // If 'expected' is nullptr then the result is expected to be invalid (out of range).
 void TestFromSubSecondFunctions(int64_t seconds, int64_t millis, const char* expected) {
-  auto tz = TimezoneDatabase::GetUtcTimezone();
-
   TimestampValue from_millis =
       TimestampValue::UtcFromUnixTimeMillis(seconds * 1000 + millis);
-  if (expected == nullptr) EXPECT_FALSE(from_millis.HasDate());
-  else EXPECT_EQ(expected, from_millis.ToString());
+  if (expected == nullptr) {
+    EXPECT_FALSE(from_millis.HasDate());
+  } else {
+    EXPECT_EQ(expected, from_millis.ToString());
+  }
 
   EXPECT_EQ(from_millis, TimestampValue::UtcFromUnixTimeMicros(
       seconds * MICROS_PER_SEC + millis * 1000));
   EXPECT_EQ(from_millis, TimestampValue::FromUnixTimeMicros(
-      seconds * MICROS_PER_SEC + millis * 1000, tz));
+      seconds * MICROS_PER_SEC + millis * 1000, UTCPTR));
 
   // Check the same timestamp shifted with some sub-nanosecs.
   vector<double> sub_nanosec_offsets =
@@ -283,12 +286,12 @@ void TestFromSubSecondFunctions(int64_t seconds, int64_t millis, const char* exp
       int64_t shifted_seconds = seconds + sign * offset;
       int64_t shifted_nanos = (millis - 1000 * sign * offset) * 1000 * 1000;
       EXPECT_EQ(from_millis,
-          TimestampValue::FromUnixTimeNanos(shifted_seconds, shifted_nanos, tz));
+          TimestampValue::FromUnixTimeNanos(shifted_seconds, shifted_nanos, UTCPTR));
     }
   }
 
   // Test UtcFromUnixTimeLimitedRangeNanos only for timestamps that fit to its range.
-  int128_t total_nanos = int128_t {seconds} * NANOS_PER_SEC + millis * 1000 * 1000;
+  __int128_t total_nanos = __int128_t {seconds} * NANOS_PER_SEC + millis * 1000 * 1000;
   if (std::numeric_limits<int64_t>::min() >= total_nanos &&
       std::numeric_limits<int64_t>::max() <= total_nanos) {
     EXPECT_EQ(from_millis,
@@ -331,8 +334,6 @@ TEST(TimestampTest, Basic) {
   // Set it to 03/01 to test 02/29 edge cases.
   TimestampValue now(date(1980, 3, 1), time_duration(16, 14, 24));
 
-  Timezone utc_tz = cctz::utc_time_zone();
-
   char s1[] = "2012-01-20 01:10:01";
   char s2[] = "1990-10-20 10:10:10.123456789  ";
   char s3[] = "  1990-10-20 10:10:10.123456789";
@@ -357,10 +358,10 @@ TEST(TimestampTest, Basic) {
   EXPECT_GT(v1, v2);
   EXPECT_GE(v2, v3);
 
-  EXPECT_NE(RawValue::GetHashValue(&v1, TYPE_TIMESTAMP, 0),
-            RawValue::GetHashValue(&v2, TYPE_TIMESTAMP, 0));
-  EXPECT_EQ(RawValue::GetHashValue(&v3, TYPE_TIMESTAMP, 0),
-            RawValue::GetHashValue(&v2, TYPE_TIMESTAMP, 0));
+  EXPECT_NE(RawValue::GetHashValue(&v1, ColumnType(TYPE_TIMESTAMP), 0),
+            RawValue::GetHashValue(&v2, ColumnType(TYPE_TIMESTAMP), 0));
+  EXPECT_EQ(RawValue::GetHashValue(&v3, ColumnType(TYPE_TIMESTAMP), 0),
+            RawValue::GetHashValue(&v2, ColumnType(TYPE_TIMESTAMP), 0));
 
   char s4[] = "2012-01-20T01:10:01";
   char s5[] = "1990-10-20T10:10:10.123456789";
@@ -400,24 +401,9 @@ TEST(TimestampTest, Basic) {
   EXPECT_EQ(dv1.date().month(), 1);
   EXPECT_EQ(dv1.date().day(), 20);
 
-  char t1[] = "10:11:12.123456789";
-  char t2[] = "00:00:00";
-  TimestampValue tv1 = TimestampValue::ParseSimpleDateFormat(t1, strlen(t1));
-  TimestampValue tv2 = TimestampValue::ParseSimpleDateFormat(t2, strlen(t2));
-
-  EXPECT_NE(tv1, tv2);
-  EXPECT_NE(tv1, v2);
-
-  EXPECT_EQ(tv1.time().hours(), 10);
-  EXPECT_EQ(tv1.time().minutes(), 11);
-  EXPECT_EQ(tv1.time().seconds(), 12);
-  EXPECT_EQ(tv1.time().fractional_seconds(), 123456789);
-  EXPECT_EQ(tv2.time().fractional_seconds(), 0);
-
   // Test variable fraction lengths
   const char* FRACTION_MAX_STR = "123456789";
-  const char* TEST_VALS[] = { "2013-12-10 12:04:17.", "2013-12-10T12:04:17.",
-      "12:04:17." };
+  const char* TEST_VALS[] = { "2013-12-10 12:04:17.", "2013-12-10T12:04:17."};
   const int TEST_VAL_CNT = sizeof(TEST_VALS) / sizeof(char*);
   for (int i = 0; i < TEST_VAL_CNT; ++i) {
     const int VAL_LEN = strlen(TEST_VALS[i]);
@@ -573,13 +559,13 @@ TEST(TimestampTest, Basic) {
     // Test out of range day
     (TimestampTC("yyyyMMdd", "20130100", false, true))
     // Test out of range hour
-    (TimestampTC("HH:mm:ss", "24:01:01", false, true))
+    (TimestampTC("yyyy-MM-dd HH:mm:ss", "1400-01-01 24:01:01", false, true))
     // Test out of range minute
-    (TimestampTC("HH:mm:ss", "23:60:01", false, true))
+    (TimestampTC("yyyy-MM-dd HH:mm:ss", "1400-01-01 23:60:01", false, true))
     // Test out of range second
-    (TimestampTC("HH:mm:ss", "23:01:60", false, true))
+    (TimestampTC("yyyy-MM-dd HH:mm:ss", "1400-01-01 23:01:60", false, true))
     // Test characters where numbers should be
-    (TimestampTC("HH:mm:ss", "aa:01:01", false, true))
+    (TimestampTC("yyyy-MM-dd HH:mm:ss", "1400-01-01 aa:01:01", false, true))
     // Test missing year
     (TimestampTC("MMdd", "1201", false, true))
     // Test missing month
@@ -620,19 +606,27 @@ TEST(TimestampTest, Basic) {
     (TimestampTC("y-M-d", "2013-11-13", false, true, false, 2013, 11, 13))
     (TimestampTC("y-M-d", "13-1-3", false, true, false, 1913, 1, 3))
     // Test short hour token
-    (TimestampTC("H:mm:ss", "14:24:34", false, false, true, 0, 0, 0, 14, 24, 34))
-    (TimestampTC("H:mm:ss", "4:24:34", false, false, true, 0, 0, 0, 4, 24, 34))
+    (TimestampTC("yyyy-MM-dd H:mm:ss", "2020-05-11 14:24:34", false, true, true, 2020,
+        05, 11, 14, 24, 34))
+    (TimestampTC("yyyy-MM-dd H:mm:ss", "2020-05-11 4:24:34", false, true, true, 2020,
+        05, 11, 4, 24, 34))
     // Test short minute token
-    (TimestampTC("HH:m:ss", "14:24:34", false, false, true, 0, 0, 0, 14, 24, 34))
-    (TimestampTC("HH:m:ss", "1:24:34", false, true))
+    (TimestampTC("yyyy-MM-dd HH:m:ss", "2020-05-11 14:24:34", false, true, true, 2020,
+        05, 11, 14, 24, 34))
+    (TimestampTC("yyyy-MM-dd HH:m:ss", "2020-05-11 1:24:34", false, true))
     // Test short second token
-    (TimestampTC("HH:mm:s", "14:24:34", false, false, true, 0, 0, 0, 14, 24, 34))
+    (TimestampTC("yyyy-MM-dd HH:mm:s", "2020-05-11 14:24:34", false, true, true, 2020,
+        05, 11, 14, 24, 34))
+    (TimestampTC("yyyy-MM-dd HH:mm:s", "2020-05-11 14:24:3", false, true, true, 2020,
+        05, 11, 14, 24, 3))
     // Test short all time tokens
-    (TimestampTC("H:m:s", "11:22:33", false, false, true, 0, 0, 0, 11, 22, 33))
-    (TimestampTC("H:m:s", "1:2:3", false, false, true, 0, 0, 0, 1, 2, 3))
+    (TimestampTC("yyyy-MM-dd H:m:s", "2020-05-11 11:22:33", false, true, true, 2020,
+        05, 11, 11, 22, 33))
+    (TimestampTC("yyyy-MM-dd H:m:s", "2020-05-11 1:2:3", false, true, true, 2020, 05,
+        11, 1, 2, 3))
     // Test short fraction token
-    (TimestampTC("HH:mm:ss:S", "14:24:34:1234", false, false, true, 0, 0, 0, 14, 24, 34,
-        123400000));
+    (TimestampTC("yyyy-MM-dd HH:mm:ss:S", "2020-05-11 14:24:34:1234", false, true,
+        true, 2020, 05, 11, 14, 24, 34, 123400000));
   // Loop through custom parse/format test cases and execute each one. Each test case
   // will be explicitly set with a pass/fail expectation related to either the format
   // or literal value.
@@ -640,7 +634,7 @@ TEST(TimestampTest, Basic) {
     TimestampTC test_case = test_cases[i];
     DateTimeFormatContext dt_ctx(test_case.fmt);
     dt_ctx.SetCenturyBreakAndCurrentTime(now);
-    bool parse_result = SimpleDateFormatTokenizer::Tokenize(&dt_ctx);
+    bool parse_result = SimpleDateFormatTokenizer::Tokenize(&dt_ctx, PARSE);
     if (test_case.fmt_should_fail) {
       EXPECT_FALSE(parse_result) << "TC: " << i;
       continue;
@@ -678,7 +672,8 @@ TEST(TimestampTest, Basic) {
       EXPECT_EQ(test_case.expected_fraction, cust_time.fractional_seconds()) << "TC: "
           << i;
       if (!test_case.should_format) continue;
-      string buff = cust_tv.Format(dt_ctx);
+      string buff;
+      cust_tv.Format(dt_ctx, buff);
       EXPECT_TRUE(!buff.empty()) << "TC: " << i;
       EXPECT_LE(buff.length(), dt_ctx.fmt_len) << "TC: " << i;
       EXPECT_EQ(string(test_case.str, strlen(test_case.str)), buff) << "TC: " << i;
@@ -690,11 +685,11 @@ TEST(TimestampTest, Basic) {
   vector<TimestampFormatTC> fmt_test_cases = list_of
     (TimestampFormatTC(1382337792, "yyyy-MM-dd HH:mm:ss.SSSSSSSSS",
         "2013-10-21 06:43:12.000000000"))
-    // Test just formatting time tokens
+    // Test formatting only time tokens
     (TimestampFormatTC(1382337792, "HH:mm:ss.SSSSSSSSS", "06:43:12.000000000"))
     (TimestampFormatTC(0, "yyyy-MM-ddTHH:mm:SS.SSSSSSSSSZ",
         "1970-01-01T00:00:00.000000000Z"))
-    // Test just formatting date tokens
+    // Test formatting only date tokens
     (TimestampFormatTC(965779200, "yyyy-MM-dd", "2000-08-09"))
     // Test short form date tokens
     (TimestampFormatTC(965779200, "yyyy-M-d", "2000-8-9"))
@@ -706,18 +701,20 @@ TEST(TimestampTest, Basic) {
     (TimestampFormatTC(965779200, "dddddd/dd/d", "000009/09/9"))
     // Test padding on double digits
     (TimestampFormatTC(1382337792, "dddddd/dd/dd", "000021/21/21"))
-    // Test just formatting time tokens on a ts value generated from a date
+    // Test formatting only time tokens on a ts value generated from a date
     (TimestampFormatTC(965779200, "HH:mm:ss", "00:00:00"));
   // Loop through format test cases
   for (int i = 0; i < fmt_test_cases.size(); ++i) {
     TimestampFormatTC test_case = fmt_test_cases[i];
     DateTimeFormatContext dt_ctx(test_case.fmt);
-    ASSERT_TRUE(SimpleDateFormatTokenizer::Tokenize(&dt_ctx))  << "TC: " << i;
-    TimestampValue cust_tv = TimestampValue::FromUnixTime(test_case.ts, utc_tz);
+    ASSERT_TRUE(SimpleDateFormatTokenizer::Tokenize(&dt_ctx, FORMAT))
+        << "TC: " << i;
+    TimestampValue cust_tv = TimestampValue::FromUnixTime(test_case.ts, UTCPTR);
     EXPECT_NE(cust_tv.date(), not_a_date) << "TC: " << i;
     EXPECT_NE(cust_tv.time(), not_a_date_time) << "TC: " << i;
     EXPECT_GE(dt_ctx.fmt_out_len, dt_ctx.fmt_len);
-    string buff = cust_tv.Format(dt_ctx);
+    string buff;
+    cust_tv.Format(dt_ctx, buff);
     EXPECT_TRUE(!buff.empty()) << "TC: " << i;
     EXPECT_LE(buff.length(), dt_ctx.fmt_out_len) << "TC: " << i;
     EXPECT_EQ(buff, string(test_case.str, strlen(test_case.str))) << "TC: " << i;
@@ -770,9 +767,9 @@ TEST(TimestampTest, Basic) {
   }
 
   EXPECT_EQ("1400-01-01 00:00:00",
-      TimestampValue::FromUnixTime(MIN_DATE_AS_UNIX_TIME, utc_tz).ToString());
+      TimestampValue::FromUnixTime(MIN_DATE_AS_UNIX_TIME, UTCPTR).ToString());
   TimestampValue too_early = TimestampValue::FromUnixTime(MIN_DATE_AS_UNIX_TIME - 1,
-      utc_tz);
+      UTCPTR);
   EXPECT_FALSE(too_early.HasDate());
   EXPECT_FALSE(too_early.HasTime());
   int64_t dummy;
@@ -842,9 +839,9 @@ TEST(TimestampTest, Basic) {
   }
 
   EXPECT_EQ("9999-12-31 23:59:59",
-      TimestampValue::FromUnixTime(MAX_DATE_AS_UNIX_TIME, utc_tz).ToString());
+      TimestampValue::FromUnixTime(MAX_DATE_AS_UNIX_TIME, UTCPTR).ToString());
   TimestampValue too_late = TimestampValue::FromUnixTime(MAX_DATE_AS_UNIX_TIME + 1,
-      utc_tz);
+      UTCPTR);
   EXPECT_FALSE(too_late.HasDate());
   EXPECT_FALSE(too_late.HasTime());
 
@@ -855,38 +852,38 @@ TEST(TimestampTest, Basic) {
 
   // Regression tests for IMPALA-1676, Unix times overflow int32 during year 2038
   EXPECT_EQ("2038-01-19 03:14:08",
-      TimestampValue::FromUnixTime(2147483648, utc_tz).ToString());
+      TimestampValue::FromUnixTime(2147483648, UTCPTR).ToString());
   EXPECT_EQ("2038-01-19 03:14:09",
-      TimestampValue::FromUnixTime(2147483649, utc_tz).ToString());
+      TimestampValue::FromUnixTime(2147483649, UTCPTR).ToString());
 
   // Tests for the cases where abs(nanoseconds) >= 1e9.
   EXPECT_EQ("2018-01-10 16:00:00",
-      TimestampValue::FromUnixTimeNanos(1515600000, 0, utc_tz).ToString());
+      TimestampValue::FromUnixTimeNanos(1515600000, 0, UTCPTR).ToString());
   EXPECT_EQ("2018-01-10 16:00:00.999999999",
-      TimestampValue::FromUnixTimeNanos(1515600000, 999999999, utc_tz).ToString());
+      TimestampValue::FromUnixTimeNanos(1515600000, 999999999, UTCPTR).ToString());
   EXPECT_EQ("2018-01-10 15:59:59.000000001",
-      TimestampValue::FromUnixTimeNanos(1515600000, -999999999, utc_tz).ToString());
+      TimestampValue::FromUnixTimeNanos(1515600000, -999999999, UTCPTR).ToString());
   EXPECT_EQ("2018-01-10 16:00:01",
-      TimestampValue::FromUnixTimeNanos(1515600000, 1000000000, utc_tz).ToString());
+      TimestampValue::FromUnixTimeNanos(1515600000, 1000000000, UTCPTR).ToString());
   EXPECT_EQ("2018-01-10 15:59:59",
-      TimestampValue::FromUnixTimeNanos(1515600000, -1000000000, utc_tz).ToString());
+      TimestampValue::FromUnixTimeNanos(1515600000, -1000000000, UTCPTR).ToString());
   EXPECT_EQ("2018-01-10 16:30:00",
-      TimestampValue::FromUnixTimeNanos(1515600000, 1800000000000, utc_tz).ToString());
+      TimestampValue::FromUnixTimeNanos(1515600000, 1800000000000, UTCPTR).ToString());
   EXPECT_EQ("2018-01-10 15:30:00",
-      TimestampValue::FromUnixTimeNanos(1515600000, -1800000000000, utc_tz).ToString());
+      TimestampValue::FromUnixTimeNanos(1515600000, -1800000000000, UTCPTR).ToString());
 
   // Test FromUnixTime around the boundary of the values that can be represented with
   // int64 in nanosecond precision. Tests 1 second before and after these bounds.
   const int64_t MIN_BOOST_CONVERT_UNIX_TIME = -9223372036;
   const int64_t MAX_BOOST_CONVERT_UNIX_TIME = 9223372036;
   const TimestampValue MIN_INT64_NANO_MINUS_1_SEC =
-      TimestampValue::FromUnixTime(MIN_BOOST_CONVERT_UNIX_TIME - 1, utc_tz);
+      TimestampValue::FromUnixTime(MIN_BOOST_CONVERT_UNIX_TIME - 1, UTCPTR);
   const TimestampValue MIN_INT64_NANO =
-      TimestampValue::FromUnixTime(MIN_BOOST_CONVERT_UNIX_TIME, utc_tz);
+      TimestampValue::FromUnixTime(MIN_BOOST_CONVERT_UNIX_TIME, UTCPTR);
   const TimestampValue MAX_INT64_NANO =
-      TimestampValue::FromUnixTime(MAX_BOOST_CONVERT_UNIX_TIME, utc_tz);
+      TimestampValue::FromUnixTime(MAX_BOOST_CONVERT_UNIX_TIME, UTCPTR);
   const TimestampValue MAX_INT64_NANO_PLUS_1_SEC =
-      TimestampValue::FromUnixTime(MAX_BOOST_CONVERT_UNIX_TIME + 1, utc_tz);
+      TimestampValue::FromUnixTime(MAX_BOOST_CONVERT_UNIX_TIME + 1, UTCPTR);
 
   EXPECT_EQ("1677-09-21 00:12:43", MIN_INT64_NANO_MINUS_1_SEC.ToString());
   EXPECT_EQ("1677-09-21 00:12:44", MIN_INT64_NANO.ToString());
@@ -917,9 +914,9 @@ TEST(TimestampTest, Basic) {
   // Test a leap second in 1998 represented by the UTC time 1998-12-31 23:59:60.
   // Unix time cannot represent the leap second, which repeats 915148800.
   EXPECT_EQ("1998-12-31 23:59:59",
-      TimestampValue::FromUnixTime(915148799, utc_tz).ToString());
+      TimestampValue::FromUnixTime(915148799, UTCPTR).ToString());
   EXPECT_EQ("1999-01-01 00:00:00",
-      TimestampValue::FromUnixTime(915148800, utc_tz).ToString());
+      TimestampValue::FromUnixTime(915148800, UTCPTR).ToString());
   // The leap second doesn't parse in Impala.
   TimestampValue leap_tv =
       TimestampValue::ParseSimpleDateFormat("1998-12-31 23:59:60.00");
@@ -935,10 +932,10 @@ TEST(TimestampTest, Basic) {
   EXPECT_TRUE(leap_tv1.HasDateAndTime());
   EXPECT_TRUE(leap_tv1 == TimestampValue(leap_ptime2));
   time_t leap_time_t;
-  EXPECT_TRUE(leap_tv1.ToUnixTime(utc_tz, &leap_time_t));
+  EXPECT_TRUE(leap_tv1.ToUnixTime(UTCPTR, &leap_time_t));
   EXPECT_EQ(915148800, leap_time_t);
   EXPECT_EQ("1999-01-01 00:00:00", leap_tv1.ToString());
-  EXPECT_TRUE(leap_tv2.ToUnixTime(utc_tz, &leap_time_t));
+  EXPECT_TRUE(leap_tv2.ToUnixTime(UTCPTR, &leap_time_t));
   EXPECT_EQ(915148800, leap_time_t);
   EXPECT_EQ("1999-01-01 00:00:00", leap_tv2.ToString());
 
@@ -946,10 +943,10 @@ TEST(TimestampTest, Basic) {
   double result;
   EXPECT_TRUE(
       TimestampValue::ParseSimpleDateFormat("2013-10-21 06:43:12.07").ToSubsecondUnixTime(
-      utc_tz, &result));
+      UTCPTR, &result));
   EXPECT_EQ(1382337792.07, result);
   EXPECT_EQ("1970-01-01 00:00:00.008000000",
-      TimestampValue::FromSubsecondUnixTime(0.008, utc_tz).ToString());
+      TimestampValue::FromSubsecondUnixTime(0.008, UTCPTR).ToString());
 }
 
 // Test subsecond unix time conversion for non edge cases.
@@ -978,21 +975,20 @@ TEST(TimestampTest, SubSecond) {
   TestFromSubSecondFunctions(-1, -2*24*60*60*1000 + 100, "1969-12-29 23:59:59.100000000");
 
   // A few test with sub-millisec precision.
-  auto tz = TimezoneDatabase::GetUtcTimezone();
   EXPECT_EQ("1970-01-01 00:00:00.000001000",
       TimestampValue::UtcFromUnixTimeMicros(1).ToString());
   EXPECT_EQ("1969-12-31 23:59:59.999999000",
       TimestampValue::UtcFromUnixTimeMicros(-1).ToString());
 
   EXPECT_EQ("1970-01-01 00:00:00.000001000",
-      TimestampValue::FromUnixTimeMicros(1, tz).ToString());
+      TimestampValue::FromUnixTimeMicros(1, UTCPTR).ToString());
   EXPECT_EQ("1969-12-31 23:59:59.999999000",
-      TimestampValue::FromUnixTimeMicros(-1, tz).ToString());
+      TimestampValue::FromUnixTimeMicros(-1, UTCPTR).ToString());
 
   EXPECT_EQ("1970-01-01 00:00:00.000000001",
-      TimestampValue::FromUnixTimeNanos(0, 1, tz).ToString());
+      TimestampValue::FromUnixTimeNanos(0, 1, UTCPTR).ToString());
   EXPECT_EQ("1969-12-31 23:59:59.999999999",
-      TimestampValue::FromUnixTimeNanos(0, -1, tz).ToString());
+      TimestampValue::FromUnixTimeNanos(0, -1, UTCPTR).ToString());
 
   EXPECT_EQ("1970-01-01 00:00:00.000000001",
       TimestampValue::UtcFromUnixTimeLimitedRangeNanos(1).ToString());
@@ -1067,4 +1063,3 @@ TEST(TimestampTest, TimezoneConversions) {
   }
 }
 }
-

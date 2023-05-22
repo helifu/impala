@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <!-- Default values -->
+  <property>
+    <name>impala.admission-control.pool-queue-timeout-ms.root.tiny</name>
+    <value>100000</value>
+  </property>
+  <property>
+    <name>impala.admission-control.max-query-mem-limit.root.tiny</name>
+   <!-- 64 MB -->
+    <value>67108864</value>
+  </property>
+  <property>
+    <name>impala.admission-control.min-query-mem-limit.root.tiny</name>
+   <!-- 0MB -->
+    <value>0</value>
+  </property>
+  <property>
+    <name>impala.admission-control.max-query-cpu-core-per-node-limit.root.tiny</name>
+    <value>2</value>
+  </property>
+  <property>
+    <name>impala.admission-control.max-query-cpu-core-coordinator-limit.root.tiny</name>
+    <value>2</value>
+  </property>
+  <property>
+    <name>llama.am.throttling.maximum.placed.reservations.root.small</name>
+    <value>10</value>
+  </property>
+  <property>
+    <name>llama.am.throttling.maximum.queued.reservations.root.small</name>
+    <value>30</value>
+  </property>
+  <property>
+    <name>impala.admission-control.pool-queue-timeout-ms.root.small</name>
+    <value>100000</value>
+  </property>
+  <property>
+    <name>impala.admission-control.max-query-mem-limit.root.small</name>
+   <!-- 90 MB -->
+    <value>94371840</value>
+  </property>
+  <property>
+    <name>impala.admission-control.min-query-mem-limit.root.small</name>
+   <!-- 0MB -->
+    <value>0</value>
+  </property>
+  <property>
+    <name>impala.admission-control.max-query-cpu-core-per-node-limit.root.small</name>
+    <value>8</value>
+  </property>
+  <property>
+    <name>impala.admission-control.max-query-cpu-core-coordinator-limit.root.small</name>
+    <value>8</value>
+  </property>
+  <property>
+    <name>impala.admission-control.max-query-mem-limit.root.large</name>
+   <!-- 8 PB -->
+    <value>9007199254740992</value>
+  </property>
+  <property>
+    <name>impala.admission-control.min-query-mem-limit.root.large</name>
+   <!-- 64MB+1 -->
+    <value>67108865</value>
+  </property>
+  <property>
+    <name>impala.admission-control.max-query-cpu-core-per-node-limit.root.large</name>
+    <value>64</value>
+  </property>
+  <property>
+    <name>impala.admission-control.max-query-cpu-core-coordinator-limit.root.large</name>
+    <value>64</value>
+  </property>
+</configuration>

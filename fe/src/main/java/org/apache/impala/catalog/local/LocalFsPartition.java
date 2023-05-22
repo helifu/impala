@@ -17,6 +17,7 @@
 
 package org.apache.impala.catalog.local;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -24,34 +25,49 @@ import javax.annotation.Nullable;
 
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.Partition;
+import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.HdfsPartitionLocationCompressor;
 import org.apache.impala.catalog.HdfsStorageDescriptor;
-import org.apache.impala.catalog.HdfsStorageDescriptor.InvalidStorageDescriptorException;
+import org.apache.impala.catalog.IcebergTable;
 import org.apache.impala.catalog.PartitionStatsUtil;
 import org.apache.impala.common.FileSystemUtil;
-import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TAccessLevel;
 import org.apache.impala.thrift.THdfsPartitionLocation;
+import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TPartitionStats;
+import org.apache.impala.util.ListMap;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import org.apache.impala.util.IcebergUtil;
 
 public class LocalFsPartition implements FeFsPartition {
   private final LocalFsTable table_;
   private final LocalPartitionSpec spec_;
-  private final Partition msPartition_;
+  private final Map<String, String> hmsParameters_;
+  private final long writeId_;
+  private final HdfsStorageDescriptor hdfsStorageDescriptor_;
+  // Prefix-compressed location. The prefix map is carried in TableMetaRef of LocalTable.
+  // The special "prototype partition" has a null location.
+  private final HdfsPartitionLocationCompressor.Location location_;
 
   /**
    * Null in the case of a 'prototype partition'.
    */
   @Nullable
-  private final ImmutableList<FileDescriptor> fileDescriptors_;
+  private ImmutableList<FileDescriptor> fileDescriptors_;
+
+  @Nullable
+  private ImmutableList<FileDescriptor> insertFileDescriptors_;
+
+  @Nullable
+  private ImmutableList<FileDescriptor> deleteFileDescriptors_;
 
   @Nullable
   private final byte[] partitionStats_;
@@ -59,15 +75,31 @@ public class LocalFsPartition implements FeFsPartition {
   // True if partitionStats_ has intermediate_col_stats populated.
   private final boolean hasIncrementalStats_;
 
+  // True if this partition is marked as cached by hdfs caching. Does not necessarily
+  // mean the data is cached. Only used in analyzing DDLs or constructing results of
+  // SHOW TABLE STATS / SHOW PARTITIONS.
+  private final boolean isMarkedCached_;
+
   public LocalFsPartition(LocalFsTable table, LocalPartitionSpec spec,
-      Partition msPartition, ImmutableList<FileDescriptor> fileDescriptors,
-      byte [] partitionStats, boolean hasIncrementalStats) {
+      Map<String, String> hmsParameters, long writeId,
+      HdfsStorageDescriptor hdfsStorageDescriptor,
+      ImmutableList<FileDescriptor> fileDescriptors,
+      ImmutableList<FileDescriptor> insertFileDescriptors,
+      ImmutableList<FileDescriptor> deleteFileDescriptors,
+      byte [] partitionStats, boolean hasIncrementalStats, boolean isMarkedCached,
+      HdfsPartitionLocationCompressor.Location location) {
     table_ = Preconditions.checkNotNull(table);
     spec_ = Preconditions.checkNotNull(spec);
-    msPartition_ = Preconditions.checkNotNull(msPartition);
+    hmsParameters_ = hmsParameters;
+    writeId_ = writeId;
+    hdfsStorageDescriptor_ = hdfsStorageDescriptor;
+    location_ = location;
     fileDescriptors_ = fileDescriptors;
+    insertFileDescriptors_ = insertFileDescriptors;
+    deleteFileDescriptors_ = deleteFileDescriptors;
     partitionStats_ = partitionStats;
     hasIncrementalStats_ = hasIncrementalStats;
+    isMarkedCached_ = isMarkedCached;
   }
 
   @Override
@@ -85,6 +117,9 @@ public class LocalFsPartition implements FeFsPartition {
     return table_;
   }
 
+  @Override // FeFsPartition
+  public ListMap<TNetworkAddress> getHostIndex() { return table_.getHostIndex(); }
+
   @Override
   public FileSystemUtil.FsType getFsType() {
     Preconditions.checkNotNull(getLocationPath().toUri().getScheme(),
@@ -94,37 +129,50 @@ public class LocalFsPartition implements FeFsPartition {
 
   @Override
   public List<FileDescriptor> getFileDescriptors() {
-    return fileDescriptors_;
+    if (!fileDescriptors_.isEmpty()) return fileDescriptors_;
+    List<FileDescriptor> ret = new ArrayList<>();
+    ret.addAll(insertFileDescriptors_);
+    ret.addAll(deleteFileDescriptors_);
+    return ret;
+  }
+
+  @Override
+  public List<FileDescriptor> getInsertFileDescriptors() {
+    return insertFileDescriptors_;
+  }
+
+  @Override
+  public List<FileDescriptor> getDeleteFileDescriptors() {
+    return deleteFileDescriptors_;
   }
 
   @Override
   public boolean hasFileDescriptors() {
-    return !fileDescriptors_.isEmpty();
+    return !fileDescriptors_.isEmpty() ||
+           !insertFileDescriptors_.isEmpty() ||
+           !deleteFileDescriptors_.isEmpty();
   }
 
   @Override
   public int getNumFileDescriptors() {
-    return fileDescriptors_.size();
+    return fileDescriptors_.size() +
+           insertFileDescriptors_.size() +
+           deleteFileDescriptors_.size();
   }
 
   @Override
   public String getLocation() {
-    return msPartition_.getSd().getLocation();
+    return (location_ != null) ? location_.toString() : null;
   }
 
   @Override
   public THdfsPartitionLocation getLocationAsThrift() {
-    String loc = getLocation();
-    // The special "prototype partition" has a null location.
-    if (loc == null) return null;
-    // TODO(todd): support prefix-compressed partition locations. For now,
-    // using -1 indicates that the location is a full path string.
-    return new THdfsPartitionLocation(/*prefix_index=*/-1, loc);
+    return (location_ != null) ? location_.toThrift() : null;
   }
 
   @Override
   public Path getLocationPath() {
-    Preconditions.checkNotNull(getLocation(),
+    Preconditions.checkNotNull(location_,
             "LocalFsPartition location is null");
     return new Path(getLocation());
   }
@@ -137,34 +185,27 @@ public class LocalFsPartition implements FeFsPartition {
 
   @Override
   public boolean isCacheable() {
-    // TODO Auto-generated method stub
-    return false;
+    return FileSystemUtil.isPathCacheable(getLocationPath());
   }
 
   @Override
   public boolean isMarkedCached() {
-    // TODO Auto-generated method stub
-    return false;
+    return isMarkedCached_;
   }
 
   @Override
   public HdfsStorageDescriptor getInputFormatDescriptor() {
-    try {
-      // TODO(todd): should we do this in the constructor to avoid having to worry
-      // about throwing an exception from this getter? The downside is that then
-      // the object would end up long-lived, whereas its actual usage is short-lived.
-      return HdfsStorageDescriptor.fromStorageDescriptor(table_.getName(),
-              msPartition_.getSd());
-    } catch (InvalidStorageDescriptorException e) {
-      throw new LocalCatalogException(String.format(
-          "Invalid input format descriptor for partition %s of table %s",
-          getPartitionName(), table_.getFullName()), e);
-    }
+    return hdfsStorageDescriptor_;
   }
 
   @Override
   public HdfsFileFormat getFileFormat() {
-    return getInputFormatDescriptor().getFileFormat();
+    HdfsFileFormat format = getInputFormatDescriptor().getFileFormat();
+    if (format == HdfsFileFormat.ICEBERG) {
+      return IcebergUtil.toHdfsFileFormat(
+          IcebergUtil.getIcebergFileFormat(table_.getMetaStoreTable()));
+    }
+    return format;
   }
 
   @Override
@@ -184,7 +225,7 @@ public class LocalFsPartition implements FeFsPartition {
   @Override
   public long getSize() {
     long size = 0;
-    for (FileDescriptor fd : fileDescriptors_) {
+    for (FileDescriptor fd : getFileDescriptors()) {
       size += fd.getFileLength();
     }
     return size;
@@ -192,7 +233,7 @@ public class LocalFsPartition implements FeFsPartition {
 
   @Override
   public long getNumRows() {
-    return FeCatalogUtils.getRowCount(msPartition_.getParameters());
+    return FeCatalogUtils.getRowCount(hmsParameters_);
   }
 
   @Override
@@ -217,11 +258,29 @@ public class LocalFsPartition implements FeFsPartition {
 
   @Override
   public Map<String, String> getParameters() {
-    return msPartition_.getParameters();
+    return hmsParameters_;
   }
 
   @Override
   public long getWriteId() {
-    return MetastoreShim.getWriteIdFromMSPartition(msPartition_);
+    return writeId_;
+  }
+
+  @Override
+  public LocalFsPartition genInsertDeltaPartition() {
+    ImmutableList<FileDescriptor> fds = insertFileDescriptors_.isEmpty() ?
+        fileDescriptors_ : insertFileDescriptors_;
+    return new LocalFsPartition(table_, spec_, hmsParameters_, writeId_,
+        hdfsStorageDescriptor_, fds, ImmutableList.of(), ImmutableList.of(),
+        partitionStats_, hasIncrementalStats_, isMarkedCached_, location_);
+  }
+
+  @Override
+  public LocalFsPartition genDeleteDeltaPartition() {
+    if (deleteFileDescriptors_.isEmpty()) return null;
+    return new LocalFsPartition(table_, spec_, hmsParameters_, writeId_,
+        hdfsStorageDescriptor_, deleteFileDescriptors_,
+        ImmutableList.of(), ImmutableList.of(), partitionStats_,
+        hasIncrementalStats_, isMarkedCached_, location_);
   }
 }

@@ -26,6 +26,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.authorization.Privilege;
@@ -34,6 +35,7 @@ import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
@@ -53,6 +55,7 @@ import org.apache.impala.thrift.TGetPartitionStatsResponse;
 import org.apache.impala.thrift.TPartitionStats;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TUnit;
+import org.apache.impala.util.MetaStoreUtil;
 import org.apache.log4j.Logger;
 
 import com.google.common.base.Joiner;
@@ -200,7 +203,6 @@ public class ComputeStatsStmt extends StatementBase {
     Preconditions.checkState(tableName != null && !tableName.isEmpty());
     Preconditions.checkState(isIncremental || partitionSet == null);
     Preconditions.checkState(!isIncremental || sampleParams == null);
-    Preconditions.checkState(!isIncremental || columns == null);
     tableName_ = tableName;
     sampleParams_ = sampleParams;
     table_ = null;
@@ -232,8 +234,8 @@ public class ComputeStatsStmt extends StatementBase {
    * set of partitions whose stats should be computed.
    */
   public static ComputeStatsStmt createIncrementalStatsStmt(TableName tableName,
-      PartitionSet partitionSet) {
-    return new ComputeStatsStmt(tableName, null, true, partitionSet, null);
+      PartitionSet partitionSet, List<String> columns) {
+    return new ComputeStatsStmt(tableName, null, true, partitionSet, columns);
   }
 
   private List<String> getBaseColumnStatsQuerySelectList(Analyzer analyzer) {
@@ -244,6 +246,13 @@ public class ComputeStatsStmt extends StatementBase {
     int startColIdx = (table_ instanceof FeHBaseTable) ? 0 :
         table_.getNumClusteringCols();
 
+    // Verify that the table is Parquet.
+    boolean computeMinMax = analyzer.getQueryCtx()
+                                .getClient_request()
+                                .getQuery_options()
+                                .isCompute_column_minmax_stats()
+        && hasAtLeastOneParquetPartition();
+
     for (int i = startColIdx; i < table_.getColumns().size(); ++i) {
       Column c = table_.getColumns().get(i);
       if (validatedColumnWhitelist_ != null && !validatedColumnWhitelist_.contains(c)) {
@@ -251,17 +260,23 @@ public class ComputeStatsStmt extends StatementBase {
       }
       if (ignoreColumn(c)) continue;
 
-      // NDV approximation function. Add explicit alias for later identification when
-      // updating the Metastore.
       String colRefSql = ToSqlUtils.getIdentSql(c.getName());
-      if (isIncremental_) {
-        columnStatsSelectList.add("NDV_NO_FINALIZE(" + colRefSql + ") AS " + colRefSql);
-      } else if (isSampling()) {
-        columnStatsSelectList.add(String.format("SAMPLED_NDV(%s, %.10f) AS %s",
-            colRefSql, effectiveSamplePerc_, colRefSql));
+
+      if (c.getType().isBinary()) {
+        // NDV is not calculated for BINARY columns (similarly to Hive).
+        columnStatsSelectList.add("NULL AS " + colRefSql);
       } else {
-        // Regular (non-incremental) compute stats without sampling.
-        columnStatsSelectList.add("NDV(" + colRefSql + ") AS " + colRefSql);
+        // NDV approximation function. Add explicit alias for later identification when
+        // updating the Metastore.
+        if (isIncremental_) {
+          columnStatsSelectList.add("NDV_NO_FINALIZE(" + colRefSql + ") AS " + colRefSql);
+        } else if (isSampling()) {
+          columnStatsSelectList.add(String.format("SAMPLED_NDV(%s, %.10f) AS %s",
+              colRefSql, effectiveSamplePerc_, colRefSql));
+        } else {
+          // Regular (non-incremental) compute stats without sampling.
+          columnStatsSelectList.add("NDV(" + colRefSql + ") AS " + colRefSql);
+        }
       }
 
       // Count the number of NULL values.
@@ -286,6 +301,35 @@ public class ComputeStatsStmt extends StatementBase {
         // Need the count in order to properly combine per-partition column stats
         columnStatsSelectList.add("COUNT(" + colRefSql + ")");
       }
+
+      // For boolean column, compute the numTrue and numFalse
+      if (type.isBoolean()) {
+        columnStatsSelectList.add(
+            "COUNT(CASE WHEN " + colRefSql + " = TRUE THEN 1 ELSE NULL END)");
+        columnStatsSelectList.add(
+            "COUNT(CASE WHEN " + colRefSql + " = FALSE THEN 1 ELSE NULL END)");
+      } else {
+        columnStatsSelectList.add("NULL");
+        columnStatsSelectList.add("NULL");
+      }
+
+      // Finally, compute the min and max. NULLs in the column are ignored unless
+      // all values are NULL in which case a NULL value will be produced.
+      //
+      // Do it only for INTEGERS, DOUBLES, DECIMAL and DATE types as they can be
+      // stored in LongColumnStatsData, DoubleColumnStatsData,
+      // DecimalColumnStatsData or DateColumnStatsData in HMS.
+      String min_expr = null;
+      String max_expr = null;
+      if (computeMinMax && MetaStoreUtil.canStoreMinmaxInHMS(type)) {
+        min_expr = "MIN(" + colRefSql + ")";
+        max_expr = "MAX(" + colRefSql + ")";
+      } else  {
+        min_expr = "NULL";
+        max_expr = "NULL";
+      }
+      columnStatsSelectList.add(min_expr);
+      columnStatsSelectList.add(max_expr);
     }
     return columnStatsSelectList;
   }
@@ -309,7 +353,7 @@ public class ComputeStatsStmt extends StatementBase {
    *
    * 2. COMPUTE STATS with TABLESAMPLE
    * 2.1 Row counts:
-   * SELECT ROUND(COUNT(*) / <effective_sample_perc>)
+   * SELECT CAST(ROUND(COUNT(*) / <effective_sample_perc>) AS BIGINT)
    * FROM tbl TABLESAMPLE SYSTEM(<sample_perc>) REPEATABLE (<random_seed>)
    *
    * 2.1 Column stats:
@@ -360,14 +404,19 @@ public class ComputeStatsStmt extends StatementBase {
           "COMPUTE STATS not supported for nested collection: %s", tableName_));
     }
     table_ = analyzer.getTable(tableName_, Privilege.ALTER, Privilege.SELECT);
-    // Adding the check here instead of tableRef.analyze because tableRef is
-    // used at multiple places and will even disallow select.
-    analyzer.ensureTableNotFullAcid(table_);
 
     if (!(table_ instanceof FeFsTable)) {
       if (partitionSet_ != null) {
         throw new AnalysisException("COMPUTE INCREMENTAL ... PARTITION not supported " +
             "for non-HDFS table " + tableName_);
+      }
+      isIncremental_ = false;
+    }
+
+    if (table_ instanceof FeIcebergTable) {
+      if (partitionSet_ != null) {
+        throw new AnalysisException("COMPUTE INCREMENTAL ... PARTITION not supported " +
+            "for Iceberg table " + tableName_);
       }
       isIncremental_ = false;
     }
@@ -410,9 +459,38 @@ public class ComputeStatsStmt extends StatementBase {
       // For incremental stats, estimate the size of intermediate stats and report an
       // error if the estimate is greater than --inc_stats_size_limit_bytes in bytes
       if (isIncremental_) {
+        long numOfAllIncStatsPartitions = 0;
+        Collection<? extends FeFsPartition> allPartitions =
+            FeCatalogUtils.loadAllPartitions(hdfsTable);
+
+        if (partitionSet_ == null) {
+          numOfAllIncStatsPartitions = allPartitions.size();
+        } else {
+          Set<Long> partIds =
+              Sets.newHashSetWithExpectedSize(partitionSet_.getPartitions().size());
+          for (FeFsPartition part: partitionSet_.getPartitions()) {
+            partIds.add(part.getId());
+          }
+
+          // incremental statistics size = Existing partition statistics
+          //     - Repeated calculation partition stats
+          //     + This time calculation partition stats
+          for (FeFsPartition part: allPartitions) {
+            // The partition has incremental stats, and the partition is not calculated
+            // this time. It is "Existing partition statistics
+            // - Repeated calculation partition stats"
+            if (part.hasIncrementalStats() && !partIds.contains(part.getId())) {
+              ++numOfAllIncStatsPartitions;
+            }
+          }
+          // This time calculation partition stats
+          numOfAllIncStatsPartitions += partitionSet_.getPartitions().size();
+        }
+
         long incStatMaxSize = BackendConfig.INSTANCE.getIncStatsMaxSize();
+        // The size of the existing stats and the stats to be calculated
         long statsSizeEstimate = hdfsTable.getColumns().size() *
-            hdfsTable.getPartitions().size() * HdfsTable.STATS_SIZE_PER_COLUMN_BYTES;
+            numOfAllIncStatsPartitions * HdfsTable.STATS_SIZE_PER_COLUMN_BYTES;
         if (statsSizeEstimate > incStatMaxSize) {
           LOG.error("Incremental stats size estimate for table " + hdfsTable.getName() +
               " exceeded " + incStatMaxSize + ", estimate = "
@@ -534,8 +612,10 @@ public class ComputeStatsStmt extends StatementBase {
     StringBuilder tableStatsQueryBuilder = new StringBuilder("SELECT ");
     String countSql = "COUNT(*)";
     if (isSampling()) {
-      // Extrapolate the count based on the effective sampling rate.
-      countSql = String.format("ROUND(COUNT(*) / %.10f)", effectiveSamplePerc_);
+      // Extrapolate the count based on the effective sampling rate. Add an explicit CAST
+      // to BIGINT, which is the expected data type for row count.
+      countSql = String.format("CAST(ROUND(COUNT(*) / %.10f) AS BIGINT)",
+        effectiveSamplePerc_);
     }
     List<String> tableStatsSelectList = Lists.newArrayList(countSql);
     // Add group by columns for incremental stats or with extrapolation disabled.
@@ -648,7 +728,7 @@ public class ComputeStatsStmt extends StatementBase {
     Preconditions.checkNotNull(partitions);
     Preconditions.checkState(!RuntimeEnv.INSTANCE.isTestEnv());
     if (partitions.isEmpty()) return Collections.emptyMap();
-    Stopwatch sw = new Stopwatch().start();
+    Stopwatch sw = Stopwatch.createStarted();
     int numCompressedBytes = 0;
     int totalPartitions = 0;
     int numPartitionsWithStats = 0;
@@ -708,7 +788,8 @@ public class ComputeStatsStmt extends StatementBase {
     profile.addToCounter(STATS_FETCH_TOTAL_PARTITIONS, TUnit.NONE, totalPartitions);
     profile.addToCounter(STATS_FETCH_NUM_PARTITIONS_WITH_STATS, TUnit.NONE,
         numPartitionsWithStats);
-    profile.addToCounter(STATS_FETCH_TIME, TUnit.TIME_MS, stopwatch.elapsedMillis());
+    profile.addToCounter(STATS_FETCH_TIME, TUnit.TIME_MS,
+        stopwatch.elapsed(TimeUnit.MILLISECONDS));
   }
 
   /**
@@ -888,8 +969,8 @@ public class ComputeStatsStmt extends StatementBase {
   public Set<Column> getValidatedColumnWhitelist() { return validatedColumnWhitelist_; }
 
   /**
-   * Returns true if this statement computes stats on Parquet/ORC partitions only,
-   * false otherwise.
+   * Returns true if this statement computes stats on Parquet/HUDI_PARQUET/ORC partitions
+   * only, false otherwise.
    */
   public boolean isColumnar() {
     if (!(table_ instanceof FeFsTable)) return false;
@@ -902,10 +983,54 @@ public class ComputeStatsStmt extends StatementBase {
     }
     for (FeFsPartition partition: affectedPartitions) {
       if (partition.getFileFormat() != HdfsFileFormat.PARQUET
+          && partition.getFileFormat() != HdfsFileFormat.HUDI_PARQUET
           && partition.getFileFormat() != HdfsFileFormat.ORC)
         return false;
     }
+
+    if (table_ instanceof FeIcebergTable) {
+      return FeIcebergTable.Utils.isColumnar((FeIcebergTable) table_);
+    }
     return true;
+  }
+
+  /**
+   * Returns true if this statement computes stats on a table with at least one Parquet
+   * partition, false otherwise.
+   */
+  public boolean hasAtLeastOneParquetPartition() {
+    if (!(table_ instanceof FeFsTable)) return false;
+    FeFsTable hdfsTable = (FeFsTable) table_;
+    Set<Long> partitionIds = hdfsTable.getPartitionIds();
+    if (partitionIds.size() > 0) {
+      for (Long partitionId : partitionIds) {
+        FeFsPartition partition = FeCatalogUtils.loadPartition(hdfsTable, partitionId);
+        if (partition.getFileFormat().isParquetBased()) {
+          return true;
+        }
+      }
+    } else {
+      Collection<? extends FeFsPartition> allPartitions =
+          FeCatalogUtils.loadAllPartitions(hdfsTable);
+      for (FeFsPartition partition : allPartitions) {
+        if (partition.getFileFormat().isParquetBased()) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  public PartitionSet getPartitionSet() {
+    return partitionSet_;
+  }
+
+  public TableName getTableName() {
+    return tableName_;
+  }
+
+  public boolean isIncremental() {
+    return isIncremental_;
   }
 
   @Override

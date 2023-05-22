@@ -18,9 +18,18 @@
 ARG BASE_IMAGE=impala_base
 FROM ${BASE_IMAGE}
 
+# Only copy in dependencies required for the statestored.
+COPY --chown=impala statestore-lib /opt/impala/lib
+
+# Run the daemon_entrypoint.sh script as a sanity check. This verifies that
+# daemon_entrypoint.sh is detecting Java appropriately and constructing a
+# LD_LIBRARY_PATH that allows statestored to start.
+RUN /opt/impala/bin/daemon_entrypoint.sh /opt/impala/bin/statestored --version
+
 # Externally-facing ports
 # Debug webserver
 EXPOSE 25010
 
 ENTRYPOINT ["/opt/impala/bin/daemon_entrypoint.sh", "/opt/impala/bin/statestored",\
-     "-log_dir=/opt/impala/logs"]
+     "-log_dir=/opt/impala/logs",\
+     "-use_resolved_hostname=true"]

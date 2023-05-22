@@ -19,15 +19,14 @@ package org.apache.impala.planner;
 
 import java.util.List;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 
@@ -36,9 +35,12 @@ import com.google.common.base.Preconditions;
  */
 public class SelectNode extends PlanNode {
   private final static Logger LOG = LoggerFactory.getLogger(SelectNode.class);
+  // in some optimizations the selectivity may be set explicitly
+  private double selectivity_;
 
   protected SelectNode(PlanNodeId id, PlanNode child, List<Expr> conjuncts) {
     super(id, "SELECT");
+    selectivity_ = -1.0;
     addChild(child);
     conjuncts_.addAll(conjuncts);
     computeTupleIds();
@@ -65,6 +67,31 @@ public class SelectNode extends PlanNode {
     createDefaultSmap(analyzer);
   }
 
+  /**
+   * Create a SelectNode that evaluates 'conjuncts' on output rows from 'root',
+   * or merge 'conjuncts' into 'root' if it is already a SelectNode.
+   */
+  public static PlanNode create(PlannerContext plannerCtx, Analyzer analyzer,
+          PlanNode root, List<Expr> conjuncts) {
+    SelectNode selectNode;
+    if (root instanceof SelectNode && !root.hasLimit()) {
+      selectNode = (SelectNode) root;
+      // This is a select node that evaluates conjuncts only. We can
+      // safely merge conjuncts from the child SelectNode into this one.
+      for (Expr conjunct : conjuncts) {
+        if (!selectNode.conjuncts_.contains(conjunct)) {
+          selectNode.conjuncts_.add(conjunct);
+        }
+      }
+    } else {
+      selectNode = new SelectNode(plannerCtx.getNextNodeId(), root, conjuncts);
+    }
+    // init() marks conjuncts as assigned
+    selectNode.init(analyzer);
+    Preconditions.checkState(selectNode.hasValidStats());
+    return selectNode;
+  }
+
   @Override
   public void computeStats(Analyzer analyzer) {
     super.computeStats(analyzer);
@@ -78,6 +105,21 @@ public class SelectNode extends PlanNode {
     if (LOG.isTraceEnabled()) {
       LOG.trace("stats Select: cardinality=" + Long.toString(cardinality_));
     }
+  }
+
+  @Override
+  protected double computeSelectivity() {
+    if (selectivity_ == -1) {
+      return super.computeSelectivity();
+    }
+    return selectivity_;
+  }
+
+  public void setSelectivity(double value) { selectivity_ = value; }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = computeDefaultProcessingCost();
   }
 
   @Override

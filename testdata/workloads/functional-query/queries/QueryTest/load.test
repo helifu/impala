@@ -19,7 +19,7 @@ select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col,
 float_col, double_col, date_string_col, string_col, timestamp_col
 from functional.alltypes where year = 2009 and month = 1
 ---- RESULTS
-year=2009/month=1/: 310
+year=2009/month=1: 310
 ====
 ---- QUERY
 select count(*) from functional.test_load
@@ -148,11 +148,8 @@ select count(*) from functional.test_load_nopart
 BIGINT
 ====
 ---- QUERY
+truncate functional.test_load;
 select count(*) from functional.test_load where year=2010 and month=1
----- SETUP
-# A refresh needs to happen before selecting from this table because file(s) changed
-# underneath it.
-RESET functional.test_load
 ---- RESULTS
 0
 ---- TYPES

@@ -21,12 +21,18 @@ import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.apache.impala.authorization.Privilege;
+import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeIcebergTable;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.planner.JoinNode.DistributionMode;
@@ -47,7 +53,7 @@ import com.google.common.collect.Lists;
  * The analysis of table refs follows a two-step process:
  *
  * 1. Resolution: A table ref's path is resolved and then the generic TableRef is
- * replaced by a concrete table ref (a BaseTableRef, CollectionTabeRef or ViewRef)
+ * replaced by a concrete table ref (a BaseTableRef, CollectionTableRef or ViewRef)
  * in the originating stmt and that is given the resolved path. This step is driven by
  * Analyzer.resolveTableRef().
  *
@@ -90,14 +96,29 @@ public class TableRef extends StmtNode {
   protected JoinOperator joinOp_;
   protected List<PlanHint> joinHints_ = new ArrayList<>();
   protected List<String> usingColNames_;
+  // Whether we should allow an empty ON clause in cases where it would usually be
+  // rejected in analysis. Used for TableRefs generated during query rewriting.
+  protected boolean allowEmptyOn_ = false;
 
   protected List<PlanHint> tableHints_ = new ArrayList<>();
   protected TReplicaPreference replicaPreference_;
   protected boolean randomReplica_;
+  // A sampling percent if convert_limit_to_sample hint is supplied. Valid range
+  // is 1-100. -1 indicates no hint.
+  protected int convertLimitToSampleHintPercent_;
 
   // Hinted distribution mode for this table ref; set after analyzeJoinHints()
   // TODO: Move join-specific members out of TableRef.
   private DistributionMode distrMode_ = DistributionMode.NONE;
+
+  public enum ZippingUnnestType {
+    NONE,
+    FROM_CLAUSE_ZIPPING_UNNEST,
+    SELECT_LIST_ZIPPING_UNNEST
+  }
+
+  // Indicates if this TableRef is for the purpose of zipping unnest for arrays.
+  protected ZippingUnnestType zippingUnnestType_ = ZippingUnnestType.NONE;
 
   /////////////////////////////////////////
   // BEGIN: Members that need to be reset()
@@ -131,28 +152,66 @@ public class TableRef extends StmtNode {
   // analysis output
   protected TupleDescriptor desc_;
 
+  // true if this table is masked by a table masking view and need to expose its nested
+  // columns via the view.
+  protected boolean exposeNestedColumnsByTableMaskView_ = false;
+
+  // Columns referenced in the query. Used in resolving column mask.
+  protected Map<String, Column> columns_ = new HashMap<>();
+
+  // Time travel spec of this table ref. It contains information specified in the
+  // FOR SYSTEM_TIME AS OF <timestamp> or FOR SYSTEM_TIME AS OF <version> clause.
+  protected TimeTravelSpec timeTravelSpec_;
+
   // END: Members that need to be reset()
   /////////////////////////////////////////
+
+  // true if this table ref is hidden, because e.g. it was generated during statement
+  // rewrite.
+  private boolean isHidden_ = false;
+
+  // Value of query hint 'TABLE_NUM_ROWS' on this table. Used in constructing ScanNode if
+  // the table does not have stats, or has corrupt stats. -1 indicates no hint. Currently,
+  // this hint is valid for hdfs and kudu table.
+  private long tableNumRowsHint_ = -1;
+  // Table row hint name used in sql.
+  private static final String TABLE_ROW_HINT = "TABLE_NUM_ROWS";
+
+  /**
+   * Returns a new, resolved, and analyzed table ref.
+   */
+  public static TableRef newTableRef(Analyzer analyzer, List<String> rawPath,
+      String alias) throws AnalysisException {
+    TableRef ret = new TableRef(rawPath, alias);
+    ret = analyzer.resolveTableRef(ret);
+    ret.analyze(analyzer);
+    return ret;
+  }
 
   public TableRef(List<String> path, String alias) {
     this(path, alias, Privilege.SELECT);
   }
 
   public TableRef(List<String> path, String alias, TableSampleClause tableSample) {
-    this(path, alias, tableSample, Privilege.SELECT, false);
+    this(path, alias, tableSample, null);
+  }
+
+  public TableRef(List<String> path, String alias, TableSampleClause tableSample,
+      TimeTravelSpec timeTravel) {
+    this(path, alias, tableSample, timeTravel, Privilege.SELECT, false);
   }
 
   public TableRef(List<String> path, String alias, Privilege priv) {
-    this(path, alias, null, priv, false);
+    this(path, alias, null, null, priv, false);
   }
 
   public TableRef(List<String> path, String alias, Privilege priv,
       boolean requireGrantOption) {
-    this(path, alias, null, priv, requireGrantOption);
+    this(path, alias, null, null, priv, requireGrantOption);
   }
 
   public TableRef(List<String> path, String alias, TableSampleClause sampleParams,
-      Privilege priv, boolean requireGrantOption) {
+      TimeTravelSpec timeTravel, Privilege priv, boolean requireGrantOption) {
     rawPath_ = path;
     if (alias != null) {
       aliases_ = new String[] { alias.toLowerCase() };
@@ -166,6 +225,8 @@ public class TableRef extends StmtNode {
     isAnalyzed_ = false;
     replicaPreference_ = null;
     randomReplica_ = false;
+    convertLimitToSampleHintPercent_ = -1;
+    timeTravelSpec_ = timeTravel;
   }
 
   /**
@@ -177,6 +238,8 @@ public class TableRef extends StmtNode {
     aliases_ = other.aliases_;
     hasExplicitAlias_ = other.hasExplicitAlias_;
     sampleParams_ = other.sampleParams_;
+    timeTravelSpec_ = other.timeTravelSpec_ != null ?
+                      other.timeTravelSpec_.clone() : null;
     priv_ = other.priv_;
     requireGrantOption_ = other.requireGrantOption_;
     joinOp_ = other.joinOp_;
@@ -184,8 +247,10 @@ public class TableRef extends StmtNode {
     onClause_ = (other.onClause_ != null) ? other.onClause_.clone() : null;
     usingColNames_ =
         (other.usingColNames_ != null) ? Lists.newArrayList(other.usingColNames_) : null;
+    allowEmptyOn_ = other.allowEmptyOn_;
     tableHints_ = Lists.newArrayList(other.tableHints_);
     replicaPreference_ = other.replicaPreference_;
+    convertLimitToSampleHintPercent_ = other.convertLimitToSampleHintPercent_;
     randomReplica_ = other.randomReplica_;
     distrMode_ = other.distrMode_;
     // The table ref links are created at the statement level, so cloning a set of linked
@@ -196,6 +261,10 @@ public class TableRef extends StmtNode {
     allMaterializedTupleIds_ = Lists.newArrayList(other.allMaterializedTupleIds_);
     correlatedTupleIds_ = Lists.newArrayList(other.correlatedTupleIds_);
     desc_ = other.desc_;
+    exposeNestedColumnsByTableMaskView_ = other.exposeNestedColumnsByTableMaskView_;
+    columns_ = new LinkedHashMap<>(other.columns_);
+    isHidden_ = other.isHidden_;
+    zippingUnnestType_ = other.zippingUnnestType_;
   }
 
   @Override
@@ -205,7 +274,7 @@ public class TableRef extends StmtNode {
   }
 
   /**
-   * Creates and returns a empty TupleDescriptor registered with the analyzer
+   * Creates and returns an empty TupleDescriptor registered with the analyzer
    * based on the resolvedPath_.
    * This method is called from the analyzer when registering this table reference.
    */
@@ -227,6 +296,7 @@ public class TableRef extends StmtNode {
     this.tableHints_ = other.tableHints_;
     this.onClause_ = other.onClause_;
     this.usingColNames_ = other.usingColNames_;
+    this.allowEmptyOn_ = other.allowEmptyOn_;
   }
 
   public JoinOperator getJoinOp() {
@@ -234,14 +304,29 @@ public class TableRef extends StmtNode {
     return (joinOp_ == null ? JoinOperator.INNER_JOIN : joinOp_);
   }
 
+  public boolean allowEmptyOn() { return allowEmptyOn_ ; }
+  public void setAllowEmptyOn(boolean v) { allowEmptyOn_ = v; }
+
   public TReplicaPreference getReplicaPreference() { return replicaPreference_; }
   public boolean getRandomReplica() { return randomReplica_; }
+  public boolean hasConvertLimitToSampleHint() {
+    return convertLimitToSampleHintPercent_ != -1;
+  }
+  public int getConvertLimitToSampleHintPercent() {
+    return convertLimitToSampleHintPercent_;
+  }
+
+  public long getTableNumRowsHint() {
+    return tableNumRowsHint_;
+  }
 
   /**
    * Returns true if this table ref has a resolved path that is rooted at a registered
    * tuple descriptor, false otherwise.
    */
   public boolean isRelative() { return false; }
+
+  public boolean isCollectionInSelectList() { return false; }
 
   /**
    * Indicates if this TableRef directly or indirectly references another TableRef from
@@ -284,6 +369,7 @@ public class TableRef extends StmtNode {
     return resolvedPath_.getRootTable();
   }
   public TableSampleClause getSampleParams() { return sampleParams_; }
+  public TimeTravelSpec getTimeTravelSpec() { return timeTravelSpec_; }
   public Privilege getPrivilege() { return priv_; }
   public boolean requireGrantOption() { return requireGrantOption_; }
   public List<PlanHint> getJoinHints() { return joinHints_; }
@@ -294,6 +380,15 @@ public class TableRef extends StmtNode {
   public void setUsingClause(List<String> colNames) { this.usingColNames_ = colNames; }
   public TableRef getLeftTblRef() { return leftTblRef_; }
   public void setLeftTblRef(TableRef leftTblRef) { this.leftTblRef_ = leftTblRef; }
+  public void setExposeNestedColumnsByTableMaskView() {
+    exposeNestedColumnsByTableMaskView_ = true;
+  }
+  public boolean exposeNestedColumnsByTableMaskView() {
+    return exposeNestedColumnsByTableMaskView_;
+  }
+
+  public void setHidden(boolean isHidden) { isHidden_ = isHidden; }
+  public boolean isHidden() { return isHidden_; }
 
   public void setJoinHints(List<PlanHint> hints) {
     Preconditions.checkNotNull(hints);
@@ -303,6 +398,10 @@ public class TableRef extends StmtNode {
   public void setTableHints(List<PlanHint> hints) {
     Preconditions.checkNotNull(hints);
     tableHints_ = hints;
+  }
+
+  public void setTableSampleClause(TableSampleClause sampleParams) {
+    sampleParams_ = sampleParams;
   }
 
   public boolean isBroadcastJoin() { return distrMode_ == DistributionMode.BROADCAST; }
@@ -315,6 +414,16 @@ public class TableRef extends StmtNode {
   public List<TupleId> getCorrelatedTupleIds() { return correlatedTupleIds_; }
   public boolean isAnalyzed() { return isAnalyzed_; }
   public boolean isResolved() { return !getClass().equals(TableRef.class); }
+
+  public boolean isFromClauseZippingUnnest() {
+    return zippingUnnestType_ == ZippingUnnestType.FROM_CLAUSE_ZIPPING_UNNEST;
+  }
+  public boolean isZippingUnnest() {
+    return zippingUnnestType_ != ZippingUnnestType.NONE;
+  }
+  public ZippingUnnestType getZippingUnnestType() { return zippingUnnestType_; }
+  public void setZippingUnnestType(ZippingUnnestType t) { zippingUnnestType_ = t; }
+
 
   /**
    * This method should only be called after the TableRef has been analyzed.
@@ -371,6 +480,14 @@ public class TableRef extends StmtNode {
     }
   }
 
+  protected void analyzeTimeTravel(Analyzer analyzer) throws AnalysisException {
+    // We are analyzing the time travel spec before we know the table type, so we
+    // cannot check if the table supports time travel.
+    if (timeTravelSpec_ != null) {
+      timeTravelSpec_.analyze(analyzer);
+    }
+  }
+
   protected void analyzeHints(Analyzer analyzer) throws AnalysisException {
     // We prefer adding warnings over throwing exceptions here to maintain view
     // compatibility with Hive.
@@ -387,9 +504,10 @@ public class TableRef extends StmtNode {
     }
     // BaseTableRef will always have their path resolved at this point.
     Preconditions.checkState(getResolvedPath() != null);
+    boolean isTableHintSupported = true;
     if (getResolvedPath().destTable() != null &&
-        !(getResolvedPath().destTable() instanceof FeFsTable)) {
-      analyzer.addWarning("Table hints only supported for Hdfs tables");
+        !supportTableHint(getResolvedPath().destTable(), analyzer)) {
+      isTableHintSupported = false;
     }
     for (PlanHint hint: tableHints_) {
       if (hint.is("SCHEDULE_CACHE_LOCAL")) {
@@ -404,12 +522,62 @@ public class TableRef extends StmtNode {
       } else if (hint.is("SCHEDULE_RANDOM_REPLICA")) {
         analyzer.setHasPlanHints();
         randomReplica_ = true;
+      } else if (hint.is("CONVERT_LIMIT_TO_SAMPLE")) {
+        List<String> args = hint.getArgs();
+        if (args == null || args.size() != 1) {
+          addHintWarning(hint, analyzer);
+          return;
+        } else {
+          try {
+            int samplePercent = Integer.parseInt(args.get(0));
+            if (samplePercent < 1 || samplePercent > 100) {
+              addHintWarning(hint, analyzer);
+              return;
+            }
+            analyzer.setHasPlanHints();
+            convertLimitToSampleHintPercent_ = samplePercent;
+          } catch (NumberFormatException e) {
+            addHintWarning(hint, analyzer);
+          }
+        }
+      } else if (hint.is(TABLE_ROW_HINT)) {
+        List<String> args = hint.getArgs();
+        if (args == null || args.size() != 1 || !isTableHintSupported) {
+          addHintWarning(hint, analyzer);
+          return;
+        }
+        analyzer.setHasPlanHints();
+        tableNumRowsHint_ = Long.parseLong(args.get(0));
       } else {
-        Preconditions.checkState(getAliases() != null && getAliases().length > 0);
-        analyzer.addWarning("Table hint not recognized for table " + getUniqueAlias() +
-            ": " + hint);
+        addHintWarning(hint, analyzer);
       }
     }
+  }
+
+  /**
+   * Returns whether the table supports hint. Currently, hdfs table support table hint
+   * usage, kudu table only support {@link this#TABLE_ROW_HINT} hint.
+   *
+   * TODO: Add other table hints for kudu table.
+   */
+  private boolean supportTableHint(FeTable table, Analyzer analyzer) {
+    if (table instanceof FeKuduTable) {
+      if (!(tableHints_.size() == 1 && tableHints_.get(0).is(TABLE_ROW_HINT))) {
+        analyzer.addWarning(String.format("Kudu table only support '%s' hint.",
+            TABLE_ROW_HINT));
+        return false;
+      }
+    } else if (!(table instanceof FeFsTable)) {
+      analyzer.addWarning("Table hints only supported for Hdfs/Kudu tables.");
+      return false;
+    }
+    return true;
+  }
+
+  private void addHintWarning(PlanHint hint, Analyzer analyzer) {
+    Preconditions.checkState(getAliases() != null && getAliases().length > 0);
+    analyzer.addWarning("Table hint not recognized for table " + getUniqueAlias() +
+        ": " + hint);
   }
 
   private void analyzeJoinHints(Analyzer analyzer) throws AnalysisException {
@@ -559,7 +727,7 @@ public class TableRef extends StmtNode {
         e.getIds(tupleIds, null);
         onClauseTupleIds.addAll(tupleIds);
       }
-    } else if (!isRelative() && !isCorrelated()
+    } else if (!allowEmptyOn() && !isRelative() && !isCorrelated()
         && (getJoinOp().isOuterJoin() || getJoinOp().isSemiJoin())) {
       throw new AnalysisException(
           joinOp_.toString() + " requires an ON or USING clause.");
@@ -574,6 +742,8 @@ public class TableRef extends StmtNode {
     Preconditions.checkState(isAnalyzed_);
     if (onClause_ != null) onClause_ = rewriter.rewrite(onClause_, analyzer);
   }
+
+  public String debugString() { return tableRefToSql(); }
 
   protected String tableRefToSql() { return tableRefToSql(DEFAULT); }
 
@@ -593,6 +763,7 @@ public class TableRef extends StmtNode {
 
   @Override
   public String toSql(ToSqlOptions options) {
+    if (isZippingUnnest()) return "";
     if (joinOp_ == null) {
       // prepend "," if we're part of a sequence of table refs w/o an
       // explicit JOIN clause
@@ -633,5 +804,60 @@ public class TableRef extends StmtNode {
     allMaterializedTupleIds_.clear();
     correlatedTupleIds_.clear();
     desc_ = null;
+    if (timeTravelSpec_ != null) timeTravelSpec_.reset();
+  }
+
+  public boolean isTableMaskingView() { return false; }
+
+  public void registerColumn(Column column) {
+    columns_.put(column.getName(), column);
+  }
+
+  /**
+   * @return an unmodifiable list of all columns, but with partition columns at the end of
+   * the list rather than the beginning. This is equivalent to the order in which Hive
+   * enumerates columns.
+   */
+  public List<Column> getColumnsInHiveOrder() {
+    return getTable().getColumnsInHiveOrder();
+  }
+
+  public List<Column> getSelectedColumnsInHiveOrder() {
+    // Map from column name to the Column object (null if not selected).
+    // Use LinkedHashMap to preserve the order.
+    Map<String, Column> colSelection = new LinkedHashMap<>();
+    for (Column c : getColumnsInHiveOrder()) {
+      colSelection.put(c.getName(), null);
+    }
+    // Update 'colSelection' with selected columns. Virtual columns will also be added.
+    for (String colName : columns_.keySet()) {
+      colSelection.put(colName, columns_.get(colName));
+    }
+    List<Column> res = new ArrayList<>();
+    for (Column c : colSelection.values()) {
+      if (c != null) res.add(c);
+    }
+    // Make sure not missing any columns
+    Preconditions.checkState(res.size() == columns_.size(),
+        "missing columns: " + res.size() + " != " + columns_.size());
+    return res;
+  }
+
+  void migratePropertiesTo(TableRef other) {
+    other.aliases_ = aliases_;
+    other.onClause_ = onClause_;
+    other.usingColNames_ = usingColNames_;
+    other.joinOp_ = joinOp_;
+    other.joinHints_ = joinHints_;
+    other.tableHints_ = tableHints_;
+    other.timeTravelSpec_ = timeTravelSpec_;
+    // Clear properties. Don't clear aliases_ since it's still used in resolving slots
+    // in the query block of 'other'.
+    // Don't clear timeTravelSpec_ as it is still relevant.
+    onClause_ = null;
+    usingColNames_ = null;
+    joinOp_ = null;
+    joinHints_ = new ArrayList<>();
+    tableHints_ = new ArrayList<>();
   }
 }

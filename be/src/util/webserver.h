@@ -20,12 +20,13 @@
 #include <map>
 #include <string>
 #include <boost/function.hpp>
-#include <boost/thread/shared_mutex.hpp>
+#include <boost/thread/pthread/shared_mutex.hpp>
 #include <rapidjson/fwd.h>
 
 #include "common/status.h"
 #include "kudu/util/web_callback_registry.h"
 #include "thirdparty/squeasel/squeasel.h"
+#include "util/ldap-util.h"
 #include "util/metrics-fwd.h"
 #include "util/network-util.h"
 #include "util/openssl-util.h"
@@ -82,9 +83,12 @@ class Webserver {
   /// as pretty printed JSON plain text.
   static const char* ENABLE_PLAIN_JSON_KEY;
 
+  enum AuthMode { NONE, HTPASSWD, SPNEGO, LDAP };
+
   /// Using this constructor, the webserver will bind to 'interface', or all available
   /// interfaces if not specified.
-  Webserver(const std::string& interface, const int port, MetricGroup* metrics);
+  Webserver(const std::string& interface, const int port, MetricGroup* metrics,
+      const AuthMode& auth_mode = GetConfiguredAuthMode());
 
   /// Uses FLAGS_webserver_{port, interface}
   Webserver(MetricGroup* metrics);
@@ -119,12 +123,18 @@ class Webserver {
   bool IsSecure() const;
 
   /// Returns the URL to the webserver as a string.
-  string url() { return url_; }
-  string hostname() { return hostname_; }
+  std::string url() { return url_; }
+  std::string hostname() { return hostname_; }
   int port() { return http_address_.port; }
 
   /// Returns the appropriate MIME type for a given ContentType.
   static const std::string GetMimeType(const ContentType& content_type);
+
+  /// Returns the authentication mode configured by the startup flags.
+  static AuthMode GetConfiguredAuthMode();
+
+  /// Parses form-uri-encoded data and returns key/value pairs.
+  static ArgumentMap GetVars(const std::string& data);
 
  private:
   /// Contains all information relevant to rendering one Url. Each Url has one callback
@@ -150,11 +160,11 @@ class Webserver {
 
    private:
     /// If true, the page appears in the navigation bar.
-    bool is_on_nav_bar_;
+    const bool is_on_nav_bar_;
 
     /// If true, use the template rendering callback, otherwise the 'raw' callback is
     /// used.
-    bool use_templates_;
+    const bool use_templates_;
 
     /// Callback to produce a Json document to render via a template.
     UrlCallback template_callback_;
@@ -189,6 +199,29 @@ class Webserver {
   sq_callback_result_t HandleSpnego(struct sq_connection* connection,
       struct sq_request_info* request_info, std::vector<std::string>* response_headers);
 
+  /// Checks and returns true if the connection originated from a trusted domain and has a
+  /// valid username set in the request's the Authorization header (using Basic Auth).
+  bool TrustedDomainCheck(const std::string& origin, struct sq_connection* connection,
+      struct sq_request_info* request_info);
+
+  /// Checks and returns true if the JWT token in Authorization header could be verified
+  /// and the token has a valid username.
+  bool JWTTokenAuth(const std::string& jwt_token, struct sq_connection* connection,
+      struct sq_request_info* request_info);
+
+  // Handle Basic authentication for this request. Returns an error if authentication was
+  // unsuccessful.
+  Status HandleBasic(struct sq_connection* connection,
+      struct sq_request_info* request_info, std::vector<std::string>* response_headers);
+
+  // Adds a 'Set-Cookie' header to 'response_headers', if cookie support is enabled.
+  // Returns the random value portion of the cookie in 'rand' for use in CSRF prevention.
+  void AddCookie(const char* user, vector<string>* response_headers, string* rand);
+
+  // Get username from Authorization header.
+  bool GetUsernameFromAuthHeader(struct sq_connection* connection,
+      struct sq_request_info* request_info, string& err_msg);
+
   /// Renders URLs through the Mustache templating library.
   /// - Default ContentType is HTML.
   /// - Argument 'raw' renders the page with PLAIN ContentType.
@@ -196,7 +229,8 @@ class Webserver {
   ///   pretty-printed.
   void RenderUrlWithTemplate(const struct sq_connection* connection,
       const WebRequest& arguments, const UrlHandler& url_handler,
-      std::stringstream* output, ContentType* content_type);
+      std::stringstream* output, ContentType* content_type,
+      const std::string& csrf_token);
 
   /// Called when an error is encountered, e.g. when a handler for a URI cannot be found.
   void ErrorHandler(const WebRequest& req, rapidjson::Document* document);
@@ -204,12 +238,13 @@ class Webserver {
   /// Builds a map of argument name to argument value from a typical URL argument
   /// string (that is, "key1=value1&key2=value2.."). If no value is given for a
   /// key, it is entered into the map as (key, "").
-  void BuildArgumentMap(const std::string& args, ArgumentMap* output);
+  static void BuildArgumentMap(const std::string& args, ArgumentMap* output);
 
   /// Adds a __common__ object to document with common data that every webpage might want
   /// to read (e.g. the names of links to write to the navbar).
   void GetCommonJson(rapidjson::Document* document,
-      const struct sq_connection* connection, const WebRequest& req);
+      const struct sq_connection* connection, const WebRequest& req,
+      const std::string& csrf_token);
 
   /// Lock guarding the path_handlers_ map
   boost::shared_mutex url_handlers_lock_;
@@ -229,6 +264,8 @@ class Webserver {
   /// The resolved hostname from 'http_address_'.
   std::string hostname_;
 
+  AuthMode auth_mode_;
+
   /// Handle to Squeasel context; owned and freed by Squeasel internally
   struct sq_context* context_;
 
@@ -241,15 +278,48 @@ class Webserver {
   /// If true and SPNEGO is in use, cookies will be used for authentication.
   bool use_cookies_;
 
+  /// If true and SPNEGO or LDAP is in use, checks whether an incoming connection can skip
+  /// auth if it originates from a trusted domain.
+  bool check_trusted_domain_;
+
+  /// If true and SPNEGO or LDAP is in use, checks whether an incoming connection can skip
+  /// auth if it has trusted auth header.
+  bool check_trusted_auth_header_;
+
+  /// If true, the JWT token in Authorization header will be used for authentication.
+  /// An incoming connection will be accepted if the JWT token could be verified.
+  bool use_jwt_ = false;
+
+  /// Used to validate usernames/passwords If LDAP authentication is in use.
+  std::unique_ptr<ImpalaLdap> ldap_;
+
   /// If 'FLAGS_webserver_require_spnego' is true, metrics for the number of successful
   /// and failed Negotiate auth attempts.
   IntCounter* total_negotiate_auth_success_ = nullptr;
   IntCounter* total_negotiate_auth_failure_ = nullptr;
 
+  /// If 'FLAGS_webserver_require_ldap' is true, metrics for the number of successful
+  /// and failed Basic auth attempts.
+  IntCounter* total_basic_auth_success_ = nullptr;
+  IntCounter* total_basic_auth_failure_ = nullptr;
+
   /// If 'use_cookies_' is true, metrics for the number of successful and failed cookie
   /// auth attempts.
   IntCounter* total_cookie_auth_success_ = nullptr;
   IntCounter* total_cookie_auth_failure_ = nullptr;
+
+  /// If 'use_cookies_' is true, metrics for the number of successful
+  /// attempts to authorize connections originating from a trusted domain.
+  IntCounter* total_trusted_domain_check_success_ = nullptr;
+
+  /// Metrics for the number of successful attempts to authorize connections with a
+  /// trusted auth header.
+  IntCounter* total_trusted_auth_header_check_success_ = nullptr;
+
+  /// If 'use_jwt_' is true, metrics for the number of successful and failed JWT auth
+  /// attempts.
+  IntCounter* total_jwt_token_auth_success_ = nullptr;
+  IntCounter* total_jwt_token_auth_failure_ = nullptr;
 };
 
 }

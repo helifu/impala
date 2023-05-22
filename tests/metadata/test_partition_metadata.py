@@ -15,17 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfFS, SkipIfLocal
 from tests.common.test_dimensions import (create_single_exec_option_dimension,
-    create_uncompressed_text_dimension)
-from tests.util.filesystem_utils import get_fs_path, WAREHOUSE, FILESYSTEM_PREFIX
-
-# Map from the test dimension file_format string to the SQL "STORED AS"
-# argument.
-STORED_AS_ARGS = { 'text': 'textfile', 'parquet': 'parquet', 'avro': 'avro',
-    'seq': 'sequencefile' }
+    create_uncompressed_text_dimension, FILE_FORMAT_TO_STORED_AS_MAP)
+from tests.util.filesystem_utils import WAREHOUSE, FILESYSTEM_PREFIX
 
 # Tests specific to partition metadata.
 # TODO: Split up the DDL tests and move some of the partition-specific tests
@@ -59,7 +55,7 @@ class TestPartitionMetadata(ImpalaTestSuite):
     # Create the table
     self.client.execute(
         "create table %s (i int) partitioned by(j int) stored as %s location '%s'"
-        % (FQ_TBL_NAME, STORED_AS_ARGS[file_format], TBL_LOCATION))
+        % (FQ_TBL_NAME, FILE_FORMAT_TO_STORED_AS_MAP[file_format], TBL_LOCATION))
 
     # Point both partitions to the same location.
     self.client.execute("alter table %s add partition (j=1) location '%s/p'"
@@ -88,11 +84,7 @@ class TestPartitionMetadata(ImpalaTestSuite):
     data = self.execute_scalar("select sum(i), sum(j) from %s" % FQ_TBL_NAME)
     assert data.split('\t') == ['6', '9']
 
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_partition_metadata_compatibility(self, vector, unique_database):
     """Regression test for IMPALA-2048. For partitioned tables, test that when Impala
     updates the partition metadata (e.g. by doing a compute stats), the tables are
@@ -181,13 +173,13 @@ class TestPartitionMetadataUncompressedTextOnly(ImpalaTestSuite):
         FQ_TBL_NAME, TBL_LOCATION))
 
     self.__add_alltypes_partition(vector, FQ_TBL_NAME, "functional", 2009, 1)
-    self.__add_alltypes_partition(vector, FQ_TBL_NAME, "functional_text_lzo", 2009, 2)
+    self.__add_alltypes_partition(vector, FQ_TBL_NAME, "functional_text_gzip", 2009, 2)
 
     # Create a new partition with a bogus file with the unsupported LZ4 suffix.
     lz4_year = 2009
     lz4_month = 3
     lz4_ym_partition_loc = self.__make_ym_partition_dir(TBL_LOCATION, lz4_year, lz4_month)
-    self.filesystem_client.create_file("{0}/fake.lz4".format(lz4_ym_partition_loc)[1:],
+    self.filesystem_client.create_file("{0}/fake.lz4".format(lz4_ym_partition_loc),
         "some test data")
     self.client.execute(
         "alter table {0} add partition (year={1}, month={2}) location '{3}'".format(
@@ -199,13 +191,23 @@ class TestPartitionMetadataUncompressedTextOnly(ImpalaTestSuite):
     fake_comp_ym_partition_loc = self.__make_ym_partition_dir(
         TBL_LOCATION, fake_comp_year, fake_comp_month)
     self.filesystem_client.create_file(
-        "{0}/fake.fake_comp".format(fake_comp_ym_partition_loc)[1:], "fake compression")
+        "{0}/fake.fake_comp".format(fake_comp_ym_partition_loc), "fake compression")
     self.client.execute(
         "alter table {0} add partition (year={1}, month={2}) location '{3}'".format(
         FQ_TBL_NAME, fake_comp_year, fake_comp_month, fake_comp_ym_partition_loc))
 
+    # Create a new partition with a bogus file with the now-unsupported LZO suffix
+    lzo_year = 2009
+    lzo_month = 5
+    lzo_ym_partition_loc = self.__make_ym_partition_dir(TBL_LOCATION, lzo_year, lzo_month)
+    self.filesystem_client.create_file("{0}/fake.lzo".format(lzo_ym_partition_loc),
+        "some test data")
+    self.client.execute(
+        "alter table {0} add partition (year={1}, month={2}) location '{3}'".format(
+            FQ_TBL_NAME, lzo_year, lzo_month, lzo_ym_partition_loc))
+
     show_files_result = self.client.execute("show files in {0}".format(FQ_TBL_NAME))
-    assert len(show_files_result.data) == 4, "Expected one file per partition dir"
+    assert len(show_files_result.data) == 5, "Expected one file per partition dir"
 
     self.run_test_case('QueryTest/unsupported-compression-partitions', vector,
         unique_database)
@@ -222,8 +224,11 @@ class TestPartitionMetadataUncompressedTextOnly(ImpalaTestSuite):
     """Create the year/month partition directory and return the path."""
     y_partition_loc = "{0}/year={1}".format(tbl_location, year)
     ym_partition_loc = "{0}/month={1}".format(y_partition_loc, month)
-    self.filesystem_client.delete_file_dir(tbl_location[1:], recursive=True)
-    self.filesystem_client.make_dir(tbl_location[1:])
-    self.filesystem_client.make_dir(y_partition_loc[1:])
-    self.filesystem_client.make_dir(ym_partition_loc[1:])
+    if not self.filesystem_client.exists(tbl_location):
+      self.filesystem_client.make_dir(tbl_location)
+    if not self.filesystem_client.exists(y_partition_loc):
+      self.filesystem_client.make_dir(y_partition_loc)
+    if self.filesystem_client.exists(ym_partition_loc):
+      self.filesystem_client.delete_file_dir(ym_partition_loc, recursive=True)
+    self.filesystem_client.make_dir(ym_partition_loc)
     return ym_partition_loc

@@ -23,10 +23,13 @@ import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
+import org.apache.impala.authorization.NoopAuthorizationFactory;
+import org.apache.impala.authorization.NoopAuthorizationFactory.NoopAuthorizationManager;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.catalog.events.MetastoreEventsProcessor.EventProcessorStatus;
+import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.util.RandomHiveQueryRunner;
 import org.apache.impala.common.Pair;
 import org.apache.impala.compat.MetastoreShim;
@@ -36,7 +39,6 @@ import org.apache.thrift.TException;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
-import org.junit.Ignore;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,7 +58,7 @@ public class EventsProcessorStressTest {
   // use a fixed seed value to make the test repeatable
   private static final Random random = new Random(117);
 
-  private static CatalogServiceCatalog catalog_;
+  private static CatalogServiceTestCatalog catalog_;
   private static MetastoreEventsProcessor eventsProcessor_;
   private static final String testDbPrefix_ = "events_stress_db_";
   private static final String testTblPrefix_ = "stress_test_tbl_";
@@ -105,11 +107,12 @@ public class EventsProcessorStressTest {
   @BeforeClass
   public static void setupTestEnv() throws Exception {
     catalog_ = CatalogServiceTestCatalog.create();
+    CatalogOpExecutor catalogOpExecutor = catalog_.getCatalogOpExecutor();
     try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
       CurrentNotificationEventId currentNotificationId =
           metaStoreClient.getHiveClient().getCurrentNotificationEventId();
       eventsProcessor_ = new SynchronousHMSEventProcessorForTests(
-          catalog_, currentNotificationId.getEventId(), 10L);
+          catalogOpExecutor, currentNotificationId.getEventId(), 10L);
       eventsProcessor_.start();
     }
     catalog_.setMetastoreEventProcessor(eventsProcessor_);
@@ -189,7 +192,6 @@ public class EventsProcessorStressTest {
     }
   }
 
-  @Ignore("Ignored until MAPREDUCE-6441 is available in the toolchain")
   @Test
   public void testUsingRandomHiveQueries() throws Exception {
     LOG.info("Using number of clients: {} number of queries per client: {}", numClients_,

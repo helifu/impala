@@ -22,9 +22,18 @@ syntax="proto2";
 package impala;
 
 // Refer to Types.thrift for documentation.
+// UDS is limited to KRPC.
 message NetworkAddressPB {
   required string hostname = 1;
   required int32 port = 2;
+  optional string uds_address = 3;
+}
+
+// Unique-id used for setting UDS address.
+enum UdsAddressUniqueIdPB {
+  IP_ADDRESS = 0;
+  BACKEND_ID = 1;
+  NO_UNIQUE_ID = 2;
 }
 
 // Proto-serialized version of Impala's Status object.
@@ -39,9 +48,38 @@ message UniqueIdPB {
   required fixed64 lo = 2;
 }
 
-// The compression codec. Currently used in row batch's header to
-// indicate the type of compression applied to the row batch.
-enum CompressionType {
-  NONE = 0; // No compression.
-  LZ4 = 1;
+// The compression codec. Currently used to indicate the compression used in
+// row batches and HDFS files. Corresponds to THdfsCompression.
+enum CompressionTypePB {
+  NONE = 0;
+  DEFAULT = 1;
+  GZIP = 2;
+  DEFLATE = 3;
+  BZIP2 = 4;
+  SNAPPY = 5;
+  SNAPPY_BLOCKED = 6;
+  LZO = 7;
+  LZ4 = 8;
+  ZLIB = 9;
+  ZSTD = 10;
+  BROTLI = 11;
+  LZ4_BLOCKED = 12;
+}
+
+// This is a union over all possible return types.
+// TODO: if we upgrade to proto3, then we can use the oneof feature in Protobuf 3 in
+// the following to save some memory because only one of the fields below is set at a
+// time.
+message ColumnValuePB {
+  optional bool bool_val = 1;
+  optional int32 byte_val = 6;
+  optional int32 short_val = 7;
+  optional int32 int_val = 2;
+  optional int64 long_val = 3;
+  optional double double_val = 4;
+  optional string string_val = 5;
+  optional string binary_val = 8;
+  optional string timestamp_val = 9;
+  optional bytes decimal_val = 10;
+  optional int32 date_val = 11;
 }

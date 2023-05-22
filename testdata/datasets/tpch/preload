@@ -30,7 +30,12 @@ then
   TPC_H_DATA=${TPC_H_DATA}${SCALE_FACTOR}
 fi
 
-TPC_H_HOME=${IMPALA_TOOLCHAIN}/tpc-h-${IMPALA_TPC_H_VERSION}
+if [ -f ${TPC_H_DATA}/SUCCESS ]; then
+  echo "Reuse existing TPC-H data in ${TPC_H_DATA}"
+  exit 0
+fi
+
+TPC_H_HOME=${IMPALA_TOOLCHAIN_PACKAGES_HOME}/tpc-h-${IMPALA_TPC_H_VERSION}
 TPC_H_DBGEN=${TPC_H_HOME}/bin/dbgen
 
 if [ ! -x ${TPC_H_DBGEN} ]; then
@@ -45,6 +50,12 @@ echo "Generating TPC-H data into ${TPC_H_DATA}"
 chmod +w ${TPC_H_DATA} || true
 rm -rf ${TPC_H_DATA}
 mkdir -p ${TPC_H_DATA}
+# Create symlink if scale factor is 1
+if [ ${SCALE_FACTOR} -eq 1 ]
+then
+  rm -rf ${TPC_H_DATA}${SCALE_FACTOR}
+  ln -s ${TPC_H_DATA} ${TPC_H_DATA}${SCALE_FACTOR}
+fi
 cd ${TPC_H_DATA}
 
 if [ -t 1 ]
@@ -63,3 +74,5 @@ for FILE in *.tbl; do
   mkdir -p ${FILE_DIR}
   mv ${FILE} ${FILE_DIR}
 done
+
+touch SUCCESS

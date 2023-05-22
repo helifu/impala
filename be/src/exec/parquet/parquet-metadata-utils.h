@@ -37,7 +37,7 @@ class ParquetMetadataUtils {
 
   /// Validate column offsets by checking if the dictionary page comes before the data
   /// pages and checking if the column offsets lie within the file.
-  static Status ValidateColumnOffsets(const string& filename, int64_t file_length,
+  static Status ValidateColumnOffsets(const std::string& filename, int64_t file_length,
       const parquet::RowGroup& row_group);
 
   /// Check that a file offset is in the file. Return an error status with a detailed
@@ -60,12 +60,13 @@ class ParquetMetadataUtils {
   /// Returns the Parquet type corresponding to Impala's internal type. The caller must
   /// validate that the input type is valid, otherwise this will DCHECK.
   static parquet::Type::type ConvertInternalToParquetType(PrimitiveType type,
-      const TQueryOptions& query_options);
+      const TParquetTimestampType::type timestamp_type);
 
   /// Sets type related fields in a SchemaElement based on the column's internal type
-  /// and query options.
+  /// and this function's arguments.
   static void FillSchemaElement(const ColumnType& col_type,
-      const TQueryOptions& query_options, parquet::SchemaElement* col_schema);
+      bool string_utf8, TParquetTimestampType::type timestamp_type,
+      const AuxColumnType& aux_type, parquet::SchemaElement* col_schema);
 };
 
 struct ParquetFileVersion {
@@ -139,13 +140,12 @@ struct SchemaNode {
 class ParquetSchemaResolver {
  public:
   ParquetSchemaResolver(const HdfsTableDescriptor& tbl_desc,
-      TParquetFallbackSchemaResolution::type fallback_schema_resolution,
+      TSchemaResolutionStrategy::type fallback_schema_resolution,
       TParquetArrayResolution::type array_resolution)
     : tbl_desc_(tbl_desc),
       fallback_schema_resolution_(fallback_schema_resolution),
       array_resolution_(array_resolution),
-      filename_(NULL) {
-  }
+      filename_(NULL) {}
 
   /// Parses the schema of the given file metadata into an internal schema
   /// representation used in path resolution. Remembers the filename for error
@@ -153,7 +153,16 @@ class ParquetSchemaResolver {
   Status Init(const parquet::FileMetaData* file_metadata, const char* filename) {
     DCHECK(filename != NULL);
     filename_ = filename;
-    return CreateSchemaTree(file_metadata->schema, &schema_);
+    // Use FIELD_ID-based column resolution for Iceberg tables if possible.
+    const auto& schema = file_metadata->schema;
+    Status status = CreateSchemaTree(file_metadata->schema, &schema_);
+    if (tbl_desc_.IsIcebergTable()) {
+      fallback_schema_resolution_ = TSchemaResolutionStrategy::type::FIELD_ID;
+
+      // schema[0] is the 'root', schema[1] is the first column.
+      if (schema.size() > 1 && !schema[1].__isset.field_id) GenerateFieldIDs();
+    }
+    return status;
   }
 
   /// Traverses 'schema_' according to 'path', returning the result in 'node'. If 'path'
@@ -182,6 +191,9 @@ class ParquetSchemaResolver {
   /// An arbitrary limit on the number of children per schema node we support.
   /// Used to sanity-check Parquet schemas.
   static const int SCHEMA_NODE_CHILDREN_SANITY_LIMIT = 64 * 1024;
+
+  /// Invalid ID used to signal corrupted file
+  static const int INVALID_ID = -1;
 
   /// Maps from the array-resolution policy to the ordered array encodings that should
   /// be tried during path resolution. All entries have the ONE_LEVEL encoding at the end
@@ -215,7 +227,10 @@ class ParquetSchemaResolver {
   /// found. The name comparison is case-insensitive because that's how Impala treats
   /// db/table/column/field names. If there are several matches with different casing,
   /// then the index of the first match is returned.
-  int FindChildWithName(SchemaNode* node, const string& name) const;
+  int FindChildWithName(SchemaNode* node, const std::string& name) const;
+  /// Returns the index of 'node's child with 'field id' for Iceberg tables.
+  /// Return -1 if the file is corrupted
+  int FindChildWithFieldId(SchemaNode* node, const int& field_id) const;
 
   /// The ResolvePathHelper() logic for arrays.
   Status ResolveArray(ArrayEncoding array_encoding, const SchemaPath& path, int idx,
@@ -225,15 +240,27 @@ class ParquetSchemaResolver {
   Status ResolveMap(const SchemaPath& path, int idx, SchemaNode** node,
       bool* missing_field) const;
 
+  /// The ResolvePathHelper() logic for structs.
+  Status ResolveStruct(const SchemaNode& node, const ColumnType& col_type,
+      const SchemaPath& path, int idx) const;
+
   /// The ResolvePathHelper() logic for scalars (just does validation since there's no
   /// more actual work to be done).
   Status ValidateScalarNode(const SchemaNode& node, const ColumnType& col_type,
       const SchemaPath& path, int idx) const;
 
+  /// Generates field ids for the columns in the same order as Iceberg. The traversal is
+  /// preorder, but the assigned field IDs are not. When a node is visited, its child
+  /// nodes are assigned an ID, hence the difference.
+  void GenerateFieldIDs();
+
+  inline int GetGeneratedFieldID(SchemaNode* node) const;
+
   const HdfsTableDescriptor& tbl_desc_;
-  const TParquetFallbackSchemaResolution::type fallback_schema_resolution_;
+  TSchemaResolutionStrategy::type fallback_schema_resolution_;
   const TParquetArrayResolution::type array_resolution_;
   const char* filename_;
+  std::unordered_map<SchemaNode*, int32_t> schema_node_to_field_id_;
 
   /// Root node of our internal schema representation populated in Init().
   SchemaNode schema_;

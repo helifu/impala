@@ -16,6 +16,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from __future__ import print_function, unicode_literals
 
 import re
 import ssl
@@ -54,6 +55,10 @@ class TSSLSocketWithWildcardSAN(TSSLSocket.TSSLSocket):
                                    ca_certs=ca_certs, unix_socket=unix_socket,
                                    ssl_version=ssl.PROTOCOL_SSLv23)
 
+  # THRIFT-5595: override TSocket.isOpen because it's broken for TSSLSocket
+  def isOpen(self):
+    return self.handle is not None
+
   def _validate_cert(self):
     cert = self.handle.getpeercert()
     self.peercert = cert
@@ -65,7 +70,7 @@ class TSSLSocketWithWildcardSAN(TSSLSocket.TSSLSocket):
       self._match_hostname(cert, self.host)
       self.is_valid = True
       return
-    except CertificateError, ce:
+    except CertificateError as ce:
       raise TTransportException(
         type=TTransportException.UNKNOWN,
         message='Certificate error with remote host: %s' % (ce))

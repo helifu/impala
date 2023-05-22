@@ -1399,6 +1399,77 @@ and cast('2010-01-01 01:40:00' as timestamp)
 bigint
 ====
 ---- QUERY
+# Regression tests for IMPALA-8054
+select count(*) from functional.alltypes where 10 between float_col and bigint_col;
+---- RESULTS
+6570
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where !(10 between null and bigint_col);
+---- RESULTS
+730
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where !(5 between float_col and null);
+---- RESULTS
+3650
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 10 between null and null;
+---- RESULTS
+0
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where null between null and null;
+---- RESULTS
+0
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 10 not between float_col and bigint_col;
+---- RESULTS
+730
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 10 not between null and bigint_col;
+---- RESULTS
+730
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 5 not between float_col and null;
+---- RESULTS
+3650
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 10 not between null and null;
+---- RESULTS
+0
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where null not between null and null;
+---- RESULTS
+0
+---- TYPES
+bigint
+====
+---- QUERY
 # Test pid() function, this should only return one pid. If pid() were not implemented
 # correctly via the global state variable, this could return multiple pids.
 select pid() p from functional.alltypes
@@ -2585,13 +2656,11 @@ UDF WARNING: Invalid base64 string; input length is 3, which is not a multiple o
 ====
 ---- QUERY
 # base64 decoding a string with invalid characters
-select base64decode('abc%')
+select base64decode('abc%') is null or base64decode('abc%') = concat('i', chr(183), chr(255))
 ---- RESULTS
-'NULL'
+true
 ---- TYPES
-STRING
----- ERRORS
-UDF WARNING: Could not base64 decode input in space 4; actual output length 0
+BOOLEAN
 ====
 ---- QUERY
 # IMPALA-1731: test parsing infinity values
@@ -2966,18 +3035,26 @@ select cast('2001-1-2 1:5:3.123' as timestamp)
 timestamp
 ====
 ---- QUERY
-select cast('1:5:3' as timestamp)
+select cast('01:05:03' as timestamp)
 ---- RESULTS
-01:05:03
+NULL
 ---- TYPES
 timestamp
 ====
 ---- QUERY
-select cast('1:5:3.1234567' as timestamp)
+select to_timestamp('01:01:01', 'HH:mm:ss');
+---- CATCH
+Query aborted:Bad date/time conversion format: HH:mm:ss
+====
+---- QUERY
+select to_timestamp('01:01:01.123', 'HH:mm:ss.SSS');
+---- CATCH
+Query aborted:Bad date/time conversion format: HH:mm:ss
+====
+---- QUERY
+select from_unixtime(1382337792,"HH:mm:ss.SSSSSSSSS");
 ---- RESULTS
-01:05:03.123456700
----- TYPES
-timestamp
+'06:43:12.000000000'
 ====
 ---- QUERY
 select cast('2001-1-2' as timestamp)
@@ -3093,4 +3170,120 @@ select distinct year from functional.alltypes where case when year = 2010 then m
 2010
 ---- TYPES
 int
+====
+---- QUERY
+# IMPALA-452 Add support for string concatenation operator using ||
+select distinct bool_col || int_col < smallint_col,
+"TEST" || string_col from functional.alltypes
+WHERE float_col = double_col || (string_col || 'test') = 'testtest';
+---- RESULTS
+true,'TEST0'
+---- TYPES
+BOOLEAN, STRING
+====
+---- QUERY
+select distinct bool_col OR int_col < smallint_col,
+concat ("TEST", string_col) from functional.alltypes
+WHERE float_col = double_col OR concat(string_col,'test') = 'testtest';
+---- RESULTS
+true,'TEST0'
+---- TYPES
+BOOLEAN, STRING
+====
+---- QUERY
+select sha1(s) from functional.strings_with_quotes where i = 10;
+---- RESULTS
+'dd34bd3ce9aa419f49921e5ff2e67210fe04a4e2'
+---- TYPES
+STRING
+====
+---- QUERY
+select sha2(s, 224), sha2(s, 256), sha2(s, 384),
+sha2(s, 512) from functional.strings_with_quotes where i = 10;
+---- RESULTS
+'c77557470807461a5f30c8eb5fc93147c78fa41261714d495eb871ec','738f748710e0adc2e62f2e5f9b5cec4ed12abfd7142c0bd4ff81966e5a17a278','afef2f6068e8a80c58ce141bf661255e696e5d6c436485212b0190fc36b5465ec4e86d6492e9fe94f6392462fb5fc06c','225b4d74a7697d2064ac6ff8d71bdfddea62d75ea495274fbc55dc39ff0800c85bce11992398d5dd7eabd2deffdbb56822fbb995666b78e449b2ab88ff7c8d86'
+---- TYPES
+STRING, STRING, STRING, STRING
+====
+---- QUERY
+select md5(s) from functional.strings_with_quotes where i = 10;
+---- RESULTS
+'ba6d5d4549e4799ceab221c63fa54203'
+---- TYPES
+STRING
+====
+---- QUERY: IMPALA-10849
+# Check that an escaped % is not treated as a wildcard character in a like
+# predicate. Note this test cannot be part of the LikeTbl tests as the
+# like predicate optimizations are only applied when the like predicate is a
+# string literal.
+select 'escape%' like 'escape\%'
+---- RESULTS
+true
+---- TYPES
+BOOLEAN
+====
+---- QUERY: IMPALA-10849
+# Check that an escaped % is not treated as a wildcard character in a like
+# predicate. Note this test cannot be part of the LikeTbl tests as the
+# like predicate optimizations are only applied when the like predicate is a
+# string literal.
+select 'esc\\ape' not like 'esc\%'
+---- RESULTS
+true
+---- TYPES
+BOOLEAN
+====
+---- QUERY: IMPALA-10849
+# Check that an escaped _ is not treated as a wildcard character in a like
+# predicate. Note this test cannot be part of the LikeTbl tests as the
+# like predicate optimizations are only applied when the like predicate is a
+# string literal.
+select 'escape_' like 'escape\_'
+---- RESULTS
+true
+---- TYPES
+BOOLEAN
+====
+---- QUERY: IMPALA-10849
+# Check that an escaped _ is not treated as a wildcard character in a like
+# predicate. Note this test cannot be part of the LikeTbl tests as the
+# like predicate optimizations are only applied when the like predicate is a
+# string literal.
+select 'esca' not like 'esc\_'
+---- RESULTS
+true
+---- TYPES
+BOOLEAN
+====
+---- QUERY: IMPALA-10849
+# Check that unescaped % is evaluated correctly.
+select 'escape' like 'esc%'
+---- RESULTS
+true
+---- TYPES
+BOOLEAN
+====
+---- QUERY: IMPALA-10849
+# Check that unescaped _ is evaluated correctly.
+select 'escape' like 'escap_'
+---- RESULTS
+true
+---- TYPES
+BOOLEAN
+====
+---- QUERY: IMPALA-955
+# Returns number of bytes in a byte string.
+select bytes(string_col), bytes(date_string_col) from functional.alltypestiny;
+---- RESULTS
+1,8
+1,8
+1,8
+1,8
+1,8
+1,8
+1,8
+1,8
+---- TYPES
+INT, INT
 ====

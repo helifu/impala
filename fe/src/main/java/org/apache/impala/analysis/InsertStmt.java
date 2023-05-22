@@ -17,33 +17,51 @@
 
 package org.apache.impala.analysis;
 
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.iceberg.types.Types;
+
 import org.apache.impala.authorization.Privilege;
+import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.HdfsFileFormat;
+import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.IcebergColumn;
 import org.apache.impala.catalog.KuduColumn;
+import org.apache.impala.catalog.MaterializedViewHdfsTable;
+import org.apache.impala.catalog.PrunablePartition;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.Pair;
 import org.apache.impala.planner.DataSink;
+import org.apache.impala.planner.HdfsTableSink;
 import org.apache.impala.planner.TableSink;
 import org.apache.impala.rewrite.ExprRewriter;
+import org.apache.impala.thrift.TIcebergPartitionTransformType;
 import org.apache.impala.thrift.TSortingOrder;
-
-import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Iterables;
+import org.apache.impala.util.IcebergUtil;
 
 /**
  * Representation of a single insert or upsert statement, including the select statement
@@ -117,6 +135,10 @@ public class InsertStmt extends StatementBase {
   // Set in analyze(). Contains metadata of target table to determine type of sink.
   private FeTable table_;
 
+  // Set in analyze(). Set the limit on the maximum number of table sink instances.
+  // A value of 0 means no limit.
+  private int maxTableSinks_ = 0;
+
   // Set in analyze(). Exprs correspond to the partitionKeyValues, if specified, or to
   // the partition columns for Kudu tables.
   private List<Expr> partitionKeyExprs_ = new ArrayList<>();
@@ -183,6 +205,10 @@ public class InsertStmt extends StatementBase {
   // Set by the Frontend if the target table is transactional.
   private long writeId_ = -1;
 
+  // Serialized metadata of transaction object which is set by the Frontend if the
+  // target table is Kudu table and Kudu's transaction is enabled.
+  private java.nio.ByteBuffer kuduTxnToken_ = null;
+
   // END: Members that need to be reset()
   /////////////////////////////////////////
 
@@ -241,6 +267,7 @@ public class InsertStmt extends StatementBase {
     table_ = other.table_;
     isUpsert_ = other.isUpsert_;
     writeId_ = other.writeId_;
+    kuduTxnToken_ = org.apache.thrift.TBaseHelper.copyBinary(other.kuduTxnToken_);
   }
 
   @Override
@@ -263,6 +290,7 @@ public class InsertStmt extends StatementBase {
     mentionedColumns_.clear();
     primaryKeyExprs_.clear();
     writeId_ = -1;
+    kuduTxnToken_ = null;
   }
 
   @Override
@@ -285,6 +313,13 @@ public class InsertStmt extends StatementBase {
       selectListExprs = Expr.cloneList(queryStmt_.getResultExprs());
     } else {
       selectListExprs = new ArrayList<>();
+    }
+
+    // Make sure static partition key values only contain const exprs.
+    if (partitionKeyValues_ != null) {
+      for (PartitionKeyValue kv: partitionKeyValues_) {
+        kv.analyze(analyzer);
+      }
     }
 
     // Set target table and perform table-type specific analysis and auth checking.
@@ -323,7 +358,11 @@ public class InsertStmt extends StatementBase {
       analysisColumnPermutation = new ArrayList<>();
       List<Column> tableColumns = table_.getColumns();
       for (int i = numClusteringCols; i < tableColumns.size(); ++i) {
-        analysisColumnPermutation.add(tableColumns.get(i).getName());
+        Column c = tableColumns.get(i);
+        // Omit auto-incrementing column for Kudu table since the values of the column
+        // will be assigned by Kudu engine.
+        if (c instanceof KuduColumn && ((KuduColumn)c).isAutoIncrementing()) continue;
+        analysisColumnPermutation.add(c.getName());
       }
     }
 
@@ -350,7 +389,7 @@ public class InsertStmt extends StatementBase {
     }
 
     int numStaticPartitionExprs = 0;
-    if (partitionKeyValues_ != null) {
+    if (partitionKeyValues_ != null && !isIcebergTarget()) {
       for (PartitionKeyValue pkv: partitionKeyValues_) {
         Column column = table_.getColumn(pkv.getColName());
         if (column == null) {
@@ -378,13 +417,6 @@ public class InsertStmt extends StatementBase {
     // Checks that exactly all columns in the target table are assigned an expr.
     checkColumnCoverage(selectExprTargetColumns, mentionedColumnNames,
         selectListExprs.size(), numStaticPartitionExprs);
-
-    // Make sure static partition key values only contain const exprs.
-    if (partitionKeyValues_ != null) {
-      for (PartitionKeyValue kv: partitionKeyValues_) {
-        kv.analyze(analyzer);
-      }
-    }
 
     // Check that we can write to the target table/partition. This must be
     // done after the partition expression has been analyzed above.
@@ -435,14 +467,15 @@ public class InsertStmt extends StatementBase {
           builder.onTable(table_).allOf(privilegeRequired).build());
     }
 
-    // We do not support (in|up)serting into views.
-    if (table_ instanceof FeView) {
+    // We do not support (in|up)serting into views and iceberg table
+    if (table_ instanceof FeView || table_ instanceof MaterializedViewHdfsTable) {
       throw new AnalysisException(
           String.format("Impala does not support %sing into views: %s", getOpName(),
               table_.getFullName()));
     }
 
-    analyzer.checkTableCapability(table_, Analyzer.OperationType.WRITE);
+    Analyzer.ensureTableNotFullAcid(table_, "INSERT");
+    Analyzer.checkTableCapability(table_, Analyzer.OperationType.WRITE);
 
     // We do not support (in|up)serting into tables with unsupported column types.
     for (Column c: table_.getColumns()) {
@@ -463,6 +496,9 @@ public class InsertStmt extends StatementBase {
     if (isUpsert_) {
       if (!(table_ instanceof FeKuduTable)) {
         throw new AnalysisException("UPSERT is only supported for Kudu tables");
+      } else if (((FeKuduTable)table_).hasAutoIncrementingColumn()) {
+        throw new AnalysisException(
+            "UPSERT is not supported for Kudu tables with auto-incrementing column");
       }
     } else {
       analyzeTableForInsert(analyzer);
@@ -486,15 +522,30 @@ public class InsertStmt extends StatementBase {
       if (isHBaseTable) {
         throw new AnalysisException("PARTITION clause is not valid for INSERT into " +
             "HBase tables. '" + targetTableName_ + "' is an HBase table");
-
       } else {
-        // Unpartitioned table, but INSERT has PARTITION clause
-        throw new AnalysisException("PARTITION clause is only valid for INSERT into " +
-            "partitioned table. '" + targetTableName_ + "' is not partitioned");
+        if (isIcebergTarget()) {
+          IcebergPartitionSpec partSpec =
+              ((FeIcebergTable)table_).getDefaultPartitionSpec();
+          if (partSpec == null || !partSpec.hasPartitionFields()) {
+            throw new AnalysisException("PARTITION clause is only valid for INSERT " +
+                "into partitioned table. '" + targetTableName_ + "' is not partitioned");
+          }
+          for (PartitionKeyValue pkv: partitionKeyValues_) {
+            if (pkv.isStatic()) {
+              throw new AnalysisException("Static partitioning is not supported for " +
+                  "Iceberg tables.");
+            }
+          }
+        } else {
+          // Unpartitioned table, but INSERT has PARTITION clause
+          throw new AnalysisException("PARTITION clause is only valid for INSERT into " +
+              "partitioned table. '" + targetTableName_ + "' is not partitioned");
+        }
       }
     }
 
     if (table_ instanceof FeFsTable) {
+      setMaxTableSinks(analyzer_.getQueryOptions().getMax_fs_writers());
       FeFsTable fsTable = (FeFsTable) table_;
       StringBuilder error = new StringBuilder();
       fsTable.parseSkipHeaderLineCount(error);
@@ -521,6 +572,33 @@ public class InsertStmt extends StatementBase {
               targetTableName_));
         }
       }
+      // Check if the target partition is supported to write. For static partitioning the
+      // file format is available on partition level, however for dynamic partitioning
+      // the target partition formats are unknown during analysis and planning, therefore
+      // it will be verified based on the table metadata.
+      if (isStaticPartitionTarget()) {
+        PrunablePartition partition =
+            HdfsTable.getPartition(fsTable, partitionKeyValues_);
+        if (partition != null && partition instanceof FeFsPartition) {
+          HdfsFileFormat fileFormat = ((FeFsPartition) partition).getFileFormat();
+          Boolean notSupported =
+              !HdfsTableSink.SUPPORTED_FILE_FORMATS.contains(fileFormat);
+          if (notSupported) {
+            throw new AnalysisException(String.format("Writing the destination " +
+                "partition format '" + fileFormat + "' is not supported."));
+          }
+        }
+      } else {
+        Set<HdfsFileFormat> formats = fsTable.getFileFormats();
+        Set<HdfsFileFormat> unsupportedFormats =
+            Sets.difference(formats, HdfsTableSink.SUPPORTED_FILE_FORMATS);
+        if (!unsupportedFormats.isEmpty()) {
+          throw new AnalysisException(String.format("Destination table '" +
+              fsTable.getFullName() + "' contains partition format(s) that are not " +
+              "supported to write: '" + Joiner.on(',').join(unsupportedFormats) + "', " +
+              "dynamic partition clauses are forbidden."));
+        }
+      }
     }
 
     if (table_ instanceof FeKuduTable) {
@@ -533,8 +611,79 @@ public class InsertStmt extends StatementBase {
       }
     }
 
+    if (table_ instanceof FeIcebergTable) {
+      FeIcebergTable iceTable = (FeIcebergTable)table_;
+      if (overwrite_) {
+        if (iceTable.getPartitionSpecs().size() > 1) {
+          throw new AnalysisException("The Iceberg table has multiple partition specs. " +
+              "This means the outcome of dynamic partition overwrite is unforeseeable. " +
+              "Consider using TRUNCATE and INSERT INTO to overwrite your table.");
+        }
+        validateBucketTransformForOverwrite(iceTable);
+      }
+      validateIcebergColumnsForInsert(iceTable);
+    }
+
     if (isHBaseTable && overwrite_) {
       throw new AnalysisException("HBase doesn't have a way to perform INSERT OVERWRITE");
+    }
+  }
+
+  private void validateIcebergColumnsForInsert(FeIcebergTable iceTable)
+      throws AnalysisException {
+    for (Types.NestedField field : iceTable.getIcebergSchema().columns()) {
+      org.apache.iceberg.types.Type iceType = field.type();
+      if (iceType.isPrimitiveType() && iceType instanceof Types.TimestampType) {
+        Types.TimestampType tsType = (Types.TimestampType)iceType;
+        if (tsType.shouldAdjustToUTC()) {
+          throw new AnalysisException("The Iceberg table has a TIMESTAMPTZ " +
+              "column that Impala cannot write.");
+        }
+      }
+    }
+  }
+
+  /**
+   * Validate if INSERT OVERWRITE could be allowed when the table has bucket partition
+   * transform. 'INSERT OVERWRITE tbl SELECT * FROM tbl' can be allowed because the source
+   * and target table is the same and the partitions are known.
+   */
+  private void validateBucketTransformForOverwrite(FeIcebergTable iceTable)
+      throws AnalysisException {
+    Preconditions.checkState(overwrite_ == true);
+    IcebergPartitionSpec spec = iceTable.getDefaultPartitionSpec();
+    if (!spec.hasPartitionFields()) return;
+    for (IcebergPartitionField field : spec.getIcebergPartitionFields()) {
+      if (field.getTransformType() != TIcebergPartitionTransformType.BUCKET) continue;
+      if (queryStmt_ instanceof ValuesStmt) {
+        throw new AnalysisException("The Iceberg table has BUCKET partitioning. " +
+            "The outcome of static partition overwrite is unforeseeable. Consider " +
+            "using TRUNCATE and INSERT INTO to overwrite your table.");
+      }
+      List<TableRef> tblRefs = queryStmt_.collectTableRefs();
+      List<String> sourceTableAliases = tblRefs.size() <= 0 ? new ArrayList(0) :
+          Arrays.asList(tblRefs.get(0).getAliases());
+      String targetTableName = iceTable.getFullName();
+      if (!(tblRefs.size() == 1 && sourceTableAliases.contains(targetTableName))) {
+        throw new AnalysisException("The Iceberg table has BUCKET partitioning and " +
+            "the source table does not match the target table. This means the " +
+            "outcome of dynamic partition overwrite is unforeseeable. Consider using " +
+            "TRUNCATE and INSERT INTO to overwrite your table.");
+      }
+      SelectList selectList = ((SelectStmt)queryStmt_).selectList_;
+      if (selectList.getItems().size() != 1 && !selectList.getItems().get(0).isStar()) {
+        throw new AnalysisException("The Iceberg table has BUCKET partitioning. " +
+            "The outcome of dynamic partition overwrite is unforeseeable with the " +
+            "given select list, only '*' allowed. Otherwise consider using TRUNCATE " +
+            "and INSERT INTO to overwrite your table.");
+      }
+      if (((SelectStmt)queryStmt_).whereClause_ != null) {
+        throw new AnalysisException("The Iceberg table has BUCKET partitioning. " +
+            "The outcome of dynamic partition overwrite is unforeseeable with the " +
+            "given select query with WHERE clause, selective overwrite is not " +
+            "supported. Consider using TRUNCATE and INSERT INTO to overwrite your " +
+            "table.");
+      }
     }
   }
 
@@ -542,19 +691,29 @@ public class InsertStmt extends StatementBase {
     if (!(table_ instanceof FeFsTable)) return;
     FeFsTable fsTable = (FeFsTable) table_;
 
-    FeFsTable.Utils.checkWriteAccess(fsTable,
-        hasStaticPartitionTarget() ? partitionKeyValues_ : null, "INSERT");
-  }
-
-  private boolean hasStaticPartitionTarget() {
-    if (partitionKeyValues_ == null) return false;
-
     // If the partition target is fully static, then check for write access against
     // the specific partition. Otherwise, check the whole table.
+    FeFsTable.Utils.checkWriteAccess(fsTable,
+        isStaticPartitionTarget() ? partitionKeyValues_ : null, "INSERT");
+  }
+
+  /**
+   * Returns true if all the partition key values of the target table are static.
+   */
+  public boolean isStaticPartitionTarget() {
+    if (partitionKeyValues_ == null) return false;
     for (PartitionKeyValue pkv : partitionKeyValues_) {
       if (pkv.isDynamic()) return false;
     }
     return true;
+  }
+
+  public List<PartitionKeyValue> getPartitionKeyValues() {
+    return partitionKeyValues_;
+  }
+
+  private boolean isIcebergTarget() {
+    return table_ instanceof FeIcebergTable;
   }
 
   /**
@@ -617,8 +776,12 @@ public class InsertStmt extends StatementBase {
     List<String> keyColumns = ((FeKuduTable) table_).getPrimaryKeyColumnNames();
     List<String> missingKeyColumnNames = new ArrayList<>();
     for (Column column : table_.getColumns()) {
+      Preconditions.checkState(column instanceof KuduColumn);
+      // Omit auto-incrementing column for Kudu table since the values of the column
+      // will be assigned by Kudu engine.
       if (!mentionedColumnNames.contains(column.getName())
-          && keyColumns.contains(column.getName())) {
+          && keyColumns.contains(column.getName())
+          && !((KuduColumn)column).isAutoIncrementing()) {
         missingKeyColumnNames.add(column.getName());
       }
     }
@@ -701,9 +864,13 @@ public class InsertStmt extends StatementBase {
     if (isKuduTable) {
       kuduPartitionColumnNames = getKuduPartitionColumnNames((FeKuduTable) table_);
     }
+    IcebergPartitionSpec icebergPartSpec = null;
+    if (isIcebergTarget()) {
+      icebergPartSpec = ((FeIcebergTable)table_).getDefaultPartitionSpec();
+    }
 
-    UnionStmt unionStmt =
-        (queryStmt_ instanceof UnionStmt) ? (UnionStmt) queryStmt_ : null;
+    SetOperationStmt unionStmt =
+        (queryStmt_ instanceof SetOperationStmt) ? (SetOperationStmt) queryStmt_ : null;
     List<Expr> widestTypeExprList = null;
     if (unionStmt != null && unionStmt.getWidestExprs() != null
         && unionStmt.getWidestExprs().size() > 0) {
@@ -747,24 +914,45 @@ public class InsertStmt extends StatementBase {
       }
     }
 
-    // Reorder the partition key exprs and names to be consistent with the target table
-    // declaration, and store their column positions.  We need those exprs in the original
-    // order to create the corresponding Hdfs folder structure correctly, or the indexes
-    // to construct rows to pass to the Kudu partitioning API.
-    for (int i = 0; i < table_.getColumns().size(); ++i) {
-      Column c = table_.getColumns().get(i);
-      for (int j = 0; j < tmpPartitionKeyNames.size(); ++j) {
-        if (c.getName().equals(tmpPartitionKeyNames.get(j))) {
-          partitionKeyExprs_.add(tmpPartitionKeyExprs.get(j));
-          partitionColPos_.add(i);
-          break;
+    if (isIcebergTarget()) {
+      // Add partition key expressions in the order of the Iceberg partition fields.
+      addIcebergPartExprs(analyzer, widestTypeExprList, selectExprTargetColumns,
+          selectListExprs, icebergPartSpec);
+    } else {
+      // Reorder the partition key exprs and names to be consistent with the target table
+      // declaration, and store their column positions.  We need those exprs in the
+      // original order to create the corresponding Hdfs folder structure correctly, or
+      // the indexes to construct rows to pass to the Kudu partitioning API.
+      for (int i = 0; i < table_.getColumns().size(); ++i) {
+        Column c = table_.getColumns().get(i);
+        for (int j = 0; j < tmpPartitionKeyNames.size(); ++j) {
+          if (c.getName().equals(tmpPartitionKeyNames.get(j))) {
+            partitionKeyExprs_.add(tmpPartitionKeyExprs.get(j));
+            partitionColPos_.add(i);
+            break;
+          }
         }
       }
     }
 
-    Preconditions.checkState(
-        (isKuduTable && partitionKeyExprs_.size() == kuduPartitionColumnNames.size())
-        || partitionKeyExprs_.size() == numClusteringCols);
+    if (isIcebergTarget() && icebergPartSpec.hasPartitionFields()) {
+      int parts = 0;
+      for (IcebergPartitionField pField : icebergPartSpec.getIcebergPartitionFields()) {
+        if (pField.getTransformType() != TIcebergPartitionTransformType.VOID) {
+          ++parts;
+        }
+      }
+      if (CollectionUtils.isEmpty(columnPermutation_)) {
+        Preconditions.checkState(partitionKeyExprs_.size() == parts);
+      }
+    }
+    else if (isKuduTable) {
+      Preconditions.checkState(
+          partitionKeyExprs_.size() == kuduPartitionColumnNames.size());
+    } else {
+      Preconditions.checkState(partitionKeyExprs_.size() == numClusteringCols);
+    }
+
     // Make sure we have stats for partitionKeyExprs
     for (Expr expr: partitionKeyExprs_) {
       expr.analyze(analyzer);
@@ -792,14 +980,27 @@ public class InsertStmt extends StatementBase {
           if (isKuduTable) {
             Preconditions.checkState(tblColumn instanceof KuduColumn);
             KuduColumn kuduCol = (KuduColumn) tblColumn;
-            if (!kuduCol.hasDefaultValue() && !kuduCol.isNullable()) {
+            if (!kuduCol.hasDefaultValue() && !kuduCol.isNullable()
+                && !kuduCol.isAutoIncrementing()) {
               throw new AnalysisException("Missing values for column that is not " +
                   "nullable and has no default value " + kuduCol.getName());
             }
           } else {
             // Unmentioned non-clustering columns get NULL literals with the appropriate
             // target type because Parquet cannot handle NULL_TYPE (IMPALA-617).
-            resultExprs_.add(NullLiteral.create(tblColumn.getType()));
+            NullLiteral nullExpr = NullLiteral.create(tblColumn.getType());
+            resultExprs_.add(nullExpr);
+            // In the case of INSERT INTO iceberg_tbl (col_a, col_b, ...), if the
+            // partition columns are not in the columnPermutation_, we should fill it
+            // with NullLiteral to partitionKeyExprs_ (IMPALA-11408).
+            if (isIcebergTarget() && !CollectionUtils.isEmpty(columnPermutation_)
+                && icebergPartSpec != null) {
+              IcebergColumn targetColumn = (IcebergColumn) tblColumn;
+              if (IcebergUtil.isPartitionColumn(targetColumn, icebergPartSpec)) {
+                partitionKeyExprs_.add(nullExpr);
+                partitionColPos_.add(targetColumn.getPosition());
+              }
+            }
           }
         }
       }
@@ -809,6 +1010,23 @@ public class InsertStmt extends StatementBase {
         if (kuduTable.getPrimaryKeyColumnNames().contains(tblColumn.getName())) {
           primaryKeyExprs_.add(Iterables.getLast(resultExprs_));
         }
+      }
+    }
+
+    // In the case of INSERT INTO iceberg_tbl (col_a, col_b, ...), to ensure that data is
+    // written to the correct partition, we need to make sure that the partitionKeyExprs_
+    // is in ascending order according to the column position of the Iceberg tables.
+    if (isIcebergTarget() && !CollectionUtils.isEmpty(columnPermutation_)) {
+      List<Pair<Integer, Expr>> exprPairs = Lists.newArrayList();
+      for (int i = 0; i < partitionColPos_.size(); i++) {
+        exprPairs.add(Pair.create(partitionColPos_.get(i), partitionKeyExprs_.get(i)));
+      }
+      exprPairs.sort(Comparator.comparingInt(p -> p.first));
+      partitionColPos_.clear();
+      partitionKeyExprs_.clear();
+      for (Pair<Integer, Expr> exprPair : exprPairs) {
+        partitionColPos_.add(exprPair.first);
+        partitionKeyExprs_.add(exprPair.second);
       }
     }
 
@@ -827,6 +1045,78 @@ public class InsertStmt extends StatementBase {
       queryStmt_ = new SelectStmt(selectList, null, null, null, null, null, null);
       queryStmt_.analyze(analyzer);
     }
+  }
+
+  /**
+   * Adds partition key expressions in the order of Iceberg partition spec fields.
+   */
+  private void addIcebergPartExprs(Analyzer analyzer, List<Expr> widestTypeExprList,
+      List<Column> selectExprTargetColumns, List<Expr> selectListExprs,
+      IcebergPartitionSpec icebergPartSpec) throws AnalysisException {
+    if (!icebergPartSpec.hasPartitionFields()) return;
+    for (IcebergPartitionField partField : icebergPartSpec.getIcebergPartitionFields()) {
+      if (partField.getTransformType() == TIcebergPartitionTransformType.VOID) continue;
+      for (int i = 0; i < selectListExprs.size(); ++i) {
+        IcebergColumn targetColumn = (IcebergColumn)selectExprTargetColumns.get(i);
+        if (targetColumn.getFieldId() != partField.getSourceId()) continue;
+        // widestTypeExpr is widest type expression for column i
+        Expr widestTypeExpr =
+            (widestTypeExprList != null) ? widestTypeExprList.get(i) : null;
+        Expr compatibleExpr = checkTypeCompatibility(targetTableName_.toString(),
+            targetColumn, selectListExprs.get(i),
+            analyzer.getQueryOptions().isDecimal_v2(),
+            widestTypeExpr);
+        Expr icebergPartitionTransformExpr =
+            getIcebergPartitionTransformExpr(partField, compatibleExpr);
+        partitionKeyExprs_.add(icebergPartitionTransformExpr);
+        partitionColPos_.add(targetColumn.getPosition());
+        break;
+      }
+    }
+  }
+
+  /**
+   * Returns the partition transform expression. E.g. if the partition transform is DAY,
+   * it returns 'to_date(compatibleExpr)'. If the partition transform is BUCKET,
+   * it returns 'iceberg_bucket_transform(compatibleExpr, transformParam)'.
+   */
+  private Expr getIcebergPartitionTransformExpr(IcebergPartitionField partField,
+      Expr compatibleExpr) {
+    String funcNameStr = transformTypeToFunctionName(partField.getTransformType());
+    if (funcNameStr == null || funcNameStr.equals("")) return compatibleExpr;
+    FunctionName fnName = new FunctionName(BuiltinsDb.NAME, funcNameStr);
+    List<Expr> paramList = new ArrayList<>();
+    paramList.add(compatibleExpr);
+    Integer transformParam = partField.getTransformParam();
+    if (transformParam != null) {
+      paramList.add(NumericLiteral.create(transformParam));
+    }
+    if (partField.getTransformType() == TIcebergPartitionTransformType.MONTH) {
+      paramList.add(new StringLiteral("yyyy-MM"));
+    }
+    else if (partField.getTransformType() == TIcebergPartitionTransformType.HOUR) {
+      paramList.add(new StringLiteral("yyyy-MM-dd-HH"));
+    }
+    FunctionCallExpr fnCall = new FunctionCallExpr(fnName, new FunctionParams(paramList));
+    fnCall.setIsInternalFnCall(true);
+    return fnCall;
+  }
+
+  /**
+   * Returns the builtin function to use for the given partition transform.
+   */
+  private static String transformTypeToFunctionName(
+      TIcebergPartitionTransformType transformType) {
+    switch (transformType) {
+      case IDENTITY: return "";
+      case HOUR:
+      case MONTH: return "from_timestamp";
+      case DAY: return "to_date";
+      case YEAR: return "year";
+      case BUCKET: return "iceberg_bucket_transform";
+      case TRUNCATE: return "iceberg_truncate_transform";
+    }
+    return "";
   }
 
   private static Set<String> getKuduPartitionColumnNames(FeKuduTable table) {
@@ -921,7 +1211,13 @@ public class InsertStmt extends StatementBase {
   public TableName getTargetTableName() { return targetTableName_; }
   public FeTable getTargetTable() { return table_; }
   public void setTargetTable(FeTable table) { this.table_ = table; }
+  public boolean isTargetTableKuduTable() { return (table_ instanceof FeKuduTable); }
+  public void setMaxTableSinks(int maxTableSinks) { this.maxTableSinks_ = maxTableSinks; }
   public void setWriteId(long writeId) { this.writeId_ = writeId; }
+  public void setKuduTransactionToken(byte[] kuduTxnToken) {
+    Preconditions.checkNotNull(kuduTxnToken);
+    kuduTxnToken_ = java.nio.ByteBuffer.wrap(kuduTxnToken.clone());
+  }
   public boolean isOverwrite() { return overwrite_; }
   public TSortingOrder getSortingOrder() { return sortingOrder_; }
 
@@ -938,6 +1234,9 @@ public class InsertStmt extends StatementBase {
   public List<Expr> getPrimaryKeyExprs() { return primaryKeyExprs_; }
   public List<Expr> getSortExprs() { return sortExprs_; }
   public long getWriteId() { return writeId_; }
+  public byte[] getKuduTransactionToken() {
+    return kuduTxnToken_ == null ? null : kuduTxnToken_.array();
+  }
 
   // Clustering is enabled by default. If the table has a 'sort.columns' property and the
   // query has a 'noclustered' hint, we issue a warning during analysis and ignore the
@@ -958,7 +1257,8 @@ public class InsertStmt extends StatementBase {
     Preconditions.checkState(table_ != null);
     return TableSink.create(table_, isUpsert_ ? TableSink.Op.UPSERT : TableSink.Op.INSERT,
         partitionKeyExprs_, resultExprs_, mentionedColumns_, overwrite_,
-        requiresClustering(), new Pair<>(sortColumns_, sortingOrder_), writeId_);
+        requiresClustering(), new Pair<>(sortColumns_, sortingOrder_), writeId_,
+        kuduTxnToken_, maxTableSinks_);
   }
 
   /**
@@ -1025,5 +1325,13 @@ public class InsertStmt extends StatementBase {
     }
     tblRefs.add(new TableRef(targetTableName_.toPath(), null));
     if (queryStmt_ != null) queryStmt_.collectTableRefs(tblRefs);
+  }
+
+  @Override
+  public boolean resolveTableMask(Analyzer analyzer) throws AnalysisException {
+    boolean hasChange = false;
+    if (withClause_ != null) hasChange = withClause_.resolveTableMask(analyzer);
+    if (queryStmt_ != null) hasChange |= queryStmt_.resolveTableMask(analyzer);
+    return hasChange;
   }
 }

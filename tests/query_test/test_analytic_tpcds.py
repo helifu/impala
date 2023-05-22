@@ -17,6 +17,7 @@
 #
 # Targeted tests to validate analytic functions use TPCDS dataset.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_dimensions import create_parquet_dimension, ImpalaTestDimension
 
@@ -44,3 +45,8 @@ class TestAnalyticTpcds(ImpalaTestSuite):
   def test_analytic_functions_tpcds(self, vector):
     vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
     self.run_test_case('QueryTest/analytic-fns-tpcds', vector)
+
+  def test_partitioned_topn(self, vector):
+    """Targeted tests for the partitioned top-n operator."""
+    vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    self.run_test_case('QueryTest/analytic-fns-tpcds-partitioned-topn', vector)

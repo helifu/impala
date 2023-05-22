@@ -28,11 +28,13 @@
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 
+#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/env.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/path_util.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/subprocess.h"
@@ -63,7 +65,9 @@ MiniKdc::MiniKdc(MiniKdcOptions options)
     options_.realm = "KRBTEST.COM";
   }
   if (options_.data_root.empty()) {
-    options_.data_root = JoinPathSegments(GetTestDataDirectory(), "krb5kdc");
+    // We hardcode "/tmp" here since the original function which initializes a random test
+    // directory (GetTestDataDirectory()), depends on gmock.
+    options_.data_root = JoinPathSegments("/tmp", "krb5kdc");
   }
   if (options_.ticket_lifetime.empty()) {
     options_.ticket_lifetime = "24h";
@@ -154,8 +158,8 @@ Status MiniKdc::Start() {
   const bool need_config_update = (options_.port == 0);
   // Wait for KDC to start listening on its ports and commencing operation
   // with a wildcard binding.
-  RETURN_NOT_OK(WaitForUdpBind(kdc_process_->pid(), &options_.port,
-                               /*addr=*/none, MonoDelta::FromSeconds(1)));
+  RETURN_NOT_OK(WaitForUdpBind(
+      kdc_process_->pid(), &options_.port, {}, MonoDelta::FromSeconds(1)));
 
   if (need_config_update) {
     // If we asked for an ephemeral port, grab the actual ports and
@@ -287,10 +291,7 @@ Status MiniKdc::RandomizePrincipalKey(const string& spn) {
 
 Status MiniKdc::CreateKeytabForExistingPrincipal(const string& spn) {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, 100, Substitute("creating keytab for $0", spn));
-  string kt_path = spn;
-  StripString(&kt_path, "/", '_');
-  kt_path = JoinPathSegments(options_.data_root, kt_path) + ".keytab";
-
+  string kt_path = GetKeytabPathForPrincipal(spn);
   string kadmin;
   RETURN_NOT_OK(GetBinaryPath("kadmin.local", &kadmin));
   RETURN_NOT_OK(Subprocess::Call(MakeArgv({
@@ -298,11 +299,38 @@ Status MiniKdc::CreateKeytabForExistingPrincipal(const string& spn) {
   return Status::OK();
 }
 
+string MiniKdc::GetKeytabPathForPrincipal(const string& spn) const {
+  string kt_path = spn;
+  StripString(&kt_path, "/", '_');
+  return JoinPathSegments(options_.data_root, kt_path) + ".keytab";
+}
+
 Status MiniKdc::Kinit(const string& username) {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, 100, Substitute("kinit for $0", username));
   string kinit;
   RETURN_NOT_OK(GetBinaryPath("kinit", &kinit));
-  RETURN_NOT_OK(Subprocess::Call(MakeArgv({ kinit, username }), username));
+  unique_ptr<WritableFile> tmp_cc_file;
+  string tmp_cc_path;
+  string tmp_username = username;
+  StripString(&tmp_username, "/", '_');
+  const auto tmp_template = Substitute("kinit-temp-$0.XXXXXX", tmp_username);
+  WritableFileOptions opts;
+  opts.is_sensitive = false;
+  RETURN_NOT_OK_PREPEND(Env::Default()->NewTempWritableFile(
+      opts,
+      JoinPathSegments(options_.data_root, tmp_template),
+      &tmp_cc_path, &tmp_cc_file),
+      "could not create temporary file");
+  auto delete_tmp_cc = MakeScopedCleanup([&]() {
+    WARN_NOT_OK(Env::Default()->DeleteFile(tmp_cc_path),
+                "could not delete file " + tmp_cc_path);
+  });
+  RETURN_NOT_OK(Subprocess::Call(MakeArgv({ kinit, "-c", tmp_cc_path, username }), username));
+  const auto env_vars_map = GetEnvVars();
+  const auto& ccache_path = FindOrDie(env_vars_map, "KRB5CCNAME");
+  RETURN_NOT_OK_PREPEND(Env::Default()->RenameFile(tmp_cc_path, ccache_path),
+                        "could not move new file into place");
+  delete_tmp_cc.cancel();
   return Status::OK();
 }
 

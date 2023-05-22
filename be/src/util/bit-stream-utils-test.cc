@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <boost/utility.hpp>
+
 #include "testutil/gtest-util.h"
 #include "util/bit-packing.inline.h"
 #include "util/bit-stream-utils.inline.h"
@@ -107,7 +109,8 @@ void TestSkipping(const uint8_t* buffer, const int len, const int bit_width,
   BatchedBitReader skipping_reader(buffer, len);
   T vals[MAX_LEN];
   skipping_reader.UnpackBatch(bit_width, skip_at, vals);
-  skipping_reader.SkipBatch(bit_width, skip_count);
+  bool skipped = skipping_reader.SkipBatch(bit_width, skip_count);
+  ASSERT_TRUE(skipped);
   skipping_reader.UnpackBatch(bit_width, value_count - skip_count, vals + skip_at);
 
   for (int i = 0; i < skip_at; ++i) {

@@ -19,17 +19,30 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <ostream>
 #include <string>
 #include <vector>
 
-// Must come before gtest.h.
-#include "kudu/gutil/mathlimits.h"
-
+#include <boost/preprocessor/arithmetic/dec.hpp>
+#include <boost/preprocessor/arithmetic/inc.hpp>
+#include <boost/preprocessor/control/iif.hpp>
+#include <boost/preprocessor/control/while.hpp>
+#include <boost/preprocessor/list/fold_left.hpp>
+#include <boost/preprocessor/logical/bitand.hpp>
+#include <boost/preprocessor/logical/bool.hpp>
+#include <boost/preprocessor/logical/compl.hpp>
+#include <boost/preprocessor/seq/elem.hpp>
+#include <boost/preprocessor/seq/fold_left.hpp>
+#include <boost/preprocessor/seq/size.hpp>
+#include <boost/preprocessor/tuple/elem.hpp>
+#include <boost/preprocessor/variadic/elem.hpp>
+#include <boost/tti/has_template.hpp>
 #include <boost/utility/binary.hpp>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/gutil/mathlimits.h"
 #include "kudu/util/bit-stream-utils.h"
 #include "kudu/util/bit-stream-utils.inline.h"
 #include "kudu/util/bit-util.h"
@@ -110,7 +123,7 @@ TEST(BitArray, TestBool) {
 
 // Writes 'num_vals' values with width 'bit_width' and reads them back.
 void TestBitArrayValues(int bit_width, int num_vals) {
-  const int kTestLen = BitUtil::Ceil(bit_width * num_vals, 8);
+  const int kTestLen = BitUtil::Ceil<3>(bit_width * num_vals);
   const uint64_t mod = bit_width == 64? 1 : 1LL << bit_width;
 
   faststring buffer(kTestLen);
@@ -235,14 +248,14 @@ TEST(Rle, SpecificSequences) {
   }
 
   for (int width = 9; width <= kMaxWidth; ++width) {
-    ValidateRle(values, width, nullptr, 2 * (1 + BitUtil::Ceil(width, 8)));
+    ValidateRle(values, width, nullptr, 2 * (1 + BitUtil::Ceil<3>(width)));
   }
 
   // Test 100 0's and 1's alternating
   for (int i = 0; i < 100; ++i) {
     values[i] = i % 2;
   }
-  int num_groups = BitUtil::Ceil(100, 8);
+  int num_groups = BitUtil::Ceil<3>(100);
   expected_buffer[0] = (num_groups << 1) | 1;
   for (int i = 0; i < 100/8; ++i) {
     expected_buffer[i + 1] = BOOST_BINARY(1 0 1 0 1 0 1 0); // 0xaa
@@ -253,7 +266,7 @@ TEST(Rle, SpecificSequences) {
   // num_groups and expected_buffer only valid for bit width = 1
   ValidateRle(values, 1, expected_buffer, 1 + num_groups);
   for (int width = 2; width <= kMaxWidth; ++width) {
-    ValidateRle(values, width, nullptr, 1 + BitUtil::Ceil(width * 100, 8));
+    ValidateRle(values, width, nullptr, 1 + BitUtil::Ceil<3>(width * 100));
   }
 }
 
@@ -543,4 +556,47 @@ TEST_F(TestRle, TestSkip) {
 
   encoder.Flush();
 }
+
+// RLE encoding groups values and decides whether to run-length encode or simply bit-pack
+// (literal encoding). This test verifies correctness of the RLE decoding when literal
+// encoding is used irrespective of the size of the group and the number of values encoded.
+template <typename IntType>
+class TestRleLiteralGetNextRun : public KuduTest {
+ public:
+  void RunTest() {
+    const auto num_bytes_per_val = sizeof(IntType);
+    const auto bit_width = 8 * num_bytes_per_val;
+
+    // Test with number of values that are not necessarily multiple of the group size (8).
+    auto max_num_vals = std::min<uint64_t>(1024, std::numeric_limits<IntType>::max());
+    for (auto num_vals = 1; num_vals <= max_num_vals; num_vals++) {
+      faststring buffer(num_vals * num_bytes_per_val);
+      RleEncoder<IntType> encoder(&buffer, bit_width);
+
+      // Use non-repeated pattern of integers so that literal encoding is used.
+      for (auto i = 0; i < num_vals; i++) {
+        encoder.Put(i, 1);
+      }
+      encoder.Flush();
+
+      RleDecoder<IntType> decoder(buffer.data(), encoder.len(), bit_width);
+      IntType val = 0;
+      for (auto i = 0; i < num_vals; i++) {
+        size_t len = decoder.GetNextRun(&val, num_vals);
+        ASSERT_EQ(1, len);
+        ASSERT_EQ(i, val);
+      }
+      // Read one beyond to verify no value is returned.
+      ASSERT_EQ(0, decoder.GetNextRun(&val, num_vals));
+    }
+  }
+};
+
+typedef ::testing::Types<int8_t, int16_t, int32_t, int64_t> IntDataTypes;
+TYPED_TEST_SUITE(TestRleLiteralGetNextRun, IntDataTypes);
+
+TYPED_TEST(TestRleLiteralGetNextRun, RleGetNextRunIntDataTypes) {
+  this->RunTest();
+}
+
 } // namespace kudu

@@ -21,6 +21,8 @@ import static java.lang.String.format;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.sql.Date;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -85,15 +87,14 @@ public class KuduUtil {
    * fetching tablet metadata.
    */
   public static KuduClient getKuduClient(String kuduMasters) {
-    KuduClient client = kuduClients_.get(kuduMasters);
-    if (client == null) {
+    KuduClient client = kuduClients_.computeIfAbsent(kuduMasters, k -> {
       KuduClientBuilder b = new KuduClient.KuduClientBuilder(kuduMasters);
       b.defaultAdminOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
       b.defaultOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
       b.workerCount(KUDU_CLIENT_WORKER_THREAD_COUNT);
-      client = b.build();
-      kuduClients_.put(kuduMasters, client);
-    }
+      b.saslProtocolName(BackendConfig.INSTANCE.getKuduSaslProtocolName());
+      return b.build();
+    });
     return client;
   }
 
@@ -168,6 +169,10 @@ public class KuduUtil {
         checkCorrectType(literal.isSetInt_literal(), type, colName, literal);
         key.addLong(pos, literal.getInt_literal().getValue());
         break;
+      case VARCHAR:
+        checkCorrectType(literal.isSetString_literal(), type, colName, literal);
+        key.addVarchar(pos, literal.getString_literal().getValue());
+        break;
       case STRING:
         checkCorrectType(literal.isSetString_literal(), type, colName, literal);
         key.addString(pos, literal.getString_literal().getValue());
@@ -175,6 +180,11 @@ public class KuduUtil {
       case UNIXTIME_MICROS:
         checkCorrectType(literal.isSetInt_literal(), type, colName, literal);
         key.addLong(pos, literal.getInt_literal().getValue());
+        break;
+      case DATE:
+        checkCorrectType(literal.isSetDate_literal(), type, colName, literal);
+        key.addDate(pos, Date.valueOf(LocalDate.ofEpochDay(
+            literal.getDate_literal().getDays_since_epoch())));
         break;
       case DECIMAL:
         checkCorrectType(literal.isSetDecimal_literal(), type, colName, literal);
@@ -220,6 +230,7 @@ public class KuduUtil {
       case DOUBLE:
         checkCorrectType(literal.isSetFloat_literal(), type, colName, literal);
         return (double) literal.getFloat_literal().getValue();
+      case VARCHAR:
       case STRING:
         checkCorrectType(literal.isSetString_literal(), type, colName, literal);
         return literal.getString_literal().getValue();
@@ -229,6 +240,10 @@ public class KuduUtil {
       case UNIXTIME_MICROS:
         checkCorrectType(literal.isSetInt_literal(), type, colName, literal);
         return literal.getInt_literal().getValue();
+      case DATE:
+        checkCorrectType(literal.isSetDate_literal(), type, colName, literal);
+        return Date.valueOf(LocalDate.ofEpochDay(
+            literal.getDate_literal().getDays_since_epoch()));
       case DECIMAL:
         checkCorrectType(literal.isSetDecimal_literal(), type, colName, literal);
         BigInteger unscaledVal = new BigInteger(literal.getDecimal_literal().getValue());
@@ -237,23 +252,6 @@ public class KuduUtil {
         throw new ImpalaRuntimeException("Unsupported value for column type: " +
             type.toString());
     }
-  }
-
-  public static long timestampToUnixTimeMicros(Analyzer analyzer, Expr timestampExpr)
-      throws AnalysisException, InternalException {
-    Preconditions.checkArgument(timestampExpr.isAnalyzed());
-    Preconditions.checkArgument(timestampExpr.isConstant());
-    Preconditions.checkArgument(timestampExpr.getType() == Type.TIMESTAMP);
-    Expr toUnixTimeExpr = new FunctionCallExpr("utc_to_unix_micros",
-        Lists.newArrayList(timestampExpr));
-    toUnixTimeExpr.analyze(analyzer);
-    TColumnValue result = FeSupport.EvalExprWithoutRow(toUnixTimeExpr,
-        analyzer.getQueryCtx());
-    if (!result.isSetLong_val()) {
-      throw new InternalException("Error converting timestamp expression: " +
-          timestampExpr.debugString());
-    }
-    return result.getLong_val();
   }
 
   public static Encoding fromThrift(TColumnEncoding encoding)
@@ -341,10 +339,13 @@ public class KuduUtil {
   }
 
   public static TColumn setColumnOptions(TColumn column, boolean isKey,
-      Boolean isNullable, Encoding encoding, CompressionAlgorithm compression,
-      Expr defaultValue, Integer blockSize, String kuduName) {
+      boolean isPrimaryKeyUnique, Boolean isNullable, boolean isAutoIncrementing,
+      Encoding encoding, CompressionAlgorithm compression, Expr defaultValue,
+      Integer blockSize, String kuduName) {
     column.setIs_key(isKey);
+    column.setIs_primary_key_unique(isPrimaryKeyUnique);
     if (isNullable != null) column.setIs_nullable(isNullable);
+    column.setIs_auto_incrementing(isAutoIncrementing);
     try {
       if (encoding != null) column.setEncoding(toThrift(encoding));
       if (compression != null) column.setCompression(toThrift(compression));
@@ -378,7 +379,8 @@ public class KuduUtil {
   }
 
   public static boolean isSupportedKeyType(org.apache.impala.catalog.Type type) {
-    return type.isIntegerType() || type.isStringType() || type.isTimestamp();
+    return type.isIntegerType() || type.isStringType() || type.isTimestamp()
+        || type.isDate();
   }
 
   /**
@@ -427,14 +429,14 @@ public class KuduUtil {
       case FLOAT: return org.apache.kudu.Type.FLOAT;
       case TIMESTAMP: return org.apache.kudu.Type.UNIXTIME_MICROS;
       case DECIMAL: return org.apache.kudu.Type.DECIMAL;
+      case DATE: return org.apache.kudu.Type.DATE;
+      case VARCHAR: return org.apache.kudu.Type.VARCHAR;
       /* Fall through below */
       case INVALID_TYPE:
       case NULL_TYPE:
       case BINARY:
-      case DATE:
       case DATETIME:
       case CHAR:
-      case VARCHAR:
       default:
         throw new ImpalaRuntimeException(format(
             "Type %s is not supported in Kudu", s.toSql()));
@@ -453,9 +455,11 @@ public class KuduUtil {
       case INT64: return Type.BIGINT;
       case STRING: return Type.STRING;
       case UNIXTIME_MICROS: return Type.TIMESTAMP;
+      case DATE: return Type.DATE;
       case DECIMAL:
         return ScalarType.createDecimalType(
             typeAttributes.getPrecision(), typeAttributes.getScale());
+      case VARCHAR: return ScalarType.createVarcharType(typeAttributes.getLength());
       default:
         throw new ImpalaRuntimeException(String.format(
             "Kudu type '%s' is not supported in Impala", t.getName()));
@@ -475,5 +479,23 @@ public class KuduUtil {
         insertStmt.getPartitionColPos());
     kuduPartitionExpr.analyze(analyzer);
     return kuduPartitionExpr;
+  }
+
+  // Used for test assertions
+  public static int getkuduClientsSize() {
+    return kuduClients_.size();
+  }
+
+  // Used for generating log messages
+  public static String getPrimaryKeyString(boolean isPrimaryKeyUnique) {
+    StringBuilder sb = new StringBuilder();
+    if (!isPrimaryKeyUnique) sb.append("NON UNIQUE ");
+    sb.append("PRIMARY KEY");
+    return sb.toString();
+  }
+
+  // Get auto-incrementing column name of Kudu table
+  public static String getAutoIncrementingColumnName() {
+    return Schema.getAutoIncrementingColumnName();
   }
 }

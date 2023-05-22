@@ -21,6 +21,7 @@
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/date_time/gregorian/gregorian.hpp>
 
+#include "exprs/timestamp-functions.h"
 #include "gutil/strings/ascii_ctype.h"
 #include "runtime/datetime-iso-sql-format-tokenizer.h"
 #include "runtime/string-value.h"
@@ -123,6 +124,9 @@ void ReportBadFormat(FunctionContext* context, FormatTokenizationResult error_ty
         break;
       case NO_DATETIME_TOKENS_ERROR:
         ss << "PARSE ERROR: No datetime tokens provided.";
+        break;
+      case NO_DATE_TOKENS_ERROR:
+        ss << "PARSE ERROR: No date tokens provided.";
         break;
       case MISPLACED_FX_MODIFIER_ERROR:
         ss << "PARSE ERROR: FX modifier should be at the beginning of the format string.";
@@ -404,9 +408,8 @@ int GetWeekOfMonth(int day) {
   return (day - 1) / 7 + 1;
 }
 
-int AdjustYearToLength(int year, int len) {
-  if (len < 4) {
-    int adjust_factor = std::pow(10, len);
+int AdjustYearToLength(int year, int adjust_factor) {
+  if (adjust_factor < 10000) {
     return year % adjust_factor;
   }
   return year;

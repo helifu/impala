@@ -21,19 +21,30 @@
 
 #include <boost/scoped_ptr.hpp>
 
+#include "codegen/codegen-fn-ptr.h"
 #include "exec/exec-node.h"
 #include "runtime/mem-pool.h"
-#include <boost/scoped_ptr.hpp>
 
 namespace impala {
 
+class SelectNode;
 class Tuple;
 class TupleRow;
 
 class SelectPlanNode : public PlanNode {
  public:
   virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+  virtual void Codegen(FragmentState* state) override;
+
   ~SelectPlanNode(){}
+
+  /// Codegened version of SelectNode::CopyRows().
+  typedef void (*CopyRowsFn)(SelectNode*, RowBatch*);
+  CodegenFnPtr<CopyRowsFn> codegend_copy_rows_fn_;
+
+ private:
+  /// Codegen SelectNode::CopyRows().
+  Status CodegenCopyRows(FragmentState* state);
 };
 
 /// Node that evaluates conjuncts and enforces a limit but otherwise passes along
@@ -44,7 +55,6 @@ class SelectNode : public ExecNode {
   SelectNode(ObjectPool* pool, const SelectPlanNode& pnode, const DescriptorTbl& descs);
 
   virtual Status Prepare(RuntimeState* state) override;
-  virtual void Codegen(RuntimeState* state) override;
   virtual Status Open(RuntimeState* state) override;
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) override;
   virtual Status Reset(RuntimeState* state, RowBatch* row_batch) override;
@@ -66,15 +76,13 @@ class SelectNode : public ExecNode {
   /// END: Members that must be Reset()
   /////////////////////////////////////////
 
-  typedef void (*CopyRowsFn)(SelectNode*, RowBatch*);
-  CopyRowsFn codegend_copy_rows_fn_;
+  /// Reference to the codegened function pointer owned by the SelectPlanNode object that
+  /// was used to create this instance.
+  const CodegenFnPtr<SelectPlanNode::CopyRowsFn>& codegend_copy_rows_fn_;
 
   /// Copy rows from child_row_batch_ for which conjuncts_ evaluate to true to
   /// output_batch, up to limit_ or till the output row batch reaches capacity.
   void CopyRows(RowBatch* output_batch);
-
-  /// Codegen CopyRows(). Used for mostly codegen'ing the conjuncts evaluation logic.
-  Status CodegenCopyRows(RuntimeState* state);
 };
 
 }

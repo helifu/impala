@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_UDF_UDF_INTERNAL_H
-#define IMPALA_UDF_UDF_INTERNAL_H
+#pragma once
 
 #include <string.h>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <utility>
 #include <vector>
-#include <boost/cstdint.hpp>
 
 /// Be very careful when adding Impala includes in this file. We don't want to pull
 /// in unnecessary dependencies for the development libs.
@@ -155,6 +154,8 @@ class FunctionContextImpl {
     ARG_TYPE_SCALE, // int[]
     /// True if decimal_v2 query option is set.
     DECIMAL_V2,
+    /// True if utf8_mode query option is set.
+    UTF8_MODE,
   };
 
   /// This function returns the various static attributes of the UDF/UDA. Calls to this
@@ -171,10 +172,10 @@ class FunctionContextImpl {
   int GetConstFnAttr(ConstFnAttr t, int i = -1);
 
   /// Return the function attribute 't' defined in ConstFnAttr above.
-  static int GetConstFnAttr(const RuntimeState* state,
+  static int GetConstFnAttr(bool uses_decimal_v2, bool is_utf8_mode,
       const impala_udf::FunctionContext::TypeDesc& return_type,
-      const std::vector<impala_udf::FunctionContext::TypeDesc>& arg_types,
-      ConstFnAttr t, int i = -1);
+      const std::vector<impala_udf::FunctionContext::TypeDesc>& arg_types, ConstFnAttr t,
+      int i = -1);
 
   /// UDFs may manipulate DecimalVal arguments via SIMD instructions such as 'movaps'
   /// that require 16-byte memory alignment.
@@ -314,11 +315,47 @@ struct CollectionVal : public AnyVal {
   }
 };
 
+/// A struct is represented by a vector of pointers where these pointers point to the
+/// children of the struct.
+struct StructVal : public AnyVal {
+  int num_children;
+
+  /// Pointer to the start of the vector of children pointers. The set of types that the
+  /// pointed-to values can have is types of the members of 'ExprValue'. A null pointer
+  /// means that this child is NULL. The buffer is not null-terminated.
+  /// Memory allocation to 'ptr' is done using FunctionContext. As a result it's not
+  /// needed to take care of memory deallocation in StructVal as it will be done through
+  /// FunctionContext automatically.
+  uint8_t** ptr;
+
+  StructVal() : AnyVal(true), num_children(0), ptr(nullptr) {}
+
+  StructVal(FunctionContext* ctx, int num_children) : AnyVal(),
+      num_children(num_children), ptr(nullptr) {
+    ReserveMemory(ctx);
+  }
+
+  static StructVal null() { return StructVal(); }
+
+  void addChild(void* child, int idx) {
+    assert(idx >= 0 && idx < num_children);
+    ptr[idx] = (uint8_t*)child;
+  }
+
+private:
+  /// Uses FunctionContext to reserve memory for 'num_children' number of pointers. Sets
+  /// 'ptr' to the beginning of this allocated memory.
+  void ReserveMemory(FunctionContext* ctx);
+};
+
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
 static_assert(sizeof(CollectionVal) == sizeof(StringVal), "Wrong size.");
 static_assert(
     offsetof(CollectionVal, num_tuples) == offsetof(StringVal, len), "Wrong offset.");
 static_assert(offsetof(CollectionVal, ptr) == offsetof(StringVal, ptr), "Wrong offset.");
-} // namespace impala_udf
 
-#endif
+static_assert(sizeof(StructVal) == sizeof(StringVal), "Wrong size.");
+static_assert(
+    offsetof(StructVal, num_children) == offsetof(StringVal, len), "Wrong offset.");
+static_assert(offsetof(StructVal, ptr) == offsetof(StringVal, ptr), "Wrong offset.");
+} // namespace impala_udf

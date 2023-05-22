@@ -34,9 +34,7 @@ import org.apache.directory.server.annotations.CreateTransport;
 import org.apache.directory.server.core.annotations.ApplyLdifFiles;
 import org.apache.directory.server.core.integ.CreateLdapServerRule;
 import org.apache.impala.testutil.ImpalaJdbcClient;
-import org.apache.impala.util.Metrics;
-import org.junit.AfterClass;
-import org.junit.Before;
+import org.apache.impala.testutil.WebClient;
 import org.junit.ClassRule;
 import org.junit.Test;
 
@@ -61,7 +59,7 @@ public class LdapJdbcTest extends JdbcTestBase {
   private static final Range<Long> zero = Range.closed(0L, 0L);
   private static final Range<Long> one = Range.closed(1L, 1L);
 
-  Metrics metrics = new Metrics();
+  WebClient client_ = new WebClient();
 
   public LdapJdbcTest(String connectionType) { super(connectionType); }
 
@@ -70,7 +68,9 @@ public class LdapJdbcTest extends JdbcTestBase {
         String.format("ldap://localhost:%s", serverRule.getLdapServer().getPort());
     String dn = "cn=#UID,ou=Users,dc=myorg,dc=com";
     String impalaArgs = String.format("--enable_ldap_auth --ldap_uri='%s' "
-        + "--ldap_bind_pattern='%s' --ldap_passwords_in_clear_ok %s", uri, dn, extraArgs);
+            + "--ldap_bind_pattern='%s' --ldap_passwords_in_clear_ok "
+            + "--cookie_require_secure=false %s",
+        uri, dn, extraArgs);
     int ret = CustomClusterRunner.StartImpalaCluster(impalaArgs);
     assertEquals(ret, 0);
 
@@ -85,20 +85,20 @@ public class LdapJdbcTest extends JdbcTestBase {
   private void verifyMetrics(Range<Long> expectedBasicSuccess,
       Range<Long> expectedBasicFailure, Range<Long> expectedCookieSuccess,
       Range<Long> expectedCookieFailure) throws Exception {
-    long actualBasicSuccess = (long) metrics.getMetric(
+    long actualBasicSuccess = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-basic-auth-success");
     assertTrue("Expected: " + expectedBasicSuccess + ", Actual: " + actualBasicSuccess,
         expectedBasicSuccess.contains(actualBasicSuccess));
-    long actualBasicFailure = (long) metrics.getMetric(
+    long actualBasicFailure = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-basic-auth-failure");
     assertTrue("Expected: " + expectedBasicFailure + ", Actual: " + actualBasicFailure,
         expectedBasicFailure.contains(actualBasicFailure));
 
-    long actualCookieSuccess = (long) metrics.getMetric(
+    long actualCookieSuccess = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-cookie-auth-success");
     assertTrue("Expected: " + expectedCookieSuccess + ", Actual: " + actualCookieSuccess,
         expectedCookieSuccess.contains(actualCookieSuccess));
-    long actualCookieFailure = (long) metrics.getMetric(
+    long actualCookieFailure = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-cookie-auth-failure");
     assertTrue("Expected: " + expectedCookieFailure + ", Actual: " + actualCookieFailure,
         expectedCookieFailure.contains(actualCookieFailure));

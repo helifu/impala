@@ -15,23 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_RUNTIME_DML_EXEC_STATE_H
-#define IMPALA_RUNTIME_DML_EXEC_STATE_H
-
-#include <string>
 #include <map>
+#include <mutex>
+#include <string>
 #include <boost/unordered_map.hpp>
-#include <boost/thread/mutex.hpp>
 
 #include "common/hdfs.h"
 #include "common/status.h"
+#include "exec/hdfs-table-writer.h"
 
 namespace impala {
 
 class DmlExecStatusPB;
 class DmlPartitionStatusPB;
 class DmlStatsPB;
+class DmlDataFileStatsPB;
+struct OutputPartition;
 class TDmlResult;
 class TFinalizeParams;
 class TUpdateCatalogRequest;
@@ -44,8 +45,7 @@ class HdfsTableDescriptor;
 /// During DML execution, the table sink adds per-partition status using AddPartition()
 /// and then UpdatePartition() for non-Kudu tables.  For Kudu tables, the sink adds DML
 /// stats using InitForKuduDml() followed by SetKuduDmlStats().  In the case of the
-/// HDFS sink, it will also record the collection of files that should be moved by the
-/// coordinator on finalization using AddFileToMove().
+/// HDFS sink, it will also record the collection of files with AddCreatedFile().
 ///
 /// The state is then serialized to thrift and merged at the coordinator using
 /// Update().  The coordinator will then use OutputPartitionStats(),
@@ -60,14 +60,22 @@ class DmlExecState {
   void Update(const DmlExecStatusPB& dml_exec_status);
 
   /// Add a new partition with the given parameters. Ignores 'base_dir' if nullptr.
+  /// If not-nullptr, staging_dir_to_clean_up will be sent to the coordinator which
+  /// will delete it.
   /// It is an error to call this for an existing partition.
-  void AddPartition(const std::string& name, int64_t id, const std::string* base_dir);
+  void AddPartition(const std::string& name, int64_t id, const std::string* base_dir,
+      const std::string* staging_dir_to_clean_up);
 
   /// Merge given values into stats for partition with name 'partition_name'.
   /// Ignores 'insert_stats' if nullptr.
   /// Requires that the partition already exist.
   void UpdatePartition(const std::string& partition_name,
       int64_t num_modified_rows_delta, const DmlStatsPB* insert_stats);
+
+  /// Extract information from 'partition', and add a new Iceberg data file.
+  /// 'insert_stats' contains stats for the Iceberg data file.
+  void AddCreatedFile(const OutputPartition& partition, bool is_iceberg,
+      const IcebergFileStats& insert_stats);
 
   /// Used to initialize this state when execute Kudu DML. Must be called before
   /// SetKuduDmlStats().
@@ -76,9 +84,6 @@ class DmlExecState {
   /// Update stats for a Kudu DML sink. Requires that InitForKuduDml() was already called.
   void SetKuduDmlStats(int64_t num_modified_rows, int64_t num_row_errors,
       int64_t latest_ts);
-
-  /// Adds new file/location to the move map.
-  void AddFileToMove(const std::string& file_name, const std::string& location);
 
   /// Outputs the partition stats to a string.
   std::string OutputPartitionStats(const std::string& prefix);
@@ -109,9 +114,12 @@ class DmlExecState {
   /// Beeswax.
   void ToTDmlResult(TDmlResult* dml_result);
 
+  // Encodes file list info in flatbuffer format expected by Iceberg API.
+  std::vector<std::string> CreateIcebergDataFilesVector();
+
  private:
   /// protects all fields below
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// Counts how many rows an DML query has added to a particular partition (partitions
   /// are identified by their partition keys: k1=v1/k2=v2 etc. Unpartitioned tables
@@ -145,5 +153,3 @@ class DmlExecState {
 };
 
 }
-
-#endif

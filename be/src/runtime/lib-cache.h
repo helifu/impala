@@ -15,15 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_RUNTIME_LIB_CACHE_H
-#define IMPALA_RUNTIME_LIB_CACHE_H
-
+#include <mutex>
 #include <string>
 #include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
 #include <boost/unordered_set.hpp>
-#include <boost/thread/mutex.hpp>
 #include "common/atomic.h"
 #include "common/object-pool.h"
 #include "common/status.h"
@@ -74,7 +72,7 @@ class LibCache {
   ~LibCache();
 
   /// Initializes the libcache. Must be called before any other APIs.
-  static Status Init();
+  static Status Init(bool external_fe);
 
   /// Gets the local 'path' used to cache the file stored at the global 'hdfs_lib_file'. If
   /// this file is not already on the local fs, or if the cached entry's last modified
@@ -147,7 +145,7 @@ class LibCache {
 
   /// Protects lib_cache_. For lock ordering, this lock must always be taken before
   /// the per entry lock.
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// Maps HDFS library path => cache entry.
   /// Entries in the cache need to be explicitly deleted.
@@ -158,7 +156,7 @@ class LibCache {
   LibCache(LibCache const& l); // disable copy ctor
   LibCache& operator=(LibCache const& l); // disable assignment
 
-  Status InitInternal();
+  Status InitInternal(bool external_fe);
 
   /// Returns the cache entry for 'hdfs_lib_file'. If this library has not been
   /// copied locally, it will copy it and add a new LibCacheEntry to 'lib_cache_'.
@@ -170,13 +168,12 @@ class LibCache {
   /// taken and returned in *entry_lock.
   /// If an error is returned, there will be no entry in lib_cache_ and *entry is NULL.
   Status GetCacheEntry(const std::string& hdfs_lib_file, LibType type, time_t exp_mtime,
-      boost::unique_lock<boost::mutex>* entry_lock, LibCacheEntry** entry);
+      std::unique_lock<std::mutex>* entry_lock, LibCacheEntry** entry);
 
   /// Implementation to get the cache entry for 'hdfs_lib_file'. Errors are returned
   /// without evicting the cache entry if the status is not OK and *entry is not NULL.
   Status GetCacheEntryInternal(const std::string& hdfs_lib_file, LibType type,
-      time_t exp_mtime, boost::unique_lock<boost::mutex>* entry_lock,
-      LibCacheEntry** entry);
+      time_t exp_mtime, std::unique_lock<std::mutex>* entry_lock, LibCacheEntry** entry);
 
   /// Returns iter's cache entry in 'entry' with 'entry_lock' held if entry does not
   /// need to be refreshed.
@@ -192,7 +189,7 @@ class LibCache {
   /// TODO: cleanup this method's interface and how the outputs are used.
   Status RefreshCacheEntry(const std::string& hdfs_lib_file, LibType type,
       time_t exp_mtime, const LibMap::iterator& iter,
-      boost::unique_lock<boost::mutex>* entry_lock, LibCacheEntry** entry);
+      std::unique_lock<std::mutex>* entry_lock, LibCacheEntry** entry);
 
   /// 'hdfs_lib_file' is copied locally and 'entry' is initialized with its contents.
   /// An error is returned if exp_mtime differs from the mtime on the file system.
@@ -236,5 +233,3 @@ class LibCacheEntryHandle {
 };
 
 }
-
-#endif

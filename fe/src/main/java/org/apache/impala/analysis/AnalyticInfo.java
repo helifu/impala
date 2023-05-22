@@ -24,7 +24,7 @@ import org.apache.impala.catalog.Type;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
 /**
@@ -113,7 +113,11 @@ public class AnalyticInfo extends AggregateInfoBase {
     for (Expr analyticExpr: analyticExprs_) {
       Preconditions.checkState(analyticExpr.isAnalyzed());
       List<Expr> partitionExprs = ((AnalyticExpr) analyticExpr).getPartitionExprs();
-      if (partitionExprs == null) continue;
+      if (partitionExprs == null || partitionExprs.size() == 0) {
+        // if any of the partition by list is empty, the intersection set is empty
+        result.clear();
+        break;
+      }
       if (result.isEmpty()) {
         result.addAll(partitionExprs);
       } else {
@@ -172,7 +176,7 @@ public class AnalyticInfo extends AggregateInfoBase {
   @Override
   public String debugString() {
     StringBuilder out = new StringBuilder(super.debugString());
-    out.append(Objects.toStringHelper(this)
+    out.append(MoreObjects.toStringHelper(this)
         .add("analytic_exprs", Expr.debugString(analyticExprs_))
         .add("smap", analyticTupleSmap_.debugString())
         .toString());

@@ -25,6 +25,7 @@
 #include <gutil/strings/substitute.h>
 
 #include "common/logging.h"
+#include "kudu/util/flags.h"
 #include "rpc/jni-thrift-util.h"
 #include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
@@ -37,6 +38,7 @@
 #include "util/jni-util.h"
 #include "util/mem-info.h"
 #include "util/memusage-path-handlers.h"
+#include "util/metrics.h"
 #include "util/pprof-path-handlers.h"
 #include "util/process-state-info.h"
 #include "util/runtime-profile-counters.h"
@@ -100,6 +102,8 @@ void FlagsHandler(const Webserver::WebRequest& req, Document* document) {
   GetAllFlags(&flag_info, true);
   Value flag_arr(kArrayType);
   for (const CommandLineFlagInfo& flag: flag_info) {
+    string flag_value = CheckFlagAndRedact(flag, kudu::EscapeMode::NONE);
+
     Value flag_val(kObjectType);
     Value name(flag.name.c_str(), document->GetAllocator());
     flag_val.AddMember("name", name, document->GetAllocator());
@@ -113,7 +117,7 @@ void FlagsHandler(const Webserver::WebRequest& req, Document* document) {
     Value default_value(flag.default_value.c_str(), document->GetAllocator());
     flag_val.AddMember("default", default_value, document->GetAllocator());
 
-    Value current_value(flag.current_value.c_str(), document->GetAllocator());
+    Value current_value(flag_value.c_str(), document->GetAllocator());
     flag_val.AddMember("current", current_value, document->GetAllocator());
 
     flag_val.AddMember("experimental", flag.hidden, document->GetAllocator());
@@ -276,7 +280,9 @@ void RootHandler(const Webserver::WebRequest& req, Document* document) {
 
 void AddDefaultUrlCallbacks(Webserver* webserver, MetricGroup* metric_group,
     MemTracker* process_mem_tracker) {
-  webserver->RegisterUrlCallback("/logs", "logs.tmpl", LogsHandler, true);
+  if (!FLAGS_logtostderr) {
+    webserver->RegisterUrlCallback("/logs", "logs.tmpl", LogsHandler, true);
+  }
   webserver->RegisterUrlCallback("/varz", "flags.tmpl", FlagsHandler, true);
   webserver->RegisterUrlCallback(
       "/profile_docs", "profile_docs.tmpl", ProfileDocsHandler, true);

@@ -110,6 +110,11 @@ public class Function extends CatalogObjectImpl {
   // native and IR functions, but only Java functions created without a signature.
   private boolean isPersistent_;
 
+  // Functions with specific parameters can be marked as unsupported so that during
+  // analysis the query can be rejected without Impala trying to cast parameters to a
+  // different type that would be supported.
+  protected boolean isUnsupported_;
+
   public Function(FunctionName name, Type[] argTypes,
       Type retType, boolean varArgs) {
     this.name_ = name;
@@ -125,6 +130,7 @@ public class Function extends CatalogObjectImpl {
       this.retType_ = retType;
     }
     this.userVisible_ = true;
+    this.isUnsupported_ = false;
   }
 
   public Function(FunctionName name, List<Type> args,
@@ -163,12 +169,14 @@ public class Function extends CatalogObjectImpl {
     Preconditions.checkState(argTypes_.length > 0);
     return argTypes_[argTypes_.length - 1];
   }
+  public boolean isUnsupported() { return isUnsupported_; }
 
   public void setLocation(HdfsUri loc) { location_ = loc; }
   public void setBinaryType(TFunctionBinaryType type) { binaryType_ = type; }
   public void setHasVarArgs(boolean v) { hasVarArgs_ = v; }
   public void setIsPersistent(boolean v) { isPersistent_ = v; }
   public void setUserVisible(boolean b) { userVisible_ = b; }
+  protected void setUnsupported() { isUnsupported_ = true; }
 
   // Returns a string with the signature in human readable format:
   // FnName(argtype1, argtyp2).  e.g. Add(int, int)
@@ -430,8 +438,7 @@ public class Function extends CatalogObjectImpl {
   // If an error occurs and the mtime cannot be retrieved, an IllegalStateException is
   // thrown.
   public final long getLastModifiedTime() {
-    if (getBinaryType() != TFunctionBinaryType.BUILTIN && getLocation() != null) {
-      Preconditions.checkState(!getLocation().toString().isEmpty());
+    if (!isBuiltinOrJava()) {
       TSymbolLookupParams lookup = Preconditions.checkNotNull(getLookupParams());
       try {
         TSymbolLookupResult result = FeSupport.LookupSymbol(lookup);
@@ -443,6 +450,17 @@ public class Function extends CatalogObjectImpl {
       }
     }
     return -1;
+  }
+
+  /**
+   * Returns true for BUILTINs, and JAVA functions when location is either null or empty.
+   *
+   * @return boolean
+   */
+  private boolean isBuiltinOrJava() {
+    return getBinaryType() == TFunctionBinaryType.BUILTIN ||
+        (getBinaryType() == TFunctionBinaryType.JAVA &&
+            (getLocation() == null || getLocation().toString().isEmpty()));
   }
 
   // Returns the resolved symbol in the binary. The BE will do a lookup of 'symbol'
@@ -515,6 +533,7 @@ public class Function extends CatalogObjectImpl {
     case VARCHAR:
     case CHAR:
     case FIXED_UDA_INTERMEDIATE:
+    case BINARY:
       // These types are marshaled into a StringVal.
       return "StringVal";
     case TIMESTAMP:

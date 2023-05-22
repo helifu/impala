@@ -14,16 +14,18 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from __future__ import absolute_import, division, print_function
 import pprint
 import pytest
 import re
 import shlex
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIf, SkipIfHive3
+from tests.common.skip import SkipIf, SkipIfHive2
 from tests.common.test_dimensions import create_uncompressed_text_dimension
 from tests.util.test_file_parser import QueryTestSectionReader, remove_comments
 from tests.common.environ import HIVE_MAJOR_VERSION
+from tests.util.filesystem_utils import WAREHOUSE
 
 
 # The purpose of the show create table tests are to ensure that the "SHOW CREATE TABLE"
@@ -39,7 +41,12 @@ class TestShowCreateTable(ImpalaTestSuite):
                            "STATS_GENERATED_VIA_STATS_TASK", "last_modified_by",
                            "last_modified_time", "numFilesErasureCoded",
                            "bucketing_version", "OBJCAPABILITIES",
-                           "TRANSLATED_TO_EXTERNAL"]
+                           "TRANSLATED_TO_EXTERNAL", "previous_metadata_location",
+                           "impala.events.catalogServiceId",
+                           "impala.events.catalogVersion", "uuid",
+                           "current-schema", "snapshot-count", "default-partition-spec",
+                           "current-snapshot-id", "current-snapshot-summary",
+                           "current-snapshot-timestamp-ms", "sort.columns", "sort.order"]
 
   @classmethod
   def get_workload(self):
@@ -59,6 +66,12 @@ class TestShowCreateTable(ImpalaTestSuite):
 
   def test_show_create_table(self, vector, unique_database):
     self.__run_show_create_table_test_case('QueryTest/show-create-table', vector,
+                                           unique_database)
+
+  @SkipIfHive2.acid
+  def test_show_create_table_full_acid(self, vector, unique_database):
+    self.__run_show_create_table_test_case('QueryTest/show-create-table-full-acid',
+                                           vector,
                                            unique_database)
 
   def __run_show_create_table_test_case(self, test_file_name, vector, unique_db_name):
@@ -94,7 +107,7 @@ class TestShowCreateTable(ImpalaTestSuite):
 
       if not test_case.existing_table:
         # create table in Impala
-        self.__exec(test_case.create_table_sql)
+        self.__exec(self.__replace_warehouse(test_case.create_table_sql))
       # execute "SHOW CREATE TABLE ..."
       result = self.__exec(test_case.show_create_table_sql)
       create_table_result = self.__normalize(result.data[0])
@@ -104,9 +117,9 @@ class TestShowCreateTable(ImpalaTestSuite):
         self.__exec(test_case.drop_table_sql)
 
       # check the result matches the expected result
-      expected_result = self.__normalize(self.__replace_uri(
+      expected_result = self.__normalize(self.__replace_warehouse(self.__replace_uri(
           test_case.expected_result,
-          self.__get_location_uri(create_table_result)))
+          self.__get_location_uri(create_table_result))))
       self.__compare_result(expected_result, create_table_result)
 
       if test_case.existing_table:
@@ -163,6 +176,9 @@ class TestShowCreateTable(ImpalaTestSuite):
     # is not valid
     s = re.sub("TBLPROPERTIES\s*\(\s*\)", "", s)
     s = re.sub("SERDEPROPERTIES\s*\(\s*\)", "", s)
+    # By removing properties in the middle we might ended up having extra whitespaces,
+    # let's remove them.
+    s = ' '.join(s.split())
     return s
 
   def __properties_map_regex(self, name):
@@ -190,6 +206,9 @@ class TestShowCreateTable(ImpalaTestSuite):
 
   def __replace_uri(self, s, uri):
     return s if uri is None else s.replace("$$location_uri$$", uri)
+
+  def __replace_warehouse(self, s):
+    return s.replace("$$warehouse$$", WAREHOUSE)
 
 
 # Represents one show-create-table test case. Performs validation of the test sections
@@ -271,7 +290,6 @@ class TestInfraCompat(ImpalaTestSuite):
                              'l_receiptdate', 'l_shipinstruct', 'l_shipmode',
                              'l_comment')}]
 
-  @SkipIf.kudu_not_supported
   @pytest.mark.parametrize('table_primary_keys_map', TABLE_PRIMARY_KEYS_MAPS)
   def test_primary_key_parse(self, impala_testinfra_cursor, table_primary_keys_map):
     """
@@ -282,7 +300,6 @@ class TestInfraCompat(ImpalaTestSuite):
     assert impala_testinfra_cursor._fetch_primary_key_names(
         table_primary_keys_map['table']) == table_primary_keys_map['primary_keys']
 
-  @SkipIf.kudu_not_supported
   @pytest.mark.parametrize('table_primary_keys_map', TABLE_PRIMARY_KEYS_MAPS)
   def test_load_table_with_primary_key_attr(self, impala_testinfra_cursor,
                                             table_primary_keys_map):

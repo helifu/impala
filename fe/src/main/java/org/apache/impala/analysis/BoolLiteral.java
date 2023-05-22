@@ -23,13 +23,14 @@ import org.apache.impala.thrift.TBoolLiteral;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 
 public class BoolLiteral extends LiteralExpr {
   private final boolean value_;
 
   public BoolLiteral(boolean value) {
     this.value_ = value;
+    this.selectivity_ = value ? 1 : 0;
     type_ = Type.BOOLEAN;
   }
 
@@ -37,8 +38,10 @@ public class BoolLiteral extends LiteralExpr {
     type_ = Type.BOOLEAN;
     if (value.toLowerCase().equals("true")) {
       this.value_ = true;
+      this.selectivity_ = 1;
     } else if (value.toLowerCase().equals("false")) {
       this.value_ = false;
+      this.selectivity_ = 0;
     } else {
       throw new AnalysisException("invalid BOOLEAN literal: " + value);
     }
@@ -54,7 +57,7 @@ public class BoolLiteral extends LiteralExpr {
 
   @Override
   public String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("value", value_)
         .toString();
   }

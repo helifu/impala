@@ -17,6 +17,7 @@
 
 # Tests end-to-end codegen behaviour.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIf
 from tests.common.test_dimensions import create_exec_option_dimension_from_dict
@@ -60,6 +61,11 @@ class TestCodegen(ImpalaTestSuite):
     """IMPALA-7288: Regression tests for the codegen failure path when working with a
     CHAR column type. Until IMPALA-3207 is completely fixed there are various paths where
     we need to bail out of codegen."""
+    # Previously codegen failed in TextConverter::CodegenWriteSlot() if there was a CHAR
+    # column, but IMPALA-9747 changed this so that instead of failing codegen for all
+    # columns, the codegen'd code for the CHAR column calls the interpreted version of the
+    # function.
+
     # Previously codegen for this join failed in HashTableCtx::CodegenEquals() because of
     # missing ScalarFnCall codegen support, which was added in IMPALA-7331.
     result = self.execute_query("select 1 from functional.chars_tiny t1, "
@@ -68,8 +74,6 @@ class TestCodegen(ImpalaTestSuite):
     profile_str = str(result.runtime_profile)
     assert "Probe Side Codegen Enabled" in profile_str, profile_str
     assert "Build Side Codegen Enabled" in profile_str, profile_str
-    assert ("TextConverter::CodegenWriteSlot(): Char isn't supported for CodegenWriteSlot"
-            in profile_str), profile_str
 
     # Codegen for this join fails because it is joining two CHAR exprs.
     result = self.execute_query("select 1 from functional.chars_tiny t1, "
@@ -80,8 +84,6 @@ class TestCodegen(ImpalaTestSuite):
             in profile_str), profile_str
     assert ("Build Side Codegen Disabled: HashTableCtx::CodegenHashRow(): CHAR NYI"
             in profile_str), profile_str
-    assert ("TextConverter::CodegenWriteSlot(): Char isn't supported for CodegenWriteSlot"
-            in profile_str), profile_str
 
     # Previously codegen for this join failed in HashTableCtx::CodegenEvalRow() because of
     # missing ScalarFnCall codegen support, which was added in IMPALA-7331.
@@ -91,5 +93,10 @@ class TestCodegen(ImpalaTestSuite):
     profile_str = str(result.runtime_profile)
     assert "Probe Side Codegen Enabled" in profile_str, profile_str
     assert "Build Side Codegen Enabled" in profile_str, profile_str
-    assert ("TextConverter::CodegenWriteSlot(): Char isn't supported for CodegenWriteSlot"
-            in profile_str), profile_str
+
+  def test_const_scalar_expr_in_union(self, vector, unique_database):
+    """Test that codegen is disabled for const scalar expressions in a UNION node.
+    if, however the UNION node is under a subplan then codegen is not disabled for
+    const expressions."""
+    self.run_test_case('QueryTest/union-const-scalar-expr-codegen', vector,
+        use_db=unique_database)

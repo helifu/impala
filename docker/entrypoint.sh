@@ -55,6 +55,32 @@ function _pg_ctl() {
   sudo service postgresql $1
 }
 
+# Install Python2 with pip2 and make them the default Python and pip commands
+# on RedHat / CentOS 8.
+# This has no notion of "default" Python, and can install both Python2 and Python3
+# side by side. Impala currently needs Python2 as the default version.
+# The function is adaptive; it performs only the necessary steps; it shares the installer
+# logic with bin/bootstrap_system.sh
+function install_python2_for_centos8() {
+  if command -v python && [[ $(python --version 2>&1 | cut -d ' ' -f 2) =~ 2\. ]]; then
+    echo "We have Python 2.x";
+  else
+    if ! command -v python2; then
+      # Python2 needs to be installed
+      dnf install -y python2
+    fi
+    # Here Python2 is installed, but is not the default Python.
+    # 1. Link pip's version to Python's version
+    alternatives --add-slave python /usr/bin/python2 /usr/bin/pip pip /usr/bin/pip2
+    alternatives --add-slave python /usr/libexec/no-python  /usr/bin/pip pip \
+        /usr/libexec/no-python
+    # 2. Set Python2 (with pip2) to be the system default.
+    alternatives --set python /usr/bin/python2
+  fi
+  # Here the Python2 runtime is already installed, add the dev package
+  dnf -y install python2-devel
+}
+
 # Boostraps the container by creating a user and adding basic tools like Python and git.
 # Takes a uid as an argument for the user to be created.
 function build() {
@@ -80,11 +106,20 @@ function build() {
     paste <(cut -d : -f3 /etc/passwd) <(cut -d : -f1 /etc/passwd) | sort -n
     exit 1
   fi
-  if which apt-get > /dev/null; then
+  if command -v apt-get > /dev/null; then
     apt-get update
     apt-get install -y sudo git lsb-release python
+  elif grep 'release 8\.' /etc/redhat-release; then
+    # WARNING: Install the following packages one by one!
+    # Installing them in a common transaction breaks something inside yum/dnf,
+    # and the subsequent step installing Python2 will fail with a GPG signature error.
+    dnf -y install sudo
+    dnf -y install which
+    dnf -y install git-core
+
+    install_python2_for_centos8
   else
-    yum -y install sudo git python
+    yum -y install which sudo git python
   fi
 
   if ! id impdev; then
@@ -163,18 +198,16 @@ function start_minicluster {
   # presumably because there's only one layer involved. See
   # https://issues.apache.org/jira/browse/KUDU-1419.
   set -x
-  if [ "true" = $KUDU_IS_SUPPORTED ]; then
-    pushd /home/impdev/Impala/testdata
-    for x in cluster/cdh*/node-*/var/lib/kudu/*/wal; do
-      echo $x
-      # This mv takes time, as it's actually copying into the latest layer.
-      mv $x $x-orig
-      mkdir $x
-      mv $x-orig/* $x
-      rmdir $x-orig
-    done
-    popd
-  fi
+  pushd /home/impdev/Impala/testdata
+  for x in cluster/cdh*/node-*/var/lib/kudu/*/wal; do
+    echo $x
+    # This mv takes time, as it's actually copying into the latest layer.
+    mv $x $x-orig
+    mkdir $x
+    mv $x-orig/* $x
+    rmdir $x-orig
+  done
+  popd
 
   # Wait for postgresql to really start; if it doesn't, Hive Metastore will fail to start.
   for i in {1..120}; do
@@ -215,14 +248,6 @@ function build_impdev() {
   git fetch /git_common_dir --no-tags "$GIT_HEAD_REV"
   git checkout -b test-with-docker FETCH_HEAD
 
-  # Checkout impala-lzo too
-  mkdir /home/impdev/Impala-lzo
-  pushd /home/impdev/Impala-lzo
-  git init
-  git fetch $IMPALA_LZO_REPO --no-tags "$IMPALA_LZO_REF"
-  git checkout -b test-with-docker FETCH_HEAD
-  popd
-
   # Link in logs. Logs are on the host since that's the most important thing to
   # look at after the tests are run.
   ln -sf /logs logs
@@ -237,38 +262,36 @@ function build_impdev() {
   # can be built when executing those tests. We use "-noclean" to
   # avoid deleting the log for this invocation which is in logs/,
   # and, this is a first build anyway.
-  ./buildall.sh -noclean -format -testdata -notests
+  if ! ./buildall.sh -noclean -format -testdata -notests; then
+    echo "Build + dataload failed!"
+    copy_cluster_logs
+    return 1
+  fi
 
   # We make one exception to "-notests":
   # test_insert_parquet.py, which is used in all the end-to-end test
   # shards, depends on this binary. We build it here once,
   # instead of building it during the startup of each container running
   # a subset of E2E tests. Building it here is also a lot faster.
-  make -j$(nproc) --load-average=$(nproc) parquet-reader
+  if ! make -j$(nproc) --load-average=$(nproc) parquet-reader impala-profile-tool; then
+    echo "Impala profile tool build failed!"
+    copy_cluster_logs
+    return 1
+  fi
 
   # Dump current memory usage to logs, before shutting things down.
-  memory_usage
+  memory_usage || true
 
   # Shut down things cleanly.
-  testdata/bin/kill-all.sh
+  testdata/bin/kill-all.sh || true
 
-  # "Compress" HDFS data by de-duplicating blocks. As a result of
-  # having three datanodes, our data load is 3x larger than it needs
-  # to be. To alleviate this (to the tune of ~20GB savings), we
-  # use hardlinks to link together the identical blocks. This is absolutely
-  # taking advantage of an implementation detail of HDFS.
-  echo "Hardlinking duplicate HDFS block data."
-  set +x
-  for x in $(find testdata/cluster/*/node-1/data/dfs/dn/current/ -name 'blk_*[0-9]'); do
-    for n in 2 3; do
-      xn=${x/node-1/node-$n}
-      if [ -f $xn ]; then
-        rm $xn
-        ln $x $xn
-      fi
-    done
-  done
-  set -x
+  if ! hardlink_duplicate_hdfs_data; then
+    echo "Hardlink duplicate HDFS data failed!"
+    copy_cluster_logs
+    return 1
+  fi
+
+  copy_cluster_logs
 
   # Shutting down PostgreSQL nicely speeds up it's start time for new containers.
   _pg_ctl stop
@@ -282,6 +305,26 @@ function build_impdev() {
   find /logs -xtype l -execdir rm '{}' ';'
 
   popd
+}
+
+# "Compress" HDFS data by de-duplicating blocks. As a result of
+# having three datanodes, our data load is 3x larger than it needs
+# to be. To alleviate this (to the tune of ~20GB savings), we
+# use hardlinks to link together the identical blocks. This is absolutely
+# taking advantage of an implementation detail of HDFS.
+function hardlink_duplicate_hdfs_data() {
+  echo "Hardlinking duplicate HDFS block data."
+  set +x
+  for x in $(find testdata/cluster/*/node-1/data/dfs/dn/current/ -name 'blk_*[0-9]'); do
+    for n in 2 3; do
+      xn=${x/node-1/node-$n}
+      if [ -f $xn ]; then
+        rm $xn
+        ln $x $xn
+      fi
+    done
+  done
+  set -x
 }
 
 # Prints top 20 RSS consumers (and other, total), in megabytes Common culprits
@@ -302,6 +345,30 @@ function memory_usage() {
       print total, "-- total --"
     }'
   ) >& /logs/memory_usage.txt
+}
+
+# Some components like hdfs, yarn, kudu creates their log in
+# testdata/cluster/cdh<version-number>/node-<node-id>/var/log/ folder
+# these log folders are symlinked to logs/cluster/ folder
+# remove symlinks and copy these logs to logs/cluster/
+function copy_cluster_logs() {
+  echo ">>> Copy cluster logs..."
+  pushd /home/impdev/Impala
+
+  for x in testdata/cluster/cdh*/node-*/var/log/; do
+    echo $x
+    if [ -d $x ]; then
+
+      CDH_VERSION=`echo $x | sed  "s#testdata/cluster/\(.*\)/node-.*#\1#"`
+      NODE_NUMBER=`echo $x | sed  "s#testdata/cluster/cdh.*/\(.*\)/var.*#\1#"`
+
+      rm -rf logs/cluster/${CDH_VERSION}-${NODE_NUMBER}
+      mkdir -p logs/cluster/${CDH_VERSION}-${NODE_NUMBER}
+      cp -R $x/* logs/cluster/${CDH_VERSION}-${NODE_NUMBER}
+    fi
+  done
+
+  popd
 }
 
 # Runs a suite passed in as the first argument. Tightly
@@ -340,16 +407,9 @@ function test_suite() {
     SKIP_TOOLCHAIN_BOOTSTRAP=true ./buildall.sh -noclean -notests -asan
   fi
 
-  # BE tests don't require the minicluster, so we can run them directly.
+  # Build the BE test binaries if needed.
   if [[ $1 = BE_TEST* ]]; then
     make -j$(nproc) --load-average=$(nproc) be-test be-benchmarks
-    if ! bin/run-backend-tests.sh; then
-      echo "Tests $1 failed!"
-      return 1
-    else
-      echo "Tests $1 succeeded!"
-      return 0
-    fi
   fi
 
   if [[ $1 == RAT_CHECK ]]; then
@@ -418,6 +478,9 @@ function test_suite() {
   # leading to test-with-docker.py hitting a timeout. Killing the minicluster
   # daemons fixes this.
   testdata/bin/kill-all.sh || true
+
+  copy_cluster_logs
+
   return $ret
 }
 
@@ -447,15 +510,6 @@ function shell() {
   mkdir -p logs
   boot_container
   impala_environment
-  # Kudu requires --privileged for the Docker container; see
-  # https://issues.apache.org/jira/browse/KUDU-2000. Because
-  # our goal here is convenience for new developers, we
-  # skip kudu if "ntptime" doesn't work, which is a good
-  # proxy for Kudu won't start.
-  if ! ntptime > /dev/null; then
-    export KUDU_IS_SUPPORTED=false
-    KUDU_MSG="Kudu is not started."
-  fi
   start_minicluster
   bin/start-impala-cluster.py
   cat <<"EOF"

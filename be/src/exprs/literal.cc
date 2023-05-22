@@ -17,6 +17,8 @@
 
 #include "literal.h"
 
+#include <cmath>
+#include <limits>
 #include <sstream>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
 
@@ -28,6 +30,7 @@
 #include "runtime/decimal-value.inline.h"
 #include "runtime/runtime-state.h"
 #include "runtime/timestamp-parse-util.h"
+#include "util/decimal-util.h"
 
 #include "common/names.h"
 
@@ -63,11 +66,23 @@ Literal::Literal(const TExprNode& node)
       DCHECK(node.__isset.int_literal);
       value_.bigint_val = node.int_literal.value;
       break;
-    case TYPE_FLOAT:
+    case TYPE_FLOAT: {
       DCHECK_EQ(node.node_type, TExprNodeType::FLOAT_LITERAL);
       DCHECK(node.__isset.float_literal);
-      value_.float_val = node.float_literal.value;
+      // 'node.float_literal.value' is actually a double. Casting from double to float
+      // invokes undefined behaviour if the value is out of range for float.
+      double literal_value = node.float_literal.value;
+      const bool out_of_range = literal_value < std::numeric_limits<float>::lowest()
+          || literal_value > std::numeric_limits<float>::max();
+      if (UNLIKELY(out_of_range && std::isfinite(literal_value))) {
+        DCHECK(false) << "Value out of range for FLOAT.";
+        value_.float_val = literal_value > 0 ? std::numeric_limits<float>::infinity()
+          : -std::numeric_limits<float>::infinity();
+      } else {
+        value_.float_val = literal_value;
+      }
       break;
+    }
     case TYPE_DOUBLE:
       DCHECK_EQ(node.node_type, TExprNodeType::FLOAT_LITERAL);
       DCHECK(node.__isset.float_literal);
@@ -353,7 +368,7 @@ string Literal::DebugString() const {
       }
       break;
     case TYPE_TIMESTAMP:
-      out << value_.timestamp_val.ToString();
+      out << value_.timestamp_val;
       break;
     case TYPE_DATE:
       out << value_.date_val;
@@ -444,6 +459,11 @@ Status Literal::GetCodegendComputeFnImpl(LlvmCodeGen* codegen, llvm::Function** 
   *fn = codegen->FinalizeFunction(*fn);
   if (UNLIKELY(*fn == nullptr)) return Status(TErrorCode::IR_VERIFY_FAILED, "Literal");
   return Status::OK();
+}
+
+bool operator==(const Literal& lhs, const Literal& rhs) {
+  if (lhs.type() != rhs.type()) return false;
+  return lhs.value_.EqualsWithType(rhs.value_, lhs.type());
 }
 
 }

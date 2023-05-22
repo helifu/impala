@@ -20,29 +20,28 @@ package org.apache.impala.catalog;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
-
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
-import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
 import org.apache.impala.analysis.TableName;
+import org.apache.impala.catalog.events.InFlightEvents;
+import org.apache.impala.catalog.monitor.CatalogMonitor;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.common.Metrics;
 import org.apache.impala.common.Pair;
-import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.RuntimeEnv;
-import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.service.MetadataOp;
 import org.apache.impala.thrift.TAccessLevel;
 import org.apache.impala.thrift.TCatalogObject;
@@ -51,20 +50,21 @@ import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TColumnDescriptor;
 import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
 import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TPartialTableInfo;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableInfoSelector;
 import org.apache.impala.thrift.TTableStats;
+import org.apache.impala.thrift.TTableType;
 import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.HdfsCachingUtil;
-import org.apache.log4j.Logger;
 
 import com.codahale.metrics.Timer;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Stopwatch;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Base class for table metadata.
@@ -76,14 +76,20 @@ import com.google.common.collect.Lists;
  * a key range into a fixed number of buckets).
  */
 public abstract class Table extends CatalogObjectImpl implements FeTable {
-  private static final Logger LOG = Logger.getLogger(Table.class);
+  private static final Logger LOG = LoggerFactory.getLogger(Table.class);
   protected org.apache.hadoop.hive.metastore.api.Table msTable_;
   protected final Db db_;
   protected final String name_;
   protected final String owner_;
   protected TAccessLevel accessLevel_ = TAccessLevel.READ_WRITE;
-  // Lock protecting this table
-  private final ReentrantLock tableLock_ = new ReentrantLock();
+  // Lock protecting this table. A read lock must be table when we are serializing
+  // the table contents over thrift (e.g when returning the table to clients over thrift
+  // or when topic-update thread serializes the table in the topic update)
+  // A write lock must be table when the table is being modified (e.g. DDLs or refresh)
+  private final ReentrantReadWriteLock tableLock_ = new ReentrantReadWriteLock(
+      true /*fair ordering*/);
+  private final ReadLock readLock_ = tableLock_.readLock();
+  private final WriteLock writeLock_ = tableLock_.writeLock();
 
   // Number of clustering columns.
   protected int numClusteringCols_;
@@ -113,14 +119,15 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   // the clustering columns.
   protected final ArrayList<Column> colsByPos_ = new ArrayList<>();
 
+  // Virtual columns of this table.
+  protected final ArrayList<VirtualColumn> virtualCols_ = new ArrayList<>();
+
   // map from lowercase column name to Column object.
-  private final Map<String, Column> colsByName_ = new HashMap<>();
+  protected final Map<String, Column> colsByName_ = new HashMap<>();
 
-  // List of primary keys associated with the table.
-  protected final List<SQLPrimaryKey> primaryKeys_ = new ArrayList<>();
-
-  // List of foreign keys associated with the table.
-  protected final List<SQLForeignKey> foreignKeys_ = new ArrayList<>();
+  // List of SQL constraints associated with the table.
+  private final SqlConstraints sqlConstraints_ = new SqlConstraints(new ArrayList<>(),
+      new ArrayList<>());
 
   // Type of this table (array of struct) that mirrors the columns. Useful for analysis.
   protected final ArrayType type_ = new ArrayType(new StructType());
@@ -136,18 +143,13 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   // impalad.
   protected long lastUsedTime_;
 
-  // Valid write id list for this table.
-  // null in the case that this table is not transactional.
-  // TODO(todd) this should probably be a ValidWriteIdList in memory instead of a String.
-  protected String validWriteIds_ = null;
+  // Represents the event id in the metastore which pertains to the creation of this
+  // table. Defaults to -1 for a preexisting table or if events processing is not active.
+  protected volatile long createEventId_ = -1;
 
-  // maximum number of catalog versions to store for in-flight events for this table
-  private static final int MAX_NUMBER_OF_INFLIGHT_EVENTS = 10;
-
-  // FIFO list of versions for all the in-flight metastore events in this table
-  // This queue can only grow up to MAX_NUMBER_OF_INFLIGHT_EVENTS size. Anything which
-  // is attempted to be added to this list when its at maximum capacity is ignored
-  private final LinkedList<Long> versionsForInflightEvents_ = new LinkedList<>();
+  // tracks the in-flight metastore events for this table. Used by Events processor to
+  // avoid unnecessary refresh when the event is received
+  private final InFlightEvents inFlightEvents = new InFlightEvents();
 
   // Table metrics. These metrics are applicable to all table types. Each subclass of
   // Table can define additional metrics specific to that table type.
@@ -171,6 +173,9 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   public static final String LOAD_DURATION_ALL_COLUMN_STATS =
       "load-duration.all-column-stats";
 
+  // metric key for the number of in-flight events for this table.
+  public static final String NUMBER_OF_INFLIGHT_EVENTS = "num-inflight-events";
+
   // Table property key for storing the time of the last DDL operation.
   public static final String TBL_PROP_LAST_DDL_TIME = "transient_lastDdlTime";
 
@@ -183,6 +188,16 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
 
   // Table property key to determined if HMS translated a managed table to external table
   public static final String TBL_PROP_EXTERNAL_TABLE_PURGE = "external.table.purge";
+  public static final String TBL_PROP_EXTERNAL_TABLE_PURGE_DEFAULT = "TRUE";
+
+  // this field represents the last event id in metastore upto which this table is
+  // synced. It is used if the flag sync_to_latest_event_on_ddls is set to true.
+  // Making it as volatile so that read and write of this variable are thread safe.
+  // As an example, EventProcessor can check if it needs to process a table event or
+  // not by reading this flag and without acquiring read lock on table object
+  protected volatile long lastSyncedEventId_ = -1;
+
+  protected volatile long lastRefreshEventId_ = -1L;
 
   protected Table(org.apache.hadoop.hive.metastore.api.Table msTable, Db db,
       String name, String owner) {
@@ -193,6 +208,34 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     tableStats_ = new TTableStats(-1);
     tableStats_.setTotal_file_bytes(-1);
     initMetrics();
+  }
+
+  // TODO: Get rid of get and createEventId
+  // once we implement the logic of setting
+  // last synced id in full table reload
+  public long getCreateEventId() { return createEventId_; }
+
+  public void setCreateEventId(long eventId) {
+    // TODO: Add a preconditions check for eventId < lastSycnedEventId
+    createEventId_ = eventId;
+    LOG.debug("createEventId_ for table: {} set to: {}", getFullName(), createEventId_);
+    // TODO: Should we reset lastSyncedEvent Id if it is less than event Id?
+    // If we don't reset it - we may start syncing table from an event id which
+    // is less than create event id
+    if (lastSyncedEventId_ < eventId) {
+      setLastSyncedEventId(eventId);
+    }
+  }
+
+  public long getLastSyncedEventId() {
+    return lastSyncedEventId_;
+  }
+
+  public void setLastSyncedEventId(long eventId) {
+    // TODO: Add a preconditions check for eventId >= createEventId_
+    LOG.debug("lastSyncedEventId_ for table: {} set from {} to {}", getFullName(),
+        lastSyncedEventId_, eventId);
+    lastSyncedEventId_ = eventId;
   }
 
   /**
@@ -218,7 +261,52 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
         .parseBoolean(msTbl.getParameters().get(TBL_PROP_EXTERNAL_TABLE_PURGE));
   }
 
-  public ReentrantLock getLock() { return tableLock_; }
+  public void takeReadLock() {
+    readLock_.lock();
+  }
+
+  public ReadLock readLock() { return readLock_; }
+  public WriteLock writeLock() { return writeLock_; }
+
+  public void releaseReadLock() {
+    readLock_.unlock();
+  }
+
+  public boolean isReadLockedByCurrentThread() {
+    return tableLock_.getReadHoldCount() > 0;
+  }
+
+  public boolean tryReadLock() {
+    try {
+      // a tryLock with a 0 timeout honors the fairness for lock acquisition
+      // in case there are other threads waiting to acquire a read lock when
+      // compared to tryLock() which "barges" in and takes a read lock if
+      // available with no consideration to other threads waiting for a read lock.
+      return readLock_.tryLock(0, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      // ignored
+    }
+    return false;
+  }
+
+  public void releaseWriteLock() {
+    writeLock_.unlock();
+  }
+
+  /**
+   * Returns true if this table is write locked by current thread.
+   */
+  public boolean isWriteLockedByCurrentThread() {
+    return writeLock_.isHeldByCurrentThread();
+  }
+
+  /**
+   * Returns true if this table is write locked by any thread.
+   */
+  public boolean isWriteLocked() {
+    return tableLock_.isWriteLocked();
+  }
+
   @Override
   public abstract TTableDescriptor toThriftDescriptor(
       int tableId, Set<Long> referencedPartitions);
@@ -254,27 +342,29 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   public void setEstimatedMetadataSize(long estimatedMetadataSize) {
     estimatedMetadataSize_.set(estimatedMetadataSize);
     if (!isStoredInImpaladCatalogCache()) {
-      CatalogUsageMonitor.INSTANCE.updateLargestTables(this);
+      CatalogMonitor.INSTANCE.getCatalogTableMetrics().updateLargestTables(this);
     }
   }
 
   public void incrementMetadataOpsCount() {
     metadataOpsCount_.incrementAndGet();
     if (!isStoredInImpaladCatalogCache()) {
-      CatalogUsageMonitor.INSTANCE.updateFrequentlyAccessedTables(this);
+      CatalogMonitor.INSTANCE.getCatalogTableMetrics().updateFrequentlyAccessedTables(
+          this);
     }
   }
 
   public void updateTableLoadingTime() {
     if (!isStoredInImpaladCatalogCache()) {
-      CatalogUsageMonitor.INSTANCE.updateLongMetadataLoadingTables(this);
+      CatalogMonitor.INSTANCE.getCatalogTableMetrics().updateLongMetadataLoadingTables(
+          this);
     }
   }
 
   public void setNumFiles(long numFiles) {
     numFiles_.set(numFiles);
     if (!isStoredInImpaladCatalogCache()) {
-      CatalogUsageMonitor.INSTANCE.updateHighFileCountTables(this);
+      CatalogMonitor.INSTANCE.getCatalogTableMetrics().updateHighFileCountTables(this);
     }
   }
 
@@ -285,6 +375,7 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     metrics_.addTimer(LOAD_DURATION_STORAGE_METADATA);
     metrics_.addTimer(HMS_LOAD_TBL_SCHEMA);
     metrics_.addTimer(LOAD_DURATION_ALL_COLUMN_STATS);
+    metrics_.addCounter(NUMBER_OF_INFLIGHT_EVENTS);
   }
 
   public Metrics getMetrics() { return metrics_; }
@@ -337,6 +428,11 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     colsByPos_.clear();
     colsByName_.clear();
     ((StructType) type_.getItemType()).clearFields();
+    virtualCols_.clear();
+  }
+
+  protected void addVirtualColumn(VirtualColumn col) {
+    virtualCols_.add(col);
   }
 
   // Returns a list of all column names for this table which we expect to have column
@@ -384,48 +480,6 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   }
 
   /**
-   * Get valid write ids for the acid table.
-   * @param client the client to access HMS
-   * @return the list of valid write IDs for the table
-   */
-  protected String fetchValidWriteIds(IMetaStoreClient client)
-      throws TableLoadingException {
-    String tblFullName = getFullName();
-    if (LOG.isTraceEnabled()) LOG.trace("Get valid writeIds for table: " + tblFullName);
-    String writeIds = null;
-    try {
-      ValidWriteIdList validWriteIds = MetastoreShim.fetchValidWriteIds(client,
-          tblFullName);
-      writeIds = validWriteIds == null ? null : validWriteIds.writeToString();
-    } catch (Exception e) {
-      throw new TableLoadingException(String.format("Error loading ValidWriteIds for " +
-          "table '%s'", getName()), e);
-    }
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("Valid writeIds: " + writeIds);
-    }
-    return writeIds;
-  }
-
-  /**
-   * Set ValistWriteIdList with stored writeId
-   * @param client the client to access HMS
-   */
-  protected void loadValidWriteIdList(IMetaStoreClient client)
-      throws TableLoadingException {
-    Stopwatch sw = new Stopwatch().start();
-    Preconditions.checkState(msTable_ != null && msTable_.getParameters() != null);
-    if (MetastoreShim.getMajorVersion() > 2 &&
-        AcidUtils.isTransactionalTable(msTable_.getParameters())) {
-      validWriteIds_ = fetchValidWriteIds(client);
-    } else {
-      validWriteIds_ = null;
-    }
-    LOG.debug("Load Valid Write Id List Done. Time taken: " +
-        PrintUtils.printTimeNs(sw.elapsed(TimeUnit.NANOSECONDS)));
-  }
-
-  /**
    * Creates a table of the appropriate type based on the given hive.metastore.api.Table
    * object.
    */
@@ -434,13 +488,21 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     CatalogInterners.internFieldsInPlace(msTbl);
     Table table = null;
     // Create a table of appropriate type
-    if (MetadataOp.TABLE_TYPE_VIEW.equals(
-          MetastoreShim.mapToInternalTableType(msTbl.getTableType()))) {
-      table = new View(msTbl, db, msTbl.getTableName(), msTbl.getOwner());
+    if (TImpalaTableType.VIEW ==
+        MetastoreShim.mapToInternalTableType(msTbl.getTableType())) {
+      if (msTbl.getTableType().equalsIgnoreCase("MATERIALIZED_VIEW") &&
+          HdfsFileFormat.isHdfsInputFormatClass(msTbl.getSd().getInputFormat())) {
+        table = new MaterializedViewHdfsTable(msTbl, db, msTbl.getTableName(),
+            msTbl.getOwner());
+      } else {
+        table = new View(msTbl, db, msTbl.getTableName(), msTbl.getOwner());
+      }
     } else if (HBaseTable.isHBaseTable(msTbl)) {
       table = new HBaseTable(msTbl, db, msTbl.getTableName(), msTbl.getOwner());
     } else if (KuduTable.isKuduTable(msTbl)) {
       table = new KuduTable(msTbl, db, msTbl.getTableName(), msTbl.getOwner());
+    } else if (IcebergTable.isIcebergTable(msTbl)) {
+      table = new IcebergTable(msTbl, db, msTbl.getTableName(), msTbl.getOwner());
     } else if (DataSourceTable.isDataSourceTable(msTbl)) {
       // It's important to check if this is a DataSourceTable before HdfsTable because
       // DataSourceTables are still represented by HDFS tables in the metastore but
@@ -464,10 +526,27 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     if (!thriftTable.isSetLoad_status() && thriftTable.isSetMetastore_table())  {
       newTable = Table.fromMetastoreTable(parentDb, thriftTable.getMetastore_table());
     } else {
+      TImpalaTableType tblType;
+      if (thriftTable.getTable_type() == TTableType.VIEW) {
+        tblType = TImpalaTableType.VIEW;
+      } else {
+        // If the table is unloaded or --pull_table_types_and_comments flag is not set,
+        // keep the legacy behavior as showing the table type as TABLE.
+        tblType = TImpalaTableType.TABLE;
+      }
       newTable =
-          IncompleteTable.createUninitializedTable(parentDb, thriftTable.getTbl_name());
+          IncompleteTable.createUninitializedTable(parentDb, thriftTable.getTbl_name(),
+              tblType, MetadataOp.getTableComment(thriftTable.getMetastore_table()));
     }
-    newTable.loadFromThrift(thriftTable);
+    try {
+      newTable.loadFromThrift(thriftTable);
+    } catch (IcebergTableLoadingException e) {
+      LOG.warn(String.format("The table %s in database %s could not be loaded.",
+                   thriftTable.getTbl_name(), parentDb.getName()),
+          e);
+      newTable = IncompleteTable.createFailedMetadataLoadTable(
+          parentDb, thriftTable.getTbl_name(), e);
+    }
     newTable.validate();
     return newTable;
   }
@@ -489,8 +568,12 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
         Column col = Column.fromThrift(columns.get(i));
         colsByPos_.add(col.getPosition(), col);
         colsByName_.put(col.getName().toLowerCase(), col);
-        ((StructType) type_.getItemType()).addField(
-            new StructField(col.getName(), col.getType(), col.getComment()));
+        ((StructType) type_.getItemType()).addField(getStructFieldFromColumn(col));
+      }
+      virtualCols_.clear();
+      virtualCols_.ensureCapacity(thriftTable.getVirtual_columns().size());
+      for (TColumn tvCol : thriftTable.getVirtual_columns()) {
+        virtualCols_.add(VirtualColumn.fromThrift(tvCol));
       }
     } catch (ImpalaRuntimeException e) {
       throw new TableLoadingException(String.format("Error loading schema for " +
@@ -507,8 +590,20 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     storageMetadataLoadTime_ = thriftTable.getStorage_metadata_load_time_ns();
 
     storedInImpaladCatalogCache_ = true;
-    validWriteIds_ = thriftTable.isSetValid_write_ids() ?
-        thriftTable.getValid_write_ids() : null;
+  }
+
+  /**
+   * If column is 'IcebergColumn', we return 'IcebergStructField', otherwise, we
+   * just return 'StructField'.
+   */
+  private StructField getStructFieldFromColumn(Column col) {
+    if (col instanceof IcebergColumn) {
+      IcebergColumn iCol = (IcebergColumn) col;
+      return new IcebergStructField(iCol.getName(), iCol.getType(),
+          iCol.getComment(), iCol.getFieldId());
+    } else {
+      return new StructField(col.getName(), col.getType(), col.getComment());
+    }
   }
 
   /**
@@ -534,7 +629,7 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     // the table lock should already be held, and we want the toThrift() to be consistent
     // with the modification. So this check helps us identify places where the lock
     // acquisition is probably missing entirely.
-    if (!tableLock_.isHeldByCurrentThread()) {
+    if (!isLockedByCurrentThread()) {
       throw new IllegalStateException(
           "Table.toThrift() called without holding the table lock: " +
               getFullName() + " " + getClass().getName());
@@ -556,33 +651,60 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
         table.addToColumns(colDesc);
       }
     }
-
-    table.setMetastore_table(getMetaStoreTable());
-    table.setTable_stats(tableStats_);
-    if (validWriteIds_ != null) {
-      table.setValid_write_ids(validWriteIds_);
+    table.setVirtual_columns(new ArrayList<>());
+    for (VirtualColumn vCol : getVirtualColumns()) {
+      table.addToVirtual_columns(vCol.toThrift());
     }
+
+    org.apache.hadoop.hive.metastore.api.Table msTable = getMetaStoreTable();
+    // IMPALA-10243: We should get our own copy of the metastore table, otherwise other
+    // threads might modify it when the table lock is not held.
+    if (msTable != null) msTable = msTable.deepCopy();
+    table.setMetastore_table(msTable);
+    table.setTable_stats(tableStats_);
     return table;
   }
 
+  private boolean isLockedByCurrentThread() {
+    return isReadLockedByCurrentThread() || tableLock_.isWriteLockedByCurrentThread();
+  }
+
   public TCatalogObject toMinimalTCatalogObject() {
+    return toMinimalTCatalogObjectHelper();
+  }
+
+  /**
+   * Helper method for generating the minimal catalog object. toMinimalTCatalogObject()
+   * may be overrided by subclasses so we put the general implementation here.
+   */
+  private TCatalogObject toMinimalTCatalogObjectHelper() {
     TCatalogObject catalogObject =
         new TCatalogObject(getCatalogObjectType(), getCatalogVersion());
-    catalogObject.setTable(new TTable());
-    catalogObject.getTable().setDb_name(getDb().getName());
-    catalogObject.getTable().setTbl_name(getName());
+    TTable table = new TTable(getDb().getName(), getName());
+    table.setTbl_comment(getTableComment());
+    catalogObject.setTable(table);
     return catalogObject;
+  }
+
+  /**
+   * Returns a TCatalogObject with only the table name for invalidation. For non-hdfs
+   * tables, it's the same as toMinimalTCatalogObject(). For hdfs tables, their
+   * toMinimalTCatalogObject() will also return the partition names. So we use this method
+   * to get a light-weight object for invalidation in LocalCatalog.
+   */
+  public TCatalogObject toInvalidationObject() {
+    return toMinimalTCatalogObjectHelper();
   }
 
   /**
    * Override parent implementation that will finally call toThrift() which requires
    * holding the table lock. However, it's not guaranteed that caller holds the table
-   * lock (IMPALA-9136). Here we use toMinimalTCatalogObject() directly since only db
-   * name and table name are needed.
+   * lock (IMPALA-9136). Here we use toMinimalTCatalogObjectHelper() directly since only
+   * db name and table name are needed.
    */
   @Override
   public final String getUniqueName() {
-    return Catalog.toCatalogObjectKey(toMinimalTCatalogObject());
+    return Catalog.toCatalogObjectKey(toMinimalTCatalogObjectHelper());
   }
 
   @Override
@@ -591,11 +713,26 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   }
 
   /**
+   * Generates a TCatalogObject based on the required form. See more details in comments
+   * of ThriftObjectType.
+   */
+  public TCatalogObject toTCatalogObject(ThriftObjectType resultType) {
+    switch (resultType) {
+      case FULL: return toTCatalogObject();
+      case DESCRIPTOR_ONLY: return toMinimalTCatalogObject();
+      case INVALIDATION: return toInvalidationObject();
+      case NONE:
+      default:
+        return null;
+    }
+  }
+
+  /**
    * Return partial info about this table. This is called only on the catalogd to
    * service GetPartialCatalogObject RPCs.
    */
   public TGetPartialCatalogObjectResponse getPartialInfo(
-      TGetPartialCatalogObjectRequest req) throws TableLoadingException {
+      TGetPartialCatalogObjectRequest req) throws CatalogException {
     Preconditions.checkState(isLoaded(), "unloaded table: %s", getFullName());
     TTableInfoSelector selector = Preconditions.checkNotNull(req.table_info_selector,
         "no table_info_selector");
@@ -613,11 +750,18 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
       // ensure that serialization of the GetPartialCatalogObjectResponse object
       // is done while we continue to hold the table lock.
       resp.table_info.setHms_table(getMetaStoreTable().deepCopy());
+      resp.table_info.setVirtual_columns(new ArrayList<>());
+      for (VirtualColumn vCol : getVirtualColumns()) {
+        resp.table_info.addToVirtual_columns(vCol.toThrift());
+      }
     }
-    if (selector.want_stats_for_column_names != null) {
-      List<ColumnStatisticsObj> statsList = Lists.newArrayListWithCapacity(
-          selector.want_stats_for_column_names.size());
-      for (String colName: selector.want_stats_for_column_names) {
+    if (selector.want_stats_for_column_names != null ||
+        selector.want_stats_for_all_columns) {
+      List<String> colList = selector.want_stats_for_all_columns ? getColumnNames() :
+          selector.want_stats_for_column_names;
+      List<ColumnStatisticsObj> statsList =
+          Lists.newArrayListWithCapacity(colList.size());
+      for (String colName: colList) {
         Column col = getColumn(colName);
         if (col == null) continue;
 
@@ -637,9 +781,15 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
       }
       resp.table_info.setColumn_stats(statsList);
     }
-
+    if (getMetaStoreTable() != null &&
+        AcidUtils.isTransactionalTable(getMetaStoreTable().getParameters())) {
+      Preconditions.checkState(getValidWriteIds() != null);
+      resp.table_info.setValid_write_ids(
+          MetastoreShim.convertToTValidWriteIdList(getValidWriteIds()));
+    }
     return resp;
   }
+
   /**
    * @see FeCatalogUtils#parseColumnType(FieldSchema, String)
    */
@@ -661,20 +811,25 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     return new TableName(db_ != null ? db_.getName() : null, name_);
   }
 
+  @Override
+  public TImpalaTableType getTableType() {
+    if (msTable_ == null) return TImpalaTableType.TABLE;
+    return MetastoreShim.mapToInternalTableType(msTable_.getTableType());
+  }
+
+  @Override
+  public String getTableComment() {
+    return MetadataOp.getTableComment(msTable_);
+  }
+
   @Override // FeTable
   public List<Column> getColumns() { return colsByPos_; }
 
   @Override // FeTable
-  public List<SQLPrimaryKey> getPrimaryKeys() {
-    // Prevent clients from modifying the primary keys list.
-    return ImmutableList.copyOf(primaryKeys_);
-  }
+  public List<VirtualColumn> getVirtualColumns() { return virtualCols_; }
 
   @Override // FeTable
-  public List<SQLForeignKey> getForeignKeys() {
-    // Prevent clients from modifying the foreign keys list.
-    return ImmutableList.copyOf(foreignKeys_);
-  }
+  public SqlConstraints getSqlConstraints()  { return sqlConstraints_; }
 
   @Override // FeTable
   public List<String> getColumnNames() { return Column.toColumnNames(colsByPos_); }
@@ -696,6 +851,12 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   @Override // FeTable
   public List<Column> getColumnsInHiveOrder() {
     List<Column> columns = Lists.newArrayList(getNonClusteringColumns());
+    if (getMetaStoreTable() != null &&
+        AcidUtils.isFullAcidTable(getMetaStoreTable().getParameters())) {
+      // Remove synthetic "row__id" column.
+      Preconditions.checkState(columns.get(0).getName().equals("row__id"));
+      columns.remove(0);
+    }
     columns.addAll(getClusteringColumns());
     return Collections.unmodifiableList(columns);
   }
@@ -807,19 +968,24 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   }
 
   /**
-   * Gets the current list of versions for in-flight events for this table
-   */
-  public List<Long> getVersionsForInflightEvents() {
-    return Collections.unmodifiableList(versionsForInflightEvents_);
-  }
-
-  /**
    * Removes a given version from the collection of version numbers for in-flight events
-   * @param versionNumber version number to remove from the collection
+   * @param isInsertEvent If true, remove eventId from list of eventIds for in-flight
+   * Insert events. If false, remove versionNumber from list of versions for in-flight DDL
+   * events
+   * @param versionNumber when isInsertEvent is true, it's eventId to remove
+   * when isInsertEvent is false, it's version number to remove
    * @return true if version was successfully removed, false if didn't exist
    */
-  public boolean removeFromVersionsForInflightEvents(long versionNumber) {
-    return versionsForInflightEvents_.remove(versionNumber);
+  public boolean removeFromVersionsForInflightEvents(
+      boolean isInsertEvent, long versionNumber) {
+    Preconditions.checkState(isWriteLockedByCurrentThread(),
+        "removeFromVersionsForInFlightEvents called without taking the table lock on "
+            + getFullName());
+    boolean removed = inFlightEvents.remove(isInsertEvent, versionNumber);
+    if (removed) {
+      metrics_.getCounter(NUMBER_OF_INFLIGHT_EVENTS).dec();
+    }
+    return removed;
   }
 
   /**
@@ -827,20 +993,25 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
    * collection is already at the max size defined by
    * <code>MAX_NUMBER_OF_INFLIGHT_EVENTS</code>, then it ignores the given version and
    * does not add it
-   * @param versionNumber version number to add
+   * @param isInsertEvent if true, add eventId to list of eventIds for in-flight Insert
+   * events. If false, add versionNumber to list of versions for in-flight DDL events
+   * @param versionNumber when isInsertEvent is true, it's eventId to add
+   * when isInsertEvent is false, it's version number to add
    * @return True if version number was added, false if the collection is at its max
    * capacity
    */
-  public boolean addToVersionsForInflightEvents(long versionNumber) {
-    if (versionsForInflightEvents_.size() == MAX_NUMBER_OF_INFLIGHT_EVENTS) {
-      LOG.warn(String.format("Number of versions to be stored for table %s is at "
-              + " its max capacity %d. Ignoring add request for version number %d. This "
-              + "could cause unnecessary table invalidation when the event is processed",
-          getFullName(), MAX_NUMBER_OF_INFLIGHT_EVENTS, versionNumber));
-      return false;
+  public void addToVersionsForInflightEvents(boolean isInsertEvent, long versionNumber) {
+    // we generally don't take locks on Incomplete tables since they are atomically
+    // replaced during load
+    Preconditions.checkState(
+        this instanceof IncompleteTable || isWriteLockedByCurrentThread());
+    if (!inFlightEvents.add(isInsertEvent, versionNumber)) {
+      LOG.warn(String.format("Could not add %s version to the table %s. This could "
+          + "cause unnecessary refresh of the table when the event is received by the "
+              + "Events processor.", versionNumber, getFullName()));
+    } else {
+      metrics_.getCounter(NUMBER_OF_INFLIGHT_EVENTS).inc();
     }
-    versionsForInflightEvents_.add(versionNumber);
-    return true;
   }
 
   @Override
@@ -849,7 +1020,38 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   }
 
   @Override
-  public String getValidWriteIds() {
-    return validWriteIds_;
+  public ValidWriteIdList getValidWriteIds() {
+    return null;
+  }
+
+  /**
+   * When altering a table we modify the cached metadata and apply the new metadata to
+   * HMS. Some DDL/DMLs require reloading the HMS and file metadata to update the cached
+   * metadata (See CatalogOpExecutor#alterTable(TAlterTableParams, TDdlExecResponse) for
+   * more details). Before reloading the metadata, these modifications are not finalized.
+   * @return true if there are any in-progress modifications need to be finalized in an
+   * incremental table reload.
+   */
+  public boolean hasInProgressModification() { return false; }
+
+  /**
+   * Clears the in-progress modifications in case of failures.
+   */
+  public void resetInProgressModification() { }
+
+  public long getLastRefreshEventId() { return lastRefreshEventId_; }
+
+  public void setLastRefreshEventId(long eventId) {
+    if (eventId > lastRefreshEventId_) {
+      lastRefreshEventId_ = eventId;
+    }
+    LOG.debug("last refreshed event id for table: {} set to: {}", getFullName(),
+        lastRefreshEventId_);
+    // TODO: Should we reset lastSyncedEvent Id if it is less than event Id?
+    // If we don't reset it - we may start syncing table from an event id which
+    // is less than refresh event id
+    if (lastSyncedEventId_ < eventId) {
+      setLastSyncedEventId(eventId);
+    }
   }
 }

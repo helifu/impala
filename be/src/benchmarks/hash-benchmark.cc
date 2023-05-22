@@ -23,7 +23,9 @@
 #include "codegen/llvm-codegen.h"
 #include "common/init.h"
 #include "experiments/data-provider.h"
+#include "runtime/fragment-state.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/query-state.h"
 #include "runtime/test-env.h"
 #include "service/fe-support.h"
 #include "util/benchmark.h"
@@ -89,7 +91,7 @@ struct TestData {
   int num_cols;
   int num_rows;
   vector<int32_t> results;
-  void* jitted_fn;
+  CodegenHashFn jitted_fn;
 };
 
 void TestFnvIntHash(int batch, void* d) {
@@ -163,7 +165,7 @@ void TestBoostIntHash(int batch, void* d) {
 
 void TestCodegenIntHash(int batch, void* d) {
   TestData* data = reinterpret_cast<TestData*>(d);
-  CodegenHashFn fn = reinterpret_cast<CodegenHashFn>(data->jitted_fn);
+  CodegenHashFn fn = data->jitted_fn;
   int rows = data->num_rows;
   for (int i = 0; i < batch; ++i) {
     char* values = reinterpret_cast<char*>(data->data);
@@ -281,7 +283,7 @@ void TestFastHashMixedHash(int batch, void* d) {
 
 void TestCodegenMixedHash(int batch, void* d) {
   TestData* data = reinterpret_cast<TestData*>(d);
-  CodegenHashFn fn = reinterpret_cast<CodegenHashFn>(data->jitted_fn);
+  CodegenHashFn fn = data->jitted_fn;
   int rows = data->num_rows;
   for (int i = 0; i < batch; ++i) {
     char* values = reinterpret_cast<char*>(data->data);
@@ -440,7 +442,7 @@ llvm::Function* CodegenCrcHash(LlvmCodeGen* codegen, bool mixed) {
     llvm::Value* string_data =
         builder.CreateGEP(data, codegen->GetI32Constant(fixed_byte_size));
     llvm::Value* string_val = builder.CreateBitCast(string_data,
-            codegen->GetSlotPtrType(TYPE_STRING));
+            codegen->GetSlotPtrType(ColumnType(TYPE_STRING)));
     llvm::Value* str_ptr = builder.CreateStructGEP(NULL, string_val, 0);
     llvm::Value* str_len = builder.CreateStructGEP(NULL, string_val, 1);
     str_ptr = builder.CreateLoad(str_ptr);
@@ -479,6 +481,11 @@ int main(int argc, char **argv) {
     return -1;
   }
   status = test_env.CreateQueryState(0, nullptr, &state);
+  QueryState* qs = state->query_state();
+  TPlanFragment* fragment = qs->obj_pool()->Add(new TPlanFragment());
+  PlanFragmentCtxPB* fragment_ctx = qs->obj_pool()->Add(new PlanFragmentCtxPB());
+  FragmentState* fragment_state =
+      qs->obj_pool()->Add(new FragmentState(qs, *fragment, *fragment_ctx));
   if (!status.ok()) {
     cout << "Could not create RuntimeState";
     return -1;
@@ -492,7 +499,7 @@ int main(int argc, char **argv) {
   DataProvider mixed_provider(&mem_pool, mixed_profile);
 
   scoped_ptr<LlvmCodeGen> codegen;
-  status = LlvmCodeGen::CreateImpalaCodegen(state, NULL, "test", &codegen);
+  status = LlvmCodeGen::CreateImpalaCodegen(fragment_state, NULL, "test", &codegen);
   if (!status.ok()) {
     cout << "Could not start codegen.";
     return -1;
@@ -500,11 +507,11 @@ int main(int argc, char **argv) {
   codegen->EnableOptimizations(true);
 
   llvm::Function* hash_ints = CodegenCrcHash(codegen.get(), false);
-  void* jitted_hash_ints;
+  CodegenFnPtr<CodegenHashFn> jitted_hash_ints;
   codegen->AddFunctionToJit(hash_ints, &jitted_hash_ints);
 
   llvm::Function* hash_mixed = CodegenCrcHash(codegen.get(), true);
-  void* jitted_hash_mixed;
+  CodegenFnPtr<CodegenHashFn> jitted_hash_mixed;
   codegen->AddFunctionToJit(hash_mixed, &jitted_hash_mixed);
 
   status = codegen->FinalizeModule();
@@ -527,7 +534,7 @@ int main(int argc, char **argv) {
   int_data.data = int_provider.NextBatch(&int_data.num_rows);
   int_data.num_cols = int_cols.size();
   int_data.results.resize(int_data.num_rows);
-  int_data.jitted_fn = jitted_hash_ints;
+  int_data.jitted_fn = jitted_hash_ints.load();
 
   // Some mixed col types.  The test hash function will know the exact
   // layout.  This is reasonable to do since we can use llvm
@@ -548,7 +555,7 @@ int main(int argc, char **argv) {
   mixed_data.data = mixed_provider.NextBatch(&mixed_data.num_rows);
   mixed_data.num_cols = mixed_cols.size();
   mixed_data.results.resize(mixed_data.num_rows);
-  mixed_data.jitted_fn = jitted_hash_mixed;
+  mixed_data.jitted_fn = jitted_hash_mixed.load();
 
   Benchmark int_suite("Int Hash");
   int_suite.AddBenchmark("Fnv", TestFnvIntHash, &int_data);

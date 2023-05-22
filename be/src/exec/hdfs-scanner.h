@@ -19,20 +19,25 @@
 #ifndef IMPALA_EXEC_HDFS_SCANNER_H_
 #define IMPALA_EXEC_HDFS_SCANNER_H_
 
-#include <vector>
 #include <memory>
 #include <stdint.h>
+#include <type_traits>
+#include <utility>
+#include <vector>
 #include <boost/scoped_ptr.hpp>
 
 #include "codegen/impala-ir.h"
 #include "common/global-flags.h"
 #include "common/object-pool.h"
 #include "common/status.h"
+#include "exec/exec-node.inline.h"
+#include "exec/file-metadata-utils.h"
 #include "exec/hdfs-scan-node-base.h"
 #include "exec/scanner-context.h"
 #include "runtime/io/disk-io-mgr.h"
 #include "runtime/row-batch.h"
 #include "runtime/tuple.h"
+#include "gutil/port.h"
 
 namespace impala {
 
@@ -130,7 +135,12 @@ class HdfsScanner {
   /// Only valid to call if the parent scan node is single-threaded.
   Status GetNext(RowBatch* row_batch) WARN_UNUSED_RESULT {
     DCHECK(!scan_node_->HasRowBatchQueue());
-    return GetNextInternal(row_batch);
+    RETURN_IF_ERROR(GetNextInternal(row_batch));
+    ++getnext_batches_returned_;
+    if ((getnext_batches_returned_ & (BATCHES_PER_FILTER_SELECTIVITY_CHECK - 1)) == 0) {
+      CheckFiltersEffectiveness();
+    }
+    return Status::OK();
   }
 
   /// Process an entire split, reading bytes from the context's streams.  Context is
@@ -164,6 +174,37 @@ class HdfsScanner {
   bool eos() const {
     DCHECK(!scan_node_->HasRowBatchQueue());
     return eos_;
+  }
+
+  /// Return the plan id of the scan node that this scanner is associated with.
+  int GetScanNodeId() const { return scan_node_->id(); }
+
+  /// Returns type of scanner: e.g. rcfile, seqfile
+  virtual THdfsFileFormat::type file_format() const = 0;
+
+  /// Not inlined in IR so it can be replaced with a constant.
+  int IR_NO_INLINE tuple_byte_size() const { return tuple_byte_size_; }
+  int IR_NO_INLINE tuple_byte_size(const TupleDescriptor& desc) const {
+    return desc.byte_size();
+  }
+
+  /// Find the index of a filter in filter_ctxs_ (a vector) through id.
+  int FindFilterIndex(int filter_id) {
+    for (int i = 0; i < filter_ctxs_.size(); ++i) {
+      const RuntimeFilter* filter = filter_ctxs_[i]->filter;
+      if (filter && filter->id() == filter_id) {
+        return i;
+      }
+    }
+    DCHECK(false);
+    return -1;
+  }
+
+  /// Return the runtime filter by index 'filter_idx'.
+  const RuntimeFilter* GetFilter(int filter_idx) {
+    DCHECK_GE(filter_idx, 0);
+    DCHECK_LT(filter_idx, filter_ctxs_.size());
+    return filter_ctxs_[filter_idx]->filter;
   }
 
   /// Scanner subclasses must implement these static functions as well.  Unfortunately,
@@ -201,6 +242,9 @@ class HdfsScanner {
 
   /// Context for this scanner
   ScannerContext* context_ = nullptr;
+
+  /// Utility class for handling file metadata.
+  FileMetadataUtils file_metadata_utils_;
 
   /// Object pool for objects with same lifetime as scanner.
   ObjectPool obj_pool_;
@@ -290,12 +334,13 @@ class HdfsScanner {
   /// Time spent decompressing bytes.
   RuntimeProfile::Counter* decompress_timer_ = nullptr;
 
-  /// Matching typedef for WriteAlignedTuples for codegen.  Refer to comments for
-  /// that function.
+  /// Matching typedef for WriteAlignedTuples for codegen. Refer to comments for that
+  /// function.
   typedef int (*WriteTuplesFn)(HdfsScanner*, MemPool*, TupleRow*, FieldLocation*,
       int, int, int, int, bool);
-  /// Jitted write tuples function pointer.  Null if codegen is disabled.
-  WriteTuplesFn write_tuples_fn_ = nullptr;
+  /// Jitted write tuples function pointer. Null if codegen is disabled.
+  /// Function type: WriteTuplesFn.
+  const CodegenFnPtrBase* write_tuples_fn_ = nullptr;
 
   struct LocalFilterStats {
     /// Total number of rows to which each filter was applied
@@ -309,13 +354,26 @@ class HdfsScanner {
     int64_t total_possible;
 
     /// Use known-width type to act as logical boolean.  Set to 1 if corresponding filter
-    /// in filter_ctxs_ should be applied, 0 if it was ineffective and was disabled.
-    uint8_t enabled;
+    /// in filter_ctxs_ should be applied at row level, 0 if it was ineffective and was
+    /// disabled.
+    uint8_t enabled_for_row;
+
+    /// Apply the filter at page level only.
+    uint8_t enabled_for_page;
+
+    /// Apply the filter at row group level only.
+    uint8_t enabled_for_rowgroup;
 
     /// Padding to ensure structs do not straddle cache-line boundary.
-    uint8_t padding[7];
+    uint8_t padding[5];
 
-    LocalFilterStats() : considered(0), rejected(0), total_possible(0), enabled(1) { }
+    LocalFilterStats()
+      : considered(0),
+        rejected(0),
+        total_possible(0),
+        enabled_for_row(1),
+        enabled_for_page(1),
+        enabled_for_rowgroup(1) {}
   };
 
   /// Cached runtime filter contexts, one for each filter that applies to this column.
@@ -326,13 +384,10 @@ class HdfsScanner {
   /// Close().
   vector<LocalFilterStats> filter_stats_;
 
-  /// Size of the file footer for ORC and Parquet. This is a guess. If this value is too
-  /// little, we will need to issue another read.
-  static const int64_t FOOTER_SIZE = 1024 * 100;
-  static_assert(FOOTER_SIZE <= READ_SIZE_MIN_VALUE,
-      "FOOTER_SIZE can not be greater than READ_SIZE_MIN_VALUE.\n"
-      "You can increase FOOTER_SIZE if you want, "
-      "just don't forget to increase READ_SIZE_MIN_VALUE as well.");
+  /// Counter for the number of batches returned from GetNext(). Only updated by the
+  /// GetNext() API (i.e. PlanNode::num_instances_per_node() > 0),
+  /// not the ProcessSplit() API.
+  int64_t getnext_batches_returned_ = 0;
 
   /// Check runtime filters' effectiveness every BATCHES_PER_FILTER_SELECTIVITY_CHECK
   /// row batches. Will update 'filter_stats_'.
@@ -355,8 +410,8 @@ class HdfsScanner {
   /// Issue just the footer range for each file. This function is only used in parquet
   /// and orc scanners. We'll then parse the footer and pick out the columns we want.
   static Status IssueFooterRanges(HdfsScanNodeBase* scan_node,
-      const THdfsFileFormat::type& file_type, const std::vector<HdfsFileDesc*>& files)
-      WARN_UNUSED_RESULT;
+      const THdfsFileFormat::type& file_type, const std::vector<HdfsFileDesc*>& files,
+      int64_t footer_size_estimate) WARN_UNUSED_RESULT;
 
   /// Implements GetNext(). Should be overridden by subclasses.
   /// Only valid to call if the parent scan node is multi-threaded.
@@ -425,6 +480,51 @@ class HdfsScanner {
       int num_tuples, int max_added_tuples, int slots_per_tuple, int row_idx_start,
       bool copy_strings);
 
+  /// Convenience struct for pointers to codegen'd function pointers (CodegenFnPtrBase*).
+  /// Calls the codegen'd function if neither the outer nor the inner pointer is nullptr,
+  /// otherwise calls the provided interpreted function.
+  ///
+  /// The signatures of the condegen'd and the interpreted functions must be the same
+  /// except that the interpreted function is a member function and the codegen'd function
+  /// is a non-member function that takes the 'this' pointer explicitly as its first
+  /// argument.
+  ///
+  /// CodegendFnT: Function pointer type of the codegen'd version. This template parameter
+  /// is separated from the other template parameters because the compiler can infer the
+  /// others but this needs to be written explicitly.
+  ///
+  /// Example:
+  ///   SomeType var = CallCodegendOrInterpreted<SomeCodegendFnType>(this,
+  ///     codegend_fn_ptr_ptr, interpreted_member_fn, arg1, arg2, arg3);
+  template <class CodegendFnT>
+  struct CallCodegendOrInterpreted {
+    /// InterpretedFnT: Member function pointer type of the interpreted version.
+    /// ThisT: type of the 'this' pointer of the caller: needed because of polymorphism.
+    /// Args: argument pack for all other arguments.
+    template <class ThisT, class InterpretedFnT, class ...Args>
+    static decltype(auto) invoke(ThisT This, const CodegenFnPtrBase* atomic_codegend_fn,
+        InterpretedFnT interpreted_fn, Args&& ...args) {
+      if (atomic_codegend_fn != nullptr) {
+        // Codegen is enabled but may not be ready (if asynchronous).
+        CodegendFnT codegend_fn
+            = reinterpret_cast<CodegendFnT>(atomic_codegend_fn->load());
+        if (codegend_fn != nullptr) {
+          // Codegen is ready.
+          return codegend_fn(This, std::forward<Args>(args)...);
+        }
+      }
+
+      // Codegen is either disabled or not ready yet.
+      return (This->*interpreted_fn)(std::forward<Args>(args)...);
+    }
+  };
+
+  /// Calls the codegen'd version of WriteAlignedTuples if codegen is enabled and ready
+  /// (in case of asynchronous codegen) or the interpreted version otherwise.
+  int WriteAlignedTuplesCodegenOrInterpret(MemPool* pool, TupleRow* tuple_row_mem,
+      FieldLocation* fields, int num_tuples, int max_added_tuples, int slots_per_tuple,
+      int row_idx_start, bool copy_strings);
+
   /// Update the decompressor_ object given a compression type or codec name. Depending on
   /// the old compression type and the new one, it may close the old decompressor and/or
   /// create a new one of different type.
@@ -473,23 +573,21 @@ class HdfsScanner {
   /// Codegen function to replace WriteCompleteTuple. Should behave identically
   /// to WriteCompleteTuple. Stores the resulting function in 'write_complete_tuple_fn'
   /// if codegen was successful or NULL otherwise.
-  static Status CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
-      LlvmCodeGen* codegen, const std::vector<ScalarExpr*>& conjuncts,
-      llvm::Function** write_complete_tuple_fn) WARN_UNUSED_RESULT;
+  static Status CodegenWriteCompleteTuple(const HdfsScanPlanNode* node,
+      FragmentState* state, llvm::Function** write_complete_tuple_fn);
 
   /// Codegen function to replace WriteAlignedTuples.  WriteAlignedTuples is cross
   /// compiled to IR.  This function loads the precompiled IR function, modifies it,
   /// and stores the resulting function in 'write_aligned_tuples_fn' if codegen was
   /// successful or NULL otherwise.
-  static Status CodegenWriteAlignedTuples(const HdfsScanNodeBase*, LlvmCodeGen*,
-      llvm::Function* write_tuple_fn,
-      llvm::Function** write_aligned_tuples_fn) WARN_UNUSED_RESULT;
+  static Status CodegenWriteAlignedTuples(const HdfsScanPlanNode*, FragmentState*,
+      llvm::Function* write_tuple_fn, llvm::Function** write_aligned_tuples_fn);
 
   /// Codegen function to replace InitTuple() removing runtime constants like the tuple
   /// size and branches like the template tuple existence check. The codegen'd version
   /// of InitTuple() is stored in 'init_tuple_fn' if codegen was successful.
   static Status CodegenInitTuple(
-      const HdfsScanNodeBase* node, LlvmCodeGen* codegen, llvm::Function** init_tuple_fn);
+      const HdfsScanPlanNode* node, LlvmCodeGen* codegen, llvm::Function** init_tuple_fn);
 
   /// Codegen EvalRuntimeFilters() by unrolling the loop in the interpreted version
   /// and emitting a customized version of EvalRuntimeFilter() for each filter in
@@ -539,7 +637,7 @@ class HdfsScanner {
             template_tuple, reinterpret_cast<Tuple*>(tuple_mem), tuple_byte_size);
         tuple_mem += tuple_byte_size;
       }
-    } else if (tuple_byte_size <= CACHE_LINE_SIZE) {
+    } else if (tuple_byte_size <= CACHELINE_SIZE) {
       // If each tuple fits in a cache line, it is quicker to zero the whole memory buffer
       // instead of just the null indicators. This is because we are fetching the cache
       // line anyway and zeroing a cache line is cheap (a couple of AVX2 instructions)
@@ -554,12 +652,6 @@ class HdfsScanner {
         tuple_mem += tuple_byte_size;
       }
     }
-  }
-
-  /// Not inlined in IR so it can be replaced with a constant.
-  int IR_NO_INLINE tuple_byte_size() const { return tuple_byte_size_; }
-  int IR_NO_INLINE tuple_byte_size(const TupleDescriptor& desc) const {
-    return desc.byte_size();
   }
 
   /// Returns true iff 'template_tuple' is non-NULL.
@@ -579,10 +671,23 @@ class HdfsScanner {
     return reinterpret_cast<TupleRow*>(mem + sizeof(Tuple*));
   }
 
+  /// This is cross-compiled to IR. Used to call the interpreted version of
+  /// TextConverter::WriteSlot from codegen'd code. For types for which
+  /// TextConverter::SupportsCodegenWriteSlot returns false (for example CHAR),
+  /// TextConverter does not support codegenning WriteSlot, but other columns may still
+  /// benefit from codegen so instead of disabling it entirely we call the interpreted
+  /// version from codegen'd code.
+  static bool TextConverterWriteSlotInterpretedIR(HdfsScanner* hdfs_scanner,
+      int slot_idx, Tuple* tuple, const char* data, int len, MemPool* pool);
+
   /// Simple wrapper around conjunct_evals_[idx]. Used in the codegen'd version of
   /// WriteCompleteTuple() because it's easier than writing IR to access
   /// conjunct_evals_.
   ScalarExprEvaluator* GetConjunctEval(int idx) const;
+
+  /// Returns error if this scanner doesn't support a slot in the tuple, e.g. virtual
+  /// columns.
+  Status ValidateSlotDescriptors() const;
 
   /// Unit test constructor
   HdfsScanner();

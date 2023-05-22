@@ -24,42 +24,60 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.commons.lang.NotImplementedException;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.ForeignKeysRequest;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.Partition;
+import org.apache.hadoop.hive.metastore.api.PrimaryKeysRequest;
 import org.apache.hadoop.hive.metastore.api.Table;
-import org.apache.hadoop.hive.metastore.api.UnknownDBException;
+import org.apache.hadoop.hive.metastore.api.TableMeta;
 import org.apache.impala.authorization.AuthorizationPolicy;
+import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.FileMetadataLoader;
 import org.apache.impala.catalog.Function;
+import org.apache.impala.catalog.HdfsCachePool;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.HdfsPartitionLocationCompressor;
+import org.apache.impala.catalog.HdfsStorageDescriptor;
 import org.apache.impala.catalog.MetaStoreClientPool;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.SqlConstraints;
+import org.apache.impala.catalog.VirtualColumn;
+import org.apache.impala.catalog.local.LocalIcebergTable.TableParams;
 import org.apache.impala.common.Pair;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TBackendGflags;
+import org.apache.impala.thrift.TBriefTableMeta;
 import org.apache.impala.thrift.TNetworkAddress;
+import org.apache.impala.thrift.TPartialTableInfo;
+import org.apache.impala.thrift.TValidWriteIdList;
+import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.ListMap;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.thrift.TException;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableCollection;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.errorprone.annotations.Immutable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Metadata provider which calls out directly to the source systems
  * (filesystem, HMS, etc) with no caching.
  */
 class DirectMetaProvider implements MetaProvider {
+  private final static Logger LOG = LoggerFactory.getLogger(DirectMetaProvider.class);
   private static MetaStoreClientPool msClientPool_;
 
   DirectMetaProvider() {
@@ -79,10 +97,16 @@ class DirectMetaProvider implements MetaProvider {
     }
   }
 
+  @Override
+  public Iterable<HdfsCachePool> getHdfsCachePools() {
+    throw new UnsupportedOperationException(
+        "HDFSCachePools are not supported in DirectMetaProvider");
+  }
 
   @Override
   public AuthorizationPolicy getAuthPolicy() {
-    throw new UnsupportedOperationException("not supported");
+    throw new UnsupportedOperationException(
+        "Authorization is not supported in DirectMetaProvider");
   }
 
   @Override
@@ -107,10 +131,19 @@ class DirectMetaProvider implements MetaProvider {
   }
 
   @Override
-  public ImmutableList<String> loadTableNames(String dbName)
-      throws MetaException, UnknownDBException, TException {
+  public ImmutableCollection<TBriefTableMeta> loadTableList(String dbName)
+      throws TException {
     try (MetaStoreClient c = msClientPool_.getClient()) {
-      return ImmutableList.copyOf(c.getHiveClient().getAllTables(dbName));
+      List<TableMeta> tableMetaList = c.getHiveClient().getTableMeta(dbName,
+          /*tablePatterns=*/null, /*tableTypes=*/null);
+      ImmutableList.Builder<TBriefTableMeta> ret = ImmutableList.builder();
+      for (TableMeta meta : tableMetaList) {
+        TBriefTableMeta briefMeta = new TBriefTableMeta(meta.getTableName());
+        briefMeta.setMsType(meta.getTableType());
+        briefMeta.setComment(meta.getComments());
+        ret.add(briefMeta);
+      }
+      return ret.build();
     }
   }
 
@@ -159,10 +192,23 @@ class DirectMetaProvider implements MetaProvider {
   }
 
   @Override
+  public SqlConstraints loadConstraints(
+      TableMetaRef table, Table msTbl) throws TException {
+    SqlConstraints sqlConstraints;
+    try (MetaStoreClient c = msClientPool_.getClient()) {
+      sqlConstraints = new SqlConstraints(c.getHiveClient().getPrimaryKeys(
+          new PrimaryKeysRequest(msTbl.getDbName(), msTbl.getTableName())),
+          c.getHiveClient().getForeignKeys(new ForeignKeysRequest(null,
+          null, msTbl.getDbName(), msTbl.getTableName())));
+    }
+    return sqlConstraints;
+  }
+
+  @Override
   public Map<String, PartitionMetadata> loadPartitionsByRefs(
       TableMetaRef table, List<String> partitionColumnNames,
       ListMap<TNetworkAddress> hostIndex,
-      List<PartitionRef> partitionRefs) throws MetaException, TException {
+      List<PartitionRef> partitionRefs) throws CatalogException, TException {
     Preconditions.checkNotNull(table);
     Preconditions.checkArgument(table instanceof TableMetaRefImpl);
     Preconditions.checkArgument(!partitionColumnNames.isEmpty());
@@ -190,7 +236,7 @@ class DirectMetaProvider implements MetaProvider {
     List<Partition> parts;
     try (MetaStoreClient c = msClientPool_.getClient()) {
       parts = MetaStoreUtil.fetchPartitionsByName(
-          c.getHiveClient(), partNames, tableImpl.dbName_, tableImpl.tableName_);
+          c.getHiveClient(), partNames, tableImpl.msTable_);
     }
 
     // HMS may return fewer partition objects than requested, and the
@@ -210,18 +256,33 @@ class DirectMetaProvider implements MetaProvider {
             " which was not requested. Requested: " + namesSet);
       }
 
-      ImmutableList<FileDescriptor> fds = loadFileMetadata(
-          fullTableName, partName, p, hostIndex);
-
-      PartitionMetadata existing = ret.put(partName, new PartitionMetadataImpl(p, fds));
+      FileMetadataLoader loader = loadFileMetadata(fullTableName, partName, p, hostIndex);
+      PartitionMetadata existing = ret.put(partName, createPartMetadataImpl(p, loader));
       if (existing != null) {
         throw new MetaException("HMS returned multiple partitions with name " +
             partName);
       }
     }
 
-
     return ret;
+  }
+
+  private PartitionMetadataImpl createPartMetadataImpl(Partition p,
+      FileMetadataLoader loader) {
+    List<FileDescriptor> deleteDescriptors = loader.getLoadedDeleteDeltaFds();
+    ImmutableList<FileDescriptor> fds;
+    ImmutableList<FileDescriptor> insertFds;
+    ImmutableList<FileDescriptor> deleteFds;
+    if (deleteDescriptors != null && !deleteDescriptors.isEmpty()) {
+      fds = ImmutableList.copyOf(Collections.emptyList());
+      insertFds = ImmutableList.copyOf(loader.getLoadedInsertDeltaFds());
+      deleteFds = ImmutableList.copyOf(loader.getLoadedDeleteDeltaFds());
+    } else {
+      fds = ImmutableList.copyOf(loader.getLoadedFds());
+      insertFds = ImmutableList.copyOf(Collections.emptyList());
+      deleteFds = ImmutableList.copyOf(Collections.emptyList());
+    }
+    return new PartitionMetadataImpl(p, fds, insertFds, deleteFds);
   }
 
   /**
@@ -231,7 +292,8 @@ class DirectMetaProvider implements MetaProvider {
    */
   private Map<String, PartitionMetadata> loadUnpartitionedPartition(
       TableMetaRefImpl table, List<PartitionRef> partitionRefs,
-      ListMap<TNetworkAddress> hostIndex) {
+      ListMap<TNetworkAddress> hostIndex) throws CatalogException {
+    //TODO(IMPALA-9042): Remove "throws MetaException"
     Preconditions.checkArgument(partitionRefs.size() == 1,
         "Expected exactly one partition to load for unpartitioned table");
     PartitionRef ref = partitionRefs.get(0);
@@ -239,10 +301,10 @@ class DirectMetaProvider implements MetaProvider {
         "Expected empty partition name for unpartitioned table");
     Partition msPartition = msTableToPartition(table.msTable_);
     String fullName = table.dbName_ + "." + table.tableName_;
-    ImmutableList<FileDescriptor> fds = loadFileMetadata(fullName,
+    FileMetadataLoader loader = loadFileMetadata(fullName,
         "default",  msPartition, hostIndex);
-    return ImmutableMap.of("", (PartitionMetadata)new PartitionMetadataImpl(
-        msPartition, fds));
+    return ImmutableMap.of("",
+        (PartitionMetadata)createPartMetadataImpl(msPartition, loader));
   }
 
   static Partition msTableToPartition(Table msTable) {
@@ -286,8 +348,10 @@ class DirectMetaProvider implements MetaProvider {
     }
   }
 
-  private ImmutableList<FileDescriptor> loadFileMetadata(String fullTableName,
-      String partName, Partition msPartition, ListMap<TNetworkAddress> hostIndex) {
+  private FileMetadataLoader loadFileMetadata(String fullTableName,
+      String partName, Partition msPartition, ListMap<TNetworkAddress> hostIndex)
+        throws CatalogException {
+    //TODO(IMPALA-9042): Remove "throws MetaException"
     Path partDir = new Path(msPartition.getSd().getLocation());
     // TODO(todd): The table property to disable recursive loading is not supported
     // by this code path. However, DirectMetaProvider is not yet a supported feature.
@@ -305,14 +369,14 @@ class DirectMetaProvider implements MetaProvider {
     } catch (FileNotFoundException fnf) {
       // If the partition directory isn't found, this is treated as having no
       // files.
-      return ImmutableList.of();
+      return fml;
     } catch (IOException ioe) {
       throw new LocalCatalogException(String.format(
           "Could not load files for partition %s of table %s",
           partName, fullTableName), ioe);
     }
 
-    return ImmutableList.copyOf(fml.getLoadedFds());
+    return fml;
   }
 
   @Immutable
@@ -333,21 +397,63 @@ class DirectMetaProvider implements MetaProvider {
   private static class PartitionMetadataImpl implements PartitionMetadata {
     private final Partition msPartition_;
     private final ImmutableList<FileDescriptor> fds_;
+    private final ImmutableList<FileDescriptor> insertFds_;
+    private final ImmutableList<FileDescriptor> deleteFds_;
 
     public PartitionMetadataImpl(Partition msPartition,
-        ImmutableList<FileDescriptor> fds) {
+        ImmutableList<FileDescriptor> fds, ImmutableList<FileDescriptor> insertFds,
+        ImmutableList<FileDescriptor> deleteFds) {
       this.msPartition_ = msPartition;
       this.fds_ = fds;
+      this.insertFds_ = insertFds;
+      this.deleteFds_ = deleteFds;
     }
 
     @Override
-    public Partition getHmsPartition() {
-      return msPartition_;
+    public Map<String, String> getHmsParameters() { return msPartition_.getParameters(); }
+
+    @Override
+    public long getWriteId() {
+      return MetastoreShim.getWriteIdFromMSPartition(msPartition_);
+    }
+
+    @Override
+    public HdfsStorageDescriptor getInputFormatDescriptor() {
+      String tblName = msPartition_.getDbName() + "." + msPartition_.getTableName();
+      try {
+        return HdfsStorageDescriptor.fromStorageDescriptor(tblName, msPartition_.getSd());
+      } catch (HdfsStorageDescriptor.InvalidStorageDescriptorException e) {
+        throw new LocalCatalogException(String.format(
+            "Invalid input format descriptor for partition (values=%s) of table %s",
+            msPartition_.getValues(), tblName), e);
+      }
+    }
+
+    @Override
+    public HdfsPartitionLocationCompressor.Location getLocation() {
+      // Treat as no prefix compression.
+      return new HdfsPartitionLocationCompressor(0).new Location(
+          msPartition_.getSd().getLocation());
     }
 
     @Override
     public ImmutableList<FileDescriptor> getFileDescriptors() {
-      return fds_;
+      if (insertFds_.isEmpty()) return fds_;
+      List<FileDescriptor> ret = Lists.newArrayListWithCapacity(
+          insertFds_.size() + deleteFds_.size());
+      ret.addAll(insertFds_);
+      ret.addAll(deleteFds_);
+      return ImmutableList.copyOf(ret);
+    }
+
+    @Override
+    public ImmutableList<FileDescriptor> getInsertFileDescriptors() {
+      return insertFds_;
+    }
+
+    @Override
+    public ImmutableList<FileDescriptor> getDeleteFileDescriptors() {
+      return deleteFds_;
     }
 
     @Override
@@ -359,6 +465,18 @@ class DirectMetaProvider implements MetaProvider {
     public byte[] getPartitionStats() {
       throw new UnsupportedOperationException("Incremental stats not supported with " +
           "DirectMetaProvider implementation.");
+    }
+
+    @Override
+    public boolean isMarkedCached() {
+      throw new UnsupportedOperationException("Hdfs caching not supported with " +
+          "DirectMetaProvider implementation");
+    }
+
+    @Override
+    public long getLastCompactionId() {
+      throw new UnsupportedOperationException("Compaction id is not provided with " +
+          "DirectMetaProvider implementation");
     }
   }
 
@@ -374,8 +492,65 @@ class DirectMetaProvider implements MetaProvider {
       this.msTable_ = msTable;
     }
 
-    private boolean isPartitioned() {
+    @Override
+    public boolean isPartitioned() {
       return msTable_.getPartitionKeysSize() != 0;
     }
+
+    @Override
+    public boolean isMarkedCached() {
+      throw new UnsupportedOperationException("Hdfs caching not supported with " +
+          "DirectMetaProvider implementation");
+    }
+
+    @Override
+    public List<String> getPartitionPrefixes() {
+      return Collections.emptyList();
+    }
+
+    @Override
+    public boolean isTransactional() {
+      return AcidUtils.isTransactionalTable(msTable_.getParameters());
+    }
+
+    @Override
+    public List<VirtualColumn> getVirtualColumns() {
+      throw new UnsupportedOperationException("Virtual columns are not supported with " +
+          "DirectMetaProvider implementation");
+    }
+  }
+
+  @Override
+  public TValidWriteIdList getValidWriteIdList(TableMetaRef ref) {
+    throw new NotImplementedException(
+        "getValidWriteIdList() is not implemented for DirectMetaProvider");
+  }
+
+  /**
+   * Fetches the latest compaction id from HMS and compares with partition metadata in
+   * cache. If a partition is stale due to compaction, removes it from metas.
+   */
+  public List<PartitionRef> checkLatestCompaction(String dbName, String tableName,
+      TableMetaRef table, Map<PartitionRef, PartitionMetadata> metas) throws TException {
+    Preconditions.checkNotNull(table, "TableMetaRef must be non-null");
+    Preconditions.checkNotNull(metas, "Partition map must be non-null");
+
+    List<PartitionRef> stalePartitions = MetastoreShim.checkLatestCompaction(
+        msClientPool_, dbName, tableName, table, metas,
+        PartitionRefImpl.UNPARTITIONED_NAME);
+    return stalePartitions;
+  }
+
+  @Override
+  public TPartialTableInfo loadIcebergTable(final TableMetaRef table) throws TException {
+    throw new NotImplementedException(
+        "loadIcebergTable() is not implemented for DirectMetaProvider");
+  }
+
+  @Override
+  public org.apache.iceberg.Table loadIcebergApiTable(final TableMetaRef table,
+      TableParams param, Table msTable) throws TException {
+    throw new NotImplementedException(
+        "loadIcebergApiTable() is not implemented for DirectMetaProvider");
   }
 }

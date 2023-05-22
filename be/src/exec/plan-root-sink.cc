@@ -17,25 +17,40 @@
 
 #include "exec/plan-root-sink.h"
 
+#include "exec/buffered-plan-root-sink.h"
+#include "exec/blocking-plan-root-sink.h"
 #include "exprs/scalar-expr-evaluator.h"
 #include "exprs/scalar-expr.h"
 #include "runtime/row-batch.h"
 #include "runtime/tuple-row.h"
 #include "service/query-result-set.h"
+#include "util/debug-util.h"
 #include "util/pretty-printer.h"
+#include "util/runtime-profile-counters.h"
 
 #include <memory>
-#include <boost/thread/mutex.hpp>
+#include <mutex>
 
 using namespace std;
-using boost::unique_lock;
-using boost::mutex;
+using std::mutex;
+using std::unique_lock;
 
 namespace impala {
 
+DataSink* PlanRootSinkConfig::CreateSink(RuntimeState* state) const {
+  TDataSinkId sink_id = state->fragment().idx;
+  ObjectPool* pool = state->obj_pool();
+  if (state->query_options().spool_query_results) {
+    return pool->Add(new BufferedPlanRootSink(
+        sink_id, *this, state, state->instance_ctx().debug_options));
+  } else {
+    return pool->Add(new BlockingPlanRootSink(sink_id, *this, state));
+  }
+}
+
 PlanRootSink::PlanRootSink(
-    TDataSinkId sink_id, const RowDescriptor* row_desc, RuntimeState* state)
-  : DataSink(sink_id, row_desc, "PLAN_ROOT_SINK", state),
+    TDataSinkId sink_id, const DataSinkConfig& sink_config, RuntimeState* state)
+  : DataSink(sink_id, sink_config, "PLAN_ROOT_SINK", state),
     num_rows_produced_limit_(state->query_options().num_rows_produced_limit) {}
 
 PlanRootSink::~PlanRootSink() {}
@@ -47,27 +62,6 @@ Status PlanRootSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker
       bind<int64_t>(&RuntimeProfile::UnitsPerSecond, rows_sent_counter_,
                                                     profile_->total_time_counter()));
   return Status::OK();
-}
-
-void PlanRootSink::ValidateCollectionSlots(
-    const RowDescriptor& row_desc, RowBatch* batch) {
-#ifndef NDEBUG
-  if (!row_desc.HasVarlenSlots()) return;
-  for (int i = 0; i < batch->num_rows(); ++i) {
-    TupleRow* row = batch->GetRow(i);
-    for (int j = 0; j < row_desc.tuple_descriptors().size(); ++j) {
-      const TupleDescriptor* tuple_desc = row_desc.tuple_descriptors()[j];
-      if (tuple_desc->collection_slots().empty()) continue;
-      for (int k = 0; k < tuple_desc->collection_slots().size(); ++k) {
-        const SlotDescriptor* slot_desc = tuple_desc->collection_slots()[k];
-        int tuple_idx = row_desc.GetTupleIdx(slot_desc->parent()->id());
-        const Tuple* tuple = row->GetTuple(tuple_idx);
-        if (tuple == NULL) continue;
-        DCHECK(tuple->IsNull(slot_desc->null_indicator_offset()));
-      }
-    }
-  }
-#endif
 }
 
 Status PlanRootSink::UpdateAndCheckRowsProducedLimit(

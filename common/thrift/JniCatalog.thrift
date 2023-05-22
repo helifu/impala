@@ -112,6 +112,11 @@ enum TAlterTableType {
   RECOVER_PARTITIONS = 14
   SET_ROW_FORMAT = 15
   SET_OWNER = 16
+  UNSET_TBL_PROPERTIES = 17
+  SET_PARTITION_SPEC = 18
+  EXECUTE = 19
+  SET_VIEW_PROPERTIES = 20
+  UNSET_VIEW_PROPERTIES = 21
 }
 
 // Parameters of CREATE DATABASE commands
@@ -135,6 +140,10 @@ struct TCreateDbParams {
   // The server name for security privileges when authorization is enabled.
   // TODO: Need to cleanup:IMPALA-7553
   6: optional string server_name
+
+  // Optional HDFS path for the database. Overrides location as the default location for
+  // all managed tables created in the database.
+  7: optional string managed_location
 }
 
 // Parameters of CREATE DATA SOURCE commands
@@ -213,7 +222,7 @@ struct TAlterTableOrViewRenameParams {
 // Parameters for ALTER TABLE ADD COLUMNS commands.
 struct TAlterTableAddColsParams {
   // List of columns to add to the table
-  1: required list<CatalogObjects.TColumn> columns
+  1: optional list<CatalogObjects.TColumn> columns
 
   // If true, no error is raised when a column already exists.
   2: required bool if_not_exists
@@ -383,6 +392,60 @@ struct TAlterTableSetCachedParams {
   2: optional list<list<CatalogObjects.TPartitionKeyValue>> partition_set
 }
 
+// Parameters for ALTER TABLE UNSET [PARTITION ('p1'='a', 'p2'='b'...)]
+// TBLPROPERTIES|SERDEPROPERTIES commands.
+struct TAlterTableUnSetTblPropertiesParams {
+  // The target table property that is being altered.
+  1: required CatalogObjects.TTablePropertyType target
+
+  // List of property keys to be unset.
+  2: required list<string> property_keys
+
+  // Remove table property only if exists else fail.
+  3: required bool if_exists
+
+  // If set, alters the properties of the given partitions, otherwise
+  // those of the table.
+  4: optional list<list<CatalogObjects.TPartitionKeyValue>> partition_set
+}
+
+// Parameters for ALTER TABLE SET PARTITION SPEC partitionSpec.
+struct TAlterTableSetPartitionSpecParams {
+  1: required CatalogObjects.TIcebergPartitionSpec partition_spec
+}
+
+// Parameters for ALTER TABLE EXECUTE EXPIRE_SNAPSHOTS operations.
+struct TAlterTableExecuteExpireSnapshotsParams {
+  1: required i64 older_than_millis
+}
+
+// ALTER TABLE EXECUTE ROLLBACK can be to a date or snapshot id.
+enum TRollbackType {
+  TIME_ID = 0
+  VERSION_ID = 1
+}
+
+// Parameters for ALTER TABLE EXECUTE ROLLBACK operations.
+struct TAlterTableExecuteRollbackParams {
+  // Is rollback to a date or snapshot id.
+  1: required TRollbackType kind
+
+  // If kind is TIME_ID this is the date to rollback to.
+  2: optional i64 timestamp_millis
+
+  // If kind is VERSION_ID this is the id to rollback to.
+  3: optional i64 snapshot_id
+}
+
+// Parameters for ALTER TABLE EXECUTE ... operations.
+struct TAlterTableExecuteParams {
+  // Parameters for ALTER TABLE EXECUTE EXPIRE_SNAPSHOTS
+  1: optional TAlterTableExecuteExpireSnapshotsParams expire_snapshots_params
+
+  // Parameters for ALTER TABLE EXECUTE ROLLBACK
+  2: optional TAlterTableExecuteRollbackParams execute_rollback_params
+}
+
 // Parameters for all ALTER TABLE commands.
 struct TAlterTableParams {
   1: required TAlterTableType alter_type
@@ -434,6 +497,15 @@ struct TAlterTableParams {
 
   // Parameters for ALTER TABLE REPLACE COLUMNS
   17: optional TAlterTableReplaceColsParams replace_cols_params
+
+  // Parameters for ALTER TABLE UNSET TBLPROPERTIES
+  18: optional TAlterTableUnSetTblPropertiesParams unset_tbl_properties_params
+
+  // Parameters for ALTER TABLE SET PARTITION SPEC
+  19: optional TAlterTableSetPartitionSpecParams set_partition_spec_params
+
+  // Parameters for ALTER TABLE EXECUTE operations
+  20: optional TAlterTableExecuteParams set_execute_params
 }
 
 // Parameters of CREATE TABLE LIKE commands
@@ -542,6 +614,15 @@ struct TCreateTableParams {
 
   // Foreign Keys Structure for Hive API
   20: optional list<hive_metastore.SQLForeignKey> foreign_keys;
+
+  // Just one PartitionSpec when create iceberg table
+  21: optional CatalogObjects.TIcebergPartitionSpec partition_spec
+
+  // Bucket desc for created bucketed table
+  22: optional CatalogObjects.TBucketInfo bucket_info
+
+  // Primary key is unique (Kudu-only)
+  23: optional bool is_primary_key_unique
 }
 
 // Parameters of a CREATE VIEW or ALTER VIEW AS SELECT command
@@ -570,6 +651,9 @@ struct TCreateOrAlterViewParams {
   // The server name for security privileges when authorization is enabled.
   // TODO: Need to cleanup:IMPALA-7553
   8: optional string server_name
+
+  // Tblproperties of the view
+  9: optional map<string, string> tblproperties
 }
 
 // Parameters of a COMPUTE STATS command
@@ -694,6 +778,10 @@ struct TTruncateParams {
 
   // If true, no error is raised if the target table does not exist
   2: required bool if_exists
+
+  // If false, table stats  will not be deleted as part of
+  // the truncate operation
+  3: optional bool delete_stats = true
 }
 
 // Parameters of DROP FUNCTION commands
@@ -747,7 +835,7 @@ struct TTableUsageMetrics {
 }
 
 // Response to a GetCatalogUsage request.
-struct TGetCatalogUsageResponse{
+struct TGetCatalogUsageResponse {
   // List of the largest (in terms of memory requirements) tables.
   1: required list<TTableUsageMetrics> large_tables
 
@@ -760,6 +848,25 @@ struct TGetCatalogUsageResponse{
 
   // List of the tables that have the longest table metadata loading time
   4: required list<TTableUsageMetrics> long_metadata_loading_tables
+}
+
+// Stores the number of in-progress operations aggregated based on the
+// catalog operation and/or table name.
+struct TOperationUsageCounter {
+  // Name of the catalog operation request
+  1: required string catalog_op_name
+
+  // Fully qualified table name
+  2: required string table_name
+
+  // Number of catalog operation requests in progress
+  3: optional i64 op_counter
+}
+
+// Response to getOperationUsage request.
+struct TGetOperationUsageResponse {
+  // List of the the number of running catalog operations
+  1: required list<TOperationUsageCounter> catalog_op_counters
 }
 
 struct TColumnName {
@@ -798,26 +905,103 @@ struct TEventProcessorMetrics {
   // Total number of events skipped so far
   3: optional i64 events_skipped
 
-  // Mean time in sec for the fetching metastore events
+  // Time in sec for the fetching metastore events
   4: optional double events_fetch_duration_mean
+  5: optional double events_fetch_duration_p75
+  6: optional double events_fetch_duration_p95
+  7: optional double events_fetch_duration_p99
 
-  // Mean time in sec for processing a given batch of events
-  5: optional double events_process_duration_mean
+  // Duration in sec for fetching the last event batch
+  8: optional double last_events_fetch_duration
+
+  // Time in sec for processing a given batch of events
+  9: optional double events_process_duration_mean
+  10: optional double events_process_duration_p75
+  11: optional double events_process_duration_p95
+  12: optional double events_process_duration_p99
+
+  // Duration in sec for processing the last event batch
+  13: optional double last_events_process_duration
 
   // Average number of events received in 1 min
-  6: optional double events_received_1min_rate
+  14: optional double events_received_1min_rate
 
-  // Average number of events received in 1 min
-  7: optional double events_received_5min_rate
+  // Average number of events received in 5 min
+  15: optional double events_received_5min_rate
 
-  // Average number of events received in 1 min
-  8: optional double events_received_15min_rate
+  // Average number of events received in 15 min
+  16: optional double events_received_15min_rate
 
   // Average number events skipped in a polling interval
-  9: optional double events_skipped_per_poll_mean
+  17: optional double events_skipped_per_poll_mean
 
   // Last metastore event id that the catalog server synced to
-  10: optional i64 last_synced_event_id
+  18: optional i64 last_synced_event_id
+
+  // Event time of the last synced event
+  19: optional i64 last_synced_event_time
+
+  // Latest metastore event id
+  20: optional i64 latest_event_id
+
+  // Event time of the latest metastore event
+  21: optional i64 latest_event_time
+}
+
+struct TCatalogHmsCacheApiMetrics {
+  // name of the API
+  1: required string api_name
+
+  // number of API requests
+  2: optional i64 api_requests
+
+  // p99 response time in milliseconds
+  3: optional double p99_response_time_ms
+
+  // p95 response time in milliseconds
+  4: optional double p95_response_time_ms
+
+  // Mean response time in milliseconds
+  5: optional double response_time_mean_ms
+
+  // Max response time in milliseconds
+  6: optional double response_time_max_ms
+
+  // Min response time in milliseconds
+  7: optional double response_time_min_ms
+
+  // Average number of API requests in 1 minute
+  8: optional double api_requests_1min_rate
+
+  // Average number of API requests in 5 minutes
+  9: optional double api_requests_5min_rate
+
+  // Average number of API requests in 15 min
+  10: optional double api_requests_15min_rate
+
+  // Cache hit ratio
+  11: optional double cache_hit_ratio
+}
+
+struct TCatalogdHmsCacheMetrics {
+
+  // API specific Catalogd HMS cache metrics
+  1: required list<TCatalogHmsCacheApiMetrics> api_metrics
+
+  // overall cache hit ratio
+  2: optional double cache_hit_ratio
+
+  // total number of API requests
+  3: optional i64 api_requests
+
+  // Average number of API requests in 1 minute
+  4: optional double api_requests_1min_rate
+
+  // Average number of API requests in 5 minutes
+  5: optional double api_requests_5min_rate
+
+  // Average number of API requests in 15 min
+  6: optional double api_requests_15min_rate
 }
 
 // Response to GetCatalogServerMetrics() call.
@@ -826,7 +1010,10 @@ struct TGetCatalogServerMetricsResponse {
   1: required i32 catalog_partial_fetch_rpc_queue_len
 
   // gets the events processor metrics if configured
-  2: optional TEventProcessorMetrics event_metrics;
+  2: optional TEventProcessorMetrics event_metrics
+
+  // get the catalogd Hive metastore server metrics, if configured
+  3: optional TCatalogdHmsCacheMetrics catalogd_hms_cache_metrics
 }
 
 // Request to copy the generated testcase from a given input path.

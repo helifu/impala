@@ -23,7 +23,6 @@ import static org.junit.Assert.fail;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
-import org.apache.impala.service.BackendConfig;
 import org.apache.impala.testutil.TestUtils;
 import org.junit.Test;
 
@@ -345,14 +344,10 @@ public class ToSqlTest extends FrontendTestBase {
         "SORT BY LEXICAL ( a, b ) STORED AS TEXTFILE" , true);
 
     // Table with SORT BY ZORDER clause.
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
-
     testToSql("create table p (a int, b int) partitioned by (day string) sort by zorder" +
         "(a ,b) ", "default",
         "CREATE TABLE default.p ( a INT, b INT ) PARTITIONED BY ( day STRING ) " +
         "SORT BY ZORDER ( a, b ) STORED AS TEXTFILE" , true);
-
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
 
     // Kudu table with a TIMESTAMP column default value
     String kuduMasters = catalog_.getDefaultKuduMasterHosts();
@@ -412,14 +407,12 @@ public class ToSqlTest extends FrontendTestBase {
         "( string_col ) STORED AS TEXTFILE AS SELECT double_col, string_col, int_col " +
         "FROM functional.alltypes", true);
     // Table with SORT BY ZORDER clause.
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
     testToSql("create table p partitioned by (string_col) sort by zorder (int_col, " +
         "bool_col) as select int_col, bool_col, string_col from functional.alltypes",
         "default",
         "CREATE TABLE default.p PARTITIONED BY ( string_col ) SORT BY ZORDER " +
         "( int_col, bool_col ) STORED AS TEXTFILE AS SELECT " +
         "int_col, bool_col, string_col FROM functional.alltypes", true);
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
     // Kudu table with multiple partition params
     String kuduMasters = catalog_.getDefaultKuduMasterHosts();
     testToSql(String.format("create table p primary key (a,b) " +
@@ -445,11 +438,9 @@ public class ToSqlTest extends FrontendTestBase {
     testToSql("create table p sort by LEXICAL (id) like functional.alltypes", "default",
         "CREATE TABLE p SORT BY LEXICAL (id) LIKE functional.alltypes");
     // Table with ZORDER sort columns.
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
     testToSql("create table p sort by zorder (bool_col, int_col) like " +
         "functional.alltypes",  "default",
         "CREATE TABLE p SORT BY ZORDER (bool_col,int_col) LIKE functional.alltypes");
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
   }
 
   @Test
@@ -473,13 +464,29 @@ public class ToSqlTest extends FrontendTestBase {
         "'hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet' " +
         "SORT BY LEXICAL ( int_col, id ) STORED AS TEXTFILE", true);
     // Table with ZORDER sort columns.
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
     testToSql("create table if not exists p like parquet " +
         "'/test-warehouse/schemas/alltypestiny.parquet' sort by zorder (int_col, id)",
         "default", "CREATE TABLE IF NOT EXISTS default.p LIKE PARQUET " +
         "'hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet' " +
         "SORT BY ZORDER ( int_col, id ) STORED AS TEXTFILE", true);
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+  }
+
+  @Test
+  public void TestCreateBucketTable() throws AnalysisException {
+    testToSql("create table bucketed_table ( a int ) " +
+        "CLUSTERED BY ( a ) into 24 buckets", "default",
+        "CREATE TABLE default.bucketed_table ( a INT ) " +
+        "CLUSTERED BY ( a ) INTO 24 BUCKETS STORED AS TEXTFILE", true);
+    testToSql("create table bucketed_table1 ( a int ) " +
+        "partitioned by ( dt string ) CLUSTERED BY ( a ) into 24 buckets", "default",
+        "CREATE TABLE default.bucketed_table1 ( a INT ) " +
+        "PARTITIONED BY ( dt STRING ) CLUSTERED BY ( a ) INTO 24 BUCKETS " +
+        "STORED AS TEXTFILE", true);
+    testToSql("create table bucketed_table2 ( a int, s string ) partitioned " +
+        "by ( dt string ) CLUSTERED BY ( a ) sort by (s) into 24 buckets",
+        "default", "CREATE TABLE default.bucketed_table2 " +
+        "( a INT, s STRING ) PARTITIONED BY ( dt STRING ) CLUSTERED BY ( a ) SORT BY " +
+        "LEXICAL ( s ) INTO 24 BUCKETS STORED AS TEXTFILE", true);
   }
 
   @Test
@@ -514,6 +521,12 @@ public class ToSqlTest extends FrontendTestBase {
         "CREATE VIEW test_view_with_subquery AS " +
         "SELECT * FROM functional.alltypestiny t WHERE EXISTS " +
         "(SELECT * FROM functional.alltypessmall s WHERE s.id = t.id)");
+    testToSql(
+      "create view test_properties tblproperties ('a'='aa', 'b'='bb') as " +
+      "select int_col, string_col from functional.alltypes",
+      "default",
+      "CREATE VIEW test_properties TBLPROPERTIES ('a'='aa', 'b'='bb') AS " +
+      "SELECT int_col, string_col FROM functional.alltypes");
   }
 
   @Test
@@ -545,6 +558,12 @@ public class ToSqlTest extends FrontendTestBase {
         "default", "ALTER VIEW functional.alltypes_view(cnt) AS "+
         "SELECT count(DISTINCT x.int_col) FROM functional.alltypessmall x " +
         "INNER JOIN functional.alltypessmall y ON (x.id = y.id) GROUP BY x.bigint_col");
+    testToSql("alter view functional.alltypes_view set tblproperties ('a'='b')",
+        "functional",
+        "ALTER VIEW functional.alltypes_view SET TBLPROPERTIES ('a'='b')");
+    testToSql("alter view functional.alltypes_view unset tblproperties ('a', 'c')",
+        "functional",
+        "ALTER VIEW functional.alltypes_view UNSET TBLPROPERTIES ('a', 'c')");
   }
 
   @Test
@@ -825,6 +844,30 @@ public class ToSqlTest extends FrontendTestBase {
         "having avg(tinyint_col) > 10 AND count(tinyint_col) > 5",
         "SELECT sum(id) FROM functional.alltypes GROUP BY tinyint_col " +
         "HAVING avg(tinyint_col) > 10 AND count(tinyint_col) > 5");
+
+    // CUBE, ROLLUP.
+    testToSql("select int_col, string_col, sum(id) from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "SELECT int_col, string_col, sum(id) FROM functional.alltypes " +
+        "GROUP BY ROLLUP(int_col, string_col)");
+    testToSql("select int_col, string_col, sum(id) from functional.alltypes " +
+        "group by int_col, string_col with rollup",
+        "SELECT int_col, string_col, sum(id) FROM functional.alltypes " +
+        "GROUP BY ROLLUP(int_col, string_col)");
+    testToSql("select int_col, string_col, sum(id) from functional.alltypes " +
+        "group by cube(int_col, string_col)",
+        "SELECT int_col, string_col, sum(id) FROM functional.alltypes " +
+        "GROUP BY CUBE(int_col, string_col)");
+    testToSql("select int_col, string_col, sum(id) from functional.alltypes " +
+        "group by int_col, string_col with cube",
+        "SELECT int_col, string_col, sum(id) FROM functional.alltypes " +
+        "GROUP BY CUBE(int_col, string_col)");
+
+    // GROUPING SETS.
+    testToSql("select int_col, string_col, sum(id) from functional.alltypes " +
+        "group by grouping sets((int_col, string_col), (int_col), ())",
+        "SELECT int_col, string_col, sum(id) FROM functional.alltypes " +
+        "GROUP BY GROUPING SETS((int_col, string_col), (int_col), ())");
   }
 
   // Test the toSql() output of the order by clause.
@@ -959,6 +1002,10 @@ public class ToSqlTest extends FrontendTestBase {
         "VALUES(112, DATE '1970-01-01')");
     testToSql("upsert into table functional_kudu.testtbl values(1, 'a', 1)",
         "UPSERT INTO TABLE functional_kudu.testtbl VALUES(1, 'a', 1)");
+    testToSql("insert into table functional.binary_tbl " +
+        "values(1, 'a', cast('a' as binary))",
+        "INSERT INTO TABLE functional.binary_tbl " +
+        "VALUES(1, 'a', CAST('a' AS BINARY))");
   }
 
   /**
@@ -1063,7 +1110,6 @@ public class ToSqlTest extends FrontendTestBase {
 
   @Test
   public void TestUpdate() {
-    TestUtils.assumeKuduIsSupported();
     testToSql("update functional_kudu.dimtbl set name = '10' where name < '11'",
         "UPDATE functional_kudu.dimtbl SET name = '10' FROM functional_kudu.dimtbl " +
             "WHERE name < '11'");
@@ -1086,7 +1132,6 @@ public class ToSqlTest extends FrontendTestBase {
 
   @Test
   public void TestDelete() {
-    TestUtils.assumeKuduIsSupported();
     testToSql("delete functional_kudu.testtbl where zip = 10",
         "DELETE FROM functional_kudu.testtbl WHERE zip = 10");
     testToSql("delete from functional_kudu.testtbl where zip = 10",
@@ -1482,6 +1527,9 @@ public class ToSqlTest extends FrontendTestBase {
         "NOT TRUE, (NOT TRUE), NOT FALSE, (NOT FALSE)");
     testToSql("select ((true and (false or false) or true) and (false or true))",
         "SELECT ((TRUE AND (FALSE OR FALSE) OR TRUE) AND (FALSE OR TRUE))");
+    // CompoundVerticalBarExpr.
+    testToSql("select true || false, 'abc' || 'xyz'",
+        "SELECT TRUE OR FALSE, concat('abc', 'xyz')");
     // InPredicate.
     testToSql("select 5 in (4, 6, 7, 5), (5 in (4, 6, 7, 5))," +
         "5 not in (4, 6, 7, 5), (5 not In (4, 6, 7, 5))",
@@ -1544,6 +1592,44 @@ public class ToSqlTest extends FrontendTestBase {
         "(date_sub(timestamp_col, interval 40 hours)) from functional.alltypes",
         "SELECT DATE_SUB(timestamp_col, INTERVAL 40 hours), " +
         "(DATE_SUB(timestamp_col, INTERVAL 40 hours)) FROM functional.alltypes");
+
+    // UNNEST() operator in SELECT statement.
+    testToSql(
+        "select unnest(arr1), unnest(arr2) from functional_parquet.complextypes_arrays",
+        "SELECT UNNEST(arr1), UNNEST(arr2) FROM functional_parquet.complextypes_arrays");
+    // UNNEST() operator in SELECT statement with aliases.
+    testToSql(
+        "select unnest(arr1) a1, unnest(arr2) a2 from " +
+            "functional_parquet.complextypes_arrays",
+        "SELECT UNNEST(arr1) a1, UNNEST(arr2) a2 FROM " +
+            "functional_parquet.complextypes_arrays");
+    testToSql(
+        "select unnest(arr1) as a1, unnest(arr2) as a2 from " +
+            "functional_parquet.complextypes_arrays",
+        "SELECT UNNEST(arr1) a1, UNNEST(arr2) a2 FROM " +
+            "functional_parquet.complextypes_arrays");
+    testToSql(
+        "select unnest(t.arr1) as a1, unnest(t.arr2) as a2 from " +
+            "functional_parquet.complextypes_arrays t",
+        "SELECT UNNEST(t.arr1) a1, UNNEST(t.arr2) a2 FROM " +
+            "functional_parquet.complextypes_arrays t");
+
+    // UNNEST() operator in FROM clause.
+    testToSql(
+        "select arr1.item, arr2.item from functional_parquet.complextypes_arrays t, " +
+            "unnest(t.arr1, t.arr2)",
+        "SELECT arr1.item, arr2.item FROM functional_parquet.complextypes_arrays t, " +
+            "UNNEST(t.arr1, t.arr2)");
+    testToSql(
+        "select arr1.item, arr2.item from functional_parquet.complextypes_arrays t, " +
+            "unnest(t.arr1, t.arr2), functional_parquet.alltypes",
+        "SELECT arr1.item, arr2.item FROM functional_parquet.complextypes_arrays t, " +
+            "UNNEST(t.arr1, t.arr2), functional_parquet.alltypes");
+    testToSql(
+        "select arr1.item, arr2.item from functional_parquet.complextypes_arrays t, " +
+            "functional_parquet.alltypes, unnest(t.arr1, t.arr2)",
+        "SELECT arr1.item, arr2.item FROM functional_parquet.complextypes_arrays t, " +
+            "functional_parquet.alltypes, UNNEST(t.arr1, t.arr2)");
   }
 
   /**
@@ -1603,6 +1689,7 @@ public class ToSqlTest extends FrontendTestBase {
     List<String> principalTypes = Arrays.asList("USER", "ROLE", "GROUP");
     String testRole = System.getProperty("user.name");
     String testUri = "hdfs://localhost:20500/test-warehouse";
+    String testStorageHandlerUri = "kudu://localhost/tbl";
 
     for (String pt : principalTypes) {
       try {
@@ -1668,6 +1755,26 @@ public class ToSqlTest extends FrontendTestBase {
               pt, testRole));
         }
 
+        privileges = Arrays.stream(Privilege.values())
+            .filter(p -> p != Privilege.OWNER &&
+                (p == Privilege.CREATE ||
+                p == Privilege.DROP ||
+                p == Privilege.SELECT))
+            .collect(Collectors.toList());
+
+        for (Privilege p : privileges) {
+          testToSql(ctx, String.format("GRANT %s ON USER_DEFINED_FN " +
+              "functional.identity TO %s %s", p, pt, testRole));
+          testToSql(ctx, String.format("GRANT %s ON USER_DEFINED_FN " +
+              "functional.identity TO %s %s WITH GRANT OPTION", p, pt, testRole));
+          testToSql(ctx, String.format(
+              "REVOKE %s ON USER_DEFINED_FN functional.identity FROM %s %s", p, pt,
+              testRole));
+          testToSql(ctx, String.format(
+              "REVOKE GRANT OPTION FOR %s ON USER_DEFINED_FN functional.identity " +
+              "FROM %s %s", p, pt, testRole));
+        }
+
         // Uri (Only ALL is supported)
         testToSql(ctx, String.format("GRANT ALL ON URI '%s' TO %s %s", testUri, pt,
             testRole));
@@ -1677,6 +1784,17 @@ public class ToSqlTest extends FrontendTestBase {
             pt, testRole));
         testToSql(ctx, String.format("REVOKE GRANT OPTION FOR ALL ON URI '%s' FROM %s %s",
             testUri, pt, testRole));
+
+        // Storage handler URI (Only RWSTORAGE is supported)
+        testToSql(ctx, String.format(
+            "GRANT RWSTORAGE ON STORAGEHANDLER_URI '%s' TO %s %s",
+            testStorageHandlerUri, pt, testRole));
+        testToSql(ctx, String.format("GRANT RWSTORAGE ON STORAGEHANDLER_URI '%s' " +
+            "TO %s %s WITH GRANT OPTION", testStorageHandlerUri, pt, testRole));
+        testToSql(ctx, String.format("REVOKE RWSTORAGE ON STORAGEHANDLER_URI '%s' " +
+            "FROM %s %s", testStorageHandlerUri, pt, testRole));
+        testToSql(ctx, String.format("REVOKE GRANT OPTION FOR RWSTORAGE ON " +
+            "STORAGEHANDLER_URI '%s' FROM %s %s", testStorageHandlerUri, pt, testRole));
 
         // Column (Only SELECT is supported)
         testToSql(ctx, String.format(

@@ -20,6 +20,7 @@
 # Additionally, we don't get any 'extra' coverage from them, so they're
 # not an essential part of functional verification.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
 
 class TestTargetedPerf(ImpalaTestSuite):
@@ -41,3 +42,9 @@ class TestTargetedPerf(ImpalaTestSuite):
 
   def test_perf_string(self, vector):
     self.run_test_case('string', vector)
+
+  def test_perf_cancel_union(self, vector):
+    self.run_test_case('primitive_cancel_union', vector)
+
+  def test_perf_topn_partitioned(self, vector):
+    self.run_test_case('primitive_top-n_partitioned', vector)

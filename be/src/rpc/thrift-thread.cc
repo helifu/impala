@@ -54,17 +54,17 @@ void ThriftThread::join() {
   impala_thread_->Join();
 }
 
-boost::shared_ptr<atc::Thread> ThriftThreadFactory::newThread(
-    boost::shared_ptr<atc::Runnable> runnable) const {
+std::shared_ptr<atc::Thread> ThriftThreadFactory::newThread(
+    std::shared_ptr<atc::Runnable> runnable) const {
   stringstream name;
-  name << prefix_ << "-" << count_++;
-  boost::shared_ptr<ThriftThread> result =
-      boost::shared_ptr<ThriftThread>(new ThriftThread(group_, name.str(), runnable));
+  name << prefix_ << "-" << count_.Add(1);
+  std::shared_ptr<ThriftThread> result = std::shared_ptr<ThriftThread>(
+      new ThriftThread(group_, name.str(), isDetached(), runnable));
   runnable->thread(result);
   return result;
 }
 
-void ThriftThread::RunRunnable(boost::shared_ptr<atc::Runnable> runnable,
+void ThriftThread::RunRunnable(std::shared_ptr<atc::Runnable> runnable,
     Promise<atc::Thread::id_t>* promise) {
   promise->Set(get_current());
   // Passing runnable in to this method (rather than reading from this->runnable())
@@ -78,9 +78,6 @@ atc::Thread::id_t ThriftThreadFactory::getCurrentThreadId() const {
   return atc::Thread::get_current();
 }
 
-ThriftThread::ThriftThread(const string& group, const string& name,
-    boost::shared_ptr<atc::Runnable> runnable)
-    : group_(group), name_(name) {
-  // Sets this::runnable (and no, I don't know why it's not protected in atc::Thread)
-  this->Thread::runnable(runnable);
-}
+ThriftThread::ThriftThread(const string& group, const string& name, bool detached,
+    std::shared_ptr<atc::Runnable> runnable)
+  : atc::Thread(detached, runnable), group_(group), name_(name) {}

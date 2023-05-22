@@ -36,6 +36,8 @@ using namespace ::apache::thrift::transport;
 
 namespace impala {
 
+class ImpalaLdap;
+
 /// System-wide authentication manager responsible for initialising authentication systems,
 /// including SSL, Sasl and Kerberos, and for providing auth-enabled Thrift structures to
 /// servers and clients.
@@ -46,9 +48,18 @@ class AuthManager {
  public:
   static AuthManager* GetInstance() { return AuthManager::auth_manager_; }
 
+  AuthManager();
+  ~AuthManager();
+
   /// Set up internal and external AuthProvider classes. This also initializes SSL (via
-  /// the creation of ssl_socket_factory_).
+  /// kudu::security::InitializeOpenSSL()).
   Status Init();
+
+  /// Returns the authentication provider to use for "external" communication with
+  /// hs2-http protocol. Generally the same as GetExternalAuthProvider(), but can
+  /// be different in case of SAML SSO is enabled but LDAP/Kerberos is not, as SAML
+  /// can be only used during http authentication.
+  AuthProvider* GetExternalHttpAuthProvider();
 
   /// Returns the authentication provider to use for "external" communication
   /// such as the impala shell, jdbc, odbc, etc. This only applies to the server
@@ -56,30 +67,38 @@ class AuthManager {
   /// internal process.
   AuthProvider* GetExternalAuthProvider();
 
+  /// Returns the authentication provider to use for "external frontend" communication.
+  /// This only applies to the server side of a connection; the client side of said
+  /// connection is never an internal process. Currently this is either null if
+  /// external_fe_port <= 0 or NoAuthProvider.
+  AuthProvider* GetExternalFrontendAuthProvider();
+
   /// Returns the authentication provider to use for internal daemon <-> daemon
   /// connections.  This goes for both the client and server sides.  An example
   /// connection this applies to would be backend <-> statestore.
   AuthProvider* GetInternalAuthProvider();
 
+  ImpalaLdap* GetLdap() { return ldap_.get(); }
+
  private:
-  /// One-time kerberos-specific environment variable setup. Called by Init() if Kerberos
-  /// is enabled.
+  /// One-time kerberos-specific environment variable setup. Sets variables like
+  /// KRB5CCNAME and friends so that command-line flags take effect in the C++ and
+  /// Java Kerberos implementations. Called by Init() whether or not Kerberos is enabled.
   Status InitKerberosEnv();
 
   static AuthManager* auth_manager_;
 
   /// These are provided for convenience, so that demon<->demon and client<->demon services
   /// don't have to check the auth flags to figure out which auth provider to use.
+  /// external_http_auth_provider_ overrides external_auth_provider_ for http requests if
+  /// the auth mechanism only supports http requests.
   boost::scoped_ptr<AuthProvider> internal_auth_provider_;
   boost::scoped_ptr<AuthProvider> external_auth_provider_;
+  boost::scoped_ptr<AuthProvider> external_http_auth_provider_;
+  boost::scoped_ptr<AuthProvider> external_fe_auth_provider_;
 
-  /// A thrift SSL socket factory must be created and live the lifetime of the process to
-  /// ensure that the thrift OpenSSL initialization code runs at Init(), and is not
-  /// unregistered (which thrift will do when the refcount of TSSLSocketFactory objects
-  /// reach 0), see IMPALA-4933. For simplicity, and because Kudu will expect SSL to be
-  /// initialized, this will be created regardless of whether or not SSL credentials are
-  /// specified. This factory isn't otherwise used.
-  boost::scoped_ptr<TSSLSocketFactory> ssl_socket_factory_;
+  /// Used to authenticate usernames and passwords to LDAP.
+  std::unique_ptr<ImpalaLdap> ldap_;
 };
 
 

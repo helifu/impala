@@ -16,6 +16,7 @@
 # under the License.
 #
 
+from __future__ import absolute_import, division, print_function
 import os
 import fnmatch
 import re
@@ -73,7 +74,7 @@ class Workload(object):
     """
 
     queries = list()
-    for query_name, query_str in self._query_map.iteritems():
+    for query_name, query_str in self._query_map.items():
       queries.append(Query(name=query_name,
                            query_str=query_str,
                            workload=self._name,

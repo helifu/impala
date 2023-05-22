@@ -17,21 +17,23 @@
 
 #include "kudu/util/flags.h"
 
+#include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h> // IWYU pragma: keep
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <iostream>
+#include <iterator>
+#include <map>
 #include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <sys/stat.h>
-#include <unistd.h> // IWYU pragma: keep
-
-#include <boost/algorithm/string/predicate.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #ifdef TCMALLOC_ENABLED
 #include <gperftools/heap-profiler.h>
@@ -73,7 +75,13 @@ DEFINE_bool(dump_metrics_json, false,
             "by this binary.");
 TAG_FLAG(dump_metrics_json, hidden);
 
+DEFINE_bool(dump_metrics_xml, false,
+            "Dump an XML document describing all of the metrics which may be emitted "
+            "by this binary.");
+TAG_FLAG(dump_metrics_xml, hidden);
+
 #ifdef TCMALLOC_ENABLED
+// Defined in Impala in common/global-flags.cc
 DECLARE_bool(enable_process_lifetime_heap_profiling);
 TAG_FLAG(enable_process_lifetime_heap_profiling, stable);
 TAG_FLAG(enable_process_lifetime_heap_profiling, advanced);
@@ -481,6 +489,7 @@ int ParseCommandLineFlags(int* argc, char*** argv, bool remove_flags) {
 
   int ret = google::ParseCommandLineNonHelpFlags(argc, argv, remove_flags);
   HandleCommonFlags();
+  ValidateFlags();
   return ret;
 }
 
@@ -491,14 +500,15 @@ void HandleCommonFlags() {
   } else if (FLAGS_dump_metrics_json) {
     MetricPrototypeRegistry::get()->WriteAsJson();
     exit(0);
+  } else if (FLAGS_dump_metrics_xml) {
+    MetricPrototypeRegistry::get()->WriteAsXML();
+    exit(0);
   } else if (FLAGS_version) {
     cout << VersionInfo::GetAllVersionInfo() << endl;
     exit(0);
   }
 
   google::HandleCommandLineHelpFlags();
-  CheckFlagsAllowed();
-  RunCustomValidators();
 
   if (FLAGS_disable_core_dumps) {
     DisableCoreDumps();
@@ -527,6 +537,11 @@ void HandleCommonFlags() {
 #endif
 }
 
+void ValidateFlags() {
+  CheckFlagsAllowed();
+  RunCustomValidators();
+}
+
 string CommandlineFlagsIntoString(EscapeMode mode) {
   string ret_value;
   vector<CommandLineFlagInfo> flags;
@@ -546,31 +561,38 @@ string CommandlineFlagsIntoString(EscapeMode mode) {
   return ret_value;
 }
 
-string GetNonDefaultFlags(const GFlagsMap& default_flags) {
-  ostringstream args;
-  vector<CommandLineFlagInfo> flags;
-  GetAllFlags(&flags);
-  for (const auto& flag : flags) {
-    if (!flag.is_default) {
-      // This only means that the flag has been rewritten. It doesn't
-      // mean that this has been done in the command line, or even
-      // that it's truly different from the default value.
-      // Next, we try to check both.
-      const auto& default_flag = default_flags.find(flag.name);
-      // it's very unlikely, but still possible that we don't have the flag in defaults
-      if (default_flag == default_flags.end() ||
-          flag.current_value != default_flag->second.current_value) {
-        if (!args.str().empty()) {
-          args << '\n';
-        }
+vector<CommandLineFlagInfo> GetNonDefaultFlagsHelper() {
+  vector<CommandLineFlagInfo> all_flags;
+  GetAllFlags(&all_flags);
+  vector<CommandLineFlagInfo> non_default_flags;
+  std::copy_if(all_flags.begin(), all_flags.end(), std::back_inserter(non_default_flags),
+               [] (const auto& flag) {
+                 // In addition to checking that the flag has been rewritten with 'is_default',
+                 // we also check that the value is different from the default value.
+                 return !flag.is_default && flag.current_value != flag.default_value;
+               });
+  return non_default_flags;
+}
 
-        // Redact the flags tagged as sensitive, if redaction is enabled.
-        string flag_value = CheckFlagAndRedact(flag, EscapeMode::NONE);
-        args << "--" << flag.name << '=' << flag_value;
-      }
-    }
+string GetNonDefaultFlags() {
+  ostringstream args;
+  for (const auto& flag : GetNonDefaultFlagsHelper()) {
+    // Redact the flags tagged as sensitive, if redaction is enabled.
+    string flag_value = CheckFlagAndRedact(flag, EscapeMode::NONE);
+    args << "--" << flag.name << '=' << flag_value << "\n";
   }
   return args.str();
+}
+
+GFlagsMap GetNonDefaultFlagsMap() {
+  GFlagsMap flags_by_name;
+  for (auto& flag : GetNonDefaultFlagsHelper()) {
+    // Instead of "flags_by_name.emplace(flag.name, std::move(flag))" using
+    // following approach as order of evaluation of parameters could be different
+    // leading to unexpected value in "flag.name".
+    flags_by_name[flag.name] = std::move(flag);
+  }
+  return flags_by_name;
 }
 
 GFlagsMap GetFlagsMap() {
@@ -578,18 +600,19 @@ GFlagsMap GetFlagsMap() {
   GetAllFlags(&default_flags);
   GFlagsMap flags_by_name;
   for (auto& flag : default_flags) {
-    flags_by_name.emplace(flag.name, std::move(flag));
+    // See the note in GetNonDefaultFlagsMap() above.
+    flags_by_name[flag.name] = std::move(flag);
   }
   return flags_by_name;
 }
 
 Status ParseTriState(const char* flag_name, const std::string& flag_value,
     TriStateFlag* tri_state) {
-  if (boost::iequals(flag_value, "required")) {
+  if (iequals(flag_value, "required")) {
     *tri_state = TriStateFlag::REQUIRED;
-  } else if (boost::iequals(flag_value, "optional")) {
+  } else if (iequals(flag_value, "optional")) {
     *tri_state = TriStateFlag::OPTIONAL;
-  } else if (boost::iequals(flag_value, "disabled")) {
+  } else if (iequals(flag_value, "disabled")) {
     *tri_state = TriStateFlag::DISABLED;
   } else {
     return Status::InvalidArgument(strings::Substitute(
@@ -597,6 +620,26 @@ Status ParseTriState(const char* flag_name, const std::string& flag_value,
           flag_name));
   }
   return Status::OK();
+}
+
+// Get the value of an environment variable that has boolean semantics.
+bool GetBooleanEnvironmentVariable(const char* env_var_name) {
+  const char* const e = getenv(env_var_name);
+  if ((e == nullptr) ||
+      (strlen(e) == 0) ||
+      (strcasecmp(e, "false") == 0) ||
+      (strcasecmp(e, "0") == 0) ||
+      (strcasecmp(e, "no") == 0)) {
+    return false;
+  }
+  if ((strcasecmp(e, "true") == 0) ||
+      (strcasecmp(e, "1") == 0) ||
+      (strcasecmp(e, "yes") == 0)) {
+    return true;
+  }
+  LOG(FATAL) << Substitute("$0: invalid value for environment variable $0",
+                           e, env_var_name);
+  return false;  // unreachable
 }
 
 } // namespace kudu

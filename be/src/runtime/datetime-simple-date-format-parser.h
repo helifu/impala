@@ -78,14 +78,16 @@ public:
   static const int DEFAULT_TIME_FRAC_FMT_LEN;
   static const int DEFAULT_SHORT_DATE_TIME_FMT_LEN;
   static const int DEFAULT_DATE_TIME_FMT_LEN;
+  static const int FRACTIONAL_MAX_LEN;
 
   /// Parse the date/time format into tokens and place them in the context.
   /// dt_ctx -- output date/time format context
   /// accept_time_toks -- if true, time tokens are accepted. Otherwise time tokens are
   /// rejected.
+  /// cast_mode -- indicates if it is a 'datetime to string' or 'string to datetime' cast
   /// Return true if the parse was successful.
-  static bool Tokenize(DateTimeFormatContext* dt_ctx,
-      bool accept_time_toks = true);
+  static bool Tokenize(DateTimeFormatContext* dt_ctx, CastDirection cast_mode,
+      bool accept_time_toks = true, bool accept_time_toks_only = false);
 
   /// Parse the date/time string to generate the DateTimeFormatToken required by
   /// DateTimeFormatContext. Similar to Tokenize() this function will take the string
@@ -95,11 +97,10 @@ public:
   /// dt_ctx -- date/time format context (must contain valid tokens)
   /// accept_time_toks -- if true, time tokens are accepted, otherwise time tokens are
   /// rejected.
-  /// accept_time_toks_only -- if true, time tokens w/o date tokens are accepted.
   /// Otherwise, they are rejected.
   /// Return true if the date/time was successfully parsed.
   static bool TokenizeByStr(DateTimeFormatContext* dt_ctx,
-      bool accept_time_toks = true, bool accept_time_toks_only = true);
+      bool accept_time_toks = true);
 
   /// Parse date/time string to find the corresponding default date/time format context.
   /// The string must adhere to a default date/time format.
@@ -113,6 +114,20 @@ public:
   /// otherwise.
   static const DateTimeFormatContext* GetDefaultFormatContext(const char* str, int len,
       bool accept_time_toks, bool accept_time_toks_only);
+
+  /// Return default date/time format context for a timestamp parsing.
+  /// If 'time' has a fractional seconds, context with pattern
+  /// "yyyy-MM-dd HH:mm:ss.SSSSSSSSS" will be returned. Otherwise, return context with
+  /// pattern "yyyy-MM-dd HH:mm:ss".
+  static ALWAYS_INLINE const DateTimeFormatContext* GetDefaultTimestampFormatContext(
+      const boost::posix_time::time_duration& time) {
+    return time.fractional_seconds() > 0 ? &DEFAULT_DATE_TIME_CTX[9] :
+                                           &DEFAULT_SHORT_DATE_TIME_CTX;
+  }
+
+  static ALWAYS_INLINE const DateTimeFormatContext* GetDefaultDateFormatContext() {
+    return &DEFAULT_DATE_CTX;
+  }
 
   /// Initialize the default format contexts. This *must* be called before using
   /// GetDefaultFormatContext().
@@ -166,6 +181,19 @@ public:
   static bool ParseDateTime(const char* str, int len,
       const DateTimeFormatContext& dt_ctx, DateTimeParseResult* dt_result);
 };
+
+/// Helper function for formatting small numbers with leading zeros
+/// This is used inline with data and timestamp formatting functions
+inline void ZeroPad(char* const dst, uint32 val, const uint32 digits) {
+  char* p = dst + digits;
+  while(val) {
+    *--p = '0' + (val % 10);
+    val /= 10;
+  }
+  while(p != dst) {
+    *--p = '0';
+  }
+}
 
 }
 

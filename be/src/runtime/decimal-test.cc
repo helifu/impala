@@ -15,17 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <sstream>
-#include <boost/cstdint.hpp>
 #include <boost/lexical_cast.hpp>
 #include "runtime/decimal-value.inline.h"
 #include "runtime/raw-value.h"
 #include "runtime/types.h"
 #include "testutil/gtest-util.h"
+#include "util/decimal-util.h"
 #include "util/string-parser.h"
 
 #include "common/names.h"
@@ -437,7 +438,7 @@ TEST(DecimalTest, StringToDecimalLarge) {
   VerifyParse("01000000000000000000", 18, 0,
       Decimal8Value(0), StringParser::PARSE_OVERFLOW);
 
-  int128_t result = DecimalUtil::MAX_UNSCALED_DECIMAL16;
+  int128_t result = MAX_UNSCALED_DECIMAL16;
   VerifyParse("99999999999999999999999999999999999999",
       38, 0, Decimal16Value(result), StringParser::PARSE_SUCCESS);
   VerifyParse("99999999999999999999999999999999999999e1",
@@ -524,7 +525,7 @@ TEST(DecimalTest, Overflow) {
   bool overflow = false;
 
   Decimal16Value result;
-  Decimal16Value d_max(DecimalUtil::MAX_UNSCALED_DECIMAL16);
+  Decimal16Value d_max(MAX_UNSCALED_DECIMAL16);
   Decimal16Value two(2);
   Decimal16Value one(1);
   Decimal16Value zero(0);
@@ -655,16 +656,16 @@ TEST(DecimalTest, Overflow) {
   EXPECT_TRUE(overflow);
 
   // Add 37 9's (with scale 0)
-  Decimal16Value d3(DecimalUtil::MAX_UNSCALED_DECIMAL16 / 10);
+  Decimal16Value d3(MAX_UNSCALED_DECIMAL16 / 10);
   overflow = false;
   result = d3.Add<int128_t>(0, zero, 1, 38, 1, false, &overflow);
   EXPECT_FALSE(overflow);
-  EXPECT_EQ(result.value(), DecimalUtil::MAX_UNSCALED_DECIMAL16 - 9);
+  EXPECT_EQ(result.value(), MAX_UNSCALED_DECIMAL16 - 9);
 
   overflow = false;
   result = d3.Add<int128_t>(0, one, 1, 38, 1, false, &overflow);
   EXPECT_FALSE(overflow);
-  EXPECT_EQ(result.value(), DecimalUtil::MAX_UNSCALED_DECIMAL16 - 8);
+  EXPECT_EQ(result.value(), MAX_UNSCALED_DECIMAL16 - 8);
 
   // Mod
   overflow = false;
@@ -678,7 +679,7 @@ TEST(DecimalTest, Overflow) {
   result = d3.Mod<int128_t>(0, two, 0, 38, 0, false, &is_nan, &overflow);
   EXPECT_FALSE(overflow);
   EXPECT_FALSE(is_nan);
-  EXPECT_EQ(result.value(), DecimalUtil::MAX_UNSCALED_DECIMAL16 % 2);
+  EXPECT_EQ(result.value(), MAX_UNSCALED_DECIMAL16 % 2);
 
   result = d3.Mod<int128_t>(0, zero, 1, 38, 1, false, &is_nan, &overflow);
   EXPECT_TRUE(is_nan);
@@ -725,6 +726,10 @@ TEST(DecimalTest, UnalignedValues) {
   stringstream ss;
   RawValue::PrintValue(unaligned, ColumnType::CreateDecimalType(28, 2), 0, &ss);
   EXPECT_EQ("123.45", ss.str());
+  // Regression test for IMPALA-9781: Verify that operator=() works
+  *unaligned = 0;
+  __int128_t val = unaligned->value();
+  EXPECT_EQ(val, 0);
   free(unaligned_mem);
 }
 
@@ -997,6 +1002,25 @@ TEST(DecimalTest, PrecisionScaleValidation) {
 
   // Incompatible precision and scale.
   EXPECT_FALSE(ColumnType::ValidateDecimalParams(15, 16));
+}
+
+template <typename T>
+static void TestGetScaleMultiplier(int scale_upper_bound, T overflow_val) {
+  T expect = 1;
+  for (int scale = 0; scale < scale_upper_bound; scale++) {
+    EXPECT_EQ(expect, DecimalUtil::GetScaleMultiplier<T>(scale));
+    expect *= 10;
+  }
+  // test overflow
+  EXPECT_EQ(overflow_val, DecimalUtil::GetScaleMultiplier<T>(scale_upper_bound));
+}
+
+TEST(DecimalTest, GetScaleMultiplier) {
+  TestGetScaleMultiplier<int32_t>(DecimalUtil::INT32_SCALE_UPPER_BOUND, -1);
+  TestGetScaleMultiplier<int64_t>(DecimalUtil::INT64_SCALE_UPPER_BOUND, -1);
+  TestGetScaleMultiplier<int128_t>(DecimalUtil::INT128_SCALE_UPPER_BOUND, -1);
+  TestGetScaleMultiplier<int256_t>(DecimalUtil::INT256_SCALE_UPPER_BOUND, -1);
+  TestGetScaleMultiplier<double>(DecimalUtil::INT64_SCALE_UPPER_BOUND, 1E19);
 }
 
 }

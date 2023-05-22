@@ -23,7 +23,6 @@ import org.junit.Test;
 public class AnalyzeUpsertStmtTest extends AnalyzerTest {
   @Test
   public void TestUpsert() {
-    TestUtils.assumeKuduIsSupported();
     // VALUES clause
     AnalyzesOk("upsert into table functional_kudu.testtbl values(1, 'a', 1)");
     AnalyzesOk("upsert into table functional_kudu.testtbl(id) values(1)");
@@ -121,11 +120,5 @@ public class AnalyzeUpsertStmtTest extends AnalyzerTest {
         "'b.int_array_col' correlated with an outer block as well as an " +
         "uncorrelated one 'functional.alltypestiny':\n" +
         "SELECT item FROM b.int_array_col, functional.alltypestiny");
-    // Illegal complex-typed expr
-    AnalysisError("upsert into functional_kudu.testtbl " +
-        "select int_struct_col from functional.allcomplextypes",
-        "Expr 'int_struct_col' in select list returns a " +
-        "complex type 'STRUCT<f1:INT,f2:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
   }
 }

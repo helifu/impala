@@ -44,9 +44,10 @@ $IMPALA_HOME/testdata/bin/kill-all.sh &>${IMPALA_CLUSTER_LOGS_DIR}/kill-all.log
 # if necessary. This is not intended to be a perfect test, but it is enough to
 # detect that bin/clean.sh removed the configurations.
 pushd "${IMPALA_HOME}/fe/src/test/resources/"
-if [ ! -f core-site.xml ] || [ ! -f hbase-site.xml ] || [ ! -f hive-site.xml ]; then
-    echo "Configuration files missing, running bin/create-test-configuration.sh"
-    ${IMPALA_HOME}/bin/create-test-configuration.sh
+if [ ! -f core-site.xml ] || [ ! -f hbase-site.xml ] \
+    || [ ! -f hive-site.xml ] || [ ! -f ozone-site.xml ]; then
+  echo "Configuration files missing, running bin/create-test-configuration.sh"
+  ${IMPALA_HOME}/bin/create-test-configuration.sh
 fi
 popd
 
@@ -59,40 +60,33 @@ $IMPALA_HOME/testdata/bin/run-mini-dfs.sh ${HDFS_FORMAT_CLUSTER-} 2>&1 | \
 # - One Yarn ResourceManager
 # - Multiple Yarn NodeManagers, exactly one per HDFS DN
 if [[ ${DEFAULT_FS} == "hdfs://${INTERNAL_LISTEN_HOST}:20500" ]]; then
-  echo " --> Starting HBase"
-  $IMPALA_HOME/testdata/bin/run-hbase.sh 2>&1 | \
-      tee ${IMPALA_CLUSTER_LOGS_DIR}/run-hbase.log
+  # HBase does not work with kerberos yet.
+  if [[ "$IMPALA_KERBERIZE" != true ]]; then
+    echo " --> Starting HBase"
+    $IMPALA_HOME/testdata/bin/run-hbase.sh 2>&1 | \
+        tee ${IMPALA_CLUSTER_LOGS_DIR}/run-hbase.log
+  fi
 
   echo " --> Starting Hive Server and Metastore Service"
-  $IMPALA_HOME/testdata/bin/run-hive-server.sh 2>&1 | \
-      tee ${IMPALA_CLUSTER_LOGS_DIR}/run-hive-server.log
-
-  echo " --> Starting the Sentry Policy Server"
-  $IMPALA_HOME/testdata/bin/run-sentry-service.sh 2>&1 | \
-      tee ${IMPALA_CLUSTER_LOGS_DIR}/run-sentry-service.log
-
-elif [[ ${DEFAULT_FS} == "${LOCAL_FS}" ]]; then
-  # When the local file system is used as default, we only start the Hive metastore.
-  # Impala can run locally without additional services.
-  $IMPALA_HOME/testdata/bin/run-hive-server.sh -only_metastore 2>&1 | \
+  HIVE_FLAGS=
+  if [[ "$IMPALA_KERBERIZE" = true ]]; then
+    HIVE_FLAGS=" -only_metastore"
+  fi
+  $IMPALA_HOME/testdata/bin/run-hive-server.sh $HIVE_FLAGS 2>&1 | \
       tee ${IMPALA_CLUSTER_LOGS_DIR}/run-hive-server.log
 else
-  # With Isilon, we only start the Hive metastore and Sentry Policy Server.
-  #   - HDFS is not started becuase Isilon is used as the defaultFs in core-site
-  #   - HBase is irrelevent for Impala testing with Isilon.
-  #   - We don't yet have a good way to start YARN using a different defaultFS. Moreoever,
+  # With other data stores we only start the Hive metastore.
+  #   - HDFS is not started because remote storage is used as the defaultFs in core-site
+  #   - HBase is irrelevent for Impala testing with remote storage.
+  #   - We don't yet have a good way to start YARN using a different defaultFS. Moreoever
   #     we currently don't run hive queries against Isilon for testing.
   #   - LLAMA is avoided because we cannot start YARN.
-  #   - KMS is used for encryption testing, which is not available on Isilon.
   #   - Hive needs YARN, and we don't run Hive queries.
+  # Impala can also run on a local file system without additional services.
   # TODO: Figure out how to start YARN, LLAMA and Hive with a different defaultFs.
   echo " --> Starting Hive Metastore Service"
   $IMPALA_HOME/testdata/bin/run-hive-server.sh -only_metastore 2>&1 | \
       tee ${IMPALA_CLUSTER_LOGS_DIR}/run-hive-server.log
-
-  echo " --> Starting the Sentry Policy Server"
-  $IMPALA_HOME/testdata/bin/run-sentry-service.sh 2>&1 | \
-      tee ${IMPALA_CLUSTER_LOGS_DIR}/run-sentry-service.log
 fi
 
 echo " --> Starting Ranger Server"

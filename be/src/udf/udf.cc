@@ -99,13 +99,21 @@ class RuntimeState {
     return false;
   }
 
+  bool utf8_mode() const {
+    assert(false);
+    return false;
+  }
+
   bool LogError(const std::string& error) {
     assert(false);
     return false;
   }
 
-  const std::string connected_user() const { return ""; }
-  const std::string GetEffectiveUser() const { return ""; }
+  const std::string connected_user() const { return user_string_; }
+  const std::string GetEffectiveUser() const { return user_string_; }
+
+ private:
+  const std::string user_string_ = "";
 };
 
 }
@@ -543,6 +551,19 @@ bool StringVal::Resize(FunctionContext* ctx, int new_len) noexcept {
   return false;
 }
 
+void StructVal::ReserveMemory(FunctionContext* ctx) {
+  assert(ctx != nullptr);
+  assert(num_children >= 0);
+  assert(is_null == false);
+  if (num_children == 0) return;
+  ptr = reinterpret_cast<uint8_t**>(
+      ctx->impl()->AllocateForResults(sizeof(uint8_t*) * num_children));
+  if (UNLIKELY(ptr == nullptr)) {
+    num_children = 0;
+    is_null = true;
+  }
+}
+
 // TODO: why doesn't libudasample.so build if this in udf-ir.cc?
 const FunctionContext::TypeDesc* FunctionContext::GetArgType(int arg_idx) const {
   if (arg_idx < 0 || arg_idx >= impl_->arg_types_.size()) return NULL;
@@ -558,13 +579,13 @@ static int GetTypeByteSize(const FunctionContext::TypeDesc& type) {
 }
 
 int FunctionContextImpl::GetConstFnAttr(FunctionContextImpl::ConstFnAttr t, int i) {
-  return GetConstFnAttr(state_, return_type_, arg_types_, t, i);
+  return GetConstFnAttr(state_->decimal_v2(), state_->utf8_mode(), return_type_,
+      arg_types_, t, i);
 }
 
-int FunctionContextImpl::GetConstFnAttr(const RuntimeState* state,
+int FunctionContextImpl::GetConstFnAttr(bool uses_decimal_v2, bool is_utf8_mode,
     const FunctionContext::TypeDesc& return_type,
-    const vector<FunctionContext::TypeDesc>& arg_types,
-    ConstFnAttr t, int i) {
+    const vector<FunctionContext::TypeDesc>& arg_types, ConstFnAttr t, int i) {
   switch (t) {
     case RETURN_TYPE_SIZE:
       assert(i == -1);
@@ -592,7 +613,9 @@ int FunctionContextImpl::GetConstFnAttr(const RuntimeState* state,
       assert(arg_types[i].type == FunctionContext::TYPE_DECIMAL);
       return arg_types[i].scale;
     case DECIMAL_V2:
-      return state->decimal_v2();
+      return uses_decimal_v2;
+    case UTF8_MODE:
+      return is_utf8_mode;
     default:
       assert(false);
       return -1;

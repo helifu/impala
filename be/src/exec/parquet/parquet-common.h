@@ -19,6 +19,9 @@
 #ifndef IMPALA_EXEC_PARQUET_COMMON_H
 #define IMPALA_EXEC_PARQUET_COMMON_H
 
+#include <boost/preprocessor/repetition/repeat_from_to.hpp>
+#include <sstream>
+
 #include "common/compiler-util.h"
 #include "gen-cpp/Descriptors_types.h"
 #include "gen-cpp/parquet_types.h"
@@ -34,7 +37,8 @@
 namespace impala {
 
 const uint8_t PARQUET_VERSION_NUMBER[4] = {'P', 'A', 'R', '1'};
-const uint32_t PARQUET_CURRENT_VERSION = 1;
+const uint32_t PARQUET_MAX_SUPPORTED_VERSION = 2;
+const uint32_t PARQUET_WRITER_VERSION = 1;
 
 /// Struct that specifies an inclusive range of rows.
 struct RowRange {
@@ -50,6 +54,13 @@ inline bool operator<(const RowRange& lhs, const RowRange& rhs) {
   return std::tie(lhs.first, lhs.last) < std::tie(rhs.first, rhs.last);
 }
 
+// Return true if this is an encoding enum value that indicates that a data page is
+// dictionary encoded.
+inline bool IsDictionaryEncoding(parquet::Encoding::type encoding) {
+  return encoding == parquet::Encoding::PLAIN_DICTIONARY
+      || encoding == parquet::Encoding::RLE_DICTIONARY;
+}
+
 /// Return the Impala compression type for the given Parquet codec. The caller must
 /// validate that the codec is a supported one, otherwise this will DCHECK.
 THdfsCompression::type ConvertParquetToImpalaCodec(parquet::CompressionCodec::type codec);
@@ -63,6 +74,48 @@ parquet::CompressionCodec::type ConvertImpalaToParquetCodec(
 /// offset index.
 void GetRowRangeForPage(const parquet::RowGroup& row_group,
     const parquet::OffsetIndex& offset_index, int page_idx, RowRange* row_range);
+
+/// Struct that specifies an inclusive range of pages.
+struct PageRange {
+  int64_t first;
+  int64_t last;
+
+  PageRange(int64_t u, int64_t v) : first(u), last(v) {}
+  bool overlap(const PageRange& other) const {
+    return !(last < other.first || other.last < first);
+  }
+  bool operator==(const PageRange& other) const {
+    return (first == other.first && last == other.last);
+  }
+
+  std::string toString() const {
+    std::stringstream ss;
+    ss << "[" << first << ", " << last << "]";
+    return ss.str();
+  }
+
+  // Populate the bit vector 'pageIndices' by setting bits corresponding to the pages
+  // in range [first, last] to on.
+  void convertToIndices(std::vector<bool>* pageIndices) const {
+    DCHECK(pageIndices);
+    for (int i = first; i <= last; i++) {
+      (*pageIndices)[i] = true;
+    }
+  }
+};
+
+inline bool IsValidPageLocation(const parquet::PageLocation& page_loc,
+    const int64_t num_rows) {
+  return page_loc.offset >= 0 &&
+         page_loc.first_row_index >= 0 &&
+         page_loc.first_row_index < num_rows;
+}
+
+/// Returns the row range for a given page range using information from the row group
+/// and offset index.
+void GetRowRangeForPageRange(const parquet::RowGroup& row_group,
+    const parquet::OffsetIndex& offset_index, const PageRange& page_range,
+    RowRange* row_range);
 
 /// Given a column chunk containing rows in the range [0, 'num_rows'), 'skip_ranges'
 /// contains the row ranges we are not interested in. 'skip_ranges' can be redundant and
@@ -295,6 +348,18 @@ class ParquetPlainEncoder {
   static int64_t DecodeBatch(const uint8_t* buffer, const uint8_t* buffer_end,
       int fixed_len_size, int64_t num_values, int64_t stride, InternalType* v);
 
+  /// Decode 'source' by memcpy() sizeof(InternalType) bytes from 'source' to 'v'.
+  template <typename InternalType>
+  static ALWAYS_INLINE inline void DecodeNoBoundsCheck(
+      const std::string& source, InternalType* v);
+
+  /// Answer the question whether an Impala internal type 'type' has the same
+  /// storage type as Parquet.
+  static bool IsIdenticalToParquetStorageType(const ColumnType& type) {
+    return (type.type == TYPE_INT || type.type == TYPE_BIGINT || type.type == TYPE_FLOAT
+        || type.type == TYPE_DOUBLE);
+  }
+
  private:
   /// Decode values without bounds checking. `buffer_end` is only used for DCHECKs in
   /// DEBUG mode, it is unused in RELEASE mode.
@@ -441,6 +506,22 @@ template <>
 inline void ParquetPlainEncoder::DecodeNoBoundsCheck<double, parquet::Type::FLOAT>(
     const uint8_t* buffer, const uint8_t* buffer_end, int fixed_len_size, double* v) {
   DecodeWithConversion<float, double>(buffer, buffer_end, v);
+}
+
+/// The string source version of DecodeNoBoundsCheck() which works with the following
+/// combination of internal and Parquet types requiring no conversions and validation.
+/// =============================
+/// InternalType   | PARQUET_TYPE
+/// =============================
+/// int32_t        | INT32
+/// int64_t        | INT64
+/// float          | FLOAT
+/// double         | DOUBLE
+template <typename InternalType>
+inline void ParquetPlainEncoder::DecodeNoBoundsCheck(
+    const string& source, InternalType* v) {
+  DCHECK_GE(source.size(), sizeof(InternalType));
+  memcpy(v, source.data(), sizeof(InternalType));
 }
 
 template <>
@@ -740,8 +821,8 @@ public:
       Precision& precision, bool& needs_conversion);
 
 private:
-  /// Timezone used for UTC->Local conversions. If nullptr, no conversion is needed.
-  const Timezone* timezone_ = nullptr;
+  /// Timezone used for UTC->Local conversions. If it is UTCPTR, no conversion is needed.
+  const Timezone* timezone_ = UTCPTR;
 
   /// Unit of the encoded timestamp. Used to decide between milli and microseconds during
   /// INT64 decoding. INT64 with nanosecond precision (and reduced range) is also planned

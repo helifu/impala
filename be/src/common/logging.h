@@ -62,16 +62,44 @@
 #define VLOG_ROW_IS_ON VLOG_IS_ON(3)
 #define VLOG_PROGRESS_IS_ON VLOG_IS_ON(2)
 
+// Define a range check macro to test x in the inclusive range from low to high.
+#define DCHECK_IN_RANGE(x, low, high) \
+  {                                   \
+    DCHECK_GE(x, low);                \
+    DCHECK_LE(x, high);               \
+  }
+
 /// Define a wrapper around DCHECK for strongly typed enums that print a useful error
 /// message on failure.
 #define DCHECK_ENUM_EQ(a, b)                                               \
   DCHECK(a == b) << "[ " #a " = " << static_cast<int>(a) << " , " #b " = " \
                  << static_cast<int>(b) << " ]"
 
+#ifndef KUDU_HEADERS_USE_SHORT_STATUS_MACROS
+/// Define DCHECK_OK that evaluates an expression that has type 'Status' and checks
+/// that the returning status is OK. If not OK, it logs the error and aborts the process.
+/// In release builds the given expression is not evaluated.
+#  ifndef NDEBUG
+#    define DCHECK_OK(status)                \
+       do {                                  \
+         const Status& _s = (status);        \
+         DCHECK(_s.ok()) << _s.GetDetail();  \
+       } while (0)
+#  else
+     // Let's define it to '{}' in case it's used in single line if statements.
+#    define DCHECK_OK(status) {}
+#  endif // NDEBUG
+#endif   // KUDU_HEADERS_USE_SHORT_STATUS_MACROS
+
+/// Define Kudu logging macros to use glog macros.
+#define KUDU_LOG              LOG
+#define KUDU_CHECK            CHECK
+#define KUDU_DCHECK           DCHECK
+
+namespace impala {
 /// IR modules don't use these methods, and can't see the google namespace used in
 /// GetFullLogFilename()'s prototype.
 #ifndef IR_COMPILE
-namespace impala {
 
 /// glog doesn't allow multiple invocations of InitGoogleLogging(). This method
 /// conditionally calls InitGoogleLogging() only if it hasn't been called before.
@@ -92,12 +120,31 @@ void LogCommandLineFlags();
 /// removes the oldest ones given an upper bound of number of logfiles to keep.
 void CheckAndRotateLogFiles(int max_log_files);
 
-/// Helper function that checks for the number of audit event logfiles in the log
-/// directory and removes the oldest ones given an upper bound of number of audit event
-/// logfiles to keep.
-void CheckAndRotateAuditEventLogFiles(int max_log_files);
-}
+/// Redirect stdout to INFO log and stderr to ERROR log.
+/// Needs to be done after InitGoogleLogging, to get the INFO/ERROR file paths.
+void AttachStdoutStderr();
+
+/// Check whether INFO or ERROR log size has exceed FLAGS_max_log_size.
+/// Return false if error encountered during individual log size check.
+/// 'log_error' controls whether to log any error occurrence to ERROR log or not.
+bool CheckLogSize(bool log_error);
+
+/// Force glog to do the log rotation.
+void ForceRotateLog();
+
+/// Return true if FLAGS_redirect_stdout_stderr is true and TestInfo::is_test() is false.
+bool RedirectStdoutStderr();
+
+/// Return true if we have log for given 'severity' in file system.
+/// Only used in testing.
+bool HasLog(google::LogSeverity severity);
 
 #endif // IR_COMPILE
 
+/// Prints v in base 10.
+/// Defined here so that __int128_t can be used in log messages (the C++ standard library
+/// does not provide support for __int128_t by default).
+std::ostream& operator<<(std::ostream& os, const __int128_t& val);
+
+} // namespace impala
 #endif

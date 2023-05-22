@@ -72,6 +72,11 @@ class Catalog {
   /// information on the error will be returned.
   Status GetCatalogObject(const TCatalogObject& request, TCatalogObject* response);
 
+  /// Like the above method but get the json string of the catalog object. The json
+  /// string can't be deserialized to Thrift objects so can only be used in showing debug
+  /// infos.
+  Status GetJsonCatalogObject(const TCatalogObject& req, std::string* res);
+
   /// Return partial information about a Catalog object.
   /// Returns OK if the operation was successful, otherwise a Status object with
   /// information on the error will be returned.
@@ -108,6 +113,9 @@ class Catalog {
   /// tables as well as the tables with the highest memory requirements.
   Status GetCatalogUsage(TGetCatalogUsageResponse* response);
 
+  /// Returns the running catalog operation metrics
+  Status GetOperationUsage(TGetOperationUsageResponse* response);
+
   /// Returns the metastore event processor summary view. The summary string
   /// in the response can contain detailed metrics along with status
   Status GetEventProcessorSummary(TEventProcessorMetricsSummaryResponse* response);
@@ -125,12 +133,6 @@ class Catalog {
   Status GetPartitionStats(
       const TGetPartitionStatsRequest& req, TGetPartitionStatsResponse* resp);
 
-  /// Checks whether the requesting user has admin privileges on the Sentry Service and
-  /// returns OK if they do. Returns a bad status if there was an error executing the
-  /// request.
-  Status SentryAdminCheck(const TSentryAdminCheckRequest& req,
-      TSentryAdminCheckResponse* resp);
-
   /// Update recently used table names and their use counts in an impalad since the last
   /// report.
   Status UpdateTableUsage(const TUpdateTableUsageRequest& req);
@@ -144,10 +146,12 @@ class Catalog {
   jmethodID exec_ddl_id_;  // JniCatalog.execDdl()
   jmethodID reset_metadata_id_;  // JniCatalog.resetMetdata()
   jmethodID get_catalog_object_id_;  // JniCatalog.getCatalogObject()
+  jmethodID get_json_catalog_object_id_;  // JniCatalog.getJsonCatalogObject()
   jmethodID get_partial_catalog_object_id_;  // JniCatalog.getPartialCatalogObject()
   jmethodID get_catalog_delta_id_;  // JniCatalog.getCatalogDelta()
   jmethodID get_catalog_version_id_;  // JniCatalog.getCatalogVersion()
   jmethodID get_catalog_usage_id_; // JniCatalog.getCatalogUsage()
+  jmethodID get_operation_usage_id_; // JniCatalog.getOperationUsage()
   jmethodID get_catalog_server_metrics_; // JniCatalog.getCatalogServerMetrics()
   jmethodID get_event_processor_summary_; // JniCatalog.getEventProcessorMetrics()
   jmethodID get_dbs_id_; // JniCatalog.getDbs()
@@ -156,7 +160,6 @@ class Catalog {
   jmethodID get_functions_id_; // JniCatalog.getFunctions()
   jmethodID get_partition_stats_id_; // JniCatalog.getPartitionStats()
   jmethodID prioritize_load_id_; // JniCatalog.prioritizeLoad()
-  jmethodID sentry_admin_check_id_; // JniCatalog.checkUserSentryAdmin()
   jmethodID catalog_ctor_;
   jmethodID update_table_usage_id_;
 };

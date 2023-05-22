@@ -17,6 +17,8 @@
 
 # This module is used for common utilities related to parsing test files
 
+from __future__ import absolute_import, division, print_function
+from builtins import map
 import codecs
 import collections
 import logging
@@ -96,7 +98,7 @@ def parse_query_test_file(file_name, valid_section_names=None, encoding=None):
   if section_names is None:
     section_names = ['QUERY', 'HIVE_QUERY', 'RESULTS', 'TYPES', 'LABELS', 'SETUP',
         'CATCH', 'ERRORS', 'USER', 'RUNTIME_PROFILE', 'SHELL', 'DML_RESULTS',
-        'DBAPI_RESULTS', 'HS2_TYPES', 'HIVE_MAJOR_VERSION', 'LINEAGE']
+        'HS2_TYPES', 'HIVE_MAJOR_VERSION', 'LINEAGE']
   return parse_test_file(file_name, section_names, encoding=encoding,
       skip_unknown_sections=False)
 
@@ -124,12 +126,12 @@ def parse_table_constraints(constraints_file):
             schema_only[f].append(table_name.lower())
         elif constraint_type == 'restrict_to':
           schema_include[table_name.lower()] +=\
-              map(parse_table_format_constraint, table_formats.split(','))
+              list(map(parse_table_format_constraint, table_formats.split(',')))
         elif constraint_type == 'exclude':
           schema_exclude[table_name.lower()] +=\
-              map(parse_table_format_constraint, table_formats.split(','))
+              list(map(parse_table_format_constraint, table_formats.split(',')))
         else:
-          raise ValueError, 'Unknown constraint type: %s' % constraint_type
+          raise ValueError('Unknown constraint type: %s' % constraint_type)
   return schema_include, schema_exclude, schema_only
 
 def parse_table_format_constraint(table_format_constraint):
@@ -156,6 +158,14 @@ def parse_test_file(test_file_name, valid_section_names, skip_unknown_sections=T
   with open(test_file_name, 'rb') as test_file:
     file_data = test_file.read()
     if encoding: file_data = file_data.decode(encoding)
+    if os.environ["USE_APACHE_HIVE"] == "true":
+      # Remove Hive 4.0 feature for tpcds_schema_template.sql
+      if "tpcds_schema_template" in test_file_name:
+        # HIVE-20703
+        file_data = file_data.replace(
+          'set hive.optimize.sort.dynamic.partition.threshold=1;', '')
+        # HIVE-18284
+        file_data = file_data.replace('distribute by ss_sold_date_sk', '')
     return parse_test_file_text(file_data, valid_section_names,
                                 skip_unknown_sections)
 
@@ -169,11 +179,11 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
     # with what looks like a subsection.
     header = text[:match.start()]
     if re.match(r'^%s' % SUBSECTION_DELIMITER, header):
-      raise RuntimeError, dedent("""
+      raise RuntimeError(dedent("""
           Header must not start with '%s'. Everything before the first line matching '%s'
           is considered header information and will be ignored. However a header must not
           start with '%s' to prevent test cases from accidentally being ignored.""" %
-          (SUBSECTION_DELIMITER, SECTION_DELIMITER, SUBSECTION_DELIMITER))
+          (SUBSECTION_DELIMITER, SECTION_DELIMITER, SUBSECTION_DELIMITER)))
     text = text[match.start():]
 
   # Split the test file up into sections. For each section, parse all subsections.
@@ -202,11 +212,11 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
 
       if subsection_name not in valid_section_names:
         if skip_unknown_sections or not subsection_name:
-          print sub_section
-          print 'Unknown section \'%s\'' % subsection_name
+          print(sub_section)
+          print('Unknown section \'%s\'' % subsection_name)
           continue
         else:
-          raise RuntimeError, 'Unknown subsection: %s' % subsection_name
+          raise RuntimeError('Unknown subsection: %s' % subsection_name)
 
       if subsection_name == 'QUERY' and subsection_comment:
         parsed_sections['QUERY_NAME'] = subsection_comment
@@ -215,10 +225,12 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
         for comment in subsection_comment.split(','):
           if comment == 'MULTI_LINE':
             parsed_sections['MULTI_LINE'] = comment
+          elif comment == 'RAW_STRING':
+            parsed_sections['RAW_STRING'] = comment
           elif comment.startswith('VERIFY'):
             parsed_sections['VERIFIER'] = comment
           else:
-            raise RuntimeError, 'Unknown subsection comment: %s' % comment
+            raise RuntimeError('Unknown subsection comment: %s' % comment)
 
       if subsection_name == 'CATCH':
         parsed_sections['CATCH'] = list()
@@ -227,7 +239,7 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
         elif subsection_comment == 'ANY_OF':
           parsed_sections['CATCH'].extend(lines_content)
         else:
-          raise RuntimeError, 'Unknown subsection comment: %s' % subsection_comment
+          raise RuntimeError('Unknown subsection comment: %s' % subsection_comment)
         for exception_str in parsed_sections['CATCH']:
           assert exception_str.strip(), "Empty exception string."
         continue
@@ -240,8 +252,8 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
       # not supported.
       if subsection_name == 'DML_RESULTS':
         if subsection_comment is None or subsection_comment == '':
-          raise RuntimeError, 'DML_RESULTS requires that the table is specified ' \
-              'in the comment.'
+          raise RuntimeError('DML_RESULTS requires that the table is specified ' \
+              'in the comment.')
         parsed_sections['DML_RESULTS_TABLE'] = subsection_comment
         parsed_sections['VERIFIER'] = 'VERIFY_IS_EQUAL_SORTED'
 
@@ -254,12 +266,12 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
         if subsection_comment is not None and subsection_comment is not "":
           allowed_formats = ['kudu']
           if not subsection_comment.startswith("table_format="):
-            raise RuntimeError, 'RUNTIME_PROFILE comment (%s) must be of the form ' \
-              '"table_format=FORMAT"' % subsection_comment
+            raise RuntimeError('RUNTIME_PROFILE comment (%s) must be of the form '
+              '"table_format=FORMAT"' % subsection_comment)
           table_format = subsection_comment[13:]
           if table_format not in allowed_formats:
-            raise RuntimeError, 'RUNTIME_PROFILE table format (%s) must be in: %s' % \
-                (table_format, allowed_formats)
+            raise RuntimeError('RUNTIME_PROFILE table format (%s) must be in: %s' %
+                (table_format, allowed_formats))
           subsection_name = 'RUNTIME_PROFILE_%s' % table_format
 
       parsed_sections[subsection_name] = subsection_str
@@ -362,7 +374,10 @@ def load_tpc_queries(workload, include_stress_queries=False, query_name_filters=
     file_name_pattern = re.compile(r"(.*)")
     query_name_pattern = re.compile(r"(.*)")
 
-  query_name_filters = map(str.strip, query_name_filters) if query_name_filters else []
+  if query_name_filters:
+    query_name_filters = list(map(str.strip, query_name_filters))
+  else:
+    query_name_filters = []
   filter_regex = re.compile(r'|'.join(['^%s$' % n for n in query_name_filters]), re.I)
 
   for query_file in os.listdir(query_dir):

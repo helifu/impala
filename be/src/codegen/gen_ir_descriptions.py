@@ -1,4 +1,6 @@
-#!/usr/bin/env impala-python
+#!/usr/bin/env python
+# This uses system python to avoid a dependency on impala-python,
+# because this runs during the build.
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -17,6 +19,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from string import Template
 import os
 import shutil
@@ -33,9 +36,9 @@ options, args = parser.parse_args()
 # This script will generate two headers that describe all of the clang cross compiled
 # functions.
 # The script outputs (run: 'impala/common/function-registry/gen_functions.py')
-#   - be/src/generated-sources/impala-ir/impala-ir-functions.h
+#   - be/generated-sources/impala-ir/impala-ir-functions.h
 #     This file contains enums for all of the cross compiled functions
-#   - be/src/generated-sources/impala-ir/impala-ir-function-names.h
+#   - be/generated-sources/impala-ir/impala-ir-names.h
 #     This file contains a mapping of <string, enum>
 
 # Mapping of enum to compiled function name. The compiled function name has to be
@@ -48,7 +51,7 @@ ir_functions = [
   ["AGG_FN_EVALUATOR_AGG_FN_CTX",
    "_ZNK6impala14AggFnEvaluator10agg_fn_ctxEv"],
   ["GROUPING_AGG_ADD_BATCH_IMPL",
-   "_ZN6impala18GroupingAggregator12AddBatchImplILb0EEENS_6StatusEPNS_8RowBatchENS_13TPrefetchMode4typeEPNS_12HashTableCtxE"],
+   "_ZN6impala18GroupingAggregator12AddBatchImplILb0EEENS_6StatusEPNS_8RowBatchENS_13TPrefetchMode4typeEPNS_12HashTableCtxEb"],
   ["NON_GROUPING_AGG_ADD_BATCH_IMPL",
    "_ZN6impala21NonGroupingAggregator12AddBatchImplEPNS_8RowBatchE"],
   ["GROUPING_AGG_ADD_BATCH_STREAMING_IMPL",
@@ -75,28 +78,6 @@ ir_functions = [
    "_Z14TimestampValEqRKN10impala_udf12TimestampValES2_"],
   ["CODEGEN_ANYVAL_TIMESTAMP_VALUE_EQ",
    "_Z16TimestampValueEqRKN10impala_udf12TimestampValERKN6impala14TimestampValueE"],
-  ["SCALAR_EXPR_GET_BOOLEAN_VAL",
-   "_ZN6impala10ScalarExpr24GetBooleanValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_TINYINT_VAL",
-   "_ZN6impala10ScalarExpr24GetTinyIntValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_SMALLINT_VAL",
-   "_ZN6impala10ScalarExpr25GetSmallIntValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_INT_VAL",
-   "_ZN6impala10ScalarExpr20GetIntValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_BIGINT_VAL",
-   "_ZN6impala10ScalarExpr23GetBigIntValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_FLOAT_VAL",
-   "_ZN6impala10ScalarExpr22GetFloatValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_DOUBLE_VAL",
-   "_ZN6impala10ScalarExpr23GetDoubleValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_STRING_VAL",
-   "_ZN6impala10ScalarExpr23GetStringValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_TIMESTAMP_VAL",
-   "_ZN6impala10ScalarExpr26GetTimestampValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_DECIMAL_VAL",
-   "_ZN6impala10ScalarExpr24GetDecimalValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
-  ["SCALAR_EXPR_GET_DATE_VAL",
-   "_ZN6impala10ScalarExpr21GetDateValInterpretedEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
   ["HASH_CRC", "IrCrcHash"],
   ["HASH_MURMUR", "IrMurmurHash"],
   ["PHJ_PROCESS_BUILD_BATCH",
@@ -120,7 +101,7 @@ ir_functions = [
   ["PHJ_PROCESS_PROBE_BATCH_FULL_OUTER_JOIN",
    "_ZN6impala23PartitionedHashJoinNode17ProcessProbeBatchILi8EEEiNS_13TPrefetchMode4typeEPNS_8RowBatchEPNS_12HashTableCtxEPNS_6StatusE"],
   ["PHJ_INSERT_BATCH",
-   "_ZN6impala10PhjBuilder9Partition11InsertBatchENS_13TPrefetchMode4typeEPNS_12HashTableCtxEPNS_8RowBatchERKSt6vectorIPhSaIS9_EEPNS_6StatusE"],
+   "_ZN6impala19PhjBuilderPartition11InsertBatchENS_13TPrefetchMode4typeEPNS_12HashTableCtxEPNS_8RowBatchERKSt6vectorIPhSaIS8_EEPNS_6StatusE"],
   ["HASH_TABLE_GET_HASH_SEED",
    "_ZNK6impala12HashTableCtx11GetHashSeedEv"],
   ["HASH_TABLE_GET_BUILD_EXPR_EVALUATORS",
@@ -182,9 +163,11 @@ ir_functions = [
   ["HDFS_SCANNER_WRITE_ALIGNED_TUPLES",
    "_ZN6impala11HdfsScanner18WriteAlignedTuplesEPNS_7MemPoolEPNS_8TupleRowEPNS_13FieldLocationEiiiib"],
   ["PROCESS_SCRATCH_BATCH",
-   "_ZN6impala18HdfsParquetScanner19ProcessScratchBatchEPNS_8RowBatchE"],
+   "_ZN6impala19HdfsColumnarScanner19ProcessScratchBatchEPNS_8RowBatchE"],
   ["HDFS_SCANNER_EVAL_RUNTIME_FILTER",
    "_ZN6impala11HdfsScanner17EvalRuntimeFilterEiPNS_8TupleRowE"],
+  ["HDFS_SCANNER_TEXT_CONVERTER_WRITE_SLOT_INTERPRETED_IR",
+   "_ZN6impala11HdfsScanner35TextConverterWriteSlotInterpretedIREPS0_iPNS_5TupleEPKciPNS_7MemPoolE"],
   ["STRING_TO_BOOL", "IrStringToBool"],
   ["STRING_TO_INT8", "IrStringToInt8"],
   ["STRING_TO_INT16", "IrStringToInt16"],
@@ -201,12 +184,14 @@ ir_functions = [
   ["GENERIC_IS_NULL_STRING", "IrGenericIsNullString"],
   ["RAW_VALUE_COMPARE",
    "_ZN6impala8RawValue7CompareEPKvS2_RKNS_10ColumnTypeE"],
-  ["RAW_VALUE_GET_HASH_VALUE",
-   "_ZN6impala8RawValue12GetHashValueEPKvRKNS_10ColumnTypeEj"],
   ["RAW_VALUE_GET_HASH_VALUE_FAST_HASH",
    "_ZN6impala8RawValue20GetHashValueFastHashEPKvRKNS_10ColumnTypeEm"],
-  ["TOPN_NODE_INSERT_BATCH",
-   "_ZN6impala8TopNNode11InsertBatchEPNS_8RowBatchE"],
+  ["RAW_VALUE_GET_HASH_VALUE_FAST_HASH32",
+   "_ZN6impala8RawValue22GetHashValueFastHash32EPKvRKNS_10ColumnTypeEj"],
+  ["TOPN_NODE_INSERT_BATCH_UNPARTITIONED",
+   "_ZN6impala8TopNNode24InsertBatchUnpartitionedEPNS_12RuntimeStateEPNS_8RowBatchE"],
+  ["TOPN_NODE_INSERT_BATCH_PARTITIONED",
+   "_ZN6impala8TopNNode22InsertBatchPartitionedEPNS_12RuntimeStateEPNS_8RowBatchE"],
   ["MEMPOOL_ALLOCATE",
    "_ZN6impala7MemPool8AllocateILb0EEEPhli"],
   ["MEMPOOL_CHECKED_ALLOCATE",
@@ -217,25 +202,72 @@ ir_functions = [
    "_ZN6impala5Tuple11CopyStringsEPKcPNS_12RuntimeStateEPKNS_11SlotOffsetsEiPNS_7MemPoolEPNS_6StatusE"],
   ["UNION_MATERIALIZE_BATCH",
   "_ZN6impala9UnionNode16MaterializeBatchEPNS_8RowBatchEPPh"],
-  ["BLOOM_FILTER_INSERT_NO_AVX2", "_ZN6impala11BloomFilter12InsertNoAvx2Ej"],
-  ["BLOOM_FILTER_INSERT_AVX2", "_ZN6impala11BloomFilter10InsertAvx2Ej"],
+  ["BLOOM_FILTER_INSERT", "_ZN6impala11BloomFilter8IrInsertEj"],
   ["SELECT_NODE_COPY_ROWS", "_ZN6impala10SelectNode8CopyRowsEPNS_8RowBatchE"],
-  ["BOOL_MIN_MAX_FILTER_INSERT", "_ZN6impala16BoolMinMaxFilter6InsertEPv"],
-  ["TINYINT_MIN_MAX_FILTER_INSERT", "_ZN6impala19TinyIntMinMaxFilter6InsertEPv"],
-  ["SMALLINT_MIN_MAX_FILTER_INSERT", "_ZN6impala20SmallIntMinMaxFilter6InsertEPv"],
-  ["INT_MIN_MAX_FILTER_INSERT", "_ZN6impala15IntMinMaxFilter6InsertEPv"],
-  ["BIGINT_MIN_MAX_FILTER_INSERT", "_ZN6impala18BigIntMinMaxFilter6InsertEPv"],
-  ["FLOAT_MIN_MAX_FILTER_INSERT", "_ZN6impala17FloatMinMaxFilter6InsertEPv"],
-  ["DOUBLE_MIN_MAX_FILTER_INSERT", "_ZN6impala18DoubleMinMaxFilter6InsertEPv"],
-  ["STRING_MIN_MAX_FILTER_INSERT", "_ZN6impala18StringMinMaxFilter6InsertEPv"],
-  ["TIMESTAMP_MIN_MAX_FILTER_INSERT", "_ZN6impala21TimestampMinMaxFilter6InsertEPv"],
-  ["DECIMAL_MIN_MAX_FILTER_INSERT4", "_ZN6impala19DecimalMinMaxFilter7Insert4EPv"],
-  ["DECIMAL_MIN_MAX_FILTER_INSERT8", "_ZN6impala19DecimalMinMaxFilter7Insert8EPv"],
-  ["DECIMAL_MIN_MAX_FILTER_INSERT16", "_ZN6impala19DecimalMinMaxFilter8Insert16EPv"],
+  ["BOOL_MIN_MAX_FILTER_INSERT", "_ZN6impala16BoolMinMaxFilter6InsertEPKv"],
+  ["TINYINT_MIN_MAX_FILTER_INSERT", "_ZN6impala19TinyIntMinMaxFilter6InsertEPKv"],
+  ["SMALLINT_MIN_MAX_FILTER_INSERT", "_ZN6impala20SmallIntMinMaxFilter6InsertEPKv"],
+  ["INT_MIN_MAX_FILTER_INSERT", "_ZN6impala15IntMinMaxFilter6InsertEPKv"],
+  ["BIGINT_MIN_MAX_FILTER_INSERT", "_ZN6impala18BigIntMinMaxFilter6InsertEPKv"],
+  ["FLOAT_MIN_MAX_FILTER_INSERT", "_ZN6impala17FloatMinMaxFilter6InsertEPKv"],
+  ["DOUBLE_MIN_MAX_FILTER_INSERT", "_ZN6impala18DoubleMinMaxFilter6InsertEPKv"],
+  ["STRING_MIN_MAX_FILTER_INSERT", "_ZN6impala18StringMinMaxFilter6InsertEPKv"],
+  ["TIMESTAMP_MIN_MAX_FILTER_INSERT", "_ZN6impala21TimestampMinMaxFilter6InsertEPKv"],
+  ["TUPLE_ROW_GET_TUPLE_IS_NULL", "_ZN6impala19TupleRowTupleIsNullEPKNS_8TupleRowEi"],
+  ["DATE_MIN_MAX_FILTER_INSERT", "_ZN6impala16DateMinMaxFilter6InsertEPKv"],
+  ["DECIMAL_MIN_MAX_FILTER_INSERT4", "_ZN6impala19DecimalMinMaxFilter7Insert4EPKv"],
+  ["DECIMAL_MIN_MAX_FILTER_INSERT8", "_ZN6impala19DecimalMinMaxFilter7Insert8EPKv"],
+  ["DECIMAL_MIN_MAX_FILTER_INSERT16", "_ZN6impala19DecimalMinMaxFilter8Insert16EPKv"],
+  ["TINYINT_IN_LIST_FILTER_INSERT",  "_ZN6impala16InListFilterImplIaLNS_13PrimitiveTypeE3EE6InsertEPKv"],
+  ["SMALLINT_IN_LIST_FILTER_INSERT", "_ZN6impala16InListFilterImplIsLNS_13PrimitiveTypeE4EE6InsertEPKv"],
+  ["INT_IN_LIST_FILTER_INSERT",      "_ZN6impala16InListFilterImplIiLNS_13PrimitiveTypeE5EE6InsertEPKv"],
+  ["BIGINT_IN_LIST_FILTER_INSERT",   "_ZN6impala16InListFilterImplIlLNS_13PrimitiveTypeE6EE6InsertEPKv"],
+  ["DATE_IN_LIST_FILTER_INSERT",     "_ZN6impala16InListFilterImplIiLNS_13PrimitiveTypeE11EE6InsertEPKv"],
+  ["STRING_IN_LIST_FILTER_INSERT",  "_ZN6impala16InListFilterImplINS_11StringValueELNS_13PrimitiveTypeE10EE6InsertEPKv"],
+  ["CHAR_IN_LIST_FILTER_INSERT",    "_ZN6impala16InListFilterImplINS_11StringValueELNS_13PrimitiveTypeE15EE6InsertEPKv"],
+  ["VARCHAR_IN_LIST_FILTER_INSERT", "_ZN6impala16InListFilterImplINS_11StringValueELNS_13PrimitiveTypeE16EE6InsertEPKv"],
   ["KRPC_DSS_GET_PART_EXPR_EVAL",
   "_ZN6impala20KrpcDataStreamSender25GetPartitionExprEvaluatorEi"],
   ["KRPC_DSS_HASH_AND_ADD_ROWS",
-  "_ZN6impala20KrpcDataStreamSender14HashAndAddRowsEPNS_8RowBatchE"]
+  "_ZN6impala20KrpcDataStreamSender14HashAndAddRowsEPNS_8RowBatchE"],
+  ["GET_FUNCTION_CTX",
+  "_ZN6impala19ScalarExprEvaluator18GetFunctionContextEPS0_i"],
+  ["GET_CHILD_EVALUATOR", "_ZN6impala19ScalarExprEvaluator17GetChildEvaluatorEPS0_i"],
+  ["STORE_RESULT_IN_EVALUATOR",
+  "_ZN6impala19ScalarExprEvaluator11StoreResultERKN10impala_udf6AnyValERKNS_10ColumnTypeE"],
+  ["FN_CTX_ALLOCATE_FOR_RESULTS",
+  "_Z23FnCtxAllocateForResultsPN10impala_udf15FunctionContextEl"],
+  ["GET_JNI_CONTEXT",
+  "_ZN6impala11HiveUdfCall13GetJniContextEPN10impala_udf15FunctionContextE"],
+  ["JNI_CTX_SET_INPUT_NULL_BUFF_ELEM",
+   "_ZN6impala11HiveUdfCall10JniContext26SetInputNullsBufferElementEPS1_ih"],
+  ["JNI_CTX_INPUT_VAL_BUFF_AT_OFFSET",
+   "_ZN6impala11HiveUdfCall10JniContext28GetInputValuesBufferAtOffsetEPS1_i"],
+  ["HIVE_UDF_CALL_CALL_JAVA",
+   "_ZN6impala11HiveUdfCall22CallJavaAndStoreResultEPKNS_10ColumnTypeEPN10impala_udf15FunctionContextEPNS0_10JniContextE"],
+
+  ["BOOL_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala16BoolMinMaxFilter10AlwaysTrueEv"],
+  ["TINYINT_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala19TinyIntMinMaxFilter10AlwaysTrueEv"],
+  ["SMALLINT_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala20SmallIntMinMaxFilter10AlwaysTrueEv"],
+  ["INT_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala15IntMinMaxFilter10AlwaysTrueEv"],
+  ["BIGINT_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala18BigIntMinMaxFilter10AlwaysTrueEv"],
+  ["FLOAT_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala17FloatMinMaxFilter10AlwaysTrueEv"],
+  ["DOUBLE_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala18DoubleMinMaxFilter10AlwaysTrueEv"],
+  ["STRING_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala18StringMinMaxFilter10AlwaysTrueEv"],
+  ["TIMESTAMP_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala21TimestampMinMaxFilter10AlwaysTrueEv"],
+  ["DATE_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala16DateMinMaxFilter10AlwaysTrueEv"],
+  ["DECIMAL_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala19DecimalMinMaxFilter10AlwaysTrueEv"],
+
+  ["SET_KUDU_PARTIAL_ROW_AND_PARTITIONER",
+   "_ZN6impala17KuduPartitionExpr31SetKuduPartialRowAndPartitionerEPNS_19ScalarExprEvaluatorEiPPN4kudu14KuduPartialRowEPPNS3_6client15KuduPartitionerE"],
+  ["WRITE_KUDU_VALUE",
+   "_ZN6impala14WriteKuduValueEiRKNS_10ColumnTypeEPKvbPN4kudu14KuduPartialRowE"],
+  ["GET_KUDU_PARTITION_ROW",
+   "_ZN6impala19GetKuduPartitionRowEPN4kudu6client15KuduPartitionerEPNS0_14KuduPartialRowE"],
+  ["TUPLE_SORTER_SORT_HELPER",
+   "_ZN6impala6Sorter11TupleSorter10SortHelperENS0_13TupleIteratorES2_"],
+  ["SORTED_RUN_MERGER_HEAPIFY_HELPER",
+   "_ZN6impala15SortedRunMerger13HeapifyHelperEi"]
 ]
 
 enums_preamble = '\
@@ -314,7 +346,7 @@ def move_if_different(src_file, dest_file):
   if not os.path.isfile(dest_file) or not filecmp.cmp(src_file, dest_file):
     shutil.move(src_file, dest_file)
   else:
-    print 'Retaining existing file: %s' % (dest_file)
+    print('Retaining existing file: %s' % (dest_file))
 
 BE_PATH = os.path.join(os.environ['IMPALA_HOME'], 'be/generated-sources/impala-ir/')
 IR_FUNCTIONS_FILE = 'impala-ir-functions.h'
@@ -328,7 +360,7 @@ if not os.path.exists(BE_PATH):
   os.makedirs(BE_PATH)
 
 if __name__ == "__main__":
-  print "Generating IR description files"
+  print("Generating IR description files")
   enums_file = open(TMP_IR_FUNCTIONS_PATH, 'w')
   enums_file.write(enums_preamble)
 

@@ -35,8 +35,10 @@ import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
-import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.BackendConfig;
+import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TFunctionCategory;
 import org.junit.Assert;
 import org.junit.Test;
@@ -48,6 +50,10 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
 public class AnalyzeStmtsTest extends AnalyzerTest {
+
+  static {
+    FeSupport.loadLibrary();
+  }
 
   /**
    * Tests analyzing the given collection table reference and field assumed to be in
@@ -72,6 +78,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         collectionField, collectionTable), tbl);
     TblsAnalyzeOk(String.format("select c.%s from $TBL a, a.int_array_col b, a.%s c",
         collectionField, collectionTable), tbl);
+    TblsAnalyzeOk(String.format(
+        "select 1 from $TBL, allcomplextypes.%s, functional.allcomplextypes.%s",
+        collectionTable, collectionTable), tbl);
 
     // Test join types. Parent/collection joins do not require an ON or USING clause.
     for (JoinOperator joinOp: JoinOperator.values()) {
@@ -112,15 +121,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         collectionField, collectionTable, collectionTable), tbl,
         "Duplicate table alias: 'b'");
     // Duplicate implicit alias.
-    String[] childTblPath = collectionTable.split("\\.");
-    String childTblAlias = childTblPath[childTblPath.length - 1];
     TblsAnalysisError(String.format("select %s from $TBL a, a.%s, a.%s",
         collectionField, collectionTable, collectionTable), tbl,
-        String.format("Duplicate table alias: '%s'", childTblAlias));
-    TblsAnalysisError(String.format(
-        "select 1 from $TBL, allcomplextypes.%s, functional.allcomplextypes.%s",
-        collectionTable, collectionTable), tbl,
-        String.format("Duplicate table alias: '%s'", childTblAlias));
+        String.format("Duplicate table alias: '%s'", "a." + collectionTable));
     // Duplicate implicit/explicit alias.
     TblsAnalysisError(String.format(
         "select %s from $TBL, functional.allcomplextypes.%s allcomplextypes",
@@ -328,6 +331,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
       AnalyzesOk(String.format(
           "select 1 from functional.allcomplextypes a %s a.struct_map_col", joinOp));
     }
+
+    AnalysisError("select pos from " +
+        "(select int_array_col from functional.allcomplextypes) v",
+        "Could not resolve column/field reference: 'pos'");
+    AnalyzesOk("select pos from " +
+        "(select int_array_col from functional.allcomplextypes) v, v.int_array_col");
   }
 
   @Test
@@ -401,10 +410,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "TABLESAMPLE is only supported on HDFS tables: functional.alltypes_view");
     AnalysisError("select * from functional.allcomplextypes.int_array_col " +
         "tablesample system (10)",
-        "TABLESAMPLE is only supported on HDFS tables: int_array_col");
+        "TABLESAMPLE is only supported on HDFS tables: " +
+        "functional.allcomplextypes.int_array_col");
     AnalysisError("select * from functional.allcomplextypes a, a.int_array_col " +
         "tablesample system (10)",
-        "TABLESAMPLE is only supported on HDFS tables: int_array_col");
+        "TABLESAMPLE is only supported on HDFS tables: a.int_array_col");
   }
 
   /**
@@ -415,16 +425,17 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
   /**
    * Checks that the given SQL analyzes ok, and asserts that the last result expr in the
-   * parsed SelectStmt is a scalar SlotRef whose absolute path is identical to the given
-   * expected one. Also asserts that the slot's absolute path is equal to its
+   * parsed SelectStmt is a non-collection SlotRef whose absolute path is identical to
+   * the given expected one. Also asserts that the slot's absolute path is equal to its
    * materialized path. Intentionally allows multiple result exprs to be analyzed to test
    * absolute path caching, though only the last path is validated.
    */
   private void testSlotRefPath(String sql, List<Integer> expectedAbsPath) {
-    SelectStmt stmt = (SelectStmt) AnalyzesOk(sql);
+    AnalysisContext ctx = createAnalysisCtx();
+    SelectStmt stmt = (SelectStmt) AnalyzesOk(sql, ctx);
     Expr e = stmt.getResultExprs().get(stmt.getResultExprs().size() - 1);
     Preconditions.checkState(e instanceof SlotRef);
-    Preconditions.checkState(e.getType().isScalarType());
+    Preconditions.checkState(!e.getType().isCollectionType());
     SlotRef slotRef = (SlotRef) e;
     List<Integer> actualAbsPath = slotRef.getDesc().getPath().getAbsolutePath();
     Assert.assertEquals("Mismatched absolute paths.", expectedAbsPath, actualAbsPath);
@@ -514,13 +525,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
     // Array of structs. No name conflicts with implicit fields. Both implicit and
     // explicit paths are allowed.
-    addTestTable("create table d.t2 (c array<struct<f:int>>)");
+    addTestTable("create table d.t2 (c array<struct<f:int>>) stored as orc");
     testSlotRefPath("select f from d.t2.c", path(0, 0, 0));
     testSlotRefPath("select item.f from d.t2.c", path(0, 0, 0));
     testSlotRefPath("select pos from d.t2.c", path(0, 1));
-    AnalysisError("select item from d.t2.c",
-        "Expr 'item' in select list returns a complex type 'STRUCT<f:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+    testSlotRefPath("select item from d.t2.c", path(0, 0));
     AnalysisError("select item.pos from d.t2.c",
         "Could not resolve column/field reference: 'item.pos'");
     // Test star expansion.
@@ -529,16 +538,14 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
     // Array of structs with name conflicts. Both implicit and explicit
     // paths are allowed.
-    addTestTable("create table d.t3 (c array<struct<f:int,item:int,pos:int>>)");
+    addTestTable("create table d.t3 (c array<struct<f:int,item:int,pos:int>>) " +
+        "stored as orc");
     testSlotRefPath("select f from d.t3.c", path(0, 0, 0));
     testSlotRefPath("select item.f from d.t3.c", path(0, 0, 0));
     testSlotRefPath("select item.item from d.t3.c", path(0, 0, 1));
     testSlotRefPath("select item.pos from d.t3.c", path(0, 0, 2));
     testSlotRefPath("select pos from d.t3.c", path(0, 1));
-    AnalysisError("select item from d.t3.c",
-        "Expr 'item' in select list returns a complex type " +
-        "'STRUCT<f:INT,item:INT,pos:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+    testSlotRefPath("select item from d.t3.c", path(0, 0));
     // Test star expansion.
     testStarPath("select * from d.t3.c", path(0, 0, 0), path(0, 0, 1), path(0, 0, 2));
     testStarPath("select c.* from d.t3.c", path(0, 0, 0), path(0, 0, 1), path(0, 0, 2));
@@ -555,37 +562,48 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
     // Map with a scalar key and struct value. No name conflicts. Both implicit and
     // explicit paths are allowed.
-    addTestTable("create table d.t5 (c map<int,struct<f:int>>)");
+    addTestTable("create table d.t5 (c map<int,struct<f:int>>) stored as orc");
     testSlotRefPath("select key from d.t5.c", path(0, 0));
     testSlotRefPath("select f from d.t5.c", path(0, 1, 0));
     testSlotRefPath("select value.f from d.t5.c", path(0, 1, 0));
     AnalysisError("select value.value from d.t5.c",
         "Could not resolve column/field reference: 'value.value'");
-    AnalysisError("select value from d.t5.c",
-        "Expr 'value' in select list returns a complex type " +
-        "'STRUCT<f:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+    testSlotRefPath("select value from d.t5.c", path(0, 1));
     // Test star expansion.
     testStarPath("select * from d.t5.c", path(0, 0), path(0, 1, 0));
     testStarPath("select c.* from d.t5.c", path(0, 0), path(0, 1, 0));
 
     // Map with a scalar key and struct value with name conflicts. Both implicit and
     // explicit paths are allowed.
-    addTestTable("create table d.t6 (c map<int,struct<f:int,key:int,value:int>>)");
+    addTestTable("create table d.t6 (c map<int,struct<f:int,key:int,value:int>>) " +
+        "stored as orc");
     testSlotRefPath("select key from d.t6.c", path(0, 0));
     testSlotRefPath("select f from d.t6.c", path(0, 1, 0));
     testSlotRefPath("select value.f from d.t6.c", path(0, 1, 0));
     testSlotRefPath("select value.key from d.t6.c", path(0, 1, 1));
     testSlotRefPath("select value.value from d.t6.c", path(0, 1, 2));
-    AnalysisError("select value from d.t6.c",
-        "Expr 'value' in select list returns a complex type " +
-        "'STRUCT<f:INT,key:INT,value:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+    testSlotRefPath("select value from d.t6.c", path(0, 1));
     // Test star expansion.
     testStarPath("select * from d.t6.c",
         path(0, 0), path(0, 1, 0), path(0, 1, 1), path(0, 1, 2));
     testStarPath("select c.* from d.t6.c",
         path(0, 0), path(0, 1, 0), path(0, 1, 1), path(0, 1, 2));
+
+    // Map with nested struct value with name conflict. Both implicit and explicit paths
+    // are allowed.
+    addTestTable("create table d.t6_nested (c map<int," +
+        "struct<f:int,key:int,value:int,s:struct<f:int,key:int,value:int>>>)" +
+        " stored as orc");
+    testSlotRefPath("select key from d.t6_nested.c", path(0,0));
+    testSlotRefPath("select value from d.t6_nested.c", path(0,1));
+    testSlotRefPath("select f from d.t6_nested.c", path(0, 1, 0));
+    testSlotRefPath("select value.key from d.t6_nested.c", path(0, 1, 1));
+    testSlotRefPath("select value.value from d.t6_nested.c", path(0, 1, 2));
+    testSlotRefPath("select value.s from d.t6_nested.c", path(0, 1, 3));
+    testSlotRefPath("select value.s.f from d.t6_nested.c", path(0, 1, 3, 0));
+    testSlotRefPath("select value.s.key from d.t6_nested.c", path(0, 1, 3, 1));
+    testSlotRefPath("select value.s.value from d.t6_nested.c", path(0, 1, 3, 2));
+
 
     // Test implicit/explicit paths on a complicated schema.
     addTestTable("create table d.t7 (" +
@@ -594,7 +612,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "c3 array<struct<a1:array<int>,a2:array<struct<x:int,y:int,a3:array<int>>>>>, " +
         "c4 bigint, " +
         "c5 map<int,struct<m1:map<int,string>," +
-        "                  m2:map<int,struct<x:int,y:int,m3:map<int,int>>>>>)");
+        "                  m2:map<int,struct<x:int,y:int,m3:map<int,int>>>>>) " +
+        "stored as orc");
 
     // Test paths with c3.
     testTableRefPath("select 1 from d.t7.c3.a1", path(2, 0, 0), null);
@@ -609,6 +628,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     testTableRefPath("select 1 from d.t7.c3.item.a2.item.a3", path(2, 0, 1, 0, 2), null);
     testSlotRefPath("select item from d.t7.c3.a2.a3", path(2, 0, 1, 0, 2, 0));
     testSlotRefPath("select item from d.t7.c3.item.a2.item.a3", path(2, 0, 1, 0, 2, 0));
+    testSlotRefPath("select item from d.t7.c3", path(2, 0));
     // Test path assembly with multiple tuple descriptors.
     testTableRefPath("select 1 from d.t7, t7.c3, c3.a2, a2.a3",
         path(2, 0, 1, 0, 2), path(2, 0, 1, 0, 2));
@@ -749,27 +769,39 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "Illegal column/field reference 'complex_nested_struct_col.f2.f11' with " +
         "intermediate collection 'f2' of type " +
         "'ARRAY<STRUCT<f11:BIGINT,f12:MAP<STRING,STRUCT<f21:BIGINT>>>>'");
+
+    // Check the support of struct in the select list for different file formats.
+    AnalysisContext ctx = createAnalysisCtx();
+    AnalysisError("select int_struct_col from functional.allcomplextypes", ctx,
+        "Querying STRUCT is only supported for ORC and Parquet file formats.");
+    AnalyzesOk("select alltypes from functional_orc_def.complextypes_structs", ctx);
+
+    // Check that a struct in the select list doesn't raise an error if it contains
+    // collections.
+    addTestTable(
+        "create table nested_structs (s1 struct<s2:struct<i:int>>) stored as orc");
+    addTestTable("create table nested_structs_with_list " +
+        "(s1 struct<s2:struct<a:array<int>>>) stored as orc");
+    AnalyzesOk("select s1 from nested_structs", ctx);
+    AnalyzesOk("select s1.s2 from nested_structs", ctx);
+    AnalyzesOk("select s1 from nested_structs_with_list", ctx);
+    AnalyzesOk("select s1.s2 from nested_structs_with_list", ctx);
   }
 
   @Test
   public void TestSlotRefPathAmbiguity() {
     addTestDb("a", null);
-    addTestTable("create table a.a (a struct<a:struct<a:int>>)");
+    addTestTable("create table a.a (a struct<a:struct<a:int>>) stored as orc");
 
     // Slot path is not ambiguous.
     AnalyzesOk("select a.a.a.a.a from a.a");
     AnalyzesOk("select t.a.a.a from a.a t");
 
-    // Slot path is not ambiguous but resolves to a struct.
-    AnalysisError("select a from a.a",
-        "Expr 'a' in select list returns a complex type 'STRUCT<a:STRUCT<a:INT>>'.\n" +
-        "Only scalar types are allowed in the select list.");
-    AnalysisError("select t.a from a.a t",
-        "Expr 't.a' in select list returns a complex type 'STRUCT<a:STRUCT<a:INT>>'.\n" +
-        "Only scalar types are allowed in the select list.");
-    AnalysisError("select t.a.a from a.a t",
-        "Expr 't.a.a' in select list returns a complex type 'STRUCT<a:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+    // Slot path is not ambiguous and resolves to a struct.
+    AnalysisContext ctx = createAnalysisCtx();
+    AnalyzesOk("select a from a.a", ctx);
+    AnalyzesOk("select t.a from a.a t", ctx);
+    AnalyzesOk("select t.a.a from a.a t", ctx);
 
     // Slot paths are ambiguous. A slot path can legally resolve to a non-scalar type,
     // even though we currently do not support non-scalar SlotRefs in the select list
@@ -964,7 +996,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   }
 
   /**
-   * Test that complex types are not allowed in the select list.
+   * Test that complex types are supported in the select list.
    */
   @Test
   public void TestComplexTypesInSelectList() {
@@ -984,35 +1016,73 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "tables only have complex-typed columns.");
     // Empty star expansion, but non empty result exprs.
     AnalyzesOk("select 1, * from only_complex_types");
-    // Illegal complex-typed expr in select list.
-    AnalysisError("select int_struct_col from functional.allcomplextypes",
-        "Expr 'int_struct_col' in select list returns a " +
-        "complex type 'STRUCT<f1:INT,f2:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
-    // Illegal complex-typed expr in a union.
-    AnalysisError("select int_struct_col from functional.allcomplextypes " +
-        "union all select int_struct_col from functional.allcomplextypes",
-        "Expr 'int_struct_col' in select list returns a " +
-        "complex type 'STRUCT<f1:INT,f2:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
-    // Illegal complex-typed expr inside inline view.
-    AnalysisError("select 1 from " +
-        "(select int_struct_col from functional.allcomplextypes) v",
-        "Expr 'int_struct_col' in select list returns a " +
-        "complex type 'STRUCT<f1:INT,f2:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+
+    // Struct in select list works only if codegen is OFF.
+    AnalysisContext ctx = createAnalysisCtx();
+    AnalyzesOk("select alltypes from functional_orc_def.complextypes_structs", ctx);
+    AnalyzesOk("select int_array_col from functional.allcomplextypes");
+    AnalyzesOk("select int_array_col from functional.allcomplextypes " +
+        "union all select int_array_col from functional.allcomplextypes");
+    AnalysisError("select int_array_col, item from functional.allcomplextypes", ctx,
+        "Could not resolve column/field reference: 'item'");
+    AnalysisError("select int_array_col, int_array_col.item " +
+        "from functional.allcomplextypes", ctx,
+        "Illegal column/field reference 'int_array_col.item' with intermediate " +
+        "collection 'int_array_col' of type 'ARRAY<INT>'");
+    AnalysisError("select tiny_struct from functional_orc_def.complextypes_structs " +
+        "union all select tiny_struct from functional_orc_def.complextypes_structs", ctx,
+        "Set operations don't support STRUCT type. STRUCT<b:BOOLEAN> in tiny_struct");
+    AnalyzesOk("select 1 from " +
+        "(select int_array_col from functional.allcomplextypes) v");
+    AnalyzesOk("select int_array_col from " +
+        "(select int_array_col from functional.allcomplextypes) v");
+    // Structs are allowed in an inline view.
+    AnalyzesOk("select v.ts from (select tiny_struct as ts from " +
+        "functional_orc_def.complextypes_structs) v;", ctx);
     // Illegal complex-typed expr in an insert.
     AnalysisError("insert into functional.allcomplextypes " +
-        "select int_struct_col from functional.allcomplextypes",
-        "Expr 'int_struct_col' in select list returns a " +
-        "complex type 'STRUCT<f1:INT,f2:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+        "select int_array_col from functional.allcomplextypes",
+        "Unable to INSERT into target table (functional.allcomplextypes) because " +
+        "the column 'int_array_col' has a complex type 'ARRAY<INT>' and Impala " +
+        "doesn't support inserting into tables containing complex type columns");
     // Illegal complex-typed expr in a CTAS.
     AnalysisError("create table new_tbl as " +
-        "select int_struct_col from functional.allcomplextypes",
-        "Expr 'int_struct_col' in select list returns a " +
-        "complex type 'STRUCT<f1:INT,f2:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
+        "select int_array_col from functional.allcomplextypes",
+        "Unable to INSERT into target table (default.new_tbl) because the column " +
+        "'int_array_col' has a complex type 'ARRAY<INT>' and Impala doesn't support " +
+        "inserting into tables containing complex type columns");
+    AnalysisError("create table new_tbl as " +
+        "select tiny_struct from functional_orc_def.complextypes_structs", ctx,
+        "Unable to INSERT into target table (default.new_tbl) because the column " +
+            "'tiny_struct' has a complex type 'STRUCT<b:BOOLEAN>' and Impala doesn't " +
+            "support inserting into tables containing complex type columns");
+
+    //Make complex types available in star queries
+    ctx.getQueryOptions().setExpand_complex_types(true);
+
+    AnalyzesOk("select * from functional_parquet.complextypes_structs",ctx);
+    AnalyzesOk("select * from functional_parquet.complextypes_nested_structs",ctx);
+    AnalyzesOk("select * from functional_parquet.complextypes_maps_view",ctx);
+
+    AnalyzesOk("select outer_struct.str, outer_struct.* from " +
+            "functional_parquet.complextypes_nested_structs",ctx);
+    AnalyzesOk("select * from (select * from " +
+            "functional_parquet.complextypes_nested_structs) v",ctx);
+    AnalyzesOk("select * from (select int_map, int_map_array from " +
+            "functional_parquet.complextypestbl) v",ctx);
+
+    AnalyzesOk("select * from functional_parquet.complextypes_arrays",ctx);
+    AnalyzesOk("select * from " +
+            "functional_parquet.complextypes_arrays_only_view",ctx);
+    AnalyzesOk("select v.id, v.* from " +
+            "(select * from functional_parquet.complextypes_arrays) v",ctx);
+
+    // Allow also structs in collections and vice versa.
+    AnalyzesOk("select * from functional_parquet.allcomplextypes", ctx);
+    AnalyzesOk("select * from functional_orc_def.complextypestbl", ctx);
+
+    AnalysisError("select * from functional_parquet.binary_in_complex_types", ctx,
+        "Binary type inside collection types is not supported (IMPALA-11491).");
   }
 
   @Test
@@ -1138,9 +1208,10 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   // HAVING is an expression, not a list like GROUP BY or ORDER BY.
   // Verify that an integer is treated as a constant, not an ordinal.
   @Test
-  public void TestHavingIntegers() throws AnalysisException {
-    if (SelectStmt.ALLOW_ORDINALS_IN_HAVING) {
+  public void TestHavingIntegers() {
+    try {
       // Legacy 3.x functionality
+      BackendConfig.INSTANCE.setAllowOrdinalsInHaving(true);
       AnalyzesOk("select not bool_col as nb from functional.alltypes having 1");
       AnalysisError("select count(*) from functional.alltypes having 1",
           "HAVING clause 'count(*)' requires return type 'BOOLEAN'. " +
@@ -1151,15 +1222,15 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
           "sum(id) OVER (ORDER BY id ASC)");
       AnalysisError("select sum(id) over(order by id) from functional.alltypes having -1",
           "HAVING: ordinal must be >= 1: -1");
-    } else {
       // Forward-looking, post 3.x functionality
       // IMPALA-7844: Ordinals not supported in HAVING since
       // HAVING is an expression, not a list like GROUP BY or ORDER BY.
+      BackendConfig.INSTANCE.setAllowOrdinalsInHaving(false);
       AnalysisError("select not bool_col as nb from functional.alltypes having 1",
           "HAVING clause '1' requires return type 'BOOLEAN'. " +
           "Actual type is 'TINYINT'.");
       AnalysisError("select not bool_col as nb from functional.alltypes having -1",
-          "HAVING clause '1' requires return type 'BOOLEAN'. " +
+          "HAVING clause '-1' requires return type 'BOOLEAN'. " +
           "Actual type is 'TINYINT'.");
       // Constant exprs should not be interpreted as ordinals
       AnalysisError("select int_col, bool_col, count(*) from functional.alltypes " +
@@ -1170,6 +1241,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
           "group by 1, 2 having if(TRUE, 2, int_col)",
           "HAVING clause 'if(TRUE, 2, int_col)' requires return type 'BOOLEAN'. " +
           "Actual type is 'INT'.");
+    } finally {
+      BackendConfig.INSTANCE.setAllowOrdinalsInHaving(false);
     }
   }
 
@@ -1610,6 +1683,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError("select * from functional.alltypes a full outer join " +
         "functional.alltypes b",
         "FULL OUTER JOIN requires an ON or USING clause");
+
+    // BINARY columns can be used in joins.
+    AnalyzesOk("select * from functional.binary_tbl a join " +
+        "functional.binary_tbl b on a.binary_col = b.binary_col");
+    AnalyzesOk("select * from functional.binary_tbl a join " +
+        "functional.binary_tbl b using (binary_col)");
   }
 
   @Test
@@ -1901,7 +1980,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         // Table hints not supported for HBase tables
         AnalyzesOk(String.format("select * from functional_hbase.alltypes %s " +
               "%sschedule_random_replica%s", alias, prefix, suffix),
-            "Table hints only supported for Hdfs tables");
+            "Table hints only supported for Hdfs/Kudu tables");
         // Table hints not supported for catalog views
         AnalyzesOk(String.format("select * from functional.alltypes_view %s " +
               "%sschedule_random_replica%s", alias, prefix, suffix),
@@ -1928,7 +2007,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   */
   private boolean hasStraightJoin(String stmt, String expectedWarning){
     AnalysisContext ctx = createAnalysisCtx();
-    AnalyzesOk(stmt,ctx, expectedWarning);
+    if (expectedWarning == null) {
+      AnalyzesOkWithoutWarnings(stmt, ctx);
+    } else {
+      AnalyzesOk(stmt, ctx, expectedWarning);
+    }
     return ctx.getAnalyzer().isStraightJoin();
   }
 
@@ -2171,7 +2254,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "aggregation without a FROM clause is not allowed");
     AnalysisError(
         "select aggfn(int_col) over (partition by int_col) from functional.alltypesagg",
-        "Aggregate function 'default.aggfn(int_col)' not supported with OVER clause.");
+        "Aggregate function 'default.aggfn(int_col) /* NATIVE UDF */' not supported " +
+        "with OVER clause.");
     AnalysisError("select aggfn(distinct int_col) from functional.alltypesagg",
         "User defined aggregates do not support DISTINCT.");
     AnalyzesOk("select default.aggfn(int_col) from functional.alltypes");
@@ -2229,7 +2313,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "aggregate function must not contain analytic parameters");
     AnalysisError("select min(aggfn(int_col)) from functional.alltypes",
         "aggregate function must not contain aggregate parameters: " +
-        "min(default.aggfn(int_col))");
+        "min(default.aggfn(int_col) /* NATIVE UDF */)");
 
     // wrong type
     AnalysisError("select sum(timestamp_col) from functional.alltypes",
@@ -2240,6 +2324,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "SUM requires a numeric parameter: sum(string_col)");
     AnalysisError("select avg(string_col) from functional.alltypes",
         "AVG requires a numeric or timestamp parameter: avg(string_col)");
+    AnalysisError("select avg(binary_col) from functional.binary_tbl",
+        "AVG requires a numeric or timestamp parameter: avg(binary_col)");
+
 
     // aggregate requires table in the FROM clause
     AnalysisError("select count(*)", "aggregation without a FROM clause is not allowed");
@@ -2265,6 +2352,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select ndv(date_col), distinctpc(date_col), distinctpcsa(date_col), "
         + "count(distinct date_col) from functional.date_tbl");
 
+    // Binary
+    AnalyzesOk("select min(binary_col), max(binary_col), count(binary_col), "
+        + "max(length(binary_col)) from functional.binary_tbl");
+    AnalysisError("select ndv(binary_col) from functional.binary_tbl",
+        "No matching function with signature: ndv(BINARY).");
+
     // Test select stmt avg smap.
     AnalyzesOk("select cast(avg(c1) as decimal(10,4)) as c from " +
         "functional.decimal_tiny group by c3 having cast(avg(c1) as " +
@@ -2279,6 +2372,313 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     checkExprType("select max(cs) from functional.chars_tiny", ScalarType.STRING);
     checkExprType("select max(lower(cs)) from functional.chars_tiny",
         ScalarType.STRING);
+  }
+
+  /**
+   * Test ROLLUP, CUBE and GROUPING SETS functionality.
+   */
+  @Test
+  public void TestGroupingSets() throws AnalysisException {
+    // Basic examples of each clause.
+    AnalyzesOk("select count(*) from functional.alltypes " +
+        "group by rollup(int_col, string_col)");
+    AnalyzesOk("select count(*) from functional.alltypes " +
+        "group by int_col, string_col with rollup");
+    AnalyzesOk("select count(*) from functional.alltypes " +
+        "group by int_col, string_col with cube");
+    AnalyzesOk("select count(*) from functional.alltypes " +
+        "group by GROUPING SETS((int_col), (string_col))");
+
+    // Test limits for number of distinct expressions
+    StringBuilder sb = new StringBuilder();
+    for (int i = 1; i <= 25; ++i) {
+      sb.append("bool_col" + i + ", tinyint_col" + i + ", smallint_col" + i +
+                ", int_col" + i + ", bigint_col" + i + ", float_col" + i +
+                ", double_col" + i + ", string_col" + i);
+      if (i != 25) {
+        sb.append(",");
+      }
+    }
+    String longColList = sb.toString();
+    AnalysisError("select count(*) from functional.widetable_250_cols " +
+        "group by rollup(" + longColList + ")",
+        "Number of grouping columns (200) exceeds GROUP BY with ROLLUP limit of 63");
+    AnalysisError("select count(*) from functional.widetable_250_cols " +
+        "group by cube(" + longColList + ")",
+        "Number of grouping columns (200) exceeds GROUP BY with CUBE limit of 63");
+    AnalysisError("select count(*) from functional.widetable_250_cols " +
+        "group by grouping sets((" + longColList + "))",
+        "Number of grouping columns (200) exceeds GROUP BY with SETS limit of 63");
+
+    // Duplicating the same column shouldn't increase distinct column count.
+    AnalysisError("select count(*) from functional.widetable_250_cols " +
+        "group by grouping sets((" + longColList + ", string_col1), " +
+        "(bool_col1, int_col1))",
+        "Number of grouping columns (200) exceeds GROUP BY with SETS limit of 63");
+
+    // Grouping sets with overlapping expression lists doesn't hit limit, since exprs are
+    // deduplicated.
+    AnalyzesOk("select count(*) from functional.widetable_250_cols " +
+      "group by grouping sets(( " +
+      "  bool_col1, tinyint_col1, smallint_col1, int_col1, bigint_col1, " +
+      "  float_col1, double_col1, string_col1, " +
+      "  bool_col2, tinyint_col2, smallint_col2, int_col2, bigint_col2, " +
+      "  float_col2, double_col2, string_col2, " +
+      "  bool_col3, tinyint_col3, smallint_col3, int_col3, bigint_col3, " +
+      "  float_col3, double_col3, string_col3, " +
+      "  bool_col4, tinyint_col4, smallint_col4, int_col4, bigint_col4, " +
+      "  float_col4, double_col4, string_col4, " +
+      "  bool_col5, tinyint_col5, smallint_col5, int_col5, bigint_col5, " +
+      "  float_col5, double_col5, string_col5, " +
+      "  bool_col6, tinyint_col6, smallint_col6, int_col6, bigint_col6, " +
+      "  float_col6, double_col6, string_col6, " +
+      "  bool_col7, tinyint_col7, smallint_col7, int_col7, bigint_col7, " +
+      "  float_col7, double_col7, string_col7), " +
+      "  (bool_col1, tinyint_col1, smallint_col1, int_col1, bigint_col1, " +
+      "  float_col1, double_col1, string_col1, " +
+      "  bool_col2, tinyint_col2, smallint_col2, int_col2, bigint_col2, " +
+      "  float_col2, double_col2, string_col2)); ");
+
+    // Test limit of number of distinct grouping sets - 63. CUBE with 6 grouping exprs
+    // results in 2^6 = 64 distinct grouping sets. CUBE with 5 grouping exprs and ROLLUP
+    // with 6 grouping exprs are both under the limit.
+    AnalyzesOk("select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
+        "float_col, count(*) " +
+        "from functional.alltypes " +
+        "group by rollup(id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
+        "float_col)");
+    AnalyzesOk("select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
+        "count(*) " +
+        "from functional.alltypes " +
+        "group by cube(id, bool_col, tinyint_col, smallint_col, int_col, bigint_col)");
+    AnalysisError("select id, bool_col, tinyint_col, smallint_col, int_col, " +
+        "bigint_col, float_col, count(*) " +
+        "from functional.alltypes " +
+        "group by cube(id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
+        "float_col)",
+        "Limit of 64 grouping sets exceeded");
+
+
+    // Basic test cases where grouping exprs are subset and superset of select list.
+    AnalyzesOk("select int_col, count(*) from functional.alltypes " +
+        "group by rollup(int_col, string_col)");
+    AnalyzesOk("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by rollup(int_col, string_col)");
+    AnalysisError("select int_col, bool_col, string_col, count(*) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "select list expression not produced by aggregation output " +
+        "(missing from GROUP BY clause?): bool_col");
+    AnalyzesOk("select int_col, count(*) from functional.alltypes " +
+        "group by cube(int_col, string_col)");
+    AnalyzesOk("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by cube(int_col, string_col)");
+    AnalysisError("select int_col, bool_col, string_col, count(*) " +
+        "from functional.alltypes " +
+        "group by cube(int_col, string_col)",
+        "select list expression not produced by aggregation output " +
+        "(missing from GROUP BY clause?): bool_col");
+    AnalyzesOk("select int_col, count(*) from functional.alltypes " +
+        "group by grouping sets((int_col, string_col), (int_col))");
+    AnalyzesOk("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by grouping sets((int_col, string_col), (int_col))");
+    AnalysisError("select int_col, bool_col, string_col, count(*) " +
+        "from functional.alltypes " +
+        "group by grouping sets((int_col, string_col), (int_col))",
+        "select list expression not produced by aggregation output " +
+        "(missing from GROUP BY clause?): bool_col");
+
+    // Support for ordinals.
+    AnalyzesOk("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by rollup(1, 2)");
+    AnalyzesOk("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by cube(1, 2)");
+    AnalyzesOk("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by grouping sets((1, 2), (1))");
+    AnalysisError("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by rollup(1, 3)",
+        "GROUP BY expression must not contain aggregate functions: 3");
+    AnalysisError("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by cube(1, 3)",
+        "GROUP BY expression must not contain aggregate functions: 3");
+    AnalysisError("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by grouping sets((1, 3), (1))",
+        "GROUP BY expression must not contain aggregate functions: 3");
+
+    // Refer to same column by name and ordinal in grouping sets.
+    AnalyzesOk("select int_col, string_col, count(*) from functional.alltypes " +
+        "group by grouping sets((1, 2), (int_col))");
+
+    // Group by non-trivial expressions not in select list
+    AnalyzesOk("select count(*) from functional.alltypes " +
+        "group by rollup(int_col, substring(string_col, 1, 2))");
+    AnalyzesOk("select int_col, count(*) from functional.alltypes " +
+        "group by cube(int_col, substring(string_col, 1, 2))");
+    AnalyzesOk("select int_col, count(*) from functional.alltypes " +
+        "group by grouping sets((int_col), (int_col, substring(string_col, 1, 2)))");
+
+    // Group by non-trivial expressions in select list
+    AnalyzesOk("select int_col, substring(string_col, 1, 2) str, count(*) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, substring(string_col, 1, 2))");
+    AnalyzesOk("select int_col, substring(string_col, 1, 2) str, count(*) " +
+        "from functional.alltypes " +
+        "group by cube(int_col, str)");
+    AnalyzesOk("select int_col, substring(string_col, 1, 2) str, count(*) " +
+        "from functional.alltypes " +
+        "group by grouping sets((int_col, str), (substring(string_col, 1, 2)))");
+
+    // Expressions in select list must appear in group by.
+    AnalysisError("select int_col, substring(string_col, 1, 3) str, count(*) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, substring(string_col, 1, 2))",
+        "select list expression not produced by aggregation output (missing from " +
+        "GROUP BY clause?): substring(string_col, 1, 3)");
+
+    // Use the expression and an alias.
+    AnalyzesOk("select int_col, substring(string_col, 1, 2) str, count(*) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, str, substring(string_col, 1, 2))");
+
+    // Group by constant expression.
+    AnalyzesOk("select int_col, count(*) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, 'constant')");
+    AnalyzesOk("select int_col, count(*) " +
+        "from functional.alltypes " +
+        "group by cube(int_col, 'constant')");
+    AnalyzesOk("select int_col, count(*) " +
+        "from functional.alltypes " +
+        "group by grouping sets((false), (int_col, 'constant'))");
+
+    // Subqueries with grouping sets inside and outside subquery.
+    AnalyzesOk("select g.int_col, count(*) " +
+        "from functional.alltypesagg g " +
+        "left outer join functional.alltypes a on g.id = a.id " +
+        "where g.int_col < 100 and g.tinyint_col < ( " +
+        "  select count(*) from functional.alltypes t " +
+        "  where t.id = g.id and g.string_col = t.string_col and t.bool_col = true) " +
+        "group by rollup(g.int_col, g.string_col) " +
+        "having count(*) < 100");
+    AnalysisError("select g.int_col, count(*) " +
+        "from functional.alltypesagg g " +
+        "where g.int_col < 100 and g.tinyint_col < ( " +
+        "  select count(*) from functional.alltypes t " +
+        "  where t.id = g.id and g.string_col = t.string_col and t.bool_col = true " +
+        "  group by rollup(t.string_col, t.bool_col)) " +
+        "  group by g.int_col",
+        "Unsupported correlated subquery with grouping and/or aggregation");
+
+    // Combining grouping sets and distinct aggregations is not supported at this point.
+    // See IMPALA-9914.
+    AnalysisError("select count(distinct id) from functional.alltypes " +
+        "group by rollup(int_col, bool_col)",
+        "Distinct aggregate functions and grouping sets are not supported in the same " +
+        "query block.");
+    AnalysisError("select count(distinct id), count(distinct string_col) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, bool_col)",
+        "Distinct aggregate functions and grouping sets are not supported in the same " +
+        "query block.");
+
+    // Combining DISTINCT and GROUP BY is not supported in general, not just for grouping
+    // sets.
+    AnalysisError("select distinct int_col, bool_col, count(*) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, bool_col)",
+        "cannot combine SELECT DISTINCT with aggregate functions or GROUP BY");
+
+    // grouping_id() and grouping() are aggregate functions that can be used in any
+    // GROUP BY, even though they are only meaningful in conjunction with
+    // CUBE/ROLLUP/GROUPING SETS. grouping() must reference exactly one of the grouping
+    // columns.
+    AnalyzesOk("select int_col, string_col, grouping_id(), grouping(int_col), " +
+        "grouping(string_col) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, string_col)");
+    AnalyzesOk("select int_col, string_col, grouping_id(), grouping(int_col), " +
+        "grouping(string_col) " +
+        "from functional.alltypes " +
+        "group by cube(int_col, string_col)");
+    AnalyzesOk("select int_col, string_col, grouping_id(), grouping(int_col), " +
+        "grouping(string_col) " +
+        "from functional.alltypes " +
+        "group by grouping sets((), (int_col, string_col))");
+
+    // grouping_id() can reference a variable number of grouping columns.
+    AnalyzesOk("select int_col, string_col, grouping_id(int_col, string_col), " +
+        "grouping(string_col) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, string_col)");
+
+    // Non-trivial expressions involving grouping_id().
+    AnalyzesOk("select bitand(grouping_id(), 1), cast(grouping(int_col) as string) " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, string_col)");
+
+    // grouping() can reference non-trivial grouping expressions
+    AnalyzesOk("select int_col * 2, string_col, grouping(int_col * 2),  count(*) " +
+        "from functional.alltypes " +
+        "group by rollup(1, 2)");
+
+    // grouping_id() and grouping() can be used in conjunction with a plain GROUP BY.
+    AnalyzesOk("select int_col, string_col, grouping_id() " +
+        "from functional.alltypes " +
+        "group by int_col, string_col");
+    AnalyzesOk("select int_col, string_col, grouping(int_col) " +
+        "from functional.alltypes " +
+        "group by int_col, string_col");
+
+    // grouping() and grouping_id() can be used in the degenerate case of a single
+    // grouping set.
+    AnalyzesOk("select int_col, string_col, grouping_id(), grouping(int_col) " +
+        "from functional.alltypes " +
+        "group by grouping sets((int_col, string_col))");
+
+    // grouping() raises analysis error if given wrong number of args.
+    AnalysisError("select int_col, string_col, grouping(int_col, string_col) " +
+        "from functional.alltypes " +
+        "group by grouping sets((), (int_col, string_col))",
+        "No matching function with signature: grouping(INT, STRING).");
+    AnalysisError("select int_col, string_col, grouping() " +
+        "from functional.alltypes " +
+        "group by grouping sets((), (int_col, string_col))",
+        "No matching function with signature: grouping().");
+
+    // grouping() and grouping_id() must reference grouping expressions.
+    AnalysisError("select int_col, grouping('test') from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "'test' is not a grouping expression");
+    AnalysisError("select int_col, grouping(1) from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "1 is not a grouping expression");
+    AnalysisError("select grouping(tinyint_col) from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "tinyint_col is not a grouping expression");
+    AnalysisError("select count(*), grouping(count(*)) from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "aggregate function must not contain aggregate parameters: grouping(count(*))");
+    AnalysisError("select int_col, grouping_id(int_col, 'test') " +
+        "from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "'test' is not a grouping expression");
+    AnalysisError("select int_col, grouping_id(1) from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "1 is not a grouping expression");
+    AnalysisError("select grouping_id(int_col, tinyint_col) from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "tinyint_col is not a grouping expression");
+    AnalysisError("select count(*), grouping_id(count(*)) from functional.alltypes " +
+        "group by rollup(int_col, string_col)",
+        "count(*) is not a grouping expression");
+
+    // grouping() and grouping_id() require GROUP BY clause.
+    AnalysisError("select int_col, grouping(int_col) from functional.alltypes",
+        "grouping() or grouping_id() function requires a GROUP BY clause: '" +
+        "grouping(int_col)'");
+    AnalysisError("select int_col, grouping_id() from functional.alltypes",
+        "grouping() or grouping_id() function requires a GROUP BY clause: '" +
+        "grouping_id()'");
   }
 
   @Test
@@ -2530,6 +2930,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "group by 1, 2");
     AnalyzesOk("select date_part, date_col, count(*) from functional.date_tbl " +
         "group by 1, 2");
+    AnalyzesOk("select binary_col, count(*) from functional.binary_tbl " +
+        "group by binary_col");
 
     // doesn't group by all non-agg select list items
     AnalysisError("select zip, count(*) from functional.testtbl",
@@ -2629,6 +3031,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "order by true asc, false desc, NULL asc");
     AnalyzesOk("select d1, d2 from functional.decimal_tbl order by d1");
     AnalyzesOk("select date_col, date_part from functional.date_tbl order by date_col");
+    AnalyzesOk("select string_col from functional.binary_tbl order by binary_col");
 
     // resolves ordinals
     AnalyzesOk("select zip, id from functional.testtbl order by 1");
@@ -2702,13 +3105,202 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
                "ORDER BY timestamp_col");
 
     // Ordering by complex-typed expressions is not allowed.
-    AnalysisError("select * from functional_parquet.allcomplextypes " +
-        "order by int_struct_col", "ORDER BY expression 'int_struct_col' with " +
-        "complex type 'STRUCT<f1:INT,f2:INT>' is not supported.");
+    AnalysisError("select * from functional_orc_def.complextypes_structs " +
+        "order by tiny_struct", "ORDER BY expression 'tiny_struct' with " +
+        "complex type 'STRUCT<b:BOOLEAN>' is not supported.");
     AnalysisError("select * from functional_parquet.allcomplextypes " +
         "order by int_array_col", "ORDER BY expression 'int_array_col' with " +
         "complex type 'ARRAY<INT>' is not supported.");
   }
+
+  @Test
+  public void TestSetOperations() {
+    // Tests for SetOperationStmt analysis which includes intersect, except and union
+    AnalyzesOk("select rank() over (order by int_col) from functional.alltypes " +
+        "intersect select int_col from functional.alltypessmall");
+    // Selects on same table without aliases.
+    AnalyzesOk("select int_col from functional.alltypes intersect " +
+        "select int_col from functional.alltypes");
+    // Longer union chain.
+    AnalyzesOk("select int_col from functional.alltypes union " +
+        "select int_col from functional.alltypes " +
+        "intersect select int_col from functional.alltypes except " +
+        "select int_col from functional.alltypes");
+
+    // Nesting
+    AnalyzesOk("(select int_col from functional.alltypes " +
+        "intersect (select tinyint_col from functional.alltypessmall union " +
+                  " select tinyint_col from functional.alltypessmall) except " +
+                  " select tinyint_col from functional.alltypestiny where id = 1) " +
+        "union (select tinyint_col from functional.alltypessmall) ");
+
+    // All columns, perfectly compatible.
+    AnalyzesOk("select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
+        "float_col, double_col, date_string_col, string_col, timestamp_col, year," +
+        "month from functional.alltypes union " +
+        "select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
+        "float_col, double_col, date_string_col, string_col, timestamp_col, year," +
+        "month from functional.alltypes");
+    // Make sure table aliases aren't visible across union operands.
+    AnalyzesOk("select a.smallint_col from functional.alltypes a " +
+        "union select a.int_col from functional.alltypessmall a");
+    // All columns compatible with NULL.
+    AnalyzesOk("select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
+        "float_col, double_col, date_string_col, string_col, timestamp_col, year," +
+        "month from functional.alltypes union " +
+        "select NULL, NULL, NULL, NULL, NULL, NULL, " +
+        "NULL, NULL, NULL, NULL, NULL, NULL," +
+        "NULL from functional.alltypes");
+
+    // No from clause. Has literals and NULLs. Requires implicit casts.
+    AnalyzesOk("select 1, 2, 3 " +
+        "union select NULL, NULL, NULL " +
+        "union select 1.0, NULL, 3 " +
+        "union select NULL, 10, NULL");
+    // Implicit casts on integer types.
+    AnalyzesOk("select tinyint_col from functional.alltypes " +
+        "union select smallint_col from functional.alltypes " +
+        "union select int_col from functional.alltypes " +
+        "union select bigint_col from functional.alltypes");
+    // Implicit casts on float types.
+    AnalyzesOk("select float_col from functional.alltypes union " +
+        "select double_col from functional.alltypes");
+    // Implicit casts on all numeric types with two columns from each select.
+    AnalyzesOk("select tinyint_col, double_col from functional.alltypes " +
+        "union select smallint_col, float_col from functional.alltypes " +
+        "union select int_col, bigint_col from functional.alltypes " +
+        "union select bigint_col, int_col from functional.alltypes " +
+        "union select float_col, smallint_col from functional.alltypes " +
+        "union select double_col, tinyint_col from functional.alltypes");
+
+    // With order by, offset and limit.
+    AnalyzesOk("(select int_col from functional.alltypes) " +
+        "union (select tinyint_col from functional.alltypessmall) " +
+        "order by int_col limit 1");
+    AnalyzesOk("(select int_col from functional.alltypes) " +
+        "union (select tinyint_col from functional.alltypessmall) " +
+        "order by int_col");
+    AnalyzesOk("(select int_col from functional.alltypes) " +
+        "union (select tinyint_col from functional.alltypessmall) " +
+        "order by int_col offset 5");
+    // Order by w/o limit is ignored in the union operand below.
+    AnalyzesOk("select int_col from functional.alltypes order by int_col " +
+        "union (select tinyint_col from functional.alltypessmall) ");
+    AnalysisError("select int_col from functional.alltypes order by int_col offset 5 " +
+        "union (select tinyint_col from functional.alltypessmall) ",
+        "Order-by with offset without limit not supported in nested queries");
+    AnalysisError("select int_col from functional.alltypes offset 5 " +
+        "union (select tinyint_col from functional.alltypessmall) ",
+        "OFFSET requires an ORDER BY clause: OFFSET 5");
+    // Order by w/o limit is ignored in the union operand below.
+    AnalyzesOk("select int_col from functional.alltypes " +
+        "union (select tinyint_col from functional.alltypessmall " +
+        "order by tinyint_col) ");
+    AnalysisError("select int_col from functional.alltypes " +
+        "union (select tinyint_col from functional.alltypessmall " +
+        "order by tinyint_col offset 5) ",
+        "Order-by with offset without limit not supported in nested queries");
+    AnalysisError("select int_col from functional.alltypes " +
+        "union (select tinyint_col from functional.alltypessmall offset 5) ",
+        "OFFSET requires an ORDER BY clause: OFFSET 5");
+    // Bigger order by.
+    AnalyzesOk("(select tinyint_col, double_col from functional.alltypes) " +
+        "union (select smallint_col, float_col from functional.alltypes) " +
+        "union (select int_col, bigint_col from functional.alltypes) " +
+        "union (select bigint_col, int_col from functional.alltypes) " +
+        "order by double_col, tinyint_col");
+    // Multiple union operands with valid order by clauses.
+    AnalyzesOk("select int_col from functional.alltypes order by int_col " +
+        "union select int_col from functional.alltypes order by int_col limit 10 " +
+        "union (select int_col from functional.alltypes " +
+        "order by int_col limit 10 offset 5) order by int_col offset 5");
+    // Bigger order by with ordinals.
+    AnalyzesOk("(select tinyint_col, double_col from functional.alltypes) " +
+        "union (select smallint_col, float_col from functional.alltypes) " +
+        "union (select int_col, bigint_col from functional.alltypes) " +
+        "union (select bigint_col, int_col from functional.alltypes) " +
+        "order by 2, 1");
+
+    // Unequal number of columns.
+    AnalysisError("select int_col from functional.alltypes " +
+        "union select int_col, float_col from functional.alltypes",
+        "Operands have unequal number of columns:\n" +
+        "'SELECT int_col FROM functional.alltypes' has 1 column(s)\n" +
+        "'SELECT int_col, float_col FROM functional.alltypes' has 2 column(s)");
+    // Unequal number of columns, longer union chain.
+    AnalysisError("select int_col from functional.alltypes " +
+        "union select tinyint_col from functional.alltypes " +
+        "union select smallint_col from functional.alltypes " +
+        "union select smallint_col, bigint_col from functional.alltypes",
+        "Operands have unequal number of columns:\n" +
+        "'SELECT int_col FROM functional.alltypes' has 1 column(s)\n" +
+        "'SELECT smallint_col, bigint_col FROM functional.alltypes' has 2 column(s)");
+    // Incompatible types.
+    AnalysisError("select bool_col from functional.alltypes " +
+        "union select lag(string_col) over(order by int_col) from functional.alltypes",
+        "Incompatible return types 'BOOLEAN' and 'STRING' of exprs " +
+        "'bool_col' and 'lag(string_col, 1, NULL)'.");
+    // Incompatible types, longer union chain.
+    AnalysisError("select int_col, string_col from functional.alltypes " +
+        "union select tinyint_col, bool_col from functional.alltypes " +
+        "union select smallint_col, int_col from functional.alltypes " +
+        "union select smallint_col, bool_col from functional.alltypes",
+        "Incompatible return types 'STRING' and 'BOOLEAN' of " +
+            "exprs 'string_col' and 'bool_col'.");
+    // Invalid ordinal in order by.
+    AnalysisError("(select int_col from functional.alltypes) " +
+        "union (select int_col from functional.alltypessmall) order by 2",
+        "ORDER BY: ordinal exceeds the number of items in the SELECT list: 2");
+    // Ambiguous order by.
+    AnalysisError("(select int_col a, string_col a from functional.alltypes) " +
+        "union (select int_col a, string_col a " +
+        "from functional.alltypessmall) order by a",
+        "ORDER BY: ambiguous alias: 'a'");
+    // Ambiguous alias in the second union operand should work.
+    AnalyzesOk("(select int_col a, string_col b from functional.alltypes) " +
+        "union (select int_col a, string_col a " +
+        "from functional.alltypessmall) order by a");
+    // Ambiguous alias even though the exprs of the first operand are identical
+    // (the corresponding in exprs in the other operand are different)
+    AnalysisError("select int_col a, int_col a from functional.alltypes " +
+        "union all (select 1, bigint_col from functional.alltypessmall) order by a",
+        "ORDER BY: ambiguous alias: 'a'");
+
+    // Column labels are inherited from first select block.
+    // Order by references an invalid column
+    AnalysisError("(select smallint_col from functional.alltypes) " +
+        "union (select int_col from functional.alltypessmall) order by int_col",
+        "Could not resolve column/field reference: 'int_col'");
+    // Make sure table aliases aren't visible across union operands.
+    AnalysisError("select a.smallint_col from functional.alltypes a " +
+        "union select a.int_col from functional.alltypessmall",
+        "Could not resolve column/field reference: 'a.int_col'");
+
+    // Regression test for IMPALA-1128, union of decimal and an int type that converts
+    // to the identical decimal.
+    AnalyzesOk("select cast(1 as bigint) union select cast(1 as decimal(19, 0))");
+
+    AnalysisContext decimalV1Ctx = createAnalysisCtx();
+    decimalV1Ctx.getQueryOptions().setDecimal_v2(false);
+    AnalysisContext decimalV2Ctx = createAnalysisCtx();
+    decimalV2Ctx.getQueryOptions().setDecimal_v2(true);
+
+    // IMPALA-6518: union of two incompatible decimal columns. There is no implicit cast
+    // if decimal_v2 is enabled.
+    String query = "select cast(123 as decimal(38, 0)) " +
+        "union all select cast(0.789 as decimal(38, 38))";
+    AnalyzesOk(query, decimalV1Ctx);
+    AnalysisError(query, decimalV2Ctx, "Incompatible return types 'DECIMAL(38,0)' and " +
+        "'DECIMAL(38,38)' of exprs 'CAST(123 AS DECIMAL(38,0))' and " +
+        "'CAST(0.789 AS DECIMAL(38,38))'.");
+
+    query = "select cast(123 as double) " +
+        "union all select cast(0.456 as float)" +
+        "union all select cast(0.789 as decimal(38, 38))";
+    AnalyzesOk(query, decimalV1Ctx);
+    AnalyzesOk(query, decimalV2Ctx);
+  }
+
 
   @Test
   public void TestUnion() {
@@ -2904,6 +3496,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "partition (year, month) " +
         "values(1, true, 1, 1, 1, 1, cast(1.0 as float), cast(1.0 as double), " +
         "'a', 'a', cast(0 as timestamp), 2009, 10)");
+
+    assertEquals("SELECT 1", AnalyzesOk("values (1)").toSql(ToSqlOptions.REWRITTEN));
+
     // Values stmt with multiple rows.
     AnalyzesOk("values((1, 2, 3), (4, 5, 6))");
     AnalyzesOk("select * from (values('a', 'b', 'c')) as t");
@@ -2927,6 +3522,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "'b', 'b', cast(0 as timestamp), 2009, 2)," +
         "(3, true, 3, 3, 3, 3, cast(3.0 as float), cast(3.0 as double), " +
         "'c', 'c', cast(0 as timestamp), 2009, 3))");
+
+    assertEquals("SELECT 1 UNION ALL SELECT 2",
+        AnalyzesOk("values (1), (2)").toSql(ToSqlOptions.REWRITTEN));
 
     // Test multiple aliases. Values() is like union, the column labels are 'x' and 'y'.
     AnalyzesOk("values((1 as x, 'a' as y), (2 as k, 'b' as j))");
@@ -2960,6 +3558,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "Target table 'functional.alltypes' is incompatible with source expressions.\n" +
         "Expression ''a'' (type: STRING) is not compatible with column 'tinyint_col'" +
         " (type: TINYINT)");
+    // Regression test for IMPALA-12042: Transitive compatibility is not
+    // allowed (boolean -> tinyint -> decimal(4,1))
+    AnalysisError("values (true), (123), (111.0)",
+        "Incompatible return types 'DECIMAL(4,1)' and 'BOOLEAN'"
+            + " of exprs '111.0' and 'TRUE'");
   }
 
   @Test
@@ -3050,7 +3653,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "select * from t1 union all select * from T2 union all select * from t3 " +
         "union all select * from T4 union all select * from t5");
 
-    // Multiple WITH clauses. One for the UnionStmt and one for each union operand.
+    // Multiple WITH clauses. One for the SetOperationStmt and one for each union operand.
     AnalyzesOk("with t1 as (values('a', 'b')) " +
         "(with t2 as (values('c', 'd')) select * from t2) union all" +
         "(with t3 as (values('e', 'f')) select * from t3) order by 1 limit 1");
@@ -3379,21 +3982,22 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
       // Source must be HDFS or S3A.
       AnalysisError(String.format("load data inpath '%s' %s into table " +
           "tpch.lineitem", "file:///test-warehouse/test.out", overwrite),
-          "INPATH location 'file:/test-warehouse/test.out' must point to an " +
-          "HDFS, S3A, ADL or ABFS filesystem.");
+          "INPATH location 'file:/test-warehouse/test.out' must point to one of the " +
+          "supported filesystem URI scheme (" +
+          FileSystemUtil.getValidLoadDataInpathSchemes() + ").");
 
       // File type / table type mismatch.
       AnalyzesOk(String.format("load data inpath '%s' %s into table " +
           "tpch.lineitem",
-          "/test-warehouse/alltypes_text_lzo/year=2009/month=4", overwrite));
+          "/test-warehouse/alltypes_text_gzip/year=2009/month=4", overwrite));
       // When table type matches, analysis passes for partitioned and unpartitioned
       // tables.
       AnalyzesOk(String.format("load data inpath '%s' %s into table " +
-          "functional_text_lzo.alltypes partition(year=2009, month=4)",
-          "/test-warehouse/alltypes_text_lzo/year=2009/month=4", overwrite));
+          "functional_text_gzip.alltypes partition(year=2009, month=4)",
+          "/test-warehouse/alltypes_text_gzip/year=2009/month=4", overwrite));
       AnalyzesOk(String.format("load data inpath '%s' %s into table " +
-          "functional_text_lzo.jointbl",
-          "/test-warehouse/alltypes_text_lzo/year=2009/month=4", overwrite));
+          "functional_text_gzip.jointbl",
+          "/test-warehouse/alltypes_text_gzip/year=2009/month=4", overwrite));
 
       // Verify with a read-only table
       AnalysisError(String.format("load data inpath '%s' into table " +
@@ -3403,6 +4007,22 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
           "Impala does not have WRITE access to HDFS location: " +
           "hdfs://localhost:20500/test-warehouse/alltypes_seq/year=2009/month=3");
     }
+  }
+
+  @Test
+  public void TestIcebergLoadData() throws AnalysisException {
+    AnalyzesOk("load data inpath "
+        + "'/test-warehouse/iceberg_test/iceberg_non_partitioned/data' into table "
+        + "functional_parquet.iceberg_non_partitioned");
+    AnalyzesOk("load data inpath "
+        + "'/test-warehouse/iceberg_test/iceberg_non_partitioned/data' overwrite into "
+        + "table functional_parquet.iceberg_non_partitioned");
+    AnalysisError("load data inpath "
+        + "'/test-warehouse/iceberg_test/iceberg_partitioned/data/"
+        + "event_time_hour=2020-01-01-08/action=view/' into table "
+        + "functional_parquet.iceberg_partitioned partition "
+        + "(event_time_hour='2020-01-01-08', action='view');", "PARTITION clause is not "
+        + "supported for Iceberg tables.");
   }
 
   @Test
@@ -3441,14 +4061,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "uncorrelated one 'functional.alltypestiny':\n" +
         "SELECT item FROM b.int_array_col, functional.alltypestiny");
 
-    if (RuntimeEnv.INSTANCE.isKuduSupported()) {
-      // Key columns missing from permutation
-      AnalysisError("insert into functional_kudu.testtbl(zip) values(1)",
-          "All primary key columns must be specified for INSERTing into Kudu tables. " +
-          "Missing columns are: id");
-      // Mixed column name case, on both primary key and non-primary key cols.
-      AnalyzesOk("insert into functional_kudu.alltypes (ID, BOOL_COL) values (0, true)");
-    }
+    // Key columns missing from permutation
+    AnalysisError("insert into functional_kudu.testtbl(zip) values(1)",
+        "All primary key columns must be specified for INSERTing into Kudu tables. " +
+        "Missing columns are: id");
+    // Mixed column name case, on both primary key and non-primary key cols.
+    AnalyzesOk("insert into functional_kudu.alltypes (ID, BOOL_COL) values (0, true)");
 
     addTestDb("d", null);
     addTestTable("create table d.dec1 (c decimal(38,37)) location '/'");
@@ -3660,6 +4278,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
         "float_col, double_col, date_string_col, string_col, timestamp_col, year, " +
         "month from functional.alltypes");
+
+    // Insert with dynamic partitioning clause into a table that has unsupported partition
+    AnalysisError("insert into table functional.multipartformat partition (p) " +
+       "select 'parquet', 1", "Destination table 'functional.multipartformat' " +
+       "contains partition format(s) that are not supported to write: 'ORC', " +
+       "dynamic partition clauses are forbidden.");
   }
 
   /**
@@ -3693,7 +4317,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "from functional.alltypes");
 
     String hbaseQuery =  "INSERT " + qualifier + " TABLE " +
-        "functional_hbase.insertalltypesagg select id, bigint_col, bool_col, " +
+        "functional_hbase.insertalltypesagg select id, bigint_col, " +
+        "cast(string_col as binary), bool_col, " +
         "date_string_col, day, double_col, float_col, int_col, month, smallint_col, " +
         "string_col, timestamp_col, tinyint_col, year from functional.alltypesagg";
 
@@ -3854,6 +4479,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
         "float_col, double_col, date_string_col, string_col, timestamp_col " +
         "from functional.alltypes");
+
+    // Insert with static partitioning clause into a partition that has unsupported
+    // partition format.
+    AnalysisError("insert into table functional.multipartformat partition (p='orc') " +
+        "select 1", "Writing the destination partition format 'ORC' is not supported.");
 
     if (qualifier.contains("OVERWRITE")) {
       AnalysisError("insert " + qualifier + " table functional_hbase.alltypessmall " +
@@ -4039,15 +4669,14 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   @Test
   public void TestClone() {
     testNumberOfMembers(QueryStmt.class, 11);
-    testNumberOfMembers(UnionStmt.class, 10);
+    testNumberOfMembers(SetOperationStmt.class, 13);
     testNumberOfMembers(ValuesStmt.class, 0);
 
     // Also check TableRefs.
-    testNumberOfMembers(TableRef.class, 21);
+    testNumberOfMembers(TableRef.class, 30);
     testNumberOfMembers(BaseTableRef.class, 0);
-    testNumberOfMembers(InlineViewRef.class, 8);
+    testNumberOfMembers(InlineViewRef.class, 10);
   }
-
   @SuppressWarnings("rawtypes")
   private void testNumberOfMembers(Class cl, int expectedNumMembers) {
     int actualNumMembers = 0;
@@ -4067,6 +4696,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   public void TestSetQueryOption() {
     AnalyzesOk("set foo=true");
     AnalyzesOk("set");
+    AnalyzesOk("unset all");
   }
 
   @Test
@@ -4194,5 +4824,364 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // Function that starts with 'castto' but does not exist should throw the
     // right error msg.
     AnalysisError("select casttobar(\"foo\")", "default.casttobar() unknown");
+  }
+
+  @Test
+  public void testCompoundVerticalBarExprAnalysis() throws ImpalaException {
+    // Valid uses of || when using as logical OR
+    AnalyzesOk("SELECT bool_col || bool_col FROM functional.alltypessmall");
+    AnalyzesOk("SELECT TRUE || bool_col FROM functional.alltypessmall");
+    AnalyzesOk("SELECT bool_col || FALSE FROM functional.alltypessmall");
+    AnalyzesOk("SELECT TRUE || FALSE FROM functional.alltypessmall");
+    AnalyzesOk("SELECT NULL || bool_col FROM functional.alltypessmall");
+    AnalyzesOk("SELECT NULL || NULL FROM functional.alltypessmall");
+
+    // Valid uses of || when using as concat function call
+    AnalyzesOk("SELECT string_col || string_col FROM functional.alltypessmall");
+    AnalyzesOk("SELECT 'literal' || string_col FROM functional.alltypessmall");
+    AnalyzesOk("SELECT string_col || 'literal' FROM functional.alltypessmall");
+    AnalyzesOk("SELECT 'literal1' || 'literal2' FROM functional.alltypessmall");
+    AnalyzesOk("SELECT 'literal' || cs FROM functional.chars_tiny");
+    AnalyzesOk("SELECT cl || 'literal' FROM functional.chars_tiny");
+    AnalyzesOk("SELECT vc || cs FROM functional.chars_tiny");
+
+    // Invalid operands result exception during analysis
+    AnalysisError("SELECT string_col || bool_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'string_col || bool_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'STRING' and 'BOOLEAN'.");
+
+    AnalysisError("SELECT bool_col || string_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'bool_col || string_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'BOOLEAN' and 'STRING'.");
+
+    AnalysisError("SELECT string_col || FALSE FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'string_col || FALSE' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'STRING' and 'BOOLEAN'.");
+
+    AnalysisError("SELECT TRUE || string_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'TRUE || string_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'BOOLEAN' and 'STRING'.");
+
+    AnalysisError("SELECT 'literal1' || bool_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "''literal1' || bool_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'STRING' and 'BOOLEAN'.");
+
+    AnalysisError("SELECT bool_col || 'literal2' FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'bool_col || 'literal2'' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'BOOLEAN' and 'STRING'.");
+
+    AnalysisError("SELECT vc || TRUE FROM functional.chars_tiny",
+        "Operands of CompoundVerticalBarExpr "
+            + "'vc || TRUE' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'VARCHAR(32)' and 'BOOLEAN'.");
+
+    AnalysisError("SELECT FALSE || cl FROM functional.chars_tiny",
+        "Operands of CompoundVerticalBarExpr "
+            + "'FALSE || cl' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'BOOLEAN' and 'CHAR(140)'.");
+
+    AnalysisError("SELECT bool_col || 'literal2' FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'bool_col || 'literal2'' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'BOOLEAN' and 'STRING'.");
+
+    AnalysisError("SELECT string_col || int_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'string_col || int_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'STRING' and 'INT'.");
+
+    AnalysisError("SELECT int_col || string_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'int_col || string_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'INT' and 'STRING'.");
+
+    AnalysisError("SELECT bool_col || int_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'bool_col || int_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'BOOLEAN' and 'INT'.");
+
+    AnalysisError("SELECT int_col || bool_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'int_col || bool_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'INT' and 'BOOLEAN'.");
+
+    AnalysisError("SELECT string_col || timestamp_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'string_col || timestamp_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'STRING' and 'TIMESTAMP'.");
+
+    AnalysisError("SELECT timestamp_col || string_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'timestamp_col || string_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'TIMESTAMP' and 'STRING'.");
+
+    AnalysisError("SELECT bool_col || timestamp_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'bool_col || timestamp_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'BOOLEAN' and 'TIMESTAMP'.");
+
+    AnalysisError("SELECT timestamp_col || bool_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'timestamp_col || bool_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'TIMESTAMP' and 'BOOLEAN'.");
+
+    AnalysisError("SELECT bool_col || double_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'bool_col || double_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'BOOLEAN' and 'DOUBLE'.");
+
+    AnalysisError("SELECT double_col || string_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'double_col || string_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'DOUBLE' and 'STRING'.");
+
+    AnalysisError("SELECT string_col || NULL FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'string_col || NULL' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'STRING' and 'NULL_TYPE'.");
+
+    AnalysisError("SELECT NULL || string_col FROM functional.alltypessmall",
+        "Operands of CompoundVerticalBarExpr "
+            + "'NULL || string_col' should both return 'BOOLEAN' type "
+            + "or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, "
+            + "but they return types 'NULL_TYPE' and 'STRING'.");
+  }
+
+  @Test
+  public void testIcebergTimeTravel() throws ImpalaException {
+    TableName iceT = new TableName("functional_parquet", "iceberg_non_partitioned");
+    TableName nonIceT = new TableName("functional", "allcomplextypes");
+
+    TblsAnalyzeOk("select * from $TBL for system_time as of now()", iceT);
+    TblsAnalyzeOk("select * from $TBL for system_time as of '2021-08-09 15:52:45'", iceT);
+    TblsAnalyzeOk("select * from $TBL for system_time as of " +
+        "cast('2021-08-09 15:52:45' as timestamp) - interval 2 days + interval 3 hours",
+        iceT);
+    TblsAnalyzeOk("select * from $TBL for system_time as of now() + interval 3 days",
+        iceT);
+    // Use a legal snapshot id '93996984692289973' from the testdata.
+    TblsAnalyzeOk("select * from $TBL for system_version as of 93996984692289973", iceT);
+
+    TblsAnalysisError("select * from $TBL for system_time as of 42", iceT,
+        "FOR SYSTEM_TIME AS OF <expression> must be a timestamp type");
+    TblsAnalysisError("select * from $TBL for system_time as of id", iceT,
+        "FOR SYSTEM_TIME AS OF <expression> must be a constant expression");
+    TblsAnalysisError("select * from $TBL for system_time as of '2021-02-32 15:52:45'",
+        iceT, "Invalid TIMESTAMP expression");
+
+    TblsAnalysisError("select * from $TBL for system_version as of 3.14",
+        iceT, "FOR SYSTEM_VERSION AS OF <expression> must be an integer type but is");
+
+    TblsAnalysisError("select * from $TBL for system_time as of now()", nonIceT,
+        "FOR SYSTEM_TIME AS OF clause is only supported for Iceberg tables.");
+    TblsAnalysisError("select * from $TBL for system_version as of 123", nonIceT,
+        "FOR SYSTEM_VERSION AS OF clause is only supported for Iceberg tables.");
+  }
+
+  @Test
+  public void testIcebergDescribeHistory() throws ImpalaException {
+    TableName iceT = new TableName("functional_parquet", "iceberg_non_partitioned");
+    TableName nonIceT = new TableName("functional", "allcomplextypes");
+
+    // Analyze without predicate.
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL", iceT);
+
+    // Analyze with predicates.
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL FROM \"2022-02-14 13:31:09.819\"", iceT);
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL FROM " +
+        "cast('2021-08-09 15:52:45' as timestamp) - interval 2 days + interval 3 days",
+        iceT);
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL FROM now() + interval 3 days", iceT);
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL BETWEEN '2021-02-22' AND '2021-02-22'", iceT);
+
+    // Analyze should fail with unsupported expression types.
+    TblsAnalysisError("DESCRIBE HISTORY $TBL FROM 42 ", iceT,
+        "FROM <expression> must be a timestamp type");
+    TblsAnalysisError("DESCRIBE HISTORY $TBL FROM id", iceT,
+        "Unsupported expression: 'id'");
+    TblsAnalysisError("DESCRIBE HISTORY $TBL FROM '2021-02-32 15:52:45'", iceT,
+        "Invalid TIMESTAMP expression");
+
+    // DESCRIBE HISTORY is only supported for Iceberg tables.
+    TblsAnalysisError("DESCRIBE HISTORY $TBL", nonIceT,
+        "DESCRIBE HISTORY must specify an Iceberg table:");
+  }
+
+  @Test
+  public void testCreatePartitionedIcebergTable() throws ImpalaException {
+    String tblProperties = " TBLPROPERTIES ('iceberg.catalog'='hadoop.tables')";
+    AnalyzesOk("CREATE TABLE tbl1 (i int, p1 int, p2 timestamp) " +
+        "PARTITIONED BY SPEC (BUCKET(10, p1), TRUNCATE(5, p1), DAY(p2)) " +
+        "STORED AS ICEBERG" + tblProperties);
+    AnalyzesOk("CREATE TABLE tbl1 (ts timestamp) " +
+        "PARTITIONED BY SPEC (YEAR(ts), MONTH(ts), DAY(ts), HOUR(ts)) " +
+        "STORED AS ICEBERG" + tblProperties);
+    AnalyzesOk("CREATE TABLE tbl1 (ts timestamp) " +
+        "PARTITIONED BY SPEC (YEARS(ts), MONTHS(ts), DAYS(ts), HOURS(ts)) " +
+        "STORED AS ICEBERG" + tblProperties);
+    AnalysisError("CREATE TABLE tbl1 (i int, p1 int, p2 timestamp) " +
+        "PARTITIONED BY SPEC (BUCKET(p1), DAY(p2)) STORED AS ICEBERG" + tblProperties,
+        "BUCKET and TRUNCATE partition transforms should have a parameter.");
+    AnalysisError("CREATE TABLE tbl1 (i int, p1 int) " +
+        "PARTITIONED BY SPEC (TRUNCATE(p1)) STORED AS ICEBERG",
+        "BUCKET and TRUNCATE partition transforms should have a parameter.");
+    AnalysisError("CREATE TABLE tbl1 (i int, p1 int, p2 timestamp) " +
+        "PARTITIONED BY SPEC (BUCKET(0, p1), DAY(p2)) STORED AS ICEBERG" + tblProperties,
+        "The parameter of a partition transform should be greater than zero.");
+    AnalysisError("CREATE TABLE tbl1 (i int, p1 int, p2 timestamp) " +
+        "PARTITIONED BY SPEC (TRUNCATE(0, p1), DAY(p2)) STORED AS ICEBERG" +
+        tblProperties,
+        "The parameter of a partition transform should be greater than zero.");
+    AnalysisError("CREATE TABLE tbl1 (i int, p1 int, p2 timestamp) " +
+        "PARTITIONED BY SPEC (BUCKET(10, p1), DAY(10, p2)) STORED AS ICEBERG" +
+        tblProperties,
+        "Only BUCKET and TRUNCATE partition transforms accept a parameter.");
+  }
+
+  @Test
+  public void testPredicateHint() {
+    // Legal hint return correct results without warning, we currently only support
+    // 'ALWAYS_TRUE' hint.
+    AnalyzesOk("select * from tpch.lineitem where /* +ALWAYS_TRUE */ " +
+            "l_shipdate <= (select '1998-09-02')");
+
+    // Illegal hint return correct results with a warning.
+    AnalyzesOk("select * from tpch.lineitem where /* +ALWAYS_TRUE_TEST */ " +
+            "l_shipdate <= (select '1998-09-02')",
+        "Predicate hint not recognized: ALWAYS_TRUE_TEST");
+    AnalyzesOk("select * from tpch.lineitem where /* +ILLEGAL_HINT_TEST */ " +
+            "l_shipdate <= (select '1998-09-02')",
+        "Predicate hint not recognized: ILLEGAL_HINT_TEST");
+
+    // Multiple hints with legal and illegal hints also output a warning.
+    AnalyzesOk("select * from tpch.lineitem where /* +ALWAYS_TRUE,ILLEGAL_HINT_TEST */ "
+            + "l_shipdate <= (select '1998-09-02')",
+        "Predicate hint not recognized: ILLEGAL_HINT_TEST");
+
+    // Multiple illegal hints will output each hint warnings.
+    AnalyzesOk("select * from tpch.lineitem where " +
+            "/* +ILLEGAL_HINT_TEST1,ILLEGAL_HINT_TEST2,ILLEGAL_HINT_TEST3 */ " +
+            "l_shipdate <= (select '1998-09-02')",
+        "Predicate hint not recognized: ILLEGAL_HINT_TEST1");
+    AnalyzesOk("select * from tpch.lineitem where " +
+            "/* +ILLEGAL_HINT_TEST1,ILLEGAL_HINT_TEST2,ILLEGAL_HINT_TEST3 */ " +
+            "l_shipdate <= (select '1998-09-02')",
+        "Predicate hint not recognized: ILLEGAL_HINT_TEST2");
+    AnalyzesOk("select * from tpch.lineitem where " +
+            "/* +ILLEGAL_HINT_TEST1,ILLEGAL_HINT_TEST2,ILLEGAL_HINT_TEST3 */ " +
+            "l_shipdate <= (select '1998-09-02')",
+        "Predicate hint not recognized: ILLEGAL_HINT_TEST3");
+  }
+
+  @Test
+  public void testTableCardinalityHintNegative() {
+    // Cannot set cardinality hint with non long type parameter
+    AnalysisError("select * from functional.alltypes /* +TABLE_NUM_ROWS(aa) */",
+        "For input string: \"aa\"");
+    AnalysisError("select * from functional.alltypes /* +TABLE_NUM_ROWS(-1) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from functional.alltypes /* +TABLE_NUM_ROWS(1.0) */",
+        "Syntax error in line 1");
+    // Cannot set cardinality hint with multiple parameters
+    AnalysisError("select * from functional.alltypes /* +TABLE_NUM_ROWS(10, 20) */",
+        "Syntax error in line 1");
+  }
+
+  @Test
+  public void testTableCardinalityHintPositive() {
+    // Cannot set cardinality hint without parameter
+    AnalyzesOk("select * from functional.alltypes /* +TABLE_NUM_ROWS */",
+        "Table hint not recognized for table functional.alltypes: TABLE_NUM_ROWS");
+    // 'TABLE_NUM_ROWS' is only valid for hdfs and kudu table now
+    AnalyzesOk("select * from functional.alltypes /* +TABLE_NUM_ROWS(100) */");
+    AnalyzesOk("select * from functional_kudu.alltypes /* +TABLE_NUM_ROWS(100) */");
+    // Kudu table only support 'TABLE_NUM_ROWS' hint
+    AnalyzesOk("select * from functional_kudu.alltypes /* +SCHEDULE_CACHE_LOCAL */",
+        "Kudu table only support 'TABLE_NUM_ROWS' hint.");
+    // Only hdfs and kudu tables can use this hint
+    AnalyzesOk("select * from functional_hbase.alltypes /* +TABLE_NUM_ROWS(100) */",
+        "Table hint not recognized for table " +
+            "functional_hbase.alltypes: TABLE_NUM_ROWS(100)");
+  }
+
+  @Test
+  public void testSelectivityHintNegative() {
+    // Selectivity hint must use bracket, even for single predicate
+    AnalysisError("select * from t1 where a > 1 and b > 2 /* +SELECTIVITY(0.1) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where a > 1 /* +SELECTIVITY(0.1) */",
+        "Syntax error in line 1");
+
+    // Cannot set selectivity hint exists predicate
+    AnalysisError("select * from t1 where exists (select x from t2) " +
+            "/* +SELECTIVITY(0.1) */",
+        "Syntax error in line 1");
+
+    // Selectivity hint only accept one parameter with decimal type
+    // Negative number and zero are not allowed
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY('0.1') */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY(0) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY(-1.0) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY(0.1, 0.2) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY(1/3) */",
+        "Syntax error in line 1");
+  }
+
+  @Test
+  public void testSelectivityHintPositive() {
+    // Selectivity hint legal value is (0,1]
+    AnalyzesOk("select * from tpch.lineitem where (l_shipdate <= '1998-09-02') " +
+            "/* +SELECTIVITY(1.1) */",
+        "Invalid selectivity hint value: 1.1, allowed value should be a double value in "
+            + "(0, 1].");
+    AnalyzesOk("select * from tpch.lineitem where (l_shipdate <= '1998-09-02') " +
+            "/* +SELECTIVITY(0.0) */",
+        "Invalid selectivity hint value: 0.0, allowed value should be a double value in "
+            + "(0, 1].");
+
+    // Also valid for a very long decimal value
+    AnalyzesOk("select * from functional.alltypes where (id > 1000)" +
+        "/* +SELECTIVITY(0.3333333333333333333333333333333333) */");
+    // Set selectivity hint for compound predicate
+    AnalyzesOk("select * from functional.alltypes where (id > 1000 and int_col = 1)" +
+        "/* +SELECTIVITY(0.1) */");
+    AnalyzesOk("select * from functional.alltypes where (id > 1000 or int_col = 1)" +
+        "/* +SELECTIVITY(0.1) */");
+
+    // Selectivity hint is invalid for 'AND' compound predicate.
+    AnalyzesOk("select * from tpch.lineitem where (l_shipdate <= '1998-09-02' and " +
+            "l_shipdate >= '1997-09-02')/* +SELECTIVITY(0.5) */",
+        "Selectivity hints are ignored for 'AND' compound predicates, either in the SQL "
+            + "query or internally generated.");
   }
 }

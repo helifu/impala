@@ -14,7 +14,7 @@ row_regex:.*Per-Host Resource Estimates: Memory=[0-9.]*MB.*
 row_regex:.*Per-Host Resources: mem-estimate=[0-9.]*[A-Z]*B mem-reservation=[0-9.]*[A-Z]*B thread-reservation=1
 'PLAN-ROOT SINK'
 '|  output exprs: tpch.lineitem.l_orderkey, tpch.lineitem.l_partkey, tpch.lineitem.l_suppkey, tpch.lineitem.l_linenumber, tpch.lineitem.l_quantity, tpch.lineitem.l_extendedprice, tpch.lineitem.l_discount, tpch.lineitem.l_tax, tpch.lineitem.l_returnflag, tpch.lineitem.l_linestatus, tpch.lineitem.l_shipdate, tpch.lineitem.l_commitdate, tpch.lineitem.l_receiptdate, tpch.lineitem.l_shipinstruct, tpch.lineitem.l_shipmode, tpch.lineitem.l_comment, tpch.orders.o_orderkey, tpch.orders.o_custkey, tpch.orders.o_orderstatus, tpch.orders.o_totalprice, tpch.orders.o_orderdate, tpch.orders.o_orderpriority, tpch.orders.o_clerk, tpch.orders.o_shippriority, tpch.orders.o_comment'
-row_regex:.*mem-estimate=[0-9.]*[A-Z]*B mem-reservation=[0-9.]*[A-Z]*B thread-reservation=0
+row_regex:.*mem-estimate=[0-9.]*[A-Z]*B mem-reservation=[0-9.]*[A-Z]*B spill-buffer=[0-9.]*MB thread-reservation=0
 '|'
 '04:EXCHANGE [UNPARTITIONED]'
 row_regex:.*mem-estimate=[0-9.]*[A-Z]*B mem-reservation=[0-9.]*[A-Z]*B thread-reservation=0
@@ -36,9 +36,9 @@ row_regex:.*mem-estimate=[0-9.]*[A-Z]*B mem-reservation=[0-9.]*[A-Z]*B thread-re
 '|  |  tuple-ids=1 row-size=171B cardinality=1.50M'
 '|  |  in pipelines: 01(GETNEXT)'
 '|  |'
-'|  F01:PLAN FRAGMENT [RANDOM] hosts=2 instances=2'
+row_regex:.*F01:PLAN FRAGMENT \[RANDOM\] hosts=[1-2] instances=[1-2]
 row_regex:.*Per-Host Resources: mem-estimate=[0-9.]*[A-Z]*B mem-reservation=[0-9.]*[A-Z]*B thread-reservation=.*
-'|  01:SCAN HDFS [tpch.orders, RANDOM]'
+'|  01:SCAN $FILESYSTEM_NAME [tpch.orders, RANDOM]'
 row_regex:.*partitions=1/1 files=1 size=.*
 '|     stored statistics:'
 row_regex:.*table: rows=[0-9.]*[A-Z]* size=.*
@@ -48,7 +48,7 @@ row_regex:.*mem-estimate=[0-9.]*[A-Z]*B mem-reservation=[0-9.]*[A-Z]*B thread-re
 '|     tuple-ids=1 row-size=171B cardinality=1.50M'
 '|     in pipelines: 01(GETNEXT)'
 '|'
-'00:SCAN HDFS [tpch.lineitem, RANDOM]'
+'00:SCAN $FILESYSTEM_NAME [tpch.lineitem, RANDOM]'
 row_regex:.*partitions=1/1 files=1 size=.*
 '   runtime filters: RF000[bloom] -> l_orderkey'
 '   stored statistics:'
@@ -67,7 +67,7 @@ from functional_avro.alltypes t1
   left outer join functional_avro.alltypes t3 on (t2.id = t3.id)
 where t1.month = 1 and t2.year = 2009 and t3.bool_col = false
 ---- RESULTS: VERIFY_IS_SUBSET
-'Per-Host Resource Estimates: Memory=74MB'
+'Per-Host Resource Estimates: Memory=55MB'
 'WARNING: The following tables are missing relevant table and/or column statistics.'
 'functional_avro.alltypes, functional_parquet.alltypessmall'
 ====
@@ -81,7 +81,16 @@ from functional_avro.alltypes t1
   left outer join functional_avro.alltypes t3 on (t2.id = t3.id)
 where t1.month = 1 and t2.year = 2009 and t3.bool_col = false
 ---- RESULTS: VERIFY_IS_SUBSET
-'Per-Host Resource Estimates: Memory=4.07GB'
+'Per-Host Resource Estimates: Memory=4.05GB'
 'WARNING: The following tables are missing relevant table and/or column statistics.'
 'functional_avro.alltypes, functional_parquet.alltypessmall'
+====
+---- QUERY
+# Tests the set operation statement rewrite
+explain select year, month from functional.alltypes
+  intersect
+select year, month from functional.alltypes where year=2009;
+---- RESULTS: VERIFY_IS_SUBSET
+'Per-Host Resources: mem-estimate=13.98MB mem-reservation=5.88MB thread-reservation=1 runtime-filters-memory=2.00MB'
+'04:HASH JOIN [LEFT SEMI JOIN, PARTITIONED]'
 ====

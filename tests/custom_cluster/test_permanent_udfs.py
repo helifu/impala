@@ -15,16 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import glob
 import os
 import pytest
 import re
 import shutil
-import subprocess
 
 from tempfile import mkdtemp
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfFS
 from tests.common.test_dimensions import create_uncompressed_text_dimension
 from tests.util.filesystem_utils import get_fs_path
 
@@ -160,11 +160,7 @@ class TestUdfPersistence(CustomClusterTestSuite):
     stmt = "RELOAD FUNCTION ; DESCRIBE FUNCTION {0}.{1}".format(db, udf)
     return self.run_stmt_in_hive(stmt)
 
-  @SkipIfIsilon.hive
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially
   def test_corrupt_java_udf(self):
     """ IMPALA-3820: This tests if the Catalog server can gracefully handle
@@ -181,12 +177,35 @@ class TestUdfPersistence(CustomClusterTestSuite):
     self.verify_function_count(
         "SHOW FUNCTIONS in {0}".format(self.JAVA_FN_TEST_DB), 0)
 
+  @SkipIfFS.hive
+  @pytest.mark.execute_serially
+  def test_corrupt_java_bad_function(self):
+    if self.exploration_strategy() != 'exhaustive': pytest.skip()
+    """ IMPALA-11528: This tests if a corrupt function exists inside of Hive
+    which does not derive from UDF. The way we do this here is to create a valid
+    function in Hive which does derive from UDF, but switch the underlying jar to
+    one that does not derive from the UDF class. """
 
-  @SkipIfIsilon.hive
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfLocal.hive
+    CORRUPT_JAR = "test-warehouse/test_corrupt.jar"
+    self.filesystem_client.delete_file_dir(CORRUPT_JAR)
+    # impala-hive-udfs.jar contains the class CorruptUdf which derives from UDF
+    # which is a valid function.
+    self.filesystem_client.copy("/test-warehouse/impala-hive-udfs.jar",
+        "/" + CORRUPT_JAR)
+    self.run_stmt_in_hive("create function %s.corrupt_bad_function_udf as \
+        'org.apache.impala.CorruptUdf' using jar '%s/%s'"
+        % (self.JAVA_FN_TEST_DB, os.getenv('DEFAULT_FS'), CORRUPT_JAR))
+    # Now copy the CorruptUdf class from the impala-corrupt-hive-udfs.jar file which
+    # does not derive from UDF, making it an invalid UDF.
+    self.filesystem_client.delete_file_dir(CORRUPT_JAR)
+    self.filesystem_client.copy("/test-warehouse/impala-corrupt-hive-udfs.jar",
+        "/" + CORRUPT_JAR)
+    self.__restart_cluster()
+    # Make sure the function count is 0
+    self.verify_function_count(
+        "SHOW FUNCTIONS in {0}".format(self.JAVA_FN_TEST_DB), 0)
+
+  @SkipIfFS.hive
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
      catalogd_args= "--local_library_dir={0}".format(LOCAL_LIBRARY_DIR))
@@ -247,11 +266,7 @@ class TestUdfPersistence(CustomClusterTestSuite):
       # Make sure we deleted all the temporary jars we copied to the local fs
       assert len(glob.glob(self.LOCAL_LIBRARY_DIR + "/*.jar")) == 0
 
-  @SkipIfIsilon.hive
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
      catalogd_args= "--local_library_dir={0}".format(LOCAL_LIBRARY_DIR))
@@ -271,7 +286,7 @@ class TestUdfPersistence(CustomClusterTestSuite):
     describe_db_hive = "DESCRIBE DATABASE EXTENDED {database}".format(
         database=self.HIVE_IMPALA_INTEGRATION_DB)
     result = self.run_stmt_in_hive(describe_db_hive)
-    regex = r"{(.*?)=(.*?)}"
+    regex = r"{.*(impala_registered_function.*?)=(.*?)[,}]"
     match = re.search(regex, result)
     func_name = match.group(1)
     func_contents = match.group(2)
@@ -310,11 +325,7 @@ class TestUdfPersistence(CustomClusterTestSuite):
     # Make sure we deleted all the temporary jars we copied to the local fs
     assert len(glob.glob(self.LOCAL_LIBRARY_DIR + "/*.jar")) == 0
 
-  @SkipIfIsilon.hive
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
      catalogd_args= "--local_library_dir={0}".format(LOCAL_LIBRARY_DIR))
@@ -454,7 +465,7 @@ class TestUdfPersistence(CustomClusterTestSuite):
     result = self.execute_query_expect_failure(self.client,
         self.CREATE_JAVA_UDF_TEMPLATE.format(db=self.JAVA_FN_TEST_DB, function="badudf",
         location=self.JAVA_UDF_JAR, symbol="org.apache.impala.IncompatibleUdfTest"))
-    assert "No compatible function signatures" in str(result)
+    assert "No compatible signatures" in str(result)
     self.verify_function_count(
         "SHOW FUNCTIONS IN %s like 'badudf*'" % self.JAVA_FN_TEST_DB, 0)
     result = self.__describe_udf_in_hive('badudf', db=self.JAVA_FN_TEST_DB)
@@ -570,7 +581,7 @@ class TestUdfPersistence(CustomClusterTestSuite):
     drop function if exists {database}.identity(decimal(38,10));
     drop function if exists {database}.all_types_fn(
         string, boolean, tinyint, smallint, int, bigint, float, double, decimal(2,0),
-        date);
+        date, binary);
     drop function if exists {database}.no_args();
     drop function if exists {database}.var_and(boolean...);
     drop function if exists {database}.var_sum(int...);
@@ -620,6 +631,10 @@ class TestUdfPersistence(CustomClusterTestSuite):
     location '{location}'
     symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_9StringValE';
 
+    create function {database}.identity(binary) returns binary
+    location '{location}'
+    symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_9StringValE';
+
     create function {database}.identity(timestamp) returns timestamp
     location '{location}'
     symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_12TimestampValE';
@@ -642,7 +657,7 @@ class TestUdfPersistence(CustomClusterTestSuite):
 
     create function {database}.all_types_fn(
         string, boolean, tinyint, smallint, int, bigint, float, double, decimal(2,0),
-        date)
+        date, binary)
     returns int
     location '{location}' symbol='AllTypes';
 

@@ -18,6 +18,8 @@
 # Tests query cancellation using the ImpalaService.Cancel API
 #
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 import threading
 from time import sleep
@@ -34,11 +36,19 @@ LINEITEM_PK = 'l_orderkey, l_partkey, l_suppkey, l_linenumber'
 # Queries to execute, mapped to a unique PRIMARY KEY for use in CTAS with Kudu. If None
 # is specified for the PRIMARY KEY, it will not be used in a CTAS statement on Kudu.
 # Use the TPC-H dataset because tables are large so queries take some time to execute.
-QUERIES = {'select l_returnflag from lineitem' : None,
-           'select count(l_returnflag) pk from lineitem' : 'pk',
-           'select * from lineitem limit 50' : LINEITEM_PK,
-           'compute stats lineitem' : None,
-           'select * from lineitem order by l_orderkey' : LINEITEM_PK}
+QUERIES = {'select l_returnflag from lineitem': None,
+           'select count(l_returnflag) pk from lineitem': 'pk',
+           'select * from lineitem limit 50': LINEITEM_PK,
+           'compute stats lineitem': None,
+           'select * from lineitem order by l_orderkey': LINEITEM_PK,
+           '''SELECT STRAIGHT_JOIN *
+           FROM lineitem
+                  JOIN /*+broadcast*/ orders ON o_orderkey = l_orderkey
+                  JOIN supplier ON s_suppkey = l_suppkey
+           WHERE o_orderstatus = 'F'
+           ORDER BY l_orderkey
+           LIMIT 10000''': LINEITEM_PK
+           }
 
 QUERY_TYPE = ["SELECT", "CTAS"]
 
@@ -65,8 +75,11 @@ JOIN_BEFORE_CLOSE = [False, True]
 
 # Extra dimensions to test order by without limit
 SORT_QUERY = 'select * from lineitem order by l_orderkey'
-SORT_CANCEL_DELAY = range(6, 10)
+SORT_CANCEL_DELAY = list(range(6, 10))
 SORT_BUFFER_POOL_LIMIT = ['0', '300m'] # Test spilling and non-spilling sorts.
+
+# Test with and without multithreading
+MT_DOP_VALUES = [0, 4]
 
 class TestCancellation(ImpalaTestSuite):
   @classmethod
@@ -92,6 +105,8 @@ class TestCancellation(ImpalaTestSuite):
         ImpalaTestDimension('buffer_pool_limit', 0))
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('cpu_limit_s', *CPU_LIMIT_S))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('mt_dop', *MT_DOP_VALUES))
 
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('query_type') != 'CTAS' or (\
@@ -139,15 +154,16 @@ class TestCancellation(ImpalaTestSuite):
     wait_action = vector.get_value('wait_action')
     fail_rpc_action = vector.get_value('fail_rpc_action')
 
-    debug_action = "|".join(filter(None, [wait_action, fail_rpc_action]))
+    debug_action = "|".join([_f for _f in [wait_action, fail_rpc_action] if _f])
     vector.get_value('exec_option')['debug_action'] = debug_action
 
     vector.get_value('exec_option')['buffer_pool_limit'] =\
         vector.get_value('buffer_pool_limit')
     vector.get_value('exec_option')['cpu_limit_s'] = vector.get_value('cpu_limit_s')
+    vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
 
     # Execute the query multiple times, cancelling it each time.
-    for i in xrange(NUM_CANCELATION_ITERATIONS):
+    for i in range(NUM_CANCELATION_ITERATIONS):
       cancel_query_and_validate_state(self.client, query,
           vector.get_value('exec_option'), vector.get_value('table_format'),
           vector.get_value('cancel_delay'), vector.get_value('join_before_close'))
@@ -182,7 +198,7 @@ class TestCancellation(ImpalaTestSuite):
                for _ in range(5)), 'Query failed to cancel'
     # Get profile and check for formatting errors
     profile = client.get_runtime_profile(handle, TRuntimeProfileFormat.THRIFT)
-    for (k, v) in profile.nodes[1].info_strings.iteritems():
+    for (k, v) in profile.nodes[1].info_strings.items():
       # Ensure that whitespace gets removed from values.
       assert v == v.rstrip(), \
         "Profile value contains surrounding whitespace: %s %s" % (k, v)

@@ -15,44 +15,45 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_RUNTIME_DESCRIPTORS_H
-#define IMPALA_RUNTIME_DESCRIPTORS_H
-
+#include <cstdint>
+#include <iosfwd>
+#include <map>
 #include <unordered_map>
+#include <utility>
 #include <vector>
-#include <boost/scoped_ptr.hpp>
-#include <ostream>
 
+#include "codegen/codegen-anyval-read-write-info.h"
 #include "codegen/impala-ir.h"
 #include "common/global-types.h"
 #include "common/status.h"
 #include "runtime/types.h"
 
-#include "gen-cpp/Descriptors_types.h"  // for TTupleId
+#include "gen-cpp/CatalogObjects_types.h"
 #include "gen-cpp/Types_types.h"
 
 namespace llvm {
   class Constant;
-  class Function;
-  class PointerType;
   class StructType;
+  class Type;
   class Value;
 };
 
 namespace impala {
 
+class CodegenAnyVal;
 class LlvmBuilder;
 class LlvmCodeGen;
 class ObjectPool;
-class RuntimeState;
-class ScalarExpr;
 class ScalarExprEvaluator;
+class TColumnDescriptor;
 class TDescriptorTable;
+class TDescriptorTableSerialized;
+class TExpr;
 class TSlotDescriptor;
-class TTable;
-class TTupleDescriptor;
 class TTableDescriptor;
+class TTupleDescriptor;
 
 /// A path into a table schema (e.g. a vector of ColumnTypes) pointing to a particular
 /// column/field. The i-th element of the path is the ordinal position of the column/field
@@ -117,8 +118,8 @@ class SlotDescriptor {
   SlotId id() const { return id_; }
   const ColumnType& type() const { return type_; }
   const TupleDescriptor* parent() const { return parent_; }
-  const TupleDescriptor* collection_item_descriptor() const {
-    return collection_item_descriptor_;
+  const TupleDescriptor* children_tuple_descriptor() const {
+    return children_tuple_descriptor_;
   }
   /// Returns the column index of this slot, including partition keys.
   /// (e.g., col_pos - num_partition_keys = the table column this slot corresponds to)
@@ -126,14 +127,21 @@ class SlotDescriptor {
   /// convenient for table formats for which we only support flat data.
   int col_pos() const { return col_path_[0]; }
   const SchemaPath& col_path() const { return col_path_; }
-  /// Returns the field index in the generated llvm struct for this slot's tuple
-  int llvm_field_idx() const { return llvm_field_idx_; }
+
+  /// Returns the field index in the generated llvm struct for this slot's tuple.
+  /// The 'llvm_field_idx' is the index of the slot in the llvm codegen'd tuple struct.
+  /// This takes into account any padding bytes.
+  int llvm_field_idx() const { return slot_idx_; }
+
   int tuple_offset() const { return tuple_offset_; }
   const NullIndicatorOffset& null_indicator_offset() const {
     return null_indicator_offset_;
   }
   bool is_nullable() const { return null_indicator_offset_.bit_mask != 0; }
   int slot_size() const { return slot_size_; }
+
+  TVirtualColumnType::type virtual_column_type() const { return virtual_column_type_; }
+  bool IsVirtual() const { return virtual_column_type_ != TVirtualColumnType::NONE; }
 
   /// Comparison function for ordering slot descriptors by their col_path_.
   /// Returns true if 'a' comes before 'b'.
@@ -148,6 +156,10 @@ class SlotDescriptor {
   /// Return true if the physical layout of this descriptor matches the physical layout
   /// of other_desc, but not necessarily ids.
   bool LayoutEquals(const SlotDescriptor& other_desc) const;
+
+  /// Load "any_val"'s value from 'raw_val_ptr', which must be a pointer to the matching
+  /// native type, e.g. a StringValue or TimestampValue slot in a tuple.
+  static void CodegenLoadAnyVal(CodegenAnyVal* any_val, llvm::Value* raw_val_ptr);
 
   /// Generate LLVM code at the insert position of 'builder' that returns a boolean value
   /// represented as a LLVM i1 indicating whether this slot is null in 'tuple'.
@@ -166,6 +178,46 @@ class SlotDescriptor {
   void CodegenSetNullIndicator(LlvmCodeGen* codegen, LlvmBuilder* builder,
       llvm::Value* tuple, llvm::Value* is_null) const;
 
+  void CodegenWriteToSlot(const CodegenAnyValReadWriteInfo& read_write_info,
+      llvm::Value* tuple_llvm_struct_ptr,
+      llvm::Value* pool_val, llvm::BasicBlock* insert_before = nullptr) const;
+
+  /// Stores this 'any_val' into a native slot, e.g. a StringValue or TimestampValue.
+  /// This should only be used if 'any_val' is not null.
+  ///
+  /// Not valid to call for FIXED_UDA_INTERMEDIATE: in that case the StringVal must be
+  /// set up to point directly to the underlying slot, e.g. by LoadFromNativePtr().
+  ///
+  /// Not valid to call for structs.
+  ///
+  /// If 'pool_val' is non-NULL, var-len data will be copied into 'pool_val'.
+  /// 'pool_val' has to be of type MemPool*.
+  ///
+  /// 'slot_desc' is needed when 'pool_val' is non-NULL and the value is a collection. In
+  /// this case the collection is copied and the slot desc is needed to calculate its byte
+  /// size.
+  static void CodegenStoreNonNullAnyVal(CodegenAnyVal& any_val,
+      llvm::Value* raw_val_ptr, llvm::Value* pool_val = nullptr,
+      const SlotDescriptor* slot_desc = nullptr);
+
+  /// Like the above, but takes a 'CodegenAnyValReadWriteInfo' instead of a
+  /// 'CodegenAnyVal'.
+  static void CodegenStoreNonNullAnyVal(const CodegenAnyValReadWriteInfo& read_write_info,
+      llvm::Value* raw_val_ptr, llvm::Value* pool_val = nullptr,
+      const SlotDescriptor* slot_desc = nullptr);
+
+  /// Like 'CodegenStoreNonNullAnyVal' but stores the value into a new alloca()
+  /// allocation. Returns a pointer to the stored value.
+  static llvm::Value* CodegenStoreNonNullAnyValToNewAlloca(
+      CodegenAnyVal& any_val, llvm::Value* pool_val = nullptr);
+
+  /// Like the above, but takes a 'CodegenAnyValReadWriteInfo' instead of a
+  /// 'CodegenAnyVal'.
+  static llvm::Value* CodegenStoreNonNullAnyValToNewAlloca(
+      const CodegenAnyValReadWriteInfo& read_write_info, llvm::Value* pool_val = nullptr);
+
+  /// Returns true if this slot is a child of a struct slot.
+  inline bool IsChildOfStruct() const;
  private:
   friend class DescriptorTbl;
   friend class TupleDescriptor;
@@ -173,8 +225,8 @@ class SlotDescriptor {
   const SlotId id_;
   const ColumnType type_;
   const TupleDescriptor* parent_;
-  /// Non-NULL only for collection slots
-  const TupleDescriptor* collection_item_descriptor_;
+  /// Non-NULL only for complex type slots
+  const TupleDescriptor* children_tuple_descriptor_;
   // TODO for 2.3: rename to materialized_path_
   const SchemaPath col_path_;
   const int tuple_offset_;
@@ -187,14 +239,11 @@ class SlotDescriptor {
   /// the byte size of this slot.
   const int slot_size_;
 
-  /// The idx of the slot in the llvm codegen'd tuple struct
-  /// This is set by TupleDescriptor during codegen and takes into account
-  /// any padding bytes.
-  int llvm_field_idx_ = -1;
+  const TVirtualColumnType::type virtual_column_type_;
 
-  /// collection_item_descriptor should be non-NULL iff this is a collection slot
+  /// 'children_tuple_descriptor' should be non-NULL iff this is a complex type slot.
   SlotDescriptor(const TSlotDescriptor& tdesc, const TupleDescriptor* parent,
-      const TupleDescriptor* collection_item_descriptor);
+      const TupleDescriptor* children_tuple_descriptor);
 
   /// Generate LLVM code at the insert position of 'builder' to get the i8 value of
   /// the byte containing 'null_indicator_offset' in 'tuple'. If 'null_byte_ptr' is
@@ -202,6 +251,37 @@ class SlotDescriptor {
   static llvm::Value* CodegenGetNullByte(LlvmCodeGen* codegen, LlvmBuilder* builder,
       const NullIndicatorOffset& null_indicator_offset, llvm::Value* tuple,
       llvm::Value** null_byte_ptr);
+
+  void CodegenWriteToSlotHelper(const CodegenAnyValReadWriteInfo& read_write_info,
+      llvm::Value* main_tuple_llvm_struct_ptr, llvm::Value* tuple_llvm_struct_ptr,
+      llvm::Value* pool_val, NonWritableBasicBlock insert_before) const;
+
+  /// Stores a struct value into a native slot. This should only be used if this struct is
+  /// not null.
+  ///
+  /// 'main_tuple_ptr' should be a pointer to the beginning of the whole main tuple, while
+  /// 'struct_slot_ptr' should be the slot where the struct should be stored. The first
+  /// one is needed because the offsets of the struct's children are calculated from the
+  /// beginning of the main tuple.
+  void CodegenStoreStructToNativePtr(const CodegenAnyValReadWriteInfo& read_write_info,
+      llvm::Value* main_tuple_ptr, llvm::Value* struct_slot_ptr, llvm::Value* pool_val,
+      NonWritableBasicBlock insert_before) const;
+
+  // Sets the null indicator bit to 0 - recursively for structs.
+  void CodegenSetToNull(const CodegenAnyValReadWriteInfo& read_write_info,
+      llvm::Value* tuple) const;
+
+  /// Codegens writing a string or a collection to the address pointed to by 'slot_ptr'.
+  /// If 'pool_val' is non-NULL, the data will be copied into 'pool_val'. 'pool_val' has
+  /// to be of type MemPool*. 'slot_desc' is needed when 'pool_val' is non-NULL and the
+  /// value is a collection. In this case the collection is copied and the slot desc is
+  /// needed to calculate its byte size.
+  static void CodegenWriteStringOrCollectionToSlot(
+      const CodegenAnyValReadWriteInfo& read_write_info,
+      llvm::Value* slot_ptr, llvm::Value* pool_val, const SlotDescriptor* slot_desc);
+
+  static llvm::Value* CodegenToTimestampValue(
+      const CodegenAnyValReadWriteInfo& read_write_info);
 };
 
 class ColumnDescriptor {
@@ -209,11 +289,23 @@ class ColumnDescriptor {
   ColumnDescriptor(const TColumnDescriptor& tdesc);
   const std::string& name() const { return name_; }
   const ColumnType& type() const { return type_; }
+
+  int field_id() const { return field_id_; }
+  int field_map_key_id() const { return field_map_key_id_; }
+  int field_map_value_id() const { return field_map_value_id_; }
+
+  const AuxColumnType& auxType() const { return aux_type_; }
   std::string DebugString() const;
 
  private:
   std::string name_;
   ColumnType type_;
+
+  int field_id_ = -1;
+  int field_map_key_id_ = -1;
+  int field_map_value_id_ = -1;
+
+  AuxColumnType aux_type_;
 };
 
 /// Base class for table descriptors.
@@ -229,7 +321,15 @@ class TableDescriptor {
   /// columns.
   bool IsClusteringCol(const SlotDescriptor* slot_desc) const {
     return slot_desc->col_path().size() == 1 &&
-        slot_desc->col_path()[0] < num_clustering_cols_;
+        slot_desc->col_path()[0] < num_clustering_cols_ &&
+        !slot_desc->IsVirtual();
+  }
+
+  /// Get ColumnDesc based on SchemaPath.
+  const ColumnDescriptor& GetColumnDesc(const SlotDescriptor* slot_desc) const {
+    DCHECK_EQ(slot_desc->col_path().size(), 1); // Not supported for nested types.
+    DCHECK_LT(slot_desc->col_path()[0], col_descs_.size());
+    return col_descs_[slot_desc->col_path()[0]];
   }
 
   const std::string& name() const { return name_; }
@@ -332,6 +432,28 @@ class HdfsTableDescriptor : public TableDescriptor {
     return prototype_partition_descriptor_;
   }
 
+  bool IsTableFullAcid() const { return is_full_acid_; }
+  const TValidWriteIdList& ValidWriteIdList() const { return valid_write_id_list_; }
+
+  bool IsIcebergTable() const { return is_iceberg_; }
+  const std::string& IcebergTableLocation() const { return iceberg_table_location_; }
+  const std::vector<std::string>& IcebergNonVoidPartitionNames() const {
+    return iceberg_non_void_partition_names_;
+  }
+  const TCompressionCodec& IcebergParquetCompressionCodec() const {
+    return iceberg_parquet_compression_codec_;
+  }
+  int64_t IcebergParquetRowGroupSize() const {
+    return iceberg_parquet_row_group_size_;
+  }
+
+  int64_t IcebergParquetPlainPageSize() const {
+    return iceberg_parquet_plain_page_size_;
+  }
+  int64_t IcebergParquetDictPageSize() const {
+    return iceberg_parquet_dict_page_size_;
+  }
+
   virtual std::string DebugString() const;
 
  protected:
@@ -343,6 +465,15 @@ class HdfsTableDescriptor : public TableDescriptor {
   HdfsPartitionDescriptor* prototype_partition_descriptor_;
   /// Set to the table's Avro schema if this is an Avro table, empty string otherwise
   std::string avro_schema_;
+  bool is_full_acid_;
+  TValidWriteIdList valid_write_id_list_;
+  bool is_iceberg_ = false;
+  std::string iceberg_table_location_;
+  std::vector<std::string> iceberg_non_void_partition_names_;
+  TCompressionCodec iceberg_parquet_compression_codec_;
+  int64_t iceberg_parquet_row_group_size_;
+  int64_t iceberg_parquet_plain_page_size_;
+  int64_t iceberg_parquet_dict_page_size_;
 };
 
 class HBaseTableDescriptor : public TableDescriptor {
@@ -418,8 +549,10 @@ class TupleDescriptor {
   TupleId id() const { return id_; }
   std::string DebugString() const;
 
-  /// Returns true if this tuple or any nested collection item tuples have string slots.
-  bool ContainsStringData() const;
+  bool isTupleOfStructSlot() const { return master_tuple_ != nullptr; }
+
+  TupleDescriptor* getMasterTuple() const { return master_tuple_; }
+  void setMasterTuple(TupleDescriptor* desc) { master_tuple_ = desc; }
 
   /// Return true if the physical layout of this descriptor matches that of other_desc,
   /// but not necessarily the id.
@@ -467,11 +600,30 @@ class TupleDescriptor {
   /// collection, empty otherwise.
   SchemaPath tuple_path_;
 
+  /// If this tuple represents the children of a struct slot then 'master_tuple_' is the
+  /// tuple that holds the topmost struct slot. For example:
+  /// - Tuple0
+  ///     - Slot1 e.g. INT slot
+  ///     - Slot2 e.g. STRUCT slot
+  ///         - Tuple1 (Holds the children of the struct)
+  ///             - Slot3 e.g. INT child of the STRUCT
+  ///             - Slot4 e.g. STRING child of the STRUCT
+  /// In the above example the 'master_tuple_' for Tuple1 (that is the struct's tuple to
+  /// hold its children) would be Tuple0. In case the STRUCT in Slot2 was a nested struct
+  /// in any depth then the 'master_tuple_' for any of the tuples under Slot2 would be
+  /// again Tuple0.
+  TupleDescriptor* master_tuple_ = nullptr;
+
   TupleDescriptor(const TTupleDescriptor& tdesc);
   void AddSlot(SlotDescriptor* slot);
 
   /// Returns slots in their physical order.
   std::vector<SlotDescriptor*> SlotsOrderedByIdx() const;
+
+  std::pair<std::vector<llvm::Type*>, int> GetLlvmTypesAndOffset(LlvmCodeGen* codegen,
+      int curr_struct_offset) const;
+  llvm::StructType* CreateLlvmStructTypeFromFieldTypes(LlvmCodeGen* codegen,
+      const std::vector<llvm::Type*>& field_types, int parent_slot_offset) const;
 };
 
 class DescriptorTbl {
@@ -502,6 +654,11 @@ class DescriptorTbl {
 
   std::string DebugString() const;
 
+  /// Converts a TDescriptorTableSerialized to a TDescriptorTable. Returns
+  /// an error if deserialization fails.
+  static Status DeserializeThrift(const TDescriptorTableSerialized& serial_tbl,
+      TDescriptorTable* desc_tbl) WARN_UNUSED_RESULT;
+
  private:
   // The friend classes use CreateInternal().
   friend class DescriptorTblBuilder;
@@ -518,11 +675,6 @@ class DescriptorTbl {
 
   static Status CreatePartKeyExprs(
       const HdfsTableDescriptor& hdfs_tbl, ObjectPool* pool) WARN_UNUSED_RESULT;
-
-  /// Converts a TDescriptorTableSerialized to a TDescriptorTable. Returns
-  /// an error if deserialization fails.
-  static Status DeserializeThrift(const TDescriptorTableSerialized& serial_tbl,
-      TDescriptorTable* desc_tbl) WARN_UNUSED_RESULT;
 
   /// Creates a TableDescriptor (allocated in 'pool', returned via 'desc')
   /// corresponding to tdesc. Returns error status on failure.
@@ -631,7 +783,4 @@ class RowDescriptor {
   /// Provide quick way to check if there are variable length slots.
   bool has_varlen_slots_;
 };
-
 }
-
-#endif

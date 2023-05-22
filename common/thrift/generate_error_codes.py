@@ -25,6 +25,7 @@
 #
 # TODO Add support for SQL Error Codes
 #      https://msdn.microsoft.com/en-us/library/ms714687%28v=vs.85%29.aspx
+from __future__ import absolute_import, division, print_function
 error_codes = (
   ("OK", 0, ""),
 
@@ -68,7 +69,7 @@ error_codes = (
 
   ("PARQUET_WRONG_PRECISION", 17,
     "File '$0' column '$1' has a precision that does not match the table metadata "
-    " precision. File metadata precision: $2, table metadata precision: $3."),
+    "precision. File metadata precision: $2, table metadata precision: $3."),
 
   ("PARQUET_BAD_CONVERTED_TYPE", 18,
    "File '$0' column '$1' does not have converted type set to DECIMAL"),
@@ -193,7 +194,7 @@ error_codes = (
    "Try running \\\"refresh $1\\\" to reload the file metadata."),
 
   ("PARQUET_BAD_VERSION_NUMBER", 60, "File '$0' has an invalid Parquet version number: "
-   "$1\\n. Please check that it is a valid Parquet file. "
+   "$1.\\nPlease check that it is a valid Parquet file. "
    "This error can also occur due to stale metadata. "
    "If you believe this is a valid Parquet file, try running \\\"refresh $2\\\"."),
 
@@ -233,7 +234,7 @@ error_codes = (
 
   ("IMPALA_KUDU_TYPE_MISSING", 73, "Impala type $0 is not available in Kudu."),
 
-  ("KUDU_NOT_SUPPORTED_ON_OS", 74, "Kudu is not supported on this operating system."),
+  ("KUDU_NOT_SUPPORTED_ON_OS", 74, "Not in use."),
 
   ("KUDU_NOT_ENABLED", 75, "Kudu features are disabled by the startup flag "
    "--disable_kudu."),
@@ -334,7 +335,7 @@ error_codes = (
   ("ADMISSION_REJECTED", 107, "Rejected query from pool $0: $1"),
 
   ("ADMISSION_TIMED_OUT", 108, "Admission for query exceeded timeout $0ms in pool $1. "
-     "Queued reason: $2"),
+          "Queued reason: $2 Additional Details: $3"),
 
   ("THREAD_CREATION_FAILED", 109, "Failed to create thread $0 in category $1: $2"),
 
@@ -442,6 +443,43 @@ error_codes = (
   ("ORC_TIMESTAMP_OUT_OF_RANGE", 145,
    "ORC file '$0' column '$1' contains an out of range timestamp. "
    "The valid date range is 1400-01-01..9999-12-31."),
+
+  ("ORC_DATE_OUT_OF_RANGE", 146,
+   "ORC file '$0' column '$1' contains an out of range date. "
+   "The valid date range is 0001-01-01..9999-12-31."),
+
+  ("ORC_NESTED_TYPE_MISMATCH", 147,
+   "File '$0' has an incompatible ORC schema for column '$1', "
+   "Column type: $2, ORC schema: $3"),
+
+  ("ORC_TYPE_NOT_ROOT_AT_STRUCT", 148,
+   "Root of the $0 type returned by the ORC lib is not STRUCT: $1. "
+   "Either there are bugs in the ORC lib or ORC file '$2' is corrupt."),
+
+  ("NAAJ_OUT_OF_MEMORY", 149,
+   "Unable to perform Null-Aware Anti-Join. Could not get enough reservation to fit "
+   "all rows with NULLs from the build side in memory. Memory required for $0 rows "
+   "was $1. $2/$3 of the join's reservation was available for the rows."),
+
+  # Note: impala_shell uses a regex to search for this specific error message, so
+  # changing it may break older shell version.
+  ("INVALID_QUERY_HANDLE", 150, "Invalid or unknown query handle: $0."),
+
+  ("JOIN_ROWS_PRODUCED_LIMIT_EXCEEDED", 151,
+   "Query $0 terminated due to join rows produced exceeds the limit of $1 "
+   "at node with id $2. Unset or increase JOIN_ROWS_PRODUCED_LIMIT query option "
+   "to produce more rows."),
+
+  ("LOCAL_DISK_FAULTY", 152,
+   "Query execution failure caused by local disk IO fatal error on backend: $0."),
+
+  ("JWKS_PARSE_ERROR", 153, "Error parsing JWKS: $0."),
+
+  ("JWT_VERIFY_FAILED", 154, "Error verifying JWT Token: $0."),
+
+  ("PARQUET_ROWS_SKIPPING", 155, "Couldn't skip rows in column '$0' in file '$1'."),
+
+  ("QUERY_OPTION_PARSE_FAILED", 156, "Failed to parse query option '$0': $1")
 )
 
 import sys

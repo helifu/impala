@@ -37,8 +37,8 @@ public interface AuthorizableFactory {
   Authorizable newDatabase(String dbName, @Nullable String ownerUser);
 
   /**
-   * Creates a new instance of table {@link Authorizable} for given database and table
-   * names owned by a given user.
+   * Creates a new instance of table {@link Authorizable} for a given database and a
+   * table name owned by a given user.
    */
   Authorizable newTable(String dbName, String tableName, @Nullable String ownerUser);
 
@@ -72,4 +72,6 @@ public interface AuthorizableFactory {
    * function names.
    */
   Authorizable newFunction(String dbName, String fnName);
+
+  Authorizable newStorageHandlerUri(String storageType, String storageUri);
 }

@@ -20,13 +20,16 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
-import org.apache.impala.analysis.UnionStmt.UnionOperand;
+import org.apache.impala.analysis.SetOperationStmt.SetOperand;
+import org.apache.impala.analysis.SetOperationStmt.SetOperator;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.TableAliasGenerator;
+import org.apache.impala.util.AcidUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Iterables;
@@ -39,8 +42,8 @@ import static org.apache.impala.analysis.ToSqlOptions.REWRITTEN;
  * Class representing a statement rewriter. The base class traverses the stmt tree and
  * the specific rewrite rules are implemented in the subclasses and are called by the
  * hooks in the base class.
- * TODO: Now that we have a nested-loop join supporting all join modes we could
- * allow more rewrites, although it is not clear we would always want to.
+ * TODO: IMPALA-9948: Now that we have a nested-loop join supporting all join modes we
+ * could allow more rewrites, although it is not clear we would always want to.
  */
 public class StmtRewriter {
   private final static Logger LOG = LoggerFactory.getLogger(StmtRewriter.class);
@@ -75,7 +78,7 @@ public class StmtRewriter {
 
   /**
    * Calls the appropriate rewrite method based on the specific type of query stmt. See
-   * rewriteSelectStatement() and rewriteUnionStatement() documentation.
+   * rewriteSelectStatement() and rewriteSetOperationStatement() documentation.
    */
   protected void rewriteQueryStatement(QueryStmt stmt, Analyzer analyzer)
       throws AnalysisException {
@@ -83,8 +86,8 @@ public class StmtRewriter {
     Preconditions.checkState(stmt.isAnalyzed());
     if (stmt instanceof SelectStmt) {
       rewriteSelectStatement((SelectStmt) stmt, analyzer);
-    } else if (stmt instanceof UnionStmt) {
-      rewriteUnionStatement((UnionStmt) stmt);
+    } else if (stmt instanceof SetOperationStmt) {
+      rewriteSetOperationStatement((SetOperationStmt) stmt, analyzer);
     } else {
       throw new AnalysisException(
           "Subqueries not supported for " + stmt.getClass().getSimpleName() +
@@ -98,7 +101,15 @@ public class StmtRewriter {
       if (!(tblRef instanceof InlineViewRef)) continue;
       InlineViewRef inlineViewRef = (InlineViewRef) tblRef;
       rewriteQueryStatement(inlineViewRef.getViewStmt(), inlineViewRef.getAnalyzer());
+      // SetOperationStmt can be rewritten to SelectStmt.
+      if (inlineViewRef.getViewStmt() instanceof SetOperationStmt
+          && !(inlineViewRef.getViewStmt() instanceof UnionStmt)) {
+        inlineViewRef.queryStmt_ =
+            ((SetOperationStmt) inlineViewRef.getViewStmt()).getRewrittenStmt();
+        Preconditions.checkState(inlineViewRef.queryStmt_ != null);
+      }
     }
+
     // Currently only SubqueryRewriter touches the where clause. Recurse into the where
     // clause when the need arises.
     rewriteSelectStmtHook(stmt, analyzer);
@@ -106,14 +117,267 @@ public class StmtRewriter {
   }
 
   /**
-   * Rewrite all operands in a UNION. The conditions that apply to SelectStmt rewriting
-   * also apply here.
+   * Generate the join predicate for EXCEPT / INTERSECT rewrites. The set semantics
+   * require null = null to evaluate to true.
    */
-  private void rewriteUnionStatement(UnionStmt stmt) throws AnalysisException {
-    for (UnionOperand operand : stmt.getOperands()) {
-      Preconditions.checkState(operand.getQueryStmt() instanceof SelectStmt);
-      rewriteSelectStatement((SelectStmt) operand.getQueryStmt(), operand.getAnalyzer());
+  private static Expr getSetOpJoinPredicates(
+      InlineViewRef left, InlineViewRef right, SetOperator operator) {
+    Preconditions.checkState(left.getColLabels().size() == right.getColLabels().size());
+    Preconditions.checkState(
+        operator == SetOperator.EXCEPT || operator == SetOperator.INTERSECT);
+
+    BinaryPredicate.Operator eqOp = BinaryPredicate.Operator.NOT_DISTINCT;
+    final List<Expr> conjuncts =
+        Lists.newArrayListWithCapacity(left.getColLabels().size());
+    for (int i = 0; i < left.getColLabels().size(); ++i) {
+      conjuncts.add(new BinaryPredicate(eqOp,
+          new SlotRef(
+              Path.createRawPath(left.getUniqueAlias(), left.getColLabels().get(i))),
+          new SlotRef(
+              Path.createRawPath(right.getUniqueAlias(), right.getColLabels().get(i)))));
     }
+    return CompoundPredicate.createConjunctivePredicate(conjuncts);
+  }
+
+  /**
+   * Rewrite all operands in a SetOperation (EXCEPT/INTERSECT/UNION).
+   *
+   * IMPALA-9944: To support the [ALL] qualifier for EXCEPT & INTERSECT
+   *
+   * EXCEPT is rewritten using a Left Anti Join with an additional IS NOT DISTINCT
+   * predicate to ensure NULL equality returns true. INTERSECT is handled similarly
+   * however using LEFT SEMI or INNER Joins.
+   *
+   * We walk the list of set operands from left to right, combining consecutive EXCEPT and
+   * INTERSECT operands by combining their joins. When we encounter a UNION operand, we
+   * start a new SelectStmt to combine all subsequent UNIONS, with the leftmost operand
+   * being the joined statements from EXCEPT / INTERSECT
+   *
+   * Example: SELECT a FROM T1 INTERSECT SELECT a FROM T2 UNION SELECT b FROM T3
+   *
+   * We start by building a new SelectStmt to combine the operands as joined view.
+   *
+   * SELECT DISTINCT * FROM (SELECT a FROM T1) $a$1 LEFT SEMI JOIN (SELECT a FROM T2) $a$2
+   *   ON $a$1.a IS NOT DISTINCT FROM $a$2.a
+   *
+   * Subsequent UNION operands require a switch to a new SelectStmt. When creating a new
+   * SelectStmt if the current operand is a UNION then the first operand's from clause
+   * will contain the previous SelectStmt. When switching to EXCEPT/INTERSECT the first
+   * element in the from clause will contain the SelectStmt from the Union.
+   *
+   * Now we create a new SelectStmt for the UNION.
+   *
+   * SELECT * FROM ( op1 UNION op2 )
+   *
+   * Filling in op1 and op2
+   *
+   * SELECT * FROM(
+   *  SELECT DISTINCT * FROM (SELECT a FROM T1) $a$1 LEFT SEMI JOIN
+   *  (SELECT a FROM T2) $a$2 ON $a$1.a IS NOT DISTINCT FROM $a$2.a
+   * UNION
+   *   SELECT b FROM T3) $a$3
+   *
+   * We continue to create new SelectStmts whenever we switch from a
+   * series of EXCEPT/INTERSECT to UNION.
+   *
+   */
+  private void rewriteSetOperationStatement(SetOperationStmt stmt, Analyzer analyzer)
+      throws AnalysisException {
+    // Early out for UnionStmt as we don't rewrite the union operator
+    if (stmt instanceof UnionStmt) {
+      for (SetOperand operand : stmt.getOperands()) {
+        rewriteQueryStatement(operand.getQueryStmt(), operand.getAnalyzer());
+        if (operand.getQueryStmt() instanceof SetOperationStmt
+            && !(operand.getQueryStmt() instanceof UnionStmt)) {
+          SetOperationStmt setOpStmt = ((SetOperationStmt) operand.getQueryStmt());
+          if (setOpStmt.hasRewrittenStmt()) {
+            QueryStmt rewrittenStmt = setOpStmt.getRewrittenStmt();
+            operand.setQueryStmt(rewrittenStmt);
+          }
+        }
+      }
+      return;
+    }
+
+    // During each iteration of the loop below, exactly one of eiSelect or uSelect becomes
+    // non-null, they function as placeholders for the current sequence of rewrites for
+    // except/intersect or union operands respectively. If the last operand processed was
+    // a union, uSelect is the current select statement that has unionStmt nested inside,
+    // which in turn contains preceding union operands.  If the last operator processed
+    // was an except or intersect, eiSelect is the current select statement containing
+    // preceding except or intersect operands in the from clause.
+    TableAliasGenerator tableAliasGenerator = new TableAliasGenerator(analyzer, null);
+    SelectStmt uSelect = null, eiSelect = null;
+    SetOperationStmt unionStmt = null;
+
+    SetOperand firstOperand = stmt.getOperands().get(0);
+    rewriteQueryStatement(firstOperand.getQueryStmt(), firstOperand.getAnalyzer());
+    if (firstOperand.getQueryStmt() instanceof SetOperationStmt) {
+      SetOperationStmt setOpStmt = ((SetOperationStmt) firstOperand.getQueryStmt());
+      if (setOpStmt.hasRewrittenStmt()) {
+        firstOperand.setQueryStmt(setOpStmt.getRewrittenStmt());
+      }
+    }
+
+    for (int i = 1; i < stmt.getOperands().size(); ++i) {
+      SetOperand operand = stmt.getOperands().get(i);
+      rewriteQueryStatement(operand.getQueryStmt(), operand.getAnalyzer());
+      if (operand.getQueryStmt() instanceof SetOperationStmt) {
+        SetOperationStmt setOpStmt = ((SetOperationStmt) operand.getQueryStmt());
+        if (setOpStmt.hasRewrittenStmt()) {
+          operand.setQueryStmt(setOpStmt.getRewrittenStmt());
+        }
+      }
+
+      switch (operand.getSetOperator()) {
+        case EXCEPT:
+        case INTERSECT:
+          if (eiSelect == null) {
+            // For a new SelectStmt the left most tableref will either be the first
+            // operand or a the SelectStmt from the union operands.
+            InlineViewRef leftMostView = null;
+            SelectList sl =
+                new SelectList(Lists.newArrayList(SelectListItem.createStarItem(null)));
+            // Intersect/Except have set semantics in SQL they must not return duplicates
+            // As an optimization we push this distinct down into the first operand if
+            // it's not a UNION and has no other aggregations.
+            // This would be best done in a cost based manner during planning.
+            sl.setIsDistinct(true);
+            eiSelect = new SelectStmt(sl, null, null, null, null, null, null);
+
+            if (i == 1) {
+              if (firstOperand.getQueryStmt() instanceof SelectStmt) {
+                // push down the distinct aggregation if the first operand isn't a UNION
+                // there are no window functions, and we determine the results exprs
+                // already produce distinct results.
+                SelectStmt firstOpStmt = (SelectStmt) firstOperand.getQueryStmt();
+                // DISTINCT is already set
+                if (firstOpStmt.getSelectList().isDistinct()) {
+                  sl.setIsDistinct(false);
+                } else {
+                  // Must not have window functions
+                  if (firstOpStmt.getTableRefs().size() > 0
+                      && !firstOpStmt.hasAnalyticInfo()) {
+                    // Add distinct if there isn't any other grouping
+                    if (!firstOpStmt.hasMultiAggInfo()) {
+                      firstOpStmt.getSelectList().setIsDistinct(true);
+                    }
+                    sl.setIsDistinct(false);
+                  }
+                }
+              }
+              leftMostView = new InlineViewRef(tableAliasGenerator.getNextAlias(),
+                  firstOperand.getQueryStmt(), (TableSampleClause) null);
+              leftMostView.analyze(analyzer);
+              eiSelect.getTableRefs().add(leftMostView);
+            }
+
+            // There was a union operator before this one.
+            if (uSelect != null) {
+              Preconditions.checkState(i != 1);
+              if (uSelect.getSelectList().isDistinct()
+                  && eiSelect.getTableRefs().size() == 0) {
+                // optimize out the distinct aggregation in the outer query
+                sl.setIsDistinct(false);
+              }
+              leftMostView = new InlineViewRef(
+                  tableAliasGenerator.getNextAlias(), uSelect, (TableSampleClause) null);
+              leftMostView.analyze(analyzer);
+              eiSelect.getTableRefs().add(leftMostView);
+              uSelect = null;
+            }
+          }
+
+          // INTERSECT => Left Semi Join and EXCEPT => Left Anti Join
+          JoinOperator joinOp = operand.getSetOperator() == SetOperator.EXCEPT ?
+              JoinOperator.LEFT_ANTI_JOIN :
+              JoinOperator.LEFT_SEMI_JOIN;
+          TableRef rightMostTbl =
+              eiSelect.getTableRefs().get(eiSelect.getTableRefs().size() - 1);
+
+          // As an optimization we can rewrite INTERSECT with an inner join if both
+          // operands return distinct rows.
+          if (operand.getQueryStmt() instanceof SelectStmt) {
+            SelectStmt inner = ((SelectStmt) operand.getQueryStmt());
+            if (inner.getSelectList().isDistinct()) {
+              if (rightMostTbl instanceof InlineViewRef) {
+                QueryStmt outer = ((InlineViewRef) rightMostTbl).getViewStmt();
+                if (outer instanceof SelectStmt) {
+                  if (((SelectStmt) outer).getSelectList().isDistinct()
+                      && operand.getSetOperator() == SetOperator.INTERSECT) {
+                    joinOp = JoinOperator.INNER_JOIN;
+                    TableRef firstTbl = eiSelect.getTableRefs().get(0);
+                    // Make sure only the leftmost view's tuples are visible
+                    eiSelect.getSelectList().getItems().set(0, SelectListItem
+                        .createStarItem(Lists.newArrayList(firstTbl.getUniqueAlias())));
+                  }
+                }
+              }
+            }
+          }
+          List<String> colLabels = new ArrayList<>();
+          for (int j = 0; j < operand.getQueryStmt().getColLabels().size(); ++j) {
+            colLabels.add(eiSelect.getColumnAliasGenerator().getNextAlias());
+          }
+          // Wraps the query statement for the current operand.
+          InlineViewRef opWrapperView = new InlineViewRef(
+              tableAliasGenerator.getNextAlias(), operand.getQueryStmt(), colLabels);
+          opWrapperView.setLeftTblRef(rightMostTbl);
+          opWrapperView.setJoinOp(joinOp);
+          opWrapperView.setOnClause(
+              getSetOpJoinPredicates((InlineViewRef) eiSelect.getTableRefs().get(0),
+                  opWrapperView, operand.getSetOperator()));
+          opWrapperView.analyze(analyzer);
+          eiSelect.getTableRefs().add(opWrapperView);
+          break;
+
+        case UNION:
+          // Create a new SelectStmt for unions.
+          if (uSelect == null) {
+            unionStmt = null;
+            SelectList sl =
+                new SelectList(Lists.newArrayList(SelectListItem.createStarItem(null)));
+            uSelect = new SelectStmt(sl, null, null, null, null, null, null);
+            SetOperationStmt.SetOperand eiOperand = null;
+            if (eiSelect != null) {
+              eiOperand = new SetOperationStmt.SetOperand(eiSelect, null, null);
+              eiSelect = null;
+            }
+            List<SetOperationStmt.SetOperand> initialOps = new ArrayList<>();
+            if (i == 1) {
+              initialOps.add(firstOperand);
+              firstOperand = null;
+            }
+            if (eiOperand != null) {
+              initialOps.add(eiOperand);
+            }
+            unionStmt = new UnionStmt(initialOps, null, null);
+            uSelect.getTableRefs().add(new InlineViewRef(
+                tableAliasGenerator.getNextAlias(), unionStmt, (TableSampleClause) null));
+          }
+          operand.reset();
+          unionStmt.getOperands().add(operand);
+          break;
+
+        default:
+          throw new AnalysisException("Unknown Set Operation Statement Operator Type");
+      }
+    }
+
+    final SelectStmt newStmt = uSelect != null ? uSelect : eiSelect;
+    Preconditions.checkNotNull(newStmt);
+
+    newStmt.limitElement_ = stmt.limitElement_;
+    newStmt.limitElement_.reset();
+    if (stmt.hasOrderByClause()) {
+      newStmt.orderByElements_ = stmt.cloneOrderByElements();
+      if (newStmt.orderByElements_ != null) {
+        for (OrderByElement o : newStmt.orderByElements_) o.getExpr().reset();
+      }
+    }
+
+    newStmt.analyze(analyzer);
+    stmt.rewrittenStmt_ = newStmt;
   }
 
   protected void rewriteSelectStmtHook(SelectStmt stmt, Analyzer analyzer)
@@ -230,7 +494,9 @@ public class StmtRewriter {
       if (!inPred.isNotIn()) return null;
 
       // CASE 2, NOT IN and RHS returns a single row:
-      if (rhsQuery.returnsSingleRow()) {
+      // IMPALA-7782: this rewrite is only valid if the subquery is always non-empty
+      // because C NOT IN (<empty set>) is true, but C != (<empty set>) is false.
+      if (rhsQuery.returnsExactlyOneRow()) {
         return new BinaryPredicate(BinaryPredicate.Operator.NE, lhs, rhs);
       }
 
@@ -307,7 +573,9 @@ public class StmtRewriter {
       boolean updateSelectList = false;
       SelectStmt subqueryStmt = (SelectStmt) expr.getSubquery().getStatement();
       boolean isScalarSubquery = expr.getSubquery().isScalarSubquery();
+      boolean isScalarColumn = expr.getSubquery().returnsScalarColumn();
       boolean isRuntimeScalar = subqueryStmt.isRuntimeScalar();
+      boolean isDisjunctive = hasSubqueryInDisjunction(expr);
       // Create a new inline view from the subquery stmt. The inline view will be added
       // to the stmt's table refs later. Explicitly set the inline view's column labels
       // to eliminate any chance that column aliases from the parent query could reference
@@ -319,6 +587,20 @@ public class StmtRewriter {
       InlineViewRef inlineView =
           new InlineViewRef(stmt.getTableAliasGenerator().getNextAlias(), subqueryStmt,
               colLabels);
+
+      // To handle a subquery in a disjunct, we need to pull out the subexpression that
+      // is the immediate parent of the subquery and prepare to add additional predicates
+      // to the WHERE clause of 'stmt'.
+      List<Expr> whereClauseConjuncts = null;
+      List<Expr> whereClauseSmapLhs = null;
+      List<Expr> whereClauseSmapRhs = null;
+      if (isDisjunctive) {
+        whereClauseConjuncts = new ArrayList<Expr>();
+        whereClauseSmapLhs = new ArrayList<Expr>();
+        whereClauseSmapRhs = new ArrayList<Expr>();
+        expr = replaceSubqueryInDisjunct(expr, inlineView, subqueryStmt,
+            whereClauseConjuncts, whereClauseSmapLhs, whereClauseSmapRhs);
+      }
 
       // Extract all correlated predicates from the subquery.
       List<Expr> onClauseConjuncts = extractCorrelatedPredicates(subqueryStmt);
@@ -349,15 +631,46 @@ public class StmtRewriter {
       // However the statement is already analyzed and since statement analysis is not
       // idempotent, the analysis needs to be reset.
       inlineView.reset();
-      inlineView.analyze(analyzer);
+      try {
+        inlineView.analyze(analyzer);
+      } catch (AnalysisException e) {
+        // We can't identify all the aggregate functions until the subquery is fully
+        // analyzed, so we need to catch the exception here and produce a more helpful
+        // error message.
+        if (isDisjunctive && subqueryStmt.hasAggregate(/*includeDistinct=*/ false)) {
+          // TODO: IMPALA-5098: we could easily support this if DISTINCT and aggregates
+          // were supported in the same query block.
+          throw new AnalysisException("Aggregate functions in subquery in disjunction " +
+              "not supported: " + subqueryStmt.toSql());
+        }
+        throw e;
+      }
       inlineView.setLeftTblRef(stmt.fromClause_.get(stmt.fromClause_.size() - 1));
       stmt.fromClause_.add(inlineView);
-      JoinOperator joinOp = JoinOperator.LEFT_SEMI_JOIN;
 
       // Create a join conjunct from the expr that contains a subquery.
       Expr joinConjunct =
-          createJoinConjunct(expr, inlineView, analyzer, !onClauseConjuncts.isEmpty());
-      if (joinConjunct != null) {
+            createJoinConjunct(expr, inlineView, analyzer, !onClauseConjuncts.isEmpty());
+      JoinOperator joinOp = JoinOperator.LEFT_SEMI_JOIN;
+
+      if (isDisjunctive) {
+        // Special case handling of disjunctive subqueries - add the WHERE conjuncts
+        // generated above and convert to a LEFT OUTER JOIN so we can reference slots
+        // from subquery.
+        for (Expr rhsExpr : whereClauseSmapRhs) {
+          rhsExpr.analyze(analyzer);
+        }
+        ExprSubstitutionMap smap =
+            new ExprSubstitutionMap(whereClauseSmapLhs, whereClauseSmapRhs);
+        for (Expr pred : whereClauseConjuncts) {
+          pred = pred.substitute(smap, analyzer, false);
+          stmt.whereClause_ =
+              CompoundPredicate.createConjunction(pred, stmt.whereClause_);
+        }
+        joinOp = JoinOperator.LEFT_OUTER_JOIN;
+        updateSelectList = true;
+        if (joinConjunct != null) onClauseConjuncts.add(joinConjunct);
+      } else if (joinConjunct != null) {
         SelectListItem firstItem =
             ((SelectStmt) inlineView.getViewStmt()).getSelectList().getItems().get(0);
         if (!onClauseConjuncts.isEmpty() && firstItem.getExpr() != null &&
@@ -460,11 +773,17 @@ public class StmtRewriter {
       }
 
       if (!hasEqJoinPred && !inlineView.isCorrelated()) {
+        // TODO: IMPALA-9948: we could support non-equi joins here
         // TODO: Remove this when independent subquery evaluation is implemented.
-        // TODO: Requires support for non-equi joins.
+        // TODO: IMPALA-5100 to cover all cases, we do let through runtime scalars with
+        // group by clauses to allow for subqueries where we haven't implemented plan time
+        // expression evaluation to ensure only a single row is returned. This may expose
+        // runtime errors in the presence of multiple runtime scalar subqueries until we
+        // implement independent evaluation.
         boolean hasGroupBy = ((SelectStmt) inlineView.getViewStmt()).hasGroupByClause();
-        if ((!isScalarSubquery && !isRuntimeScalar) ||
-            (hasGroupBy && !stmt.selectList_.isDistinct())) {
+        if ((!isScalarSubquery && !isRuntimeScalar)
+            || (hasGroupBy && !stmt.selectList_.isDistinct() && !isScalarColumn
+                   && !isRuntimeScalar)) {
           throw new AnalysisException(
               "Unsupported predicate with subquery: " + expr.toSql());
         }
@@ -481,6 +800,9 @@ public class StmtRewriter {
         stmt.whereClause_ =
             CompoundPredicate.createConjunction(onClausePredicate, stmt.whereClause_);
         inlineView.setJoinOp(JoinOperator.CROSS_JOIN);
+        // Indicate this inline view returns at most one value through a
+        // non-correlated scalar subquery.
+        if (isScalarSubquery) inlineView.setIsNonCorrelatedScalarSubquery();
         // Indicate that the CROSS JOIN may add a new visible tuple to stmt's
         // select list (if the latter contains an unqualified star item '*')
         return true;
@@ -521,6 +843,78 @@ public class StmtRewriter {
     }
 
     /**
+     * Handle a single subquery in 'expr', which is a predicate containing a disjunction,
+     * which in turn contains a subquery. The inline view and subqueryStmt are modified
+     * as needed and where clause predicates are generated and added to
+     * 'whereClauseConjuncts'. A smap constructed from 'smapLhs' and 'smapRhs' will be
+     * later applied to 'whereClauseConjuncts'. Exprs in 'smapRhs' will be analyzed by
+     * the caller before construction of the smap.
+     *
+     * 'subqueryStmt' must have a single item in its select list.
+     *
+     * @returns the parent expr of the subquery to be converted into a join conjunct
+     *    in the containing statement of the subquery.
+     * @throws AnalysisException if this predicate cannot be converted into a join
+     *    conjunct.
+     */
+    static private Expr replaceSubqueryInDisjunct(Expr expr, InlineViewRef inlineView,
+        SelectStmt subqueryStmt, List<Expr> whereClauseConjuncts,
+        List<Expr> smapLhs, List<Expr> smapRhs) throws AnalysisException {
+      Preconditions.checkState(subqueryStmt.getSelectList().getItems().size() == 1);
+      List<Expr> parents = new ArrayList<>();
+      expr.collect(Expr.HAS_SUBQUERY_CHILD, parents);
+      Preconditions.checkState(parents.size() == 1, "Must contain exactly 1 subquery");
+      Expr parent = parents.get(0);
+
+      // The caller will convert the IN predicate, a binary predicate against a
+      // scalar subquery and and any correlated predicates into join predicates.
+      // We can then replace the expression referencing the subquery with a NULL or
+      // IS NOT NULL referencing the select list item from the inline view, e.g.:
+      //
+      //    WHERE <condition 1> OR inlineview.col IS NOT NULL.
+      //
+      // Other expressions are not supported and rejected earlier in analysis.
+      // TODO: add support for [NOT] EXISTS. We could implement [NOT] EXISTS
+      // support by manipulating the select list of the subquery so that it
+      // includes a constant value, then referencing that in the generated WHERE conjunct.
+      if (parent instanceof ExistsPredicate) {
+        throw new AnalysisException("EXISTS/NOT EXISTS subqueries in OR predicates are " +
+            "not supported: " + expr.toSql());
+      } else if (parent instanceof InPredicate && ((InPredicate)parent).isNotIn()) {
+        throw new AnalysisException("NOT IN subqueries in OR predicates are not "
+            + "supported: " + expr.toSql());
+      } else if (!(parent instanceof Predicate)) {
+        // If the predicate is not the parent of the subquery, it requires more work to
+        // convert into a join conjunct.
+        // TODO: IMPALA-5226: handle a broader spectrum of expressions in where clause
+        // conjuncts.
+        throw new AnalysisException("Subqueries that are arguments to non-predicate " +
+            "exprs are not supported inside OR: " + expr.toSql());
+      }
+      Preconditions.checkState(parent instanceof InPredicate ||
+          parent instanceof BinaryPredicate || parent instanceof LikePredicate, parent);
+      // Get a reference to the first select list item from the IN.
+      SlotRef slotRef = new SlotRef(Lists.newArrayList(inlineView.getUniqueAlias(),
+            inlineView.getColLabels().get(0)));
+      // Add the original predicate to the where clause, and set up the subquery to be
+      // replaced.
+      whereClauseConjuncts.add(expr);
+      // We are going to do a LEFT OUTER equi-join against the single select list item
+      // from the subquery. We need each left input row to match at most one row from
+      // the right input, which we can ensure by adding a distinct to the subquery.
+      // The distinct supersedes any pre-existing grouping.
+      if (!subqueryStmt.returnsAtMostOneRow()) {
+        subqueryStmt.getSelectList().setIsDistinct(true);
+        subqueryStmt.removeGroupBy();
+      }
+      smapLhs.add(parent);
+      // The new IsNullPredicate is not analyzed, but will be analyzed during
+      // construction of the smap.
+      smapRhs.add(new IsNullPredicate(slotRef, true));
+      return parent;
+    }
+
+    /**
      * Replace all unqualified star exprs ('*') from stmt's select list with qualified
      * ones, i.e. tbl_1.*,...,tbl_n.*, where tbl_1,...,tbl_n are the visible tablerefs
      * in stmt. 'tableIdx' indicates the maximum tableRef ordinal to consider when
@@ -555,13 +949,10 @@ public class StmtRewriter {
 
     /**
      * Return true if the Expr tree rooted at 'expr' can be safely
-     * eliminated, i.e. it only consists of conjunctions of true BoolLiterals.
+     * eliminated, e.g. if it only consists of conjunctions of true BoolLiterals.
      */
     private static boolean canEliminate(Expr expr) {
-      for (Expr conjunct : expr.getConjuncts()) {
-        if (!Expr.IS_TRUE_LITERAL.apply(conjunct)) return false;
-      }
-      return true;
+      return expr.isTriviallyTrue();
     }
 
     /**
@@ -808,11 +1199,7 @@ public class StmtRewriter {
           new SelectList(items, isDistinct, stmt.selectList_.getPlanHints());
       // Update subquery's GROUP BY clause
       if (groupByExprs != null && !groupByExprs.isEmpty()) {
-        if (stmt.hasGroupByClause()) {
-          stmt.groupingExprs_.addAll(groupByExprs);
-        } else {
-          stmt.groupingExprs_ = groupByExprs;
-        }
+        stmt.addGroupingExprs(groupByExprs);
       }
     }
 
@@ -934,24 +1321,25 @@ public class StmtRewriter {
 
     /**
      * Rewrite all the subqueries of a SelectStmt in place. Subqueries are currently
-     * supported in FROM and WHERE clauses. The rewrite is performed in place and not in a
-     * clone of SelectStmt because it requires the stmt to be analyzed.
+     * supported in the FROM clause, WHERE clause and SELECT list. The rewrite is
+     * performed in place and not in a clone of SelectStmt because it requires the stmt to
+     * be analyzed.
      */
     @Override
     protected void rewriteSelectStmtHook(SelectStmt stmt, Analyzer analyzer)
         throws AnalysisException {
+      // Rewrite all the subqueries in the HAVING clause.
+      if (stmt.hasHavingClause() && stmt.havingClause_.getSubquery() != null) {
+        rewriteHavingClauseSubqueries(stmt, analyzer);
+      }
+
       // Rewrite all the subqueries in the WHERE clause.
       if (stmt.hasWhereClause()) {
         // Push negation to leaf operands.
         stmt.whereClause_ = Expr.pushNegationToOperands(stmt.whereClause_);
-        // Check if we can rewrite the subqueries in the WHERE clause. OR predicates with
-        // subqueries are not supported.
-        if (hasSubqueryInDisjunction(stmt.whereClause_)) {
-          throw new AnalysisException("Subqueries in OR predicates are not supported: " +
-              stmt.whereClause_.toSql());
-        }
         rewriteWhereClauseSubqueries(stmt, analyzer);
       }
+      rewriteSelectListSubqueries(stmt, analyzer);
     }
 
     /**
@@ -1095,6 +1483,395 @@ public class StmtRewriter {
       ExprSubstitutionMap smap = new ExprSubstitutionMap();
       smap.put(subquery, newSubquery);
       return expr.substitute(smap, analyzer, false);
+    }
+
+    /**
+     * Rewrite subqueries of a stmt's SELECT list. Scalar subqueries are the only type
+     * of subquery supported in the select list.  Scalar subqueries return a single column
+     * and at most 1 row, a runtime error should be thrown if more than one row is
+     * returned. Generally these subqueries can be evaluated once for every row of the
+     * outer query however for performance reasons we want to rewrite evaluation to use
+     * joins where possible.
+     *
+     * 1) Uncorrelated Scalar Aggregate Query
+     *
+     *    SELECT T1.a, (SELECT avg(T2.a) from T2) FROM T1;
+     *
+     *    This is implemented by flattening into a join.
+     *
+     *    SELECT T1.a, $a$1.$c$1 FROM T1, (SELECT avg(T2.a) $c$1 FROM T2) $a$1
+     *
+     *    Currently we only support very simple subqueries which return a single aggregate
+     *    function with no group by columns unless a LIMIT 1 is given. TODO: IMPALA-1285
+     *
+     * 2) Correlated Scalar Aggregate
+     *
+     *    TODO: IMPALA-8955
+     *    SELECT id, (SELECT count(*) FROM T2 WHERE id=a.id ) FROM T1 a
+     *
+     *    This can be flattened with a LEFT OUTER JOIN
+     *
+     *    SELECT T1.a, $a$1.$c$1 FROM T1 LEFT OUTER JOIN
+     *      (SELECT id, count(*) $c$1 FROM T2 GROUP BY id) $a$1 ON T1.id = $a$1.id
+     *
+     * 3) Correlated Scalar
+     *
+     *    TODO: IMPALA-6315
+     *    SELECT id, (SELECT cost FROM T2 WHERE id=a.id ) FROM T1 a
+     *
+     *    In this case there is no aggregate function to guarantee only a single row is
+     *    returned per group so a run time cardinality check must be applied. An exception
+     *    would be if the correlated predicates had primary key constraints.
+     *
+     * 4) Runtime Scalar Subqueries
+     *
+     *    TODO: IMPALA-5100
+     *    We do have a {@link CardinalityCheckNode} for runtime checks however queries
+     *    can't always be rewritten into an NLJ without special care. For example with
+     *    conditional expression like below:
+     *
+     *    SELECT T1.a,
+     *      IF((SELECT max(T2.a) from T2 > 10,
+     *         (SELECT T2.a from T2 WHERE id=T1.id),
+     *         (SELECT T3.a from T2 WHERE if=T1.id)
+     *    FROM T1;
+     *
+     *    If rewritten to joins with cardinality checks then both legs of the conditional
+     *    expression would be evaluated regardless of the condition. If the false case
+     *    were to return a runtime error while when the true doesn't and the condition
+     *    evaluates to true then we'd have incorrect behavior.
+     */
+    private void rewriteSelectListSubqueries(SelectStmt stmt, Analyzer analyzer)
+        throws AnalysisException {
+      Preconditions.checkNotNull(stmt);
+      Preconditions.checkNotNull(analyzer);
+      final int numTableRefs = stmt.fromClause_.size();
+      final boolean parentHasAgg = stmt.hasMultiAggInfo();
+      // Track any new inline views so we later ensure they are rewritten if needed.
+      // An improvement would be to have a pre/post order abstract rewriter class.
+      final List<InlineViewRef> newViews = new ArrayList<>();
+      for (SelectListItem selectItem : stmt.getSelectList().getItems()) {
+        if (selectItem.isStar()) {
+          continue;
+        }
+
+        final Expr expr = selectItem.getExpr();
+        final List<Subquery> subqueries = new ArrayList<>();
+        // Use collect as opposed to collectAll in order to allow nested subqueries to be
+        // rewritten as needed. For example a subquery in the select list which contains
+        // its own subquery in the where clause.
+        expr.collect(Predicates.instanceOf(Subquery.class), subqueries);
+        if (subqueries.size() == 0) {
+          continue;
+        }
+        final ExprSubstitutionMap smap = new ExprSubstitutionMap();
+        for (Subquery sq : subqueries) {
+          final SelectStmt subqueryStmt = (SelectStmt) sq.getStatement();
+          // TODO: Handle correlated subqueries IMPALA-8955
+          if (isCorrelated(subqueryStmt)) {
+            throw new AnalysisException("A correlated scalar subquery is not supported "
+                + "in the expression: " + expr.toSql());
+          }
+          Preconditions.checkState(sq.getType().isScalarType());
+
+          // Existential subqueries in Impala aren't really execution time expressions,
+          // they are either checked at plan time or expected to be handled by the
+          // subquery rewrite into a join. In the case of the select list we will only
+          // support plan time evaluation.
+          boolean replacedExists = false;
+          final List<ExistsPredicate> existsPredicates = new ArrayList<>();
+          expr.collect(ExistsPredicate.class, existsPredicates);
+          for (ExistsPredicate ep : existsPredicates) {
+            // Check to see if the current subquery is the child of an exists predicate.
+            if (ep.contains(sq)) {
+              final BoolLiteral boolLiteral = replaceExistsPredicate(ep);
+              if (boolLiteral != null) {
+                boolLiteral.analyze(analyzer);
+                smap.put(ep, boolLiteral);
+                replacedExists = true;
+                break;
+              } else {
+                throw new AnalysisException(
+                    "Unsupported subquery with runtime scalar check: " + ep.toSql());
+              }
+            }
+          }
+          if (replacedExists) {
+            continue;
+          }
+
+          List<String> colLabels = new ArrayList<>();
+          for (int i = 0; i < subqueryStmt.getColLabels().size(); ++i) {
+            colLabels.add(subqueryStmt.getColumnAliasGenerator().getNextAlias());
+          }
+          // Create a new inline view from the subquery stmt aliasing the columns.
+          InlineViewRef inlineView = new InlineViewRef(
+              stmt.getTableAliasGenerator().getNextAlias(), subqueryStmt, colLabels);
+          inlineView.reset();
+          inlineView.analyze(analyzer);
+
+          // For uncorrelated scalar subqueries we rewrite with a CROSS_JOIN or
+          // LEFT OUTER JOIN with no join predicates. We prefer CROSS JOIN where
+          // possible because it makes it simpler to further optimize by merging
+          // subqueries without worrying about join ordering as in IMPALA-9796.
+          // For correlated subqueries we would need to rewrite to a LOJ.
+          inlineView.setJoinOp(subqueryStmt.returnsExactlyOneRow() ?
+              JoinOperator.CROSS_JOIN : JoinOperator.LEFT_OUTER_JOIN);
+          inlineView.setAllowEmptyOn(true); // Needed to allow LOJ with no ON clause.
+          stmt.fromClause_.add(inlineView);
+          newViews.add(inlineView);
+
+          SlotRef slotRef = new SlotRef(Lists.newArrayList(
+              inlineView.getUniqueAlias(), inlineView.getColLabels().get(0)));
+          slotRef.analyze(analyzer);
+          Expr substitute = slotRef;
+          // Need to wrap the expression with a no-op aggregate function if the stmt does
+          // any aggregation, using MAX() given no explicit function to return any value
+          // in a group.
+          if (parentHasAgg) {
+            final FunctionCallExpr aggWrapper =
+                new FunctionCallExpr("max", Lists.newArrayList((Expr) slotRef));
+            aggWrapper.analyze(analyzer);
+            substitute = aggWrapper;
+          }
+          // Substitute original subquery expression with a reference to the inline view.
+          smap.put(sq, substitute);
+        }
+        // Update select list with any new slot references.
+        selectItem.setExpr(expr.substitute(smap, analyzer, false));
+      }
+      // Rewrite any new views
+      for (InlineViewRef v : newViews) {
+        rewriteQueryStatement(v.getViewStmt(), v.getAnalyzer());
+      }
+      // Only applies to the original list of TableRefs, not any as a result of the
+      // rewrite.
+      if (!newViews.isEmpty()) {
+        replaceUnqualifiedStarItems(stmt, numTableRefs);
+      }
+    }
+
+    /**
+     * Rewrite subqueries of a stmt's HAVING clause. The stmt is rewritten into two
+     * separate statements; an inner statement which performs all sql operations that
+     * evaluated before the HAVING clause and an outer statement which projects the inner
+     * stmt's results with the HAVING clause rewritten as a WHERE clause and also performs
+     * the remainder of the sql operations (ORDER BY, LIMIT). We then rely on the WHERE
+     * clause rewrite rule to handle the subqueries that were originally in the HAVING
+     * clause.
+     *
+     * SELECT a, sum(b) FROM T1 GROUP BY a HAVING count(b) > (SELECT max(c) FROM T2)
+     * ORDER BY 2 LIMIT 10
+     *
+     * Inner Stmt becomes:
+     *
+     * SELECT a, sum(b), count(b) FROM T1 GROUP BY a
+     *
+     * Notice we augment the select list with any aggregates in the HAVING clause that are
+     * missing in the original select list.
+     *
+     * Outer Stmt becomes:
+     *
+     * SELECT $a$1.$c$1 a, $a$1.$c$2 sum(b) FROM
+     * (SELECT a, sum(b), count(b) FROM T1 GROUP BY a) $a$1 ($c$1, $c$2, $c$3) WHERE
+     * $a$1.$c$3 > (SELECT max(c) FROM T2) ORDER BY 2 LIMIT 10
+     *
+     * The query should would then be rewritten by the caller using
+     * rewriteWhereClauseSubqueries()
+     *
+     */
+    private void rewriteHavingClauseSubqueries(SelectStmt stmt, Analyzer analyzer)
+        throws AnalysisException {
+      // Generate the inner query from the current statement pulling up the order by,
+      // limit, and any aggregates in the having clause that aren't projected in the
+      // select list.
+      final SelectStmt innerStmt = stmt.clone();
+      final List<FunctionCallExpr> aggExprs = stmt.hasMultiAggInfo() ?
+          stmt.getMultiAggInfo().getAggExprs() :
+          new ArrayList<>();
+      for (FunctionCallExpr agg : aggExprs) {
+        boolean contains = false;
+        for (SelectListItem selectListItem : stmt.getSelectList().getItems()) {
+          contains = selectListItem.getExpr().equals(agg);
+          if (contains) {
+            break;
+          }
+        }
+        if (!contains) {
+          innerStmt.selectList_.getItems().add(
+              new SelectListItem(agg.clone().reset(), null));
+        }
+      }
+
+      // Remove clauses that will go into the outer statement.
+      innerStmt.havingClause_ = null;
+      innerStmt.limitElement_ = new LimitElement(null, null);
+      if (innerStmt.hasOrderByClause()) {
+        innerStmt.orderByElements_ = null;
+      }
+      innerStmt.reset();
+
+      // Used in the substitution map, as post analyze() exprs won't match.
+      final List<SelectListItem> preAnalyzeSelectList =
+          innerStmt.getSelectList().clone().getItems();
+      final ExprSubstitutionMap smap = new ExprSubstitutionMap();
+      List<String> colLabels =
+          Lists.newArrayListWithCapacity(innerStmt.getSelectList().getItems().size());
+
+      for (int i = 0; i < innerStmt.getSelectList().getItems().size(); ++i) {
+        String colAlias = stmt.getColumnAliasGenerator().getNextAlias();
+        colLabels.add(colAlias);
+      }
+
+      final String innerAlias = stmt.getTableAliasGenerator().getNextAlias();
+      final InlineViewRef innerView = new InlineViewRef(innerAlias, innerStmt, colLabels);
+      innerView.analyze(analyzer);
+
+      // Rewrite the new inline view.
+      rewriteSelectStatement(
+          (SelectStmt) innerView.getViewStmt(), innerView.getViewStmt().getAnalyzer());
+
+      for (int i = 0; i < preAnalyzeSelectList.size(); ++i) {
+        final Expr slot = new SlotRef(Lists.newArrayList(innerAlias, colLabels.get(i)));
+        slot.analyze(analyzer);
+        smap.put(preAnalyzeSelectList.get(i).getExpr(), slot);
+      }
+
+      // Create the new outer statement's select list.
+      final List<SelectListItem> outerSelectList = new ArrayList<>();
+      for (int i = 0; i < stmt.getSelectList().getItems().size(); ++i) {
+        // Project the original select list items and labels
+        final SelectListItem si = new SelectListItem(
+            stmt.getSelectList().getItems().get(i).getExpr().clone().reset().substitute(
+                smap, analyzer, false),
+            stmt.getColLabels().get(i));
+        si.getExpr().analyze(analyzer);
+        outerSelectList.add(si);
+      }
+
+      // Clear out the old stmt properties.
+      stmt.whereClause_ = stmt.havingClause_.reset().substitute(smap, analyzer, false);
+      stmt.whereClause_.analyze(analyzer);
+      stmt.havingClause_ = null;
+      stmt.groupingExprs_ = null;
+      stmt.selectList_.getItems().clear();
+      stmt.selectList_.getItems().addAll(outerSelectList);
+      stmt.fromClause_.getTableRefs().clear();
+      stmt.fromClause_.add(innerView);
+
+      stmt.analyze(analyzer);
+      if (LOG.isTraceEnabled())
+        LOG.trace("Rewritten HAVING Clause SQL: " + stmt.toSql(REWRITTEN));
+    }
+  }
+
+  /**
+   * Statement rewriter that rewrites queries against ACID tables. We need to do such
+   * rewrites when querying complex types in ACID tables, because ACID scanning needs
+   * to inject slot references to the hidden ACID columns, e.g. rowid.
+   * We can only inject those slot references if the scanner's base tuple is a table level
+   * tuple. This is not true for some complex type queries, e.g.:
+   *   SELECT item FROM complextypestbl.int_array;
+   * So the above query needs to be rewritten to:
+   *   SELECT item FROM complextypestbl $a$1, $a$1.int_array;
+   * With this rewrite the scanner's root tuple will be the table level tuple that can
+   * contain slot refs to the hidden columns.
+   */
+  static class AcidRewriter extends StmtRewriter {
+    @Override
+    protected void rewriteSelectStmtHook(SelectStmt stmt, Analyzer analyzer)
+        throws AnalysisException {
+      for (int i = 0; i < stmt.fromClause_.size(); ++i) {
+        TableRef tblRef = stmt.fromClause_.get(i);
+        if (tblRef instanceof CollectionTableRef &&
+            AcidUtils.isFullAcidTable(
+                tblRef.getTable().getMetaStoreTable().getParameters())) {
+          CollectionTableRef collRef = (CollectionTableRef)tblRef;
+          if (collRef.getCollectionExpr() == null) {
+            splitCollectionRef(analyzer, stmt, i);
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Rewritten ACID FROM Clause SQL: " + stmt.toSql(REWRITTEN));
+            }
+          }
+        }
+      }
+    }
+
+    /**
+     * We have a collection ref in the FROM clause like complextypestbl.int_array. But,
+     * for ACID scans we need to replace it with two table refs, like:
+     *  complextypestbl $a$1, $a$1.int_array
+     * This method modifies the FROM clause of the SELECT statement 'stmt' in-place.
+     * @param stmt is the SELECT statement
+     * @param tblRefIdx is the index of the collection ref in the FROM clause that needs
+     * to be split.
+     */
+    private void splitCollectionRef(Analyzer analyzer, SelectStmt stmt, int tableRefIdx)
+        throws AnalysisException {
+      TableRef collTblRef = stmt.fromClause_.get(tableRefIdx);
+      Preconditions.checkState(collTblRef instanceof CollectionTableRef);
+      // Let's create a base table ref with a unique alias.
+      TableName tblName = collTblRef.getTable().getTableName();
+      List<String> rawTblPath = generatePathFrom(tblName);
+      String alias = stmt.getTableAliasGenerator().getNextAlias();
+      TableRef baseTblRef = TableRef.newTableRef(analyzer, rawTblPath, alias);
+      // Let's root the collection table ref from the base table ref.
+      List<String> newCollPath = new ArrayList<>(collTblRef.getPath());
+      if (newCollPath.get(0).equals(tblName.getDb())) {
+        // Let's remove db name from the path.
+        newCollPath.remove(0);
+      }
+      Preconditions.checkState(newCollPath.get(0).equals(tblName.getTbl()));
+      // Let's remove the table name from the path.
+      newCollPath.remove(0);
+      // So instead of <db name>.<table name>, let's start the new path with <alias>.
+      newCollPath.add(0, alias);
+      // Remove the alias of the old collection ref from the analyzer. We need to add
+      // the new collection ref with the same old alias.
+      String[] old_aliases = collTblRef.getAliases();
+      for (String old_alias: old_aliases) {
+        analyzer.removeAlias(old_alias);
+      }
+      TableRef newCollTblRef = TableRef.newTableRef(
+          analyzer, newCollPath, old_aliases[old_aliases.length - 1]);
+      // Set JOIN attributes. Please note that we cannot use TableRef.setJoinAttrs()
+      // because we only want to copy the ON clause and the plan hints. The col names
+      // in USING have been already converted to an ON clause. We let the analyzer/
+      // planner to figure out the other attributes.
+      newCollTblRef.setOnClause(collTblRef.getOnClause());
+      newCollTblRef.setJoinHints(collTblRef.getJoinHints());
+      newCollTblRef.setTableHints(collTblRef.getTableHints());
+      // Substitute the old collection ref to 'newCollTblRef'.
+      stmt.fromClause_.set(tableRefIdx, newCollTblRef);
+      // Insert the base table ref in front of the collection ref.
+      stmt.fromClause_.add(tableRefIdx, baseTblRef);
+      // The newly added table ref should be hidden, e.g. it shouldn't affect star
+      // expansion, neither column resolution.
+      baseTblRef.setHidden(true);
+    }
+
+    private List<String> generatePathFrom(TableName tblName) {
+      List<String> rawTblPath = new ArrayList<>();
+      if (tblName.getDb() != null) rawTblPath.add(tblName.getDb());
+      rawTblPath.add(tblName.getTbl());
+      return rawTblPath;
+    }
+  }
+
+  /**
+   * The purpose of this rewriter is to add CollectionTableRefs to the FROM clause of
+   * select queries where unnest() is in the select list. One example of such a query:
+   * SELECT unnest(arr1), unnest(arr2) FROM complextypes_arrays;
+   * In the above example there will be two CollectionTableRefs added to the FROM clause,
+   * one for each unnested array.
+   */
+  static class ZippingUnnestRewriter extends StmtRewriter {
+    @Override
+    protected void rewriteSelectStmtHook(SelectStmt stmt, Analyzer analyzer)
+        throws AnalysisException {
+      Set<CollectionTableRef> unnestTableRefs = analyzer.getTableRefsFromUnnestExpr();
+      Preconditions.checkState(stmt.getResultExprs().size() >= unnestTableRefs.size());
+      for (TableRef tblRef : unnestTableRefs) stmt.fromClause_.add(tblRef);
     }
   }
 }

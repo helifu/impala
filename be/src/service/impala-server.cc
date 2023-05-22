@@ -21,6 +21,12 @@
 #include <unistd.h>
 #include <algorithm>
 #include <exception>
+#include <fstream>
+#include <sstream>
+#ifdef CALLONCEHACK
+#include <calloncehack.h>
+#endif
+
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -48,13 +54,19 @@
 #include "catalog/catalog-util.h"
 #include "common/compiler-util.h"
 #include "common/logging.h"
+#include "common/object-pool.h"
 #include "common/thread-debug-info.h"
 #include "common/version.h"
 #include "exec/external-data-source-executor.h"
 #include "exprs/timezone_db.h"
 #include "gen-cpp/CatalogService_constants.h"
+#include "gen-cpp/admission_control_service.proxy.h"
+#include "kudu/rpc/rpc_context.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/security/security_flags.h"
 #include "kudu/util/random_util.h"
 #include "rpc/authentication.h"
+#include "rpc/rpc-mgr.h"
 #include "rpc/rpc-trace.h"
 #include "rpc/thrift-thread.h"
 #include "rpc/thrift-util.h"
@@ -62,21 +74,24 @@
 #include "runtime/coordinator.h"
 #include "runtime/exec-env.h"
 #include "runtime/lib-cache.h"
+#include "runtime/query-driver.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
 #include "runtime/tmp-file-mgr.h"
+#include "scheduling/admission-control-service.h"
 #include "scheduling/admission-controller.h"
 #include "service/cancellation-work.h"
-#include "service/impala-http-handler.h"
-#include "service/impala-internal-service.h"
 #include "service/client-request-state.h"
 #include "service/frontend.h"
+#include "service/impala-http-handler.h"
 #include "util/auth-util.h"
 #include "util/bit-util.h"
+#include "util/coding-util.h"
 #include "util/debug-util.h"
 #include "util/error-util.h"
 #include "util/histogram-metric.h"
 #include "util/impalad-metrics.h"
+#include "util/jwt-util.h"
 #include "util/metrics.h"
 #include "util/network-util.h"
 #include "util/openssl-util.h"
@@ -85,17 +100,17 @@
 #include "util/redactor.h"
 #include "util/runtime-profile-counters.h"
 #include "util/runtime-profile.h"
+#include "util/simple-logger.h"
 #include "util/string-parser.h"
 #include "util/summary-util.h"
 #include "util/test-info.h"
-#include "util/uid-util.h"
 #include "util/time.h"
+#include "util/uid-util.h"
 
 #include "gen-cpp/Types_types.h"
 #include "gen-cpp/ImpalaService.h"
 #include "gen-cpp/DataSinks_types.h"
 #include "gen-cpp/ImpalaService_types.h"
-#include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/LineageGraph_types.h"
 #include "gen-cpp/Frontend_types.h"
 
@@ -112,7 +127,10 @@ using boost::get_system_time;
 using boost::system_time;
 using boost::uuids::random_generator;
 using boost::uuids::uuid;
+using google::protobuf::RepeatedPtrField;
 using kudu::GetRandomSeed32;
+using kudu::rpc::RpcContext;
+using kudu::security::SecurityDefaults;
 using namespace apache::hive::service::cli::thrift;
 using namespace apache::thrift;
 using namespace apache::thrift::transport;
@@ -131,21 +149,32 @@ DECLARE_string(debug_actions);
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disk_spill_encryption);
 DECLARE_bool(enable_ldap_auth);
+DECLARE_bool(gen_experimental_profile);
 DECLARE_bool(use_local_catalog);
 
 DEFINE_int32(beeswax_port, 21000, "port on which Beeswax client requests are served."
-    "If 0 or less, the Beeswax server is not started.");
+    "If 0 or less, the Beeswax server is not started. This interface is deprecated and "
+    "will be removed in a future version.");
 DEFINE_int32(hs2_port, 21050, "port on which HiveServer2 client requests are served."
     "If 0 or less, the HiveServer2 server is not started.");
 DEFINE_int32(hs2_http_port, 28000, "port on which HiveServer2 HTTP(s) client "
     "requests are served. If 0 or less, the HiveServer2 http server is not started.");
+DEFINE_int32(external_fe_port, 0, "port on which External Frontend requests are served. "
+    "If 0 or less, the External Frontend server is not started. Careful consideration "
+    "must be taken when enabling due to the fact that this port is currently always "
+    "unauthenticated.");
+DEFINE_bool(enable_external_fe_http, false,
+    "if true enables http transport for external_fe_port otherwise binary transport is "
+    "used");
 
 DEFINE_int32(fe_service_threads, 64,
     "number of threads available to serve client requests");
 DEFINE_string(default_query_options, "", "key=value pair of default query options for"
     " impalad, separated by ','");
-DEFINE_int32(query_log_size, 25, "Number of queries to retain in the query log. If -1, "
+DEFINE_int32(query_log_size, 100, "Number of queries to retain in the query log. If -1, "
     "the query log has unbounded size.");
+DEFINE_int32(query_stmt_size, 250, "length of the statements in the query log. If <=0, "
+    "the full statement is displayed in the query log without trimming.");
 DEFINE_bool(log_query_to_file, true, "if true, logs completed query profiles to file.");
 
 DEFINE_int64(max_result_cache_size, 100000L, "Maximum number of query results a client "
@@ -159,6 +188,9 @@ DEFINE_string(audit_event_log_dir, "", "The directory in which audit event log f
     "written. Setting this flag will enable audit event logging.");
 DEFINE_bool(abort_on_failed_audit_event, true, "Shutdown Impala if there is a problem "
     "recording an audit event.");
+DEFINE_int32(max_audit_event_log_files, 0, "Maximum number of audit event log files "
+    "to retain. The most recent audit event log files are retained. If set to 0, "
+    "all audit event log files are retained.");
 
 DEFINE_int32(max_lineage_log_file_size, 5000, "The maximum size (in queries) of "
     "the lineage event log file before a new one is created (if lineage logging is "
@@ -179,6 +211,16 @@ DEFINE_int32(max_profile_log_files, 10, "Maximum number of profile log files to 
 DEFINE_int32(cancellation_thread_pool_size, 5,
     "(Advanced) Size of the thread-pool processing cancellations due to node failure");
 
+DEFINE_int32(unregistration_thread_pool_size, 4,
+    "(Advanced) Size of the thread-pool for unregistering queries, including "
+    "finalizing runtime profiles");
+// Limit the number of queries that can be queued for unregistration to avoid holding
+// too many queries in memory unnecessary. The default is set fairly low so that if
+// queries are finishing faster than they can be unregistered, there will be backpressure
+// on query execution before too much memory fills up with queries pending unregistration.
+DEFINE_int32(unregistration_thread_pool_queue_depth, 16,
+    "(Advanced) Max number of queries that can be queued for unregistration.");
+
 DEFINE_string(ssl_server_certificate, "", "The full path to the SSL certificate file used"
     " to authenticate Impala to clients. If set, both Beeswax and HiveServer2 ports will "
     "only accept SSL connections");
@@ -195,19 +237,26 @@ DEFINE_string(ssl_private_key_password_cmd, "", "A Unix command whose output ret
     "will not be invoked. The output of the command will be truncated to 1024 bytes, and "
     "then all trailing whitespace will be trimmed before it is used to decrypt the "
     "private key");
-
-// TODO: For 3.0 (compatibility-breaking release), set this to a whitelist of ciphers,
-// e.g.  https://wiki.mozilla.org/Security/Server_Side_TLS
-DEFINE_string(ssl_cipher_list, "",
+// This defaults ssl_cipher_list to the same set of ciphers used by Kudu,
+// which is based on Mozilla's intermediate compatibility recommendations
+// from https://wiki.mozilla.org/Security/Server_Side_TLS
+DEFINE_string(ssl_cipher_list, SecurityDefaults::kDefaultTlsCiphers,
     "The cipher suite preferences to use for TLS-secured "
     "Thrift RPC connections. Uses the OpenSSL cipher preference list format. See man (1) "
     "ciphers for more information. If empty, the default cipher list for your platform "
     "is used");
 
+DEFINE_string(tls_ciphersuites,
+    kudu::security::SecurityDefaults::kDefaultTlsCipherSuites,
+    "The TLSv1.3 cipher suites to use for TLS-secured Thrift RPC and KRPC connections. "
+    "TLSv1.3 uses a new way to specify ciper suites that is independent of the older "
+    "TLSv1.2 and below cipher lists. See 'man (1) ciphers' for more information. "
+    "This flag is only effective if Impala is built with OpenSSL v1.1.1 or newer.");
+
 const string SSL_MIN_VERSION_HELP = "The minimum SSL/TLS version that Thrift "
     "services should use for both client and server connections. Supported versions are "
     "TLSv1.0, TLSv1.1 and TLSv1.2 (as long as the system OpenSSL library supports them)";
-DEFINE_string(ssl_minimum_version, "tlsv1", SSL_MIN_VERSION_HELP.c_str());
+DEFINE_string(ssl_minimum_version, "tlsv1.2", SSL_MIN_VERSION_HELP.c_str());
 
 DEFINE_int32(idle_session_timeout, 0, "The time, in seconds, that a session may be idle"
     " for before it is closed (and all running queries cancelled) by Impala. If 0, idle"
@@ -249,10 +298,22 @@ DEFINE_string(executor_groups, "",
     "contains at least that number of executors for the group will it be considered "
     "healthy for admission. Currently only a single group may be specified.");
 
-DEFINE_int32(num_expected_executors, 20, "The number of executors that are expected to "
+DEFINE_int32(num_expected_executors, 20,
+    "The number of executors that are expected to "
     "be available for the execution of a single query. This value is used during "
     "planning if no executors have started yet. Once a healthy executor group has "
-    "started, its size is used instead.");
+    "started, its size is used instead. NOTE: This flag is overridden by "
+    "'expected_executor_group_sets' which is a more expressive way of specifying "
+    "multiple executor group sets");
+
+DEFINE_string(expected_executor_group_sets, "",
+    "Only used by the coordinator. List of expected executor group sets, separated by "
+    "comma in the following format: <executor_group_name_prefix>:<expected_group_size> . "
+    "For eg. “prefix1:10”, this set will include executor groups named like "
+    "prefix1-group1, prefix1-group2, etc. The expected group size (number of executors "
+    "in each group) is used during planning when no healthy executor group is available. "
+    "If this flag is used then any executor groups that do not map to the specified group"
+    " sets will never be used to schedule queries.");
 
 // TODO: can we automatically choose a startup grace period based on the max admission
 // control queue timeout + some margin for error?
@@ -286,13 +347,48 @@ DEFINE_int32(query_event_hook_nthreads, 1, "Number of threads to use for "
     "QueryEventHook execution. If this number is >1 then hooks will execute "
     "concurrently.");
 
+// Dumps used for debugging and diffing ExecRequests in text form.
+DEFINE_string(dump_exec_request_path, "",
+    "If set, dump TExecRequest structures to {dump_exec_request_path}/"
+    "TExecRequest-{internal|external}.{query_id.hi}-{query_id.lo}");
+
 DECLARE_bool(compact_catalog_topic);
+
+DEFINE_bool(use_local_tz_for_unix_timestamp_conversions, false,
+    "When true, TIMESTAMPs are interpreted in the local time zone when converting to "
+    "and from Unix times. When false, TIMESTAMPs are interpreted in the UTC time zone. "
+    "Set to true for Hive compatibility. "
+    "Can be overriden with the query option with the same name.");
+
+// Provide a workaround for IMPALA-1658.
+DEFINE_bool(convert_legacy_hive_parquet_utc_timestamps, false,
+    "When true, TIMESTAMPs read from files written by Parquet-MR (used by Hive) will "
+    "be converted from UTC to local time. Writes are unaffected. "
+    "Can be overriden with the query option with the same name.");
+
+DEFINE_int32(admission_heartbeat_frequency_ms, 1000,
+    "(Advanced) The time in milliseconds to wait between sending heartbeats to the "
+    "admission service, if enabled. Heartbeats are used to ensure resources are properly "
+    "accounted for even if rpcs to the admission service occasionally fail.");
+
+DEFINE_bool(auto_check_compaction, false,
+    "When true, compaction checking will be conducted for each query in local catalog "
+    "mode. Note that this checking introduces additional overhead because Impala makes "
+    "additional RPCs to hive metastore for each table in a query during the query "
+    "compilation.");
+
+// Flags for JWT token based authentication.
+DECLARE_bool(jwt_token_auth);
+DECLARE_bool(jwt_validate_signature);
+DECLARE_string(jwks_file_path);
+DECLARE_string(jwks_url);
+DECLARE_bool(jwks_verify_server_certificate);
+DECLARE_string(jwks_ca_certificate);
 
 namespace {
 using namespace impala;
 
-vector<impala::TExecutorGroupDesc> GetExecutorGroups(const string& flag) {
-  vector<impala::TExecutorGroupDesc> result;
+void SetExecutorGroups(const string& flag, BackendDescriptorPB* be_desc) {
   vector<StringPiece> groups;
   groups = Split(flag, ",", SkipEmpty());
   if (groups.empty()) groups.push_back(ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME);
@@ -300,21 +396,20 @@ vector<impala::TExecutorGroupDesc> GetExecutorGroups(const string& flag) {
   // Name and optional minimum group size are separated by ':'.
   for (const StringPiece& group : groups) {
     int colon_idx = group.find_first_of(':');
-    TExecutorGroupDesc group_desc;
-    group_desc.name = group.substr(0, colon_idx).as_string();
-    group_desc.min_size = 1;
+    ExecutorGroupDescPB* group_desc = be_desc->add_executor_groups();
+    group_desc->set_name(group.substr(0, colon_idx).as_string());
     if (colon_idx != StringPiece::npos) {
       StringParser::ParseResult result;
-      group_desc.min_size = StringParser::StringToInt<int64_t>(
-          group.data() + colon_idx + 1, group.length() - colon_idx - 1, &result);
+      group_desc->set_min_size(StringParser::StringToInt<int64_t>(
+          group.data() + colon_idx + 1, group.length() - colon_idx - 1, &result));
       if (result != StringParser::PARSE_SUCCESS) {
         LOG(FATAL) << "Failed to parse minimum executor group size from group: "
                      << group.ToString();
       }
+    } else {
+      group_desc->set_min_size(1);
     }
-    result.push_back(group_desc);
   }
-  return result;
 }
 } // end anonymous namespace
 
@@ -329,7 +424,7 @@ namespace impala {
 // relative to UTC. The same time zone change was made for the audit log, but the
 // version was kept at 1.0 because there is no known consumer of the timestamp.
 const string PROFILE_LOG_FILE_PREFIX = "impala_profile_log_1.1-";
-const string ImpalaServer::AUDIT_EVENT_LOG_FILE_PREFIX = "impala_audit_event_log_1.0-";
+const string AUDIT_EVENT_LOG_FILE_PREFIX = "impala_audit_event_log_1.0-";
 const string LINEAGE_LOG_FILE_PREFIX = "impala_lineage_log_1.0-";
 
 const uint32_t MAX_CANCELLATION_QUEUE_SIZE = 65536;
@@ -344,13 +439,16 @@ const char* ImpalaServer::SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION = "42000";
 const char* ImpalaServer::SQLSTATE_GENERAL_ERROR = "HY000";
 const char* ImpalaServer::SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED = "HYC00";
 
+const char* ImpalaServer::GET_LOG_QUERY_RETRY_INFO_FORMAT =
+    "Original query failed:\n$0\nQuery has been retried using query id: $1\n";
+
 // Interval between checks for query expiration.
 const int64_t EXPIRATION_CHECK_INTERVAL_MS = 1000L;
 
 // Template to return error messages for client requests that could not be found, belonged
 // to the wrong session, or had a mismatched secret. We need to use this particular string
 // in some places because the shell has a regex for it.
-// TODO: Make consistent with "Invalid query handle: $0" template used elsewhere.
+// TODO: Make consistent "Invalid or unknown query handle: $0" template used elsewhere.
 // TODO: this should be turned into a proper error code and used throughout ImpalaServer.
 static const char* LEGACY_INVALID_QUERY_HANDLE_TEMPLATE = "Query id $0 not found.";
 
@@ -443,16 +541,20 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
         filter_prefix, catalog_cb));
   }
 
-  ABORT_IF_ERROR(UpdateCatalogMetrics());
-
   // Initialise the cancellation thread pool with 5 (by default) threads. The max queue
   // size is deliberately set so high that it should never fill; if it does the
   // cancellations will get ignored and retried on the next statestore heartbeat.
   cancellation_thread_pool_.reset(new ThreadPool<CancellationWork>(
           "impala-server", "cancellation-worker",
       FLAGS_cancellation_thread_pool_size, MAX_CANCELLATION_QUEUE_SIZE,
-      bind<void>(&ImpalaServer::CancelFromThreadPool, this, _1, _2)));
+      bind<void>(&ImpalaServer::CancelFromThreadPool, this, _2)));
   ABORT_IF_ERROR(cancellation_thread_pool_->Init());
+
+  unreg_thread_pool_.reset(new ThreadPool<QueryHandle>("impala-server",
+      "unregistration-worker", FLAGS_unregistration_thread_pool_size,
+      FLAGS_unregistration_thread_pool_queue_depth,
+      bind<void>(&ImpalaServer::FinishUnregisterQuery, this, _2)));
+  ABORT_IF_ERROR(unreg_thread_pool_->Init());
 
   // Initialize a session expiry thread which blocks indefinitely until the first session
   // with non-zero timeout value is opened. Note that a session which doesn't specify any
@@ -483,6 +585,11 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
     ABORT_IF_ERROR(Thread::Create("impala-server", "unresponsive-backend-thread",
         bind<void>(&ImpalaServer::UnresponsiveBackendThread, this),
         &unresponsive_backend_thread_));
+  }
+  if (exec_env_->AdmissionServiceEnabled()) {
+    ABORT_IF_ERROR(Thread::Create("impala-server", "admission-heartbeat-thread",
+        bind<void>(&ImpalaServer::AdmissionHeartbeatThread, this),
+        &admission_heartbeat_thread_));
   }
 
   is_coordinator_ = FLAGS_is_coordinator;
@@ -527,15 +634,6 @@ bool ImpalaServer::IsExecutor() { return is_executor_; }
 
 bool ImpalaServer::IsHealthy() { return services_started_.load(); }
 
-int ImpalaServer::GetThriftBackendPort() {
-  DCHECK(thrift_be_server_ != nullptr);
-  return thrift_be_server_->port();
-}
-
-TNetworkAddress ImpalaServer::GetThriftBackendAddress() {
-  return MakeNetworkAddress(FLAGS_hostname, GetThriftBackendPort());
-}
-
 int ImpalaServer::GetBeeswaxPort() {
   DCHECK(beeswax_server_ != nullptr);
   return beeswax_server_->port();
@@ -577,7 +675,8 @@ Status ImpalaServer::InitAuditEventLogging() {
     return Status::OK();
   }
   audit_event_logger_.reset(new SimpleLogger(FLAGS_audit_event_log_dir,
-     AUDIT_EVENT_LOG_FILE_PREFIX, FLAGS_max_audit_event_log_file_size));
+      AUDIT_EVENT_LOG_FILE_PREFIX, FLAGS_max_audit_event_log_file_size,
+      FLAGS_max_audit_event_log_files));
   RETURN_IF_ERROR(audit_event_logger_->Init());
   RETURN_IF_ERROR(Thread::Create("impala-server", "audit-event-log-flush",
       &ImpalaServer::AuditEventLoggerFlushThread, this,
@@ -613,127 +712,261 @@ Status ImpalaServer::AppendLineageEntry(const string& entry ) {
   return lineage_logger_->AppendEntry(entry);
 }
 
+Status ImpalaServer::GetRuntimeProfileOutput(const string& user,
+    const QueryHandle& query_handle, TRuntimeProfileFormat::type format,
+    RuntimeProfileOutput* profile) {
+  // For queries in INITIALIZED state, the profile information isn't populated yet.
+  if (query_handle->exec_state() == ClientRequestState::ExecState::INITIALIZED) {
+    return Status::Expected("Query plan is not ready.");
+  }
+  lock_guard<mutex> l(*query_handle->lock());
+  RETURN_IF_ERROR(CheckProfileAccess(
+      user, query_handle->effective_user(), query_handle->user_has_profile_access()));
+  if (query_handle->GetCoordinator() != nullptr) {
+    UpdateExecSummary(query_handle);
+  }
+  if (format == TRuntimeProfileFormat::BASE64) {
+    RETURN_IF_ERROR(
+        query_handle->profile()->SerializeToArchiveString(profile->string_output));
+  } else if (format == TRuntimeProfileFormat::THRIFT) {
+    query_handle->profile()->ToThrift(profile->thrift_output);
+  } else if (format == TRuntimeProfileFormat::JSON) {
+    query_handle->profile()->ToJson(profile->json_output);
+  } else {
+    DCHECK_EQ(format, TRuntimeProfileFormat::STRING);
+    query_handle->profile()->PrettyPrint(profile->string_output);
+  }
+  return Status::OK();
+}
+
+Status ImpalaServer::GetQueryRecord(const TUniqueId& query_id,
+    shared_ptr<QueryStateRecord>* query_record,
+    shared_ptr<QueryStateRecord>* retried_query_record) {
+  lock_guard<mutex> l(query_log_lock_);
+  auto iterator = query_log_index_.find(query_id);
+  if (iterator == query_log_index_.end()) {
+    // Common error, so logging explicitly and eliding Status's stack trace.
+    string err =
+        strings::Substitute(LEGACY_INVALID_QUERY_HANDLE_TEMPLATE, PrintId(query_id));
+    VLOG(1) << err;
+    return Status::Expected(err);
+  }
+  *query_record = *(iterator->second);
+  if (retried_query_record != nullptr && (*query_record)->was_retried) {
+    DCHECK((*query_record)->retried_query_id != nullptr);
+    iterator = query_log_index_.find(*(*query_record)->retried_query_id);
+
+    // The record of the retried query should always be later in the query log compared
+    // to the original query. Since the query log is a FIFO queue, this means that if the
+    // original query is in the log, then the retried query must be in the log as well.
+    DCHECK(iterator != query_log_index_.end());
+    *retried_query_record = *(iterator->second);
+  }
+  return Status::OK();
+}
+
 Status ImpalaServer::GetRuntimeProfileOutput(const TUniqueId& query_id,
-    const string& user, TRuntimeProfileFormat::type format, stringstream* output,
-    TRuntimeProfileTree* thrift_output, Document* json_output) {
-  DCHECK(output != nullptr);
+    const string& user, TRuntimeProfileFormat::type format,
+    RuntimeProfileOutput* original_profile, RuntimeProfileOutput* retried_profile,
+    bool* was_retried) {
+  DCHECK(original_profile != nullptr);
+  DCHECK(original_profile->string_output != nullptr);
+  DCHECK(retried_profile != nullptr);
+  DCHECK(retried_profile->string_output != nullptr);
+
   // Search for the query id in the active query map
   {
-    shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
-    if (request_state.get() != nullptr) {
-      // For queries in INITIALIZED state, the profile information isn't populated yet.
-      if (request_state->exec_state() == ClientRequestState::ExecState::INITIALIZED) {
-        return Status::Expected("Query plan is not ready.");
+    // QueryHandle of the active query and original query. If the query was retried the
+    // active handle points to the most recent query attempt and the original handle
+    // points to the original query attempt (the one that failed). If the query was not
+    // retried the active handle == the original handle.
+    QueryHandle active_query_handle;
+    QueryHandle original_query_handle;
+    Status status =
+        GetAllQueryHandles(query_id, &active_query_handle, &original_query_handle,
+            /*return_unregistered=*/ true);
+
+    if (status.ok()) {
+      // If the query was retried, then set the retried profile using the active query
+      // handle. The active query handle corresponds to the most recent query attempt,
+      // so it should be used to set the retried profile.
+      if (original_query_handle->WasRetried()) {
+        *was_retried = true;
+        RETURN_IF_ERROR(
+          GetRuntimeProfileOutput(user, active_query_handle, format, retried_profile));
       }
-      lock_guard<mutex> l(*request_state->lock());
-      RETURN_IF_ERROR(CheckProfileAccess(user, request_state->effective_user(),
-          request_state->user_has_profile_access()));
-      if (request_state->GetCoordinator() != nullptr) {
-        UpdateExecSummary(request_state);
-      }
-      if (format == TRuntimeProfileFormat::BASE64) {
-        RETURN_IF_ERROR(request_state->profile()->SerializeToArchiveString(output));
-      } else if (format == TRuntimeProfileFormat::THRIFT) {
-        request_state->profile()->ToThrift(thrift_output);
-      } else if (format == TRuntimeProfileFormat::JSON) {
-        request_state->profile()->ToJson(json_output);
-      } else {
-        DCHECK_EQ(format, TRuntimeProfileFormat::STRING);
-        request_state->profile()->PrettyPrint(output);
-      }
+
+      // Set the profile for the original query.
+      RETURN_IF_ERROR(
+          GetRuntimeProfileOutput(user, original_query_handle, format, original_profile));
+      return Status::OK();
+    }
+  }
+
+  // The query was not found in the active query map, search the query log.
+  {
+    // Set the profile for the original query.
+    shared_ptr<QueryStateRecord> query_record;
+    shared_ptr<QueryStateRecord> retried_query_record;
+    RETURN_IF_ERROR(GetQueryRecord(query_id, &query_record, &retried_query_record));
+    RETURN_IF_ERROR(CheckProfileAccess(user, query_record->effective_user,
+        query_record->user_has_profile_access));
+    RETURN_IF_ERROR(DecompressToProfile(format, query_record, original_profile));
+
+    // Set the profile for the retried query.
+    if (query_record->was_retried) {
+      *was_retried = true;
+      DCHECK(retried_query_record != nullptr);
+
+      // If the original profile was accessible by the user, then the retried profile
+      // must be accessible by the user as well.
+      Status status = CheckProfileAccess(user, retried_query_record->effective_user,
+          retried_query_record->user_has_profile_access);
+      DCHECK(status.ok());
+      RETURN_IF_ERROR(status);
+
+      RETURN_IF_ERROR(DecompressToProfile(format, retried_query_record, retried_profile));
+    }
+  }
+  return Status::OK();
+}
+
+Status ImpalaServer::GetRuntimeProfileOutput(const TUniqueId& query_id,
+    const string& user, TRuntimeProfileFormat::type format,
+    RuntimeProfileOutput* profile) {
+  DCHECK(profile != nullptr);
+  DCHECK(format == TRuntimeProfileFormat::JSON || profile->string_output != nullptr);
+
+  // Search for the query id in the active query map
+  {
+    QueryHandle query_handle;
+    Status status = GetQueryHandle(query_id, &query_handle,
+        /*return_unregistered=*/ true);
+    if (status.ok()) {
+      RETURN_IF_ERROR(GetRuntimeProfileOutput(user, query_handle, format, profile));
       return Status::OK();
     }
   }
 
   // The query was not found the active query map, search the query log.
   {
-    lock_guard<mutex> l(query_log_lock_);
-    QueryLogIndex::const_iterator query_record = query_log_index_.find(query_id);
-    if (query_record == query_log_index_.end()) {
-      // Common error, so logging explicitly and eliding Status's stack trace.
-      string err =
-          strings::Substitute(LEGACY_INVALID_QUERY_HANDLE_TEMPLATE, PrintId(query_id));
-      VLOG(1) << err;
-      return Status::Expected(err);
-    }
-    RETURN_IF_ERROR(CheckProfileAccess(user, query_record->second->effective_user,
-        query_record->second->user_has_profile_access));
-    if (format == TRuntimeProfileFormat::BASE64) {
-      (*output) << query_record->second->encoded_profile_str;
-    } else if (format == TRuntimeProfileFormat::THRIFT) {
-      RETURN_IF_ERROR(RuntimeProfile::DeserializeFromArchiveString(
-          query_record->second->encoded_profile_str, thrift_output));
-    } else if (format == TRuntimeProfileFormat::JSON) {
-      ParseResult parse_ok = json_output->Parse(
-          query_record->second->json_profile_str.c_str());
-      // When there is an error, the json_output will stay unchanged
-      // based on rapidjson parse API
-      if (!parse_ok){
-        string err = strings::Substitute("JSON parse error: $0 (Offset: $1)",
-            GetParseError_En(parse_ok.Code()), parse_ok.Offset());
-        VLOG(1) << err;
-        return Status::Expected(err);
-      }
-    } else {
-      DCHECK_EQ(format, TRuntimeProfileFormat::STRING);
-      (*output) << query_record->second->profile_str;
-    }
+    shared_ptr<QueryStateRecord> query_record;
+    RETURN_IF_ERROR(GetQueryRecord(query_id, &query_record));
+    RETURN_IF_ERROR(CheckProfileAccess(user, query_record->effective_user,
+        query_record->user_has_profile_access));
+    RETURN_IF_ERROR(DecompressToProfile(format, query_record, profile));
+  }
+  return Status::OK();
+}
+
+Status ImpalaServer::DecompressToProfile(TRuntimeProfileFormat::type format,
+    shared_ptr<QueryStateRecord> query_record, RuntimeProfileOutput* profile) {
+  if (format == TRuntimeProfileFormat::BASE64) {
+    Base64Encode(query_record->compressed_profile, profile->string_output);
+  } else if (format == TRuntimeProfileFormat::THRIFT) {
+    RETURN_IF_ERROR(RuntimeProfile::DecompressToThrift(
+        query_record->compressed_profile, profile->thrift_output));
+  } else if (format == TRuntimeProfileFormat::JSON) {
+    ObjectPool tmp_pool;
+    RuntimeProfile* tmp_profile;
+    RETURN_IF_ERROR(RuntimeProfile::DecompressToProfile(
+        query_record->compressed_profile, &tmp_pool, &tmp_profile));
+    tmp_profile->ToJson(profile->json_output);
+  } else {
+    DCHECK_EQ(format, TRuntimeProfileFormat::STRING);
+    ObjectPool tmp_pool;
+    RuntimeProfile* tmp_profile;
+    RETURN_IF_ERROR(RuntimeProfile::DecompressToProfile(
+        query_record->compressed_profile, &tmp_pool, &tmp_profile));
+    tmp_profile->PrettyPrint(profile->string_output);
   }
   return Status::OK();
 }
 
 Status ImpalaServer::GetExecSummary(const TUniqueId& query_id, const string& user,
-    TExecSummary* result) {
+    TExecSummary* result, TExecSummary* original_result, bool* was_retried) {
+  if (was_retried != nullptr) *was_retried = false;
   // Search for the query id in the active query map.
   {
-    shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
-    if (request_state != nullptr) {
-      lock_guard<mutex> l(*request_state->lock());
-      RETURN_IF_ERROR(CheckProfileAccess(user, request_state->effective_user(),
-          request_state->user_has_profile_access()));
-      if (request_state->exec_state() == ClientRequestState::ExecState::PENDING) {
-        const string* admission_result = request_state->summary_profile()->GetInfoString(
+    // QueryHandle of the current query.
+    QueryHandle query_handle;
+    // QueryHandle or the original query if the query is retried.
+    QueryHandle original_query_handle;
+    Status status = GetAllQueryHandles(query_id, &query_handle, &original_query_handle,
+        /*return_unregistered=*/ true);
+    if (status.ok()) {
+      lock_guard<mutex> l(*query_handle->lock());
+      RETURN_IF_ERROR(CheckProfileAccess(user, query_handle->effective_user(),
+          query_handle->user_has_profile_access()));
+      if (query_handle->exec_state() == ClientRequestState::ExecState::PENDING) {
+        const string* admission_result = query_handle->summary_profile()->GetInfoString(
             AdmissionController::PROFILE_INFO_KEY_ADMISSION_RESULT);
         if (admission_result != nullptr) {
           if (*admission_result == AdmissionController::PROFILE_INFO_VAL_QUEUED) {
             result->__set_is_queued(true);
-            const string* queued_reason = request_state->summary_profile()->GetInfoString(
+            const string* queued_reason = query_handle->summary_profile()->GetInfoString(
                 AdmissionController::PROFILE_INFO_KEY_LAST_QUEUED_REASON);
             if (queued_reason != nullptr) {
               result->__set_queued_reason(*queued_reason);
             }
           }
         }
-        return Status::OK();
-      } else if (request_state->GetCoordinator() != nullptr) {
-        request_state->GetCoordinator()->GetTExecSummary(result);
+      } else if (query_handle->GetCoordinator() != nullptr) {
+        query_handle->GetCoordinator()->GetTExecSummary(result);
         TExecProgress progress;
         progress.__set_num_completed_scan_ranges(
-            request_state->GetCoordinator()->progress().num_complete());
+            query_handle->GetCoordinator()->progress().num_complete());
         progress.__set_total_scan_ranges(
-            request_state->GetCoordinator()->progress().total());
+            query_handle->GetCoordinator()->progress().total());
         // TODO: does this not need to be synchronized?
         result->__set_progress(progress);
-        return Status::OK();
+      } else {
+        *result = TExecSummary();
       }
+      if (query_handle->IsRetriedQuery()) {
+        // Don't need to acquire lock on original_query_handle since the query is
+        // finished. There are no concurrent updates on its status.
+        result->error_logs.push_back(original_query_handle->query_status().GetDetail());
+        result->error_logs.push_back(Substitute("Retrying query using query id: $0",
+            PrintId(query_handle->query_id())));
+        result->__isset.error_logs = true;
+        if (was_retried != nullptr) {
+          *was_retried = true;
+          DCHECK(original_result != nullptr);
+          // The original query could not in PENDING state because it already fails.
+          // Handle the other two cases as above.
+          if (original_query_handle->GetCoordinator() != nullptr) {
+            original_query_handle->GetCoordinator()->GetTExecSummary(original_result);
+          } else {
+            *original_result = TExecSummary();
+          }
+        }
+      }
+      return Status::OK();
     }
   }
 
   // Look for the query in completed query log.
-  // IMPALA-5275: Don't create Status while holding query_log_lock_
   {
     string effective_user;
     bool user_has_profile_access = false;
     bool is_query_missing = false;
     TExecSummary exec_summary;
+    TExecSummary retried_exec_summary;
     {
-      lock_guard<mutex> l(query_log_lock_);
-      QueryLogIndex::const_iterator query_record = query_log_index_.find(query_id);
-      is_query_missing = query_record == query_log_index_.end();
+      shared_ptr<QueryStateRecord> query_record;
+      shared_ptr<QueryStateRecord> retried_query_record;
+      is_query_missing =
+          !GetQueryRecord(query_id, &query_record, &retried_query_record).ok();
       if (!is_query_missing) {
-        effective_user = query_record->second->effective_user;
-        user_has_profile_access = query_record->second->user_has_profile_access;
-        exec_summary = query_record->second->exec_summary;
+        effective_user = query_record->effective_user;
+        user_has_profile_access = query_record->user_has_profile_access;
+        exec_summary = query_record->exec_summary;
+        if (query_record->was_retried) {
+          if (was_retried != nullptr) *was_retried = true;
+          DCHECK(retried_query_record != nullptr);
+          retried_exec_summary = retried_query_record->exec_summary;
+        }
       }
     }
     if (is_query_missing) {
@@ -744,7 +977,14 @@ Status ImpalaServer::GetExecSummary(const TUniqueId& query_id, const string& use
       return Status::Expected(err);
     }
     RETURN_IF_ERROR(CheckProfileAccess(user, effective_user, user_has_profile_access));
-    *result = exec_summary;
+    if (was_retried != nullptr && *was_retried) {
+      DCHECK(original_result != nullptr);
+      // 'result' returns the latest summary so it's the retried one.
+      *result = retried_exec_summary;
+      *original_result = exec_summary;
+    } else {
+      *result = exec_summary;
+    }
   }
   return Status::OK();
 }
@@ -787,9 +1027,9 @@ Status ImpalaServer::GetExecSummary(const TUniqueId& query_id, const string& use
   }
 }
 
-void ImpalaServer::ArchiveQuery(const ClientRequestState& query) {
-  string encoded_profile_str;
-  Status status = query.profile()->SerializeToArchiveString(&encoded_profile_str);
+void ImpalaServer::ArchiveQuery(const QueryHandle& query_handle) {
+  vector<uint8_t> compressed_profile;
+  Status status = query_handle->profile()->Compress(&compressed_profile);
   if (!status.ok()) {
     // Didn't serialize the string. Continue with empty string.
     LOG_EVERY_N(WARNING, 1000) << "Could not serialize profile to archive string "
@@ -801,7 +1041,8 @@ void ImpalaServer::ArchiveQuery(const ClientRequestState& query) {
   // FLAGS_log_query_to_file will have been set to false
   if (FLAGS_log_query_to_file) {
     stringstream ss;
-    ss << UnixMillis() << " " << PrintId(query.query_id()) << " " << encoded_profile_str;
+    ss << UnixMillis() << " " << PrintId(query_handle->query_id()) << " ";
+    Base64Encode(compressed_profile, &ss);
     status = profile_logger_->AppendEntry(ss.str());
     if (!status.ok()) {
       LOG_EVERY_N(WARNING, 1000) << "Could not write to profile log file file ("
@@ -813,17 +1054,26 @@ void ImpalaServer::ArchiveQuery(const ClientRequestState& query) {
   }
 
   if (FLAGS_query_log_size == 0) return;
-  QueryStateRecord record(query, true, encoded_profile_str);
-  if (query.GetCoordinator() != nullptr)
-    query.GetCoordinator()->GetTExecSummary(&record.exec_summary);
+  // 'fetch_rows_lock()' protects several fields in ClientReqestState that are read
+  // during QueryStateRecord creation. There should be no contention on this lock because
+  // the query has already been closed (e.g. no more results can be fetched).
+  shared_ptr<QueryStateRecord> record = nullptr;
+  {
+    lock_guard<mutex> l(*query_handle->fetch_rows_lock());
+    record = make_shared<QueryStateRecord>(*query_handle, move(compressed_profile));
+  }
+  if (query_handle->GetCoordinator() != nullptr) {
+    query_handle->GetCoordinator()->GetTExecSummary(&record->exec_summary);
+  }
   {
     lock_guard<mutex> l(query_log_lock_);
     // Add record to the beginning of the log, and to the lookup index.
-    query_log_index_[query.query_id()] = query_log_.insert(query_log_.begin(), record);
+    query_log_.push_front(move(record));
+    query_log_index_[query_handle->query_id()] = &query_log_.front();
 
     if (FLAGS_query_log_size > -1 && FLAGS_query_log_size < query_log_.size()) {
       DCHECK_EQ(query_log_.size() - FLAGS_query_log_size, 1);
-      query_log_index_.erase(query_log_.back().id);
+      query_log_index_.erase(query_log_.back()->id);
       query_log_.pop_back();
     }
   }
@@ -871,6 +1121,9 @@ void ImpalaServer::AddPoolConfiguration(TQueryCtx* ctx,
            << " overlay_mask=" << overlay_mask.to_string();
   OverlayQueryOptions(pool_options, overlay_mask, &ctx->client_request.query_options);
 
+  // Enforce the max mt_dop after the defaults and overlays have already been done.
+  EnforceMaxMtDop(ctx, config.max_mt_dop);
+
   status = ValidateQueryOptions(&pool_options);
   if (!status.ok()) {
     VLOG_QUERY << "Ignoring errors while validating default query options for pool="
@@ -878,9 +1131,22 @@ void ImpalaServer::AddPoolConfiguration(TQueryCtx* ctx,
   }
 }
 
-Status ImpalaServer::Execute(TQueryCtx* query_ctx,
-    shared_ptr<SessionState> session_state,
-    shared_ptr<ClientRequestState>* request_state) {
+void ImpalaServer::EnforceMaxMtDop(TQueryCtx* query_ctx, int64_t max_mt_dop) {
+  TQueryOptions& query_options = query_ctx->client_request.query_options;
+  // The mt_dop is overridden if all three conditions are met:
+  // 1. There is a nonnegative max mt_dop setting
+  // 2. The mt_dop query option is set
+  // 3. The specified mt_dop is larger than the max mt_dop setting
+  if (max_mt_dop >= 0 && query_options.__isset.mt_dop &&
+      max_mt_dop < query_options.mt_dop) {
+    query_ctx->__set_overridden_mt_dop_value(query_options.mt_dop);
+    query_options.__set_mt_dop(max_mt_dop);
+  }
+}
+
+Status ImpalaServer::Execute(TQueryCtx* query_ctx, shared_ptr<SessionState> session_state,
+    QueryHandle* query_handle,
+    const TExecRequest* external_exec_request) {
   PrepareQueryContext(query_ctx);
   ScopedThreadContext debug_ctx(GetThreadDebugInfo(), query_ctx->query_id);
   ImpaladMetrics::IMPALA_SERVER_NUM_QUERIES->Increment(1L);
@@ -890,38 +1156,71 @@ Status ImpalaServer::Execute(TQueryCtx* query_ctx,
   Redact(&stmt);
   query_ctx->client_request.__set_redacted_stmt((const string) stmt);
 
-  bool registered_request_state;
-  Status status = ExecuteInternal(*query_ctx, session_state, &registered_request_state,
-      request_state);
-  if (!status.ok() && registered_request_state) {
-    discard_result(UnregisterQuery((*request_state)->query_id(), false, &status));
+  bool registered_query = false;
+  Status status = ExecuteInternal(*query_ctx, external_exec_request, session_state,
+      &registered_query, query_handle);
+  if (!status.ok() && registered_query) {
+    UnregisterQueryDiscardResult((*query_handle)->query_id(), false, &status);
   }
   return status;
 }
 
-Status ImpalaServer::ExecuteInternal(
-    const TQueryCtx& query_ctx,
-    shared_ptr<SessionState> session_state,
-    bool* registered_request_state,
-    shared_ptr<ClientRequestState>* request_state) {
+void DumpTExecReq(const TExecRequest& exec_request, const char* dump_type,
+    const TUniqueId& query_id) {
+  if (FLAGS_dump_exec_request_path.empty()) return;
+  int depth = 0;
+  std::stringstream tmpstr;
+  string fn(Substitute("$0/TExecRequest-$1.$2", FLAGS_dump_exec_request_path,
+      dump_type, PrintId(query_id, "-")));
+  std::ofstream ofs(fn);
+  tmpstr << exec_request;
+  std::string s = tmpstr.str();
+  const char *p = s.c_str();
+  const int len = s.length();
+  for (int i = 0; i < len; ++i) {
+    const char ch = p[i];
+    ofs << ch;
+    if (ch == '(') {
+      depth++;
+    } else if (ch == ')' && depth > 0) {
+      depth--;
+    } else if (ch == ',') {
+    } else {
+      continue;
+    }
+    ofs << '\n' << std::setw(depth) << " ";
+  }
+}
+
+Status ImpalaServer::ExecuteInternal(const TQueryCtx& query_ctx,
+    const TExecRequest* external_exec_request, shared_ptr<SessionState> session_state,
+    bool* registered_query, QueryHandle* query_handle) {
   DCHECK(session_state != nullptr);
-  *registered_request_state = false;
+  DCHECK(query_handle != nullptr);
+  DCHECK(registered_query != nullptr);
+  *registered_query = false;
+  // Create the QueryDriver for this query. CreateNewDriver creates the associated
+  // ClientRequestState as well.
+  QueryDriver::CreateNewDriver(this, query_handle, query_ctx, session_state);
 
-  request_state->reset(new ClientRequestState(
-      query_ctx, exec_env_, exec_env_->frontend(), this, session_state));
+  bool is_external_req = external_exec_request != nullptr;
 
-  (*request_state)->query_events()->MarkEvent("Query submitted");
+  if (is_external_req && external_exec_request->remote_submit_time) {
+    (*query_handle)->SetRemoteSubmitTime(external_exec_request->remote_submit_time);
+  }
+
+  (*query_handle)->query_events()->MarkEvent("Query submitted");
 
   {
-    // Keep a lock on request_state so that registration and setting
+    // Keep a lock on query_handle so that registration and setting
     // result_metadata are atomic.
-    lock_guard<mutex> l(*(*request_state)->lock());
+    lock_guard<mutex> l(*(*query_handle)->lock());
 
     // register exec state as early as possible so that queries that
     // take a long time to plan show up, and to handle incoming status
     // reports before execution starts.
-    RETURN_IF_ERROR(RegisterQuery(session_state, *request_state));
-    *registered_request_state = true;
+    RETURN_IF_ERROR(RegisterQuery(query_ctx.query_id, session_state, query_handle));
+    *registered_query = true;
 
 #ifndef NDEBUG
     // Inject a sleep to simulate metadata loading pauses for tables. This
@@ -939,25 +1238,49 @@ Status ImpalaServer::ExecuteInternal(
           statement_length, max_statement_length));
     }
 
-    // Takes the TQueryCtx and calls into the frontend to initialize the TExecRequest for
-    // this query.
-    RETURN_IF_ERROR((*request_state)->InitExecRequest(query_ctx));
+    Status exec_status = Status::OK();
+    TUniqueId query_id = (*query_handle)->query_id();
+    // Generate TExecRequest here if one was not passed in or we want one
+    // from the Impala planner to compare with
+    if (!is_external_req || !FLAGS_dump_exec_request_path.empty()) {
+      // Takes the TQueryCtx and calls into the frontend to initialize the TExecRequest
+      // for this query.
+      RETURN_IF_ERROR(query_handle->query_driver()->RunFrontendPlanner(query_ctx));
+      DumpTExecReq((*query_handle)->exec_request(), "internal", query_id);
+    }
 
-    const TExecRequest& result = (*request_state)->exec_request();
-    (*request_state)->query_events()->MarkEvent("Planning finished");
-    (*request_state)->set_user_profile_access(result.user_has_profile_access);
-    (*request_state)->summary_profile()->AddEventSequence(
+    if (is_external_req) {
+      // Use passed in exec_request
+      RETURN_IF_ERROR(query_handle->query_driver()->SetExternalPlan(
+          query_ctx, *external_exec_request));
+
+      if(external_exec_request->query_exec_request.query_ctx.transaction_id > 0) {
+        RETURN_IF_ERROR(exec_env_->frontend()->addTransaction(
+            external_exec_request->query_exec_request.query_ctx));
+      }
+      exec_status = Status::OK();
+      DumpTExecReq((*query_handle)->exec_request(), "external", query_id);
+    }
+
+    const TExecRequest& result = (*query_handle)->exec_request();
+    // If this is an external request, planning was done by the external frontend
+    if (!is_external_req) {
+      (*query_handle)->query_events()->MarkEvent("Planning finished");
+    }
+    (*query_handle)->SetPlanningDone();
+    (*query_handle)->set_user_profile_access(result.user_has_profile_access);
+    (*query_handle)->summary_profile()->AddEventSequence(
         result.timeline.name, result.timeline);
-    (*request_state)->SetFrontendProfile(result.profile);
+    (*query_handle)->SetFrontendProfile(result);
     if (result.__isset.result_set_metadata) {
-      (*request_state)->set_result_metadata(result.result_set_metadata);
+      (*query_handle)->set_result_metadata(result.result_set_metadata);
     }
   }
   VLOG(2) << "Execution request: "
-          << ThriftDebugString((*request_state)->exec_request());
+          << ThriftDebugString((*query_handle)->exec_request());
 
   // start execution of query; also starts fragment status reports
-  RETURN_IF_ERROR((*request_state)->Exec());
+  RETURN_IF_ERROR((*query_handle)->Exec());
   Status status = UpdateCatalogMetrics();
   if (!status.ok()) {
     VLOG_QUERY << "Couldn't update catalog metrics: " << status.GetDetail();
@@ -966,12 +1289,12 @@ Status ImpalaServer::ExecuteInternal(
 }
 
 void ImpalaServer::PrepareQueryContext(TQueryCtx* query_ctx) {
-  PrepareQueryContext(GetThriftBackendAddress(),
-      ExecEnv::GetInstance()->krpc_address(), query_ctx);
+  PrepareQueryContext(exec_env_->configured_backend_address().hostname,
+      exec_env_->krpc_address(), query_ctx);
 }
 
-void ImpalaServer::PrepareQueryContext(const TNetworkAddress& backend_addr,
-    const TNetworkAddress& krpc_addr, TQueryCtx* query_ctx) {
+void ImpalaServer::PrepareQueryContext(const std::string& hostname,
+    const NetworkAddressPB& krpc_addr, TQueryCtx* query_ctx) {
   query_ctx->__set_pid(getpid());
   int64_t now_us = UnixMicros();
   const Timezone& utc_tz = TimezoneDatabase::GetUtcTimezone();
@@ -998,11 +1321,15 @@ void ImpalaServer::PrepareQueryContext(const TNetworkAddress& backend_addr,
     query_ctx->__set_now_string(query_ctx->client_request.query_options.now_string);
   }
   query_ctx->__set_start_unix_millis(now_us / MICROS_PER_MILLI);
-  query_ctx->__set_coord_address(backend_addr);
-  query_ctx->__set_coord_krpc_address(krpc_addr);
+  query_ctx->__set_coord_hostname(hostname);
+  query_ctx->__set_coord_ip_address(FromNetworkAddressPB(krpc_addr));
+  TUniqueId backend_id;
+  UniqueIdPBToTUniqueId(ExecEnv::GetInstance()->backend_id(), &backend_id);
+  query_ctx->__set_coord_backend_id(backend_id);
   query_ctx->__set_local_time_zone(local_tz_name);
   query_ctx->__set_status_report_interval_ms(FLAGS_status_report_interval_ms);
   query_ctx->__set_status_report_max_retry_s(FLAGS_status_report_max_retry_s);
+  query_ctx->__set_gen_aggregated_profile(FLAGS_gen_experimental_profile);
 
   // Creating a random_generator every time is not free, but
   // benchmarks show it to be slightly cheaper than contending for a
@@ -1020,32 +1347,30 @@ void ImpalaServer::PrepareQueryContext(const TNetworkAddress& backend_addr,
   }
 }
 
-Status ImpalaServer::RegisterQuery(shared_ptr<SessionState> session_state,
-    const shared_ptr<ClientRequestState>& request_state) {
+Status ImpalaServer::RegisterQuery(const TUniqueId& query_id,
+    shared_ptr<SessionState> session_state, QueryHandle* query_handle) {
   lock_guard<mutex> l2(session_state->lock);
   // The session wasn't expired at the time it was checked out and it isn't allowed to
   // expire while checked out, so it must not be expired.
-  DCHECK(session_state->ref_count > 0 && !session_state->expired);
+  DCHECK_GT(session_state->ref_count, 0);
+  DCHECK(!session_state->expired);
   // The session may have been closed after it was checked out.
   if (session_state->closed) {
     VLOG(1) << "RegisterQuery(): session has been closed, ignoring query.";
     return Status::Expected("Session has been closed, ignoring query.");
   }
-  const TUniqueId& query_id = request_state->query_id();
   DCHECK_EQ(this, ExecEnv::GetInstance()->impala_server());
-  RETURN_IF_ERROR(
-      client_request_state_map_.AddClientRequestState(query_id, request_state));
-
+  RETURN_IF_ERROR(query_driver_map_.Add(query_id, query_handle->query_driver()));
   // Metric is decremented in UnregisterQuery().
   ImpaladMetrics::NUM_QUERIES_REGISTERED->Increment(1L);
-  VLOG_QUERY << "Registered query query_id=" << PrintId(query_id)
-             << " session_id=" << PrintId(request_state->session_id());
+  VLOG_QUERY << "Registered query query_id=" << PrintId(query_id) << " session_id="
+             << PrintId(session_state->session_id);
   return Status::OK();
 }
 
-Status ImpalaServer::SetQueryInflight(shared_ptr<SessionState> session_state,
-    const shared_ptr<ClientRequestState>& request_state) {
-  const TUniqueId& query_id = request_state->query_id();
+Status ImpalaServer::SetQueryInflight(
+    shared_ptr<SessionState> session_state, const QueryHandle& query_handle) {
+  const TUniqueId& query_id = query_handle->query_id();
   lock_guard<mutex> l(session_state->lock);
   // The session wasn't expired at the time it was checked out and it isn't allowed to
   // expire while checked out, so it must not be expired.
@@ -1061,18 +1386,20 @@ Status ImpalaServer::SetQueryInflight(shared_ptr<SessionState> session_state,
   ++session_state->total_queries;
 
   // If the query has a timeout or time limit, schedule checks.
-  int32_t idle_timeout_s = request_state->query_options().query_timeout_s;
+  int32_t idle_timeout_s = query_handle->query_options().query_timeout_s;
   if (FLAGS_idle_query_timeout > 0 && idle_timeout_s > 0) {
     idle_timeout_s = min(FLAGS_idle_query_timeout, idle_timeout_s);
   } else {
     // Use a non-zero timeout, if one exists
     idle_timeout_s = max(FLAGS_idle_query_timeout, idle_timeout_s);
   }
-  int32_t exec_time_limit_s = request_state->query_options().exec_time_limit_s;
-  int64_t cpu_limit_s = request_state->query_options().cpu_limit_s;
-  int64_t scan_bytes_limit = request_state->query_options().scan_bytes_limit;
-  if (idle_timeout_s > 0 || exec_time_limit_s > 0 ||
-        cpu_limit_s > 0 || scan_bytes_limit > 0) {
+  int32_t exec_time_limit_s = query_handle->query_options().exec_time_limit_s;
+  int64_t cpu_limit_s = query_handle->query_options().cpu_limit_s;
+  int64_t scan_bytes_limit = query_handle->query_options().scan_bytes_limit;
+  int64_t join_rows_produced_limit =
+      query_handle->query_options().join_rows_produced_limit;
+  if (idle_timeout_s > 0 || exec_time_limit_s > 0 || cpu_limit_s > 0
+      || scan_bytes_limit > 0 || join_rows_produced_limit > 0) {
     lock_guard<mutex> l2(query_expiration_lock_);
     int64_t now = UnixMillis();
     if (idle_timeout_s > 0) {
@@ -1087,7 +1414,7 @@ Status ImpalaServer::SetQueryInflight(shared_ptr<SessionState> session_state,
       queries_by_timestamp_.emplace(ExpirationEvent{
           now + (1000L * exec_time_limit_s), query_id, ExpirationKind::EXEC_TIME_LIMIT});
     }
-    if (cpu_limit_s > 0 || scan_bytes_limit > 0) {
+    if (cpu_limit_s > 0 || scan_bytes_limit > 0 || join_rows_produced_limit > 0) {
       if (cpu_limit_s > 0) {
         VLOG_QUERY << "Query " << PrintId(query_id) << " has CPU limit of "
                    << PrettyPrinter::Print(cpu_limit_s, TUnit::TIME_S);
@@ -1096,6 +1423,10 @@ Status ImpalaServer::SetQueryInflight(shared_ptr<SessionState> session_state,
         VLOG_QUERY << "Query " << PrintId(query_id) << " has scan bytes limit of "
                    << PrettyPrinter::Print(scan_bytes_limit, TUnit::BYTES);
       }
+      if (join_rows_produced_limit > 0) {
+        VLOG_QUERY << "Query " << PrintId(query_id) << " has join rows produced limit of "
+                   << PrettyPrinter::Print(join_rows_produced_limit, TUnit::UNIT);
+      }
       queries_by_timestamp_.emplace(ExpirationEvent{
           now + EXPIRATION_CHECK_INTERVAL_MS, query_id, ExpirationKind::RESOURCE_LIMIT});
     }
@@ -1103,81 +1434,105 @@ Status ImpalaServer::SetQueryInflight(shared_ptr<SessionState> session_state,
   return Status::OK();
 }
 
-void ImpalaServer::UpdateExecSummary(
-    std::shared_ptr<ClientRequestState> request_state) const {
-  DCHECK(request_state->GetCoordinator() != nullptr);
+void ImpalaServer::UpdateExecSummary(const QueryHandle& query_handle) const {
+  DCHECK(query_handle->GetCoordinator() != nullptr);
   TExecSummary t_exec_summary;
-  request_state->GetCoordinator()->GetTExecSummary(&t_exec_summary);
-  request_state->summary_profile()->SetTExecSummary(t_exec_summary);
+  query_handle->GetCoordinator()->GetTExecSummary(&t_exec_summary);
+  query_handle->summary_profile()->SetTExecSummary(t_exec_summary);
   string exec_summary = PrintExecSummary(t_exec_summary);
-  request_state->summary_profile()->AddInfoStringRedacted("ExecSummary", exec_summary);
-  request_state->summary_profile()->AddInfoStringRedacted("Errors",
-      request_state->GetCoordinator()->GetErrorLog());
+  query_handle->summary_profile()->AddInfoStringRedacted("ExecSummary", exec_summary);
+  query_handle->summary_profile()->AddInfoStringRedacted("Errors",
+      query_handle->GetCoordinator()->GetErrorLog());
 }
 
 Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_inflight,
     const Status* cause) {
   VLOG_QUERY << "UnregisterQuery(): query_id=" << PrintId(query_id);
-  // Cancel the query.
-  RETURN_IF_ERROR(CancelInternal(query_id, check_inflight, cause));
 
-  // Delete it from the client_request_state_map_ and from the http_handler_.
-  DCHECK_EQ(this, ExecEnv::GetInstance()->impala_server());
-  shared_ptr<ClientRequestState> request_state;
+  QueryHandle query_handle;
+  RETURN_IF_ERROR(GetActiveQueryHandle(query_id, &query_handle));
+
+  // Do the work of unregistration that needs to be done synchronously. Once
+  // Finalize() returns, the query is considered unregistered from the client's point of
+  // view. If Finalize() returns OK, this thread is responsible for doing the
+  // unregistration work. Finalize() succeeds for the first thread to call it to avoid
+  // multiple threads unregistering.
   RETURN_IF_ERROR(
-      client_request_state_map_.DeleteClientRequestState(query_id, &request_state));
+      query_handle.query_driver()->Finalize(&query_handle, check_inflight, cause));
 
-  // Close and delete the ClientRequestState.
-  RETURN_IF_ERROR(CloseClientRequestState(request_state));
-
+  // Do the rest of the unregistration work in the background so that the client does
+  // not need to wait for profile serialization, etc.
+  unreg_thread_pool_->Offer(move(query_handle));
   return Status::OK();
 }
 
-Status ImpalaServer::CloseClientRequestState(
-    const std::shared_ptr<ClientRequestState>& request_state) {
-  request_state->Done();
+void ImpalaServer::FinishUnregisterQuery(const QueryHandle& query_handle) {
+  DCHECK_EQ(this, ExecEnv::GetInstance()->impala_server());
+  // Do all the finalization before removing the QueryDriver from the map so that
+  // concurrent operations, e.g. GetRuntimeProfile() can find the query.
+  CloseClientRequestState(query_handle);
+  // Make the QueryDriver inaccessible. There is a time window where the query is
+  // both in 'query_driver_map_' and 'query_locations_'.
+  Status status = query_handle.query_driver()->Unregister(&query_driver_map_);
+  string err_msg = "QueryDriver can only be deleted once: " + status.GetDetail();
+  DCHECK(status.ok()) << err_msg;
+  if (UNLIKELY(!status.ok())) {
+    LOG(ERROR) << status.GetDetail();
+  } else {
+    VLOG_QUERY << "Query successfully unregistered: query_id="
+               << PrintId(query_handle->query_id());
+  }
+}
 
-  int64_t duration_us = request_state->end_time_us() - request_state->start_time_us();
+void ImpalaServer::UnregisterQueryDiscardResult(
+    const TUniqueId& query_id, bool check_inflight, const Status* cause) {
+  Status status = UnregisterQuery(query_id, check_inflight, cause);
+  if (!status.ok()) {
+    LOG(ERROR) << Substitute("Query de-registration for query_id=$0 failed: $1",
+        PrintId(query_id), cause->GetDetail());
+  }
+}
+
+void ImpalaServer::CloseClientRequestState(const QueryHandle& query_handle) {
+  int64_t duration_us = query_handle->end_time_us() - query_handle->start_time_us();
   int64_t duration_ms = duration_us / MICROS_PER_MILLI;
 
   // duration_ms can be negative when the local timezone changes during query execution.
   if (duration_ms >= 0) {
-    if (request_state->stmt_type() == TStmtType::DDL) {
+    if (query_handle->stmt_type() == TStmtType::DDL) {
       ImpaladMetrics::DDL_DURATIONS->Update(duration_ms);
     } else {
       ImpaladMetrics::QUERY_DURATIONS->Update(duration_ms);
     }
   }
   {
-    lock_guard<mutex> l(request_state->session()->lock);
-    request_state->session()->inflight_queries.erase(request_state->query_id());
+    lock_guard<mutex> l(query_handle->session()->lock);
+    query_handle->session()->inflight_queries.erase(query_handle->query_id());
   }
 
-  if (request_state->GetCoordinator() != nullptr) {
-    UpdateExecSummary(request_state);
+  if (query_handle->GetCoordinator() != nullptr) {
+    UpdateExecSummary(query_handle);
   }
 
-  if (request_state->schedule() != nullptr) {
-    const PerBackendExecParams& per_backend_params =
-        request_state->schedule()->per_backend_exec_params();
-    if (!per_backend_params.empty()) {
+  if (query_handle->schedule() != nullptr) {
+    const RepeatedPtrField<BackendExecParamsPB>& backend_exec_params =
+        query_handle->schedule()->backend_exec_params();
+    if (!backend_exec_params.empty()) {
       lock_guard<mutex> l(query_locations_lock_);
-      for (const auto& entry : per_backend_params) {
-        const TNetworkAddress& hostport = entry.first;
+      for (const BackendExecParamsPB& param : backend_exec_params) {
         // Query may have been removed already by cancellation path. In particular, if
         // node to fail was last sender to an exchange, the coordinator will realise and
         // fail the query at the same time the failure detection path does the same
         // thing. They will harmlessly race to remove the query from this map.
-        QueryLocations::iterator it = query_locations_.find(hostport);
+        auto it = query_locations_.find(param.backend_id());
         if (it != query_locations_.end()) {
-          it->second.erase(request_state->query_id());
+          it->second.query_ids.erase(query_handle->query_id());
         }
       }
     }
   }
-  ArchiveQuery(*request_state);
+  ArchiveQuery(query_handle);
   ImpaladMetrics::NUM_QUERIES_REGISTERED->Increment(-1L);
-  return Status::OK();
 }
 
 Status ImpalaServer::UpdateCatalogMetrics() {
@@ -1217,14 +1572,81 @@ Status ImpalaServer::UpdateCatalogMetrics() {
 
 }
 
-Status ImpalaServer::CancelInternal(const TUniqueId& query_id, bool check_inflight,
-    const Status* cause) {
-  VLOG_QUERY << "Cancel(): query_id=" << PrintId(query_id);
-  shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
-  if (request_state == nullptr) {
-    return Status::Expected("Invalid or unknown query handle");
+shared_ptr<QueryDriver> ImpalaServer::GetQueryDriver(
+    const TUniqueId& query_id, bool return_unregistered) {
+  DCHECK_EQ(this, ExecEnv::GetInstance()->impala_server());
+  ScopedShardedMapRef<shared_ptr<QueryDriver>> map_ref(query_id, &query_driver_map_);
+  DCHECK(map_ref.get() != nullptr);
+
+  auto entry = map_ref->find(query_id);
+  if (entry == map_ref->end()) return shared_ptr<QueryDriver>();
+
+  // This started_unregister() check can race with unregistration. It cannot prevent
+  // unregistration starting immediately after the value is loaded. This check, however,
+  // is sufficient to ensure that after a client operation has unregistered the request,
+  // subsequent operations won't spuriously find the request.
+  if (!return_unregistered && entry->second->finalized()) {
+    return shared_ptr<QueryDriver>();
   }
-  RETURN_IF_ERROR(request_state->Cancel(check_inflight, cause));
+  return entry->second;
+}
+
+Status ImpalaServer::GetActiveQueryHandle(
+    const TUniqueId& query_id, QueryHandle* query_handle) {
+  DCHECK(query_handle != nullptr);
+  shared_ptr<QueryDriver> query_driver = GetQueryDriver(query_id);
+  if (UNLIKELY(query_driver == nullptr)) {
+    Status err = Status::Expected(TErrorCode::INVALID_QUERY_HANDLE, PrintId(query_id));
+    VLOG(1) << err.GetDetail();
+    return err;
+  }
+  query_handle->SetHandle(query_driver, query_driver->GetActiveClientRequestState());
+  return Status::OK();
+}
+
+Status ImpalaServer::GetQueryHandle(
+    const TUniqueId& query_id, QueryHandle* query_handle, bool return_unregistered) {
+  DCHECK(query_handle != nullptr);
+  shared_ptr<QueryDriver> query_driver = GetQueryDriver(query_id, return_unregistered);
+  if (UNLIKELY(query_driver == nullptr)) {
+    Status err = Status::Expected(TErrorCode::INVALID_QUERY_HANDLE, PrintId(query_id));
+    VLOG(1) << err.GetDetail();
+    return err;
+  }
+  ClientRequestState* request_state = query_driver->GetClientRequestState(query_id);
+  if (UNLIKELY(request_state == nullptr)) {
+    Status err = Status::Expected(TErrorCode::INVALID_QUERY_HANDLE, PrintId(query_id));
+    VLOG(1) << err.GetDetail();
+    return err;
+  }
+  query_handle->SetHandle(query_driver, request_state);
+  return Status::OK();
+}
+
+Status ImpalaServer::GetAllQueryHandles(const TUniqueId& query_id,
+    QueryHandle* active_query_handle, QueryHandle* original_query_handle,
+    bool return_unregistered) {
+  DCHECK(active_query_handle != nullptr);
+  DCHECK(original_query_handle != nullptr);
+  shared_ptr<QueryDriver> query_driver = GetQueryDriver(query_id, return_unregistered);
+  if (UNLIKELY(query_driver == nullptr)) {
+    Status err = Status::Expected(TErrorCode::INVALID_QUERY_HANDLE, PrintId(query_id));
+    VLOG(1) << err.GetDetail();
+    return err;
+  }
+  active_query_handle->SetHandle(query_driver,
+      query_driver->GetActiveClientRequestState());
+  original_query_handle->SetHandle(query_driver,
+      query_driver->GetClientRequestState(query_id));
+  return Status::OK();
+}
+
+Status ImpalaServer::CancelInternal(const TUniqueId& query_id) {
+  VLOG_QUERY << "Cancel(): query_id=" << PrintId(query_id);
+  QueryHandle query_handle;
+  RETURN_IF_ERROR(GetActiveQueryHandle(query_id, &query_handle));
+  RETURN_IF_ERROR(
+      query_handle->Cancel(/*check_inflight=*/ true, /*cause=*/ nullptr));
   return Status::OK();
 }
 
@@ -1274,7 +1696,7 @@ Status ImpalaServer::CloseSessionInternal(const TUniqueId& session_id,
   Status status = Status::Expected("Session closed");
   for (const TUniqueId& query_id: inflight_queries) {
     // TODO: deal with an error status
-    discard_result(UnregisterQuery(query_id, false, &status));
+    UnregisterQueryDiscardResult(query_id, false, &status);
   }
   // Reconfigure the poll period of session_maintenance_thread_ if necessary.
   UnregisterSessionTimeout(session_state->session_timeout);
@@ -1296,7 +1718,7 @@ Status ImpalaServer::GetSessionState(const TUniqueId& session_id, const SecretAr
               << " with invalid "
               << (secret.is_session_secret() ? "session" : "operation") << " secret.";
     }
-    *session_state = std::shared_ptr<SessionState>();
+    *session_state = shared_ptr<SessionState>();
     string err_msg = secret.is_session_secret() ?
         Substitute("Invalid session id: $0", PrintId(session_id)) :
         Substitute(LEGACY_INVALID_QUERY_HANDLE_TEMPLATE, PrintId(secret.query_id()));
@@ -1327,6 +1749,13 @@ void ImpalaServer::InitializeConfigVariables() {
   // Set idle_session_timeout here to let the SET command return the value of
   // the command line option FLAGS_idle_session_timeout
   default_query_options_.__set_idle_session_timeout(FLAGS_idle_session_timeout);
+  // The next query options used to be set with flags. Setting them in
+  // default_query_options_ here in order to make default_query_options
+  // take precedence over the legacy flags.
+  default_query_options_.__set_use_local_tz_for_unix_timestamp_conversions(
+    FLAGS_use_local_tz_for_unix_timestamp_conversions);
+  default_query_options_.__set_convert_legacy_hive_parquet_utc_timestamps(
+    FLAGS_convert_legacy_hive_parquet_utc_timestamps);
   QueryOptionsMask set_query_options; // unused
   Status status = ParseQueryOptions(FLAGS_default_query_options,
       &default_query_options_, &set_query_options);
@@ -1394,18 +1823,55 @@ TQueryOptions ImpalaServer::SessionState::QueryOptions() {
   return ret;
 }
 
-void ImpalaServer::CancelFromThreadPool(uint32_t thread_id,
-    const CancellationWork& cancellation_work) {
+Status ImpalaServer::WaitForResults(const TUniqueId& query_id,
+    QueryHandle* query_handle, int64_t* block_on_wait_time_us,
+    bool* timed_out) {
+  // Make sure ClientRequestState::Wait() has completed before fetching rows. Wait()
+  // ensures that rows are ready to be fetched (e.g., Wait() opens
+  // ClientRequestState::output_exprs_, which are evaluated in
+  // ClientRequestState::FetchRows() below).
+  RETURN_IF_ERROR(GetActiveQueryHandle(query_id, query_handle));
+  BlockOnWait(*query_handle, timed_out, block_on_wait_time_us);
+
+  // After BlockOnWait returns, it is possible that the query did not time out, and that
+  // it was instead retried. In that case, wait until the query has been successfully
+  // retried and then call GetActiveQueryHandle, which should now return the
+  // ClientRequestState for the new query.
+  ClientRequestState::RetryState retry_state;
+  retry_state = (*query_handle)->retry_state();
+  if (retry_state == ClientRequestState::RetryState::RETRYING
+      || retry_state == ClientRequestState::RetryState::RETRIED) {
+    (*query_handle)->WaitUntilRetried();
+    RETURN_IF_ERROR(GetActiveQueryHandle(query_id, query_handle));
+    // Call BlockOnWait and then DCHECK that the state is not RETRYING or RETRIED
+    BlockOnWait(*query_handle, timed_out, block_on_wait_time_us);
+    retry_state = (*query_handle)->retry_state();
+    DCHECK(retry_state != ClientRequestState::RetryState::RETRYING
+        && retry_state != ClientRequestState::RetryState::RETRIED)
+        << "Unexpected state: " << (*query_handle)->RetryStateToString(retry_state);
+  }
+  return Status::OK();
+}
+
+void ImpalaServer::BlockOnWait(QueryHandle& query_handle,
+    bool* timed_out, int64_t* block_on_wait_time_us) {
+  int64_t fetch_rows_timeout_us = query_handle->fetch_rows_timeout_us();
+  *timed_out =
+      !query_handle->BlockOnWait(fetch_rows_timeout_us, block_on_wait_time_us);
+}
+
+void ImpalaServer::CancelFromThreadPool(const CancellationWork& cancellation_work) {
   const TUniqueId& query_id = cancellation_work.query_id();
-  shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
+  QueryHandle query_handle;
+  Status status = GetQueryHandle(query_id, &query_handle);
   // Query was already unregistered.
-  if (request_state == nullptr) {
+  if (!status.ok()) {
     VLOG_QUERY << "CancelFromThreadPool(): query " << PrintId(query_id)
                << " already unregistered.";
     return;
   }
 
-  DebugActionNoFail(request_state->query_options(), "QUERY_CANCELLATION_THREAD");
+  DebugActionNoFail(query_handle->query_options(), "QUERY_CANCELLATION_THREAD");
   Status error;
   switch (cancellation_work.cause()) {
     case CancellationWorkCause::TERMINATED_BY_SERVER:
@@ -1414,8 +1880,8 @@ void ImpalaServer::CancelFromThreadPool(uint32_t thread_id,
     case CancellationWorkCause::BACKEND_FAILED: {
       // We only want to proceed with cancellation if the backends are still in use for
       // the query.
-      vector<TNetworkAddress> active_backends;
-      Coordinator* coord = request_state->GetCoordinator();
+      vector<NetworkAddressPB> active_backends;
+      Coordinator* coord = query_handle->GetCoordinator();
       if (coord == nullptr) {
         // Query hasn't started yet - it still will run on all backends.
         active_backends = cancellation_work.failed_backends();
@@ -1429,7 +1895,7 @@ void ImpalaServer::CancelFromThreadPool(uint32_t thread_id,
       }
       stringstream msg;
       for (int i = 0; i < active_backends.size(); ++i) {
-        msg << TNetworkAddressToString(active_backends[i]);
+        msg << active_backends[i];
         if (i + 1 != active_backends.size()) msg << ", ";
       }
       error = Status::Expected(TErrorCode::UNREACHABLE_IMPALADS, msg.str());
@@ -1440,17 +1906,26 @@ void ImpalaServer::CancelFromThreadPool(uint32_t thread_id,
   }
 
   if (cancellation_work.unregister()) {
-    Status status = UnregisterQuery(cancellation_work.query_id(), true, &error);
-    if (!status.ok()) {
-      VLOG_QUERY << "Query de-registration (" << PrintId(cancellation_work.query_id())
-                 << ") failed";
-    }
+    UnregisterQueryDiscardResult(cancellation_work.query_id(), true, &error);
   } else {
-    VLOG_QUERY << "CancelFromThreadPool(): cancelling query_id=" << PrintId(query_id);
-    Status status = request_state->Cancel(true, &error);
-    if (!status.ok()) {
-      VLOG_QUERY << "Query cancellation (" << PrintId(cancellation_work.query_id())
-                 << ") did not succeed: " << status.GetDetail();
+    // Retry queries that would otherwise be cancelled due to an impalad leaving the
+    // cluster. CancellationWorkCause::BACKEND_FAILED indicates that a backend running
+    // the query was removed from the cluster membership due to a statestore heartbeat
+    // timeout. Historically, this would cause the Coordinator to cancel all queries
+    // running on that backend. Now, Impala attempts to retry the queries instead of
+    // cancelling them.
+    bool was_retried = false;
+    if (cancellation_work.cause() == CancellationWorkCause::BACKEND_FAILED) {
+      query_handle.query_driver()->TryQueryRetry(&*query_handle, &error, &was_retried);
+    }
+    // If the query could not be retried, then cancel the query.
+    if (!was_retried) {
+      VLOG_QUERY << "CancelFromThreadPool(): cancelling query_id=" << PrintId(query_id);
+      Status status = query_handle->Cancel(true, &error);
+      if (!status.ok()) {
+        VLOG_QUERY << "Query cancellation (" << PrintId(cancellation_work.query_id())
+                   << ") did not succeed: " << status.GetDetail();
+      }
     }
   }
 }
@@ -1529,6 +2004,23 @@ Status ImpalaServer::AuthorizeProxyUser(const string& user, const string& do_as_
   string error_msg_str = error_msg.str();
   VLOG(1) << error_msg_str;
   return Status::Expected(error_msg_str);
+}
+
+bool ImpalaServer::IsAuthorizedProxyUser(const string& user) {
+  if (user.empty()) return false;
+
+  // Get the short version of the user name (the user name up to the first '/' or '@')
+  // from the full principal name.
+  size_t end_idx = min(user.find("/"), user.find("@"));
+  // If neither are found (or are found at the beginning of the user name),
+  // return the username. Otherwise, return the username up to the matching character.
+  string short_user(
+      end_idx == string::npos || end_idx == 0 ? user : user.substr(0, end_idx));
+
+  return authorized_proxy_user_config_.find(short_user)
+      != authorized_proxy_user_config_.end()
+      || authorized_proxy_group_config_.find(short_user)
+      != authorized_proxy_group_config_.end();
 }
 
 void ImpalaServer::CatalogUpdateVersionInfo::UpdateCatalogVersionMetrics()
@@ -1676,19 +2168,52 @@ Status ImpalaServer::ProcessCatalogUpdateResult(
       WaitForCatalogUpdateTopicPropagation(catalog_service_id);
     }
   } else {
-    CatalogUpdateResultIterator callback_ctx(catalog_update_result);
-    TUpdateCatalogCacheRequest update_req;
-    update_req.__set_is_delta(true);
-    update_req.__set_native_iterator_ptr(reinterpret_cast<int64_t>(&callback_ctx));
-    // The catalog version is updated in WaitForCatalogUpdate below. So we need a
-    // standalone field in the request to update the service ID without touching the
-    // catalog version.
-    update_req.__set_catalog_service_id(catalog_update_result.catalog_service_id);
-    // Apply the changes to the local catalog cache.
-    TUpdateCatalogCacheResponse resp;
-    Status status = exec_env_->frontend()->UpdateCatalogCache(update_req, &resp);
-    if (!status.ok()) LOG(ERROR) << status.GetDetail();
-    RETURN_IF_ERROR(status);
+    TUniqueId cur_service_id;
+    {
+      unique_lock<mutex> ver_lock(catalog_version_lock_);
+      cur_service_id = catalog_update_info_.catalog_service_id;
+      if (catalog_update_info_.catalog_service_id != catalog_service_id) {
+        LOG(INFO) << "Catalog service ID mismatch. Current ID: "
+            << PrintId(cur_service_id) << ". ID in response: "
+            << PrintId(catalog_service_id) << ". Catalogd may be restarted. Waiting for"
+            " new catalog update from statestore.";
+        // Catalog service ID has been changed, and impalad request a full topic update.
+        // When impalad completes the full topic update, it will exit this loop.
+        while (cur_service_id == catalog_update_info_.catalog_service_id) {
+          catalog_version_update_cv_.Wait(ver_lock);
+        }
+        cur_service_id = catalog_update_info_.catalog_service_id;
+      }
+    }
+
+    if (cur_service_id == catalog_service_id) {
+      CatalogUpdateResultIterator callback_ctx(catalog_update_result);
+      TUpdateCatalogCacheRequest update_req;
+      update_req.__set_is_delta(true);
+      update_req.__set_native_iterator_ptr(reinterpret_cast<int64_t>(&callback_ctx));
+      // The catalog version is updated in WaitForCatalogUpdate below. So we need a
+      // standalone field in the request to update the service ID without touching the
+      // catalog version.
+      update_req.__set_catalog_service_id(catalog_update_result.catalog_service_id);
+      // Apply the changes to the local catalog cache.
+      TUpdateCatalogCacheResponse resp;
+      Status status = exec_env_->frontend()->UpdateCatalogCache(update_req, &resp);
+      if (!status.ok()) LOG(ERROR) << status.GetDetail();
+      RETURN_IF_ERROR(status);
+    } else {
+      // We can't apply updates on another service id, because the local catalog is still
+      // inconsistent with the catalogd that executes the DDL. Catalogd may be restarted
+      // more than once inside a statestore update cycle. 'cur_service_id' could belong
+      // to 1) a stale update from the previous restarted catalogd, or 2) a newer update
+      // from next restarted catalogd. We are good to ignore the DDL result at the second
+      // case. However, in the first case clients may see stale catalog until the
+      // expected catalog topic update comes.
+      // TODO: handle the first case in IMPALA-10875.
+      LOG(WARNING) << "Ignoring catalog update result of catalog service ID: "
+          << PrintId(catalog_service_id) << ". The expected catalog service ID: "
+          << PrintId(catalog_service_id) << ". Current catalog service ID: "
+          << PrintId(cur_service_id) <<". Catalogd may be restarted more than once.";
+    }
     if (!wait_for_all_subscribers) return Status::OK();
     // Wait until we receive and process the catalog update that covers the effects
     // (catalog objects) of this operation.
@@ -1701,33 +2226,42 @@ Status ImpalaServer::ProcessCatalogUpdateResult(
 }
 
 void ImpalaServer::RegisterQueryLocations(
-    const PerBackendExecParams& per_backend_params, const TUniqueId& query_id) {
+    const RepeatedPtrField<BackendExecParamsPB>& backend_params,
+    const TUniqueId& query_id) {
   VLOG_QUERY << "Registering query locations";
-  if (!per_backend_params.empty()) {
+  if (!backend_params.empty()) {
     lock_guard<mutex> l(query_locations_lock_);
-    for (const auto& entry : per_backend_params) {
-      const TNetworkAddress& host = entry.first;
-      query_locations_[host].insert(query_id);
+    for (const BackendExecParamsPB& param : backend_params) {
+      const BackendIdPB& backend_id = param.backend_id();
+      auto it = query_locations_.find(backend_id);
+      if (it == query_locations_.end()) {
+        query_locations_.emplace(
+            backend_id, QueryLocationInfo(param.address(), query_id));
+      } else {
+        it->second.query_ids.insert(query_id);
+      }
     }
   }
 }
 
 void ImpalaServer::CancelQueriesOnFailedBackends(
-    const std::unordered_set<TNetworkAddress>& current_membership) {
+    const std::unordered_set<BackendIdPB>& current_membership) {
   // Maps from query id (to be cancelled) to a list of failed Impalads that are
-  // the cause of the cancellation.
-  map<TUniqueId, vector<TNetworkAddress>> queries_to_cancel;
+  // the cause of the cancellation. Note that we don't need to use TBackendIds as a single
+  // query can't be scheduled on two backends with the same TNetworkAddress so there's no
+  // ambiguity, and passing the TNetworkAddresses into the CancellationWork makes them
+  // available for generating a user-friendly error message.
+  map<TUniqueId, vector<NetworkAddressPB>> queries_to_cancel;
   {
     // Build a list of queries that are running on failed hosts (as evidenced by their
     // absence from the membership list).
-    // TODO: crash-restart failures can give false negatives for failed Impala demons.
     lock_guard<mutex> l(query_locations_lock_);
     QueryLocations::const_iterator loc_entry = query_locations_.begin();
     while (loc_entry != query_locations_.end()) {
       if (current_membership.find(loc_entry->first) == current_membership.end()) {
         // Add failed backend locations to all queries that ran on that backend.
-        for (const auto& query_id : loc_entry->second) {
-          queries_to_cancel[query_id].push_back(loc_entry->first);
+        for (const auto& query_id : loc_entry->second.query_ids) {
+          queries_to_cancel[query_id].push_back(loc_entry->second.address);
         }
         loc_entry = query_locations_.erase(loc_entry);
       } else {
@@ -1748,7 +2282,7 @@ void ImpalaServer::CancelQueriesOnFailedBackends(
     for (const auto& cancellation_entry : queries_to_cancel) {
       stringstream backends_ss;
       for (int i = 0; i < cancellation_entry.second.size(); ++i) {
-        backends_ss << TNetworkAddressToString(cancellation_entry.second[i]);
+        backends_ss << cancellation_entry.second[i];
         if (i + 1 != cancellation_entry.second.size()) backends_ss << ", ";
       }
       VLOG_QUERY << "Backends failed for query " << PrintId(cancellation_entry.first)
@@ -1759,121 +2293,123 @@ void ImpalaServer::CancelQueriesOnFailedBackends(
   }
 }
 
-std::shared_ptr<const TBackendDescriptor> ImpalaServer::GetLocalBackendDescriptor() {
+std::shared_ptr<const BackendDescriptorPB> ImpalaServer::GetLocalBackendDescriptor() {
   if (!services_started_.load()) return nullptr;
 
   lock_guard<mutex> l(local_backend_descriptor_lock_);
   // Check if the current backend descriptor needs to be initialized.
   if (local_backend_descriptor_.get() == nullptr) {
-    std::shared_ptr<TBackendDescriptor> new_be_desc =
-        std::make_shared<TBackendDescriptor>();
+    shared_ptr<BackendDescriptorPB> new_be_desc =
+        std::make_shared<BackendDescriptorPB>();
     BuildLocalBackendDescriptorInternal(new_be_desc.get());
     local_backend_descriptor_ = new_be_desc;
   }
 
   // Check to see if it needs to be updated.
-  if (IsShuttingDown() != local_backend_descriptor_->is_quiescing) {
-    std::shared_ptr<TBackendDescriptor> new_be_desc =
-      std::make_shared<TBackendDescriptor>(*local_backend_descriptor_);
-    new_be_desc->is_quiescing = IsShuttingDown();
+  if (IsShuttingDown() != local_backend_descriptor_->is_quiescing()) {
+    std::shared_ptr<BackendDescriptorPB> new_be_desc =
+        std::make_shared<BackendDescriptorPB>(*local_backend_descriptor_);
+    new_be_desc->set_is_quiescing(IsShuttingDown());
     local_backend_descriptor_ = new_be_desc;
   }
 
   return local_backend_descriptor_;
 }
 
-void ImpalaServer::BuildLocalBackendDescriptorInternal(TBackendDescriptor* be_desc) {
+void ImpalaServer::BuildLocalBackendDescriptorInternal(BackendDescriptorPB* be_desc) {
   DCHECK(services_started_.load());
   bool is_quiescing = shutting_down_.Load() != 0;
 
-  be_desc->__set_address(exec_env_->GetThriftBackendAddress());
-  be_desc->__set_ip_address(exec_env_->ip_address());
-  be_desc->__set_is_coordinator(FLAGS_is_coordinator);
-  be_desc->__set_is_executor(FLAGS_is_executor);
+  *be_desc->mutable_backend_id() = exec_env_->backend_id();
+  *be_desc->mutable_address() =
+      MakeNetworkAddressPB(exec_env_->configured_backend_address().hostname,
+          exec_env_->configured_backend_address().port, exec_env_->backend_id(),
+          exec_env_->rpc_mgr()->GetUdsAddressUniqueId());
+  be_desc->set_ip_address(exec_env_->ip_address());
+  be_desc->set_is_coordinator(FLAGS_is_coordinator);
+  be_desc->set_is_executor(FLAGS_is_executor);
 
   Webserver* webserver = ExecEnv::GetInstance()->webserver();
   if (webserver != nullptr) {
-    be_desc->__set_debug_http_address(
-        MakeNetworkAddress(webserver->hostname(), webserver->port()));
-    be_desc->__set_secure_webserver(webserver->IsSecure());
+    *be_desc->mutable_debug_http_address() =
+        MakeNetworkAddressPB(webserver->hostname(), webserver->port());
+    be_desc->set_secure_webserver(webserver->IsSecure());
   }
 
-  const TNetworkAddress& krpc_address = exec_env_->krpc_address();
+  const NetworkAddressPB& krpc_address = exec_env_->krpc_address();
   DCHECK(IsResolvedAddress(krpc_address));
-  be_desc->__set_krpc_address(krpc_address);
+  *be_desc->mutable_krpc_address() = krpc_address;
 
-  be_desc->__set_admit_mem_limit(exec_env_->admit_mem_limit());
-  be_desc->__set_admission_slots(exec_env_->admission_slots());
-  be_desc->__set_is_quiescing(is_quiescing);
-  be_desc->executor_groups = GetExecutorGroups(FLAGS_executor_groups);
+  be_desc->set_admit_mem_limit(exec_env_->admit_mem_limit());
+  be_desc->set_admission_slots(exec_env_->admission_slots());
+  be_desc->set_is_quiescing(is_quiescing);
+  SetExecutorGroups(FLAGS_executor_groups, be_desc);
 }
 
-ImpalaServer::QueryStateRecord::QueryStateRecord(const ClientRequestState& request_state,
-    bool copy_profile, const string& encoded_profile) {
-  id = request_state.query_id();
-  const TExecRequest& request = request_state.exec_request();
+ImpalaServer::QueryStateRecord::QueryStateRecord(
+    const ClientRequestState& query_handle, vector<uint8_t>&& compressed_profile)
+  : compressed_profile(compressed_profile) {
+  Init(query_handle);
+}
 
-  const string* plan_str = request_state.summary_profile()->GetInfoString("Plan");
+ImpalaServer::QueryStateRecord::QueryStateRecord(const ClientRequestState& query_handle)
+  : compressed_profile() {
+  Init(query_handle);
+}
+
+void ImpalaServer::QueryStateRecord::Init(const ClientRequestState& query_handle) {
+  id = query_handle.query_id();
+  const TExecRequest& request = query_handle.exec_request();
+
+  const string* plan_str = query_handle.summary_profile()->GetInfoString("Plan");
   if (plan_str != nullptr) plan = *plan_str;
-  stmt = request_state.sql_stmt();
+  stmt = query_handle.sql_stmt();
   stmt_type = request.stmt_type;
-  effective_user = request_state.effective_user();
-  default_db = request_state.default_db();
-  start_time_us = request_state.start_time_us();
-  end_time_us = request_state.end_time_us();
+  effective_user = query_handle.effective_user();
+  default_db = query_handle.default_db();
+  start_time_us = query_handle.start_time_us();
+  end_time_us = query_handle.end_time_us();
   has_coord = false;
 
-  Coordinator* coord = request_state.GetCoordinator();
+  Coordinator* coord = query_handle.GetCoordinator();
   if (coord != nullptr) {
     num_complete_fragments = coord->progress().num_complete();
     total_fragments = coord->progress().total();
     has_coord = true;
   }
-  query_state = request_state.BeeswaxQueryState();
-  num_rows_fetched = request_state.num_rows_fetched();
-  query_status = request_state.query_status();
-
-  request_state.query_events()->ToThrift(&event_sequence);
-
-  if (copy_profile) {
-    stringstream ss;
-    request_state.profile()->PrettyPrint(&ss);
-    profile_str = ss.str();
-
-    Document json_profile(rapidjson::kObjectType);
-    request_state.profile()->ToJson(&json_profile);
-
-    StringBuffer buffer;
-    Writer<StringBuffer> writer(buffer);
-    json_profile.Accept(writer);
-    json_profile_str = buffer.GetString();
-
-    if (encoded_profile.empty()) {
-      Status status =
-          request_state.profile()->SerializeToArchiveString(&encoded_profile_str);
-      if (!status.ok()) {
-        LOG_EVERY_N(WARNING, 1000) << "Could not serialize profile to archive string "
-                                   << status.GetDetail();
-      }
-    } else {
-      encoded_profile_str = encoded_profile;
-    }
+  beeswax_query_state = query_handle.BeeswaxQueryState();
+  ClientRequestState::RetryState retry_state = query_handle.retry_state();
+  if (retry_state == ClientRequestState::RetryState::NOT_RETRIED) {
+    query_state = _QueryState_VALUES_TO_NAMES.find(beeswax_query_state)->second;
+  } else {
+    query_state = query_handle.RetryStateToString(retry_state);
   }
+  num_rows_fetched = query_handle.num_rows_fetched();
+  query_status = query_handle.query_status();
+
+  query_handle.query_events()->ToThrift(&event_sequence);
 
   // Save the query fragments so that the plan can be visualised.
   for (const TPlanExecInfo& plan_exec_info:
-      request_state.exec_request().query_exec_request.plan_exec_info) {
+      query_handle.exec_request().query_exec_request.plan_exec_info) {
     fragments.insert(fragments.end(),
         plan_exec_info.fragments.begin(), plan_exec_info.fragments.end());
   }
-  all_rows_returned = request_state.eos();
-  last_active_time_ms = request_state.last_active_ms();
+  all_rows_returned = query_handle.eos();
+  last_active_time_ms = query_handle.last_active_ms();
   // For statement types other than QUERY/DML, show an empty string for resource pool
   // to indicate that they are not subjected to admission control.
   if (stmt_type == TStmtType::QUERY || stmt_type == TStmtType::DML) {
-    resource_pool = request_state.request_pool();
+    resource_pool = query_handle.request_pool();
   }
-  user_has_profile_access = request_state.user_has_profile_access();
+  user_has_profile_access = query_handle.user_has_profile_access();
+
+  // In some cases like canceling and closing the original query or closing the session
+  // we may not create the new query, we also check whether the retrided query id is set.
+  was_retried = query_handle.WasRetried() && query_handle.IsSetRetriedId();
+  if (was_retried) {
+    retried_query_id = make_unique<TUniqueId>(query_handle.retried_id());
+  }
 }
 
 bool ImpalaServer::QueryStateRecordLessThan::operator() (
@@ -1898,7 +2434,7 @@ void ImpalaServer::ConnectionStart(
     TUniqueId secret;
     UUIDToTUniqueId(secret_uuid, &secret);
     shared_ptr<SessionState> session_state =
-        make_shared<SessionState>(this, session_id, secret);
+        std::make_shared<SessionState>(this, session_id, secret);
     session_state->closed = false;
     session_state->start_time_ms = UnixMillis();
     session_state->last_accessed_ms = UnixMillis();
@@ -1972,7 +2508,8 @@ void ImpalaServer::ConnectionEnd(
     }
   } else {
     DCHECK(connection_context.server_name ==  HS2_SERVER_NAME
-        || connection_context.server_name == HS2_HTTP_SERVER_NAME);
+        || connection_context.server_name == HS2_HTTP_SERVER_NAME
+        || connection_context.server_name == EXTERNAL_FRONTEND_SERVER_NAME);
     for (const TUniqueId& session_id : disconnected_sessions) {
       shared_ptr<SessionState> state;
       Status status = GetSessionState(session_id, SecretArg::SkipSecretCheck(), &state);
@@ -2079,7 +2616,8 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
                   >= FLAGS_disconnected_session_timeout * 1000L) {
             // This session has no active connections and is past the disconnected session
             // timeout, so close it.
-            DCHECK_ENUM_EQ(session_state->session_type, TSessionType::HIVESERVER2);
+            DCHECK(session_state->session_type == TSessionType::HIVESERVER2 ||
+                session_state->session_type == TSessionType::EXTERNAL_FRONTEND);
             LOG(INFO) << "Closing session: " << PrintId(session_id)
                       << ", user: " << session_state->connected_user
                       << ", because it no longer  has any open connections. The last "
@@ -2157,23 +2695,28 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
         // 'queries_by_timestamp_' is stored in ascending order of deadline so we can
         // break out of the loop and sleep as soon as we see a deadline in the future.
         if (expiration_event->deadline > now) break;
-        shared_ptr<ClientRequestState> crs =
-            GetClientRequestState(expiration_event->query_id);
-        if (crs == nullptr || crs->is_expired()) {
-          // Query was deleted or expired already from a previous expiration event.
+        shared_ptr<QueryDriver> query_driver = GetQueryDriver(expiration_event->query_id);
+        if (query_driver == nullptr) {
+          // Query was deleted already from a previous expiration event
+          expiration_event = queries_by_timestamp_.erase(expiration_event);
+          continue;
+        }
+        ClientRequestState* crs = query_driver->GetActiveClientRequestState();
+        if (crs->is_expired()) {
+          // Query was expired already from a previous expiration event.
           expiration_event = queries_by_timestamp_.erase(expiration_event);
           continue;
         }
 
         // Check for CPU and scanned bytes limits
         if (expiration_event->kind == ExpirationKind::RESOURCE_LIMIT) {
-          Status resource_status = CheckResourceLimits(crs.get());
+          Status resource_status = CheckResourceLimits(crs);
           if (resource_status.ok()) {
             queries_by_timestamp_.emplace(
                 ExpirationEvent{now + EXPIRATION_CHECK_INTERVAL_MS,
                     expiration_event->query_id, ExpirationKind::RESOURCE_LIMIT});
           } else {
-            ExpireQuery(crs.get(), resource_status);
+            ExpireQuery(crs, resource_status);
           }
           expiration_event = queries_by_timestamp_.erase(expiration_event);
           continue;
@@ -2184,7 +2727,7 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
           int32_t exec_time_limit_s = crs->query_options().exec_time_limit_s;
           VLOG_QUERY << "Expiring query " << PrintId(expiration_event->query_id)
                      << " due to execution time limit of " << exec_time_limit_s << "s.";
-          ExpireQuery(crs.get(),
+          ExpireQuery(crs,
               Status::Expected(TErrorCode::EXEC_TIME_LIMIT_EXCEEDED,
                   PrintId(expiration_event->query_id),
                   PrettyPrinter::Print(exec_time_limit_s, TUnit::TIME_S)));
@@ -2225,7 +2768,7 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
           VLOG_QUERY << "Expiring query due to client inactivity: "
                      << PrintId(expiration_event->query_id) << ", last activity was at: "
                      << ToStringFromUnixMillis(crs->last_active_ms());
-          ExpireQuery(crs.get(),
+          ExpireQuery(crs,
               Status::Expected(TErrorCode::INACTIVE_QUERY_EXPIRED,
                   PrintId(expiration_event->query_id),
                   PrettyPrinter::Print(idle_timeout_s, TUnit::TIME_S)));
@@ -2252,18 +2795,19 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
           << "more than " << max_lag_ms << "ms.";
   while (true) {
     vector<CancellationWork> to_cancel;
-    client_request_state_map_.DoFuncForAllEntries(
-        [&](const std::shared_ptr<ClientRequestState>& request_state) {
+    query_driver_map_.DoFuncForAllEntries(
+        [&](const std::shared_ptr<QueryDriver>& query_driver) {
+          ClientRequestState* request_state = query_driver->GetActiveClientRequestState();
           Coordinator* coord = request_state->GetCoordinator();
           if (coord != nullptr) {
-            TNetworkAddress address;
+            NetworkAddressPB address;
             int64_t lag_time_ms = coord->GetMaxBackendStateLagMs(&address);
             if (lag_time_ms > max_lag_ms) {
               to_cancel.push_back(
                   CancellationWork::TerminatedByServer(request_state->query_id(),
                       Status(TErrorCode::UNRESPONSIVE_BACKEND,
                           PrintId(request_state->query_id()),
-                          TNetworkAddressToString(address), lag_time_ms, max_lag_ms),
+                          NetworkAddressPBToString(address), lag_time_ms, max_lag_ms),
                       false /* unregister */));
             }
           }
@@ -2271,11 +2815,47 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
 
     // We call Offer() outside of DoFuncForAllEntries() to ensure that if the
     // cancellation_thread_pool_ queue is full, we're not blocked while holding one of the
-    // 'client_request_state_map_' shard locks.
+    // 'query_driver_map_' shard locks.
     for (auto cancellation_work : to_cancel) {
       cancellation_thread_pool_->Offer(cancellation_work);
     }
     SleepForMs(max_lag_ms * 0.1);
+  }
+}
+
+[[noreturn]] void ImpalaServer::AdmissionHeartbeatThread() {
+  while (true) {
+    SleepForMs(FLAGS_admission_heartbeat_frequency_ms);
+    std::unique_ptr<AdmissionControlServiceProxy> proxy;
+    Status get_proxy_status = AdmissionControlService::GetProxy(&proxy);
+    if (!get_proxy_status.ok()) {
+      LOG(ERROR) << "Admission heartbeat thread was unabe to get an "
+                    "AdmissionControlService proxy:"
+                 << get_proxy_status.GetDetail();
+      continue;
+    }
+
+    AdmissionHeartbeatRequestPB request;
+    AdmissionHeartbeatResponsePB response;
+    *request.mutable_host_id() = exec_env_->backend_id();
+    request.set_version(++admission_heartbeat_version_);
+    query_driver_map_.DoFuncForAllEntries(
+        [&](const std::shared_ptr<QueryDriver>& query_driver) {
+          ClientRequestState* request_state = query_driver->GetActiveClientRequestState();
+          TUniqueIdToUniqueIdPB(request_state->query_id(), request.add_query_ids());
+        });
+
+    kudu::rpc::RpcController rpc_controller;
+    kudu::Status rpc_status =
+        proxy->AdmissionHeartbeat(request, &response, &rpc_controller);
+    if (!rpc_status.ok()) {
+      LOG(ERROR) << "Admission heartbeat rpc failed: " << rpc_status.ToString();
+      continue;
+    }
+    Status heartbeat_status(response.status());
+    if (!heartbeat_status.ok()) {
+      LOG(ERROR) << "Admission heartbeat failed: " << heartbeat_status;
+    }
   }
 }
 
@@ -2304,6 +2884,18 @@ Status ImpalaServer::CheckResourceLimits(ClientRequestState* crs) {
     VLOG_QUERY << err.msg().msg();
     return err;
   }
+
+  auto& max_join_node_entry = utilization.MaxJoinNodeRowsProduced();
+  int32_t join_node_id = max_join_node_entry.first;
+  int64_t join_rows_produced = max_join_node_entry.second;
+  int64_t join_rows_produced_limit = crs->query_options().join_rows_produced_limit;
+  if (join_rows_produced_limit > 0 && join_rows_produced > join_rows_produced_limit) {
+    Status err = Status::Expected(TErrorCode::JOIN_ROWS_PRODUCED_LIMIT_EXCEEDED,
+        PrintId(crs->query_id()),
+        PrettyPrinter::Print(join_rows_produced_limit, TUnit::UNIT), join_node_id);
+    VLOG_QUERY << err.msg().msg();
+    return err;
+  }
   // Query is within the resource limits, check again later.
   return Status::OK();
 }
@@ -2316,15 +2908,26 @@ void ImpalaServer::ExpireQuery(ClientRequestState* crs, const Status& status) {
   crs->set_expired();
 }
 
-Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t hs2_port,
-    int32_t hs2_http_port) {
+Status ImpalaServer::Start(int32_t beeswax_port, int32_t hs2_port,
+    int32_t hs2_http_port, int32_t external_fe_port) {
   exec_env_->SetImpalaServer(this);
+
+#ifdef CALLONCEHACK
+  // Include this calloncehack call (which is a no-op) to make sure calloncehack
+  // is required at link time when using it.
+  calloncehack::InitializeCallOnceHack();
+#endif
 
   // We must register the HTTP handlers after registering the ImpalaServer with the
   // ExecEnv. Otherwise the HTTP handlers will try to resolve the ImpalaServer through the
   // ExecEnv singleton and will receive a nullptr.
-  http_handler_.reset(new ImpalaHttpHandler(this));
+  http_handler_.reset(ImpalaHttpHandler::CreateImpaladHandler(
+      this, exec_env_->admission_controller(), exec_env_->cluster_membership_mgr()));
   http_handler_->RegisterHandlers(exec_env_->webserver());
+  if (exec_env_->metrics_webserver() != nullptr) {
+    http_handler_->RegisterHandlers(
+        exec_env_->metrics_webserver(), /* metrics_only */ true);
+  }
 
   if (!FLAGS_is_coordinator && !FLAGS_is_executor) {
     return Status("Impala does not have a valid role configured. "
@@ -2335,7 +2938,10 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t
   // then wait for the initial catalog update.
   RETURN_IF_ERROR(exec_env_->StartStatestoreSubscriberService());
 
-  if (FLAGS_is_coordinator) exec_env_->frontend()->WaitForCatalog();
+  if (FLAGS_is_coordinator) {
+    exec_env_->frontend()->WaitForCatalog();
+    ABORT_IF_ERROR(UpdateCatalogMetrics());
+  }
 
   SSLProtocol ssl_version = SSLProtocol::TLSv1_0;
   if (IsExternalTlsConfigured() || IsInternalTlsConfigured()) {
@@ -2343,39 +2949,31 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t
         SSLProtoVersions::StringToProtocol(FLAGS_ssl_minimum_version, &ssl_version));
   }
 
-  // Start the internal service.
-  if (thrift_be_port > 0 || (TestInfo::is_test() && thrift_be_port == 0)) {
-    boost::shared_ptr<ImpalaInternalService> thrift_if(new ImpalaInternalService());
-    boost::shared_ptr<TProcessor> be_processor(
-        new ImpalaInternalServiceProcessor(thrift_if));
-    boost::shared_ptr<TProcessorEventHandler> event_handler(
-        new RpcEventHandler("backend", exec_env_->metrics()));
-    be_processor->setEventHandler(event_handler);
-
-    ThriftServerBuilder be_builder("backend", be_processor, thrift_be_port);
-
-    if (IsInternalTlsConfigured()) {
-      LOG(INFO) << "Enabling SSL for backend";
-      be_builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key)
-          .pem_password_cmd(FLAGS_ssl_private_key_password_cmd)
-          .ssl_version(ssl_version)
-          .cipher_list(FLAGS_ssl_cipher_list);
-    }
-    ThriftServer* server;
-    RETURN_IF_ERROR(be_builder.metrics(exec_env_->metrics()).Build(&server));
-    thrift_be_server_.reset(server);
-  }
-
   if (!FLAGS_is_coordinator) {
     LOG(INFO) << "Initialized executor Impala server on "
-              << TNetworkAddressToString(GetThriftBackendAddress());
+              << TNetworkAddressToString(exec_env_->configured_backend_address());
   } else {
+    // Load JWKS from file if validation for signature of JWT token is enabled.
+    if (FLAGS_jwt_token_auth && FLAGS_jwt_validate_signature) {
+      if (!FLAGS_jwks_file_path.empty()) {
+        RETURN_IF_ERROR(JWTHelper::GetInstance()->Init(FLAGS_jwks_file_path));
+      } else if (!FLAGS_jwks_url.empty()) {
+        if (TestInfo::is_test()) sleep(1);
+        RETURN_IF_ERROR(JWTHelper::GetInstance()->Init(FLAGS_jwks_url,
+            FLAGS_jwks_verify_server_certificate, FLAGS_jwks_ca_certificate, false));
+      } else {
+        LOG(ERROR) << "JWKS file is not specified when the validation of JWT signature "
+                   << " is enabled.";
+        return Status("JWKS file is not specified");
+      }
+    }
+
     // Initialize the client servers.
-    boost::shared_ptr<ImpalaServer> handler = shared_from_this();
+    shared_ptr<ImpalaServer> handler = shared_from_this();
     if (beeswax_port > 0 || (TestInfo::is_test() && beeswax_port == 0)) {
-      boost::shared_ptr<TProcessor> beeswax_processor(
+      shared_ptr<TProcessor> beeswax_processor(
           new ImpalaServiceProcessor(handler));
-      boost::shared_ptr<TProcessorEventHandler> event_handler(
+      shared_ptr<TProcessorEventHandler> event_handler(
           new RpcEventHandler("beeswax", exec_env_->metrics()));
       beeswax_processor->setEventHandler(event_handler);
       ThriftServerBuilder builder(BEESWAX_SERVER_NAME, beeswax_processor, beeswax_port);
@@ -2401,9 +2999,9 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t
     }
 
     if (hs2_port > 0 || (TestInfo::is_test() && hs2_port == 0)) {
-      boost::shared_ptr<TProcessor> hs2_fe_processor(
+      shared_ptr<TProcessor> hs2_fe_processor(
           new ImpalaHiveServer2ServiceProcessor(handler));
-      boost::shared_ptr<TProcessorEventHandler> event_handler(
+      shared_ptr<TProcessorEventHandler> event_handler(
           new RpcEventHandler("hs2", exec_env_->metrics()));
       hs2_fe_processor->setEventHandler(event_handler);
 
@@ -2429,10 +3027,41 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t
       hs2_server_->SetConnectionHandler(this);
     }
 
-    if (hs2_http_port > 0 || (TestInfo::is_test() && hs2_http_port == 0)) {
-      boost::shared_ptr<TProcessor> hs2_http_processor(
+    if (external_fe_port > 0 || (TestInfo::is_test() && external_fe_port == 0)) {
+      shared_ptr<TProcessor> external_fe_processor(
           new ImpalaHiveServer2ServiceProcessor(handler));
-      boost::shared_ptr<TProcessorEventHandler> event_handler(
+      shared_ptr<TProcessorEventHandler> event_handler(
+          new RpcEventHandler("external_frontend", exec_env_->metrics()));
+      external_fe_processor->setEventHandler(event_handler);
+
+      ThriftServer::TransportType external_fe_port_transport =
+          ThriftServer::TransportType::BINARY;
+      if (FLAGS_enable_external_fe_http) {
+        LOG(INFO) << "External FE endpoint is using HTTP for transport";
+        external_fe_port_transport = ThriftServer::TransportType::HTTP;
+      }
+
+      ThriftServerBuilder builder(EXTERNAL_FRONTEND_SERVER_NAME, external_fe_processor,
+          external_fe_port);
+      ThriftServer* server;
+      RETURN_IF_ERROR(
+          builder
+              .auth_provider(
+                  AuthManager::GetInstance()->GetExternalFrontendAuthProvider())
+              .transport_type(external_fe_port_transport)
+              .metrics(exec_env_->metrics())
+              .max_concurrent_connections(FLAGS_fe_service_threads)
+              .queue_timeout_ms(FLAGS_accepted_client_cnxn_timeout)
+              .idle_poll_period_ms(FLAGS_idle_client_poll_period_s * MILLIS_PER_SEC)
+              .Build(&server));
+      external_fe_server_.reset(server);
+      external_fe_server_->SetConnectionHandler(this);
+    }
+
+    if (hs2_http_port > 0 || (TestInfo::is_test() && hs2_http_port == 0)) {
+      shared_ptr<TProcessor> hs2_http_processor(
+          new ImpalaHiveServer2ServiceProcessor(handler));
+      shared_ptr<TProcessorEventHandler> event_handler(
           new RpcEventHandler("hs2_http", exec_env_->metrics()));
       hs2_http_processor->setEventHandler(event_handler);
 
@@ -2449,7 +3078,7 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t
 
       RETURN_IF_ERROR(
           http_builder
-              .auth_provider(AuthManager::GetInstance()->GetExternalAuthProvider())
+              .auth_provider(AuthManager::GetInstance()->GetExternalHttpAuthProvider())
               .transport_type(ThriftServer::TransportType::HTTP)
               .metrics(exec_env_->metrics())
               .max_concurrent_connections(FLAGS_fe_service_threads)
@@ -2461,14 +3090,10 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t
     }
   }
   LOG(INFO) << "Initialized coordinator/executor Impala server on "
-      << TNetworkAddressToString(GetThriftBackendAddress());
+            << TNetworkAddressToString(exec_env_->configured_backend_address());
 
   // Start the RPC services.
   RETURN_IF_ERROR(exec_env_->StartKrpcService());
-  if (thrift_be_server_.get()) {
-    RETURN_IF_ERROR(thrift_be_server_->Start());
-    LOG(INFO) << "Impala InternalService listening on " << thrift_be_server_->port();
-  }
   if (hs2_server_.get()) {
     RETURN_IF_ERROR(hs2_server_->Start());
     LOG(INFO) << "Impala HiveServer2 Service listening on " << hs2_server_->port();
@@ -2477,6 +3102,11 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t
     RETURN_IF_ERROR(hs2_http_server_->Start());
     LOG(INFO) << "Impala HiveServer2 Service (HTTP) listening on "
               << hs2_http_server_->port();
+  }
+  if (external_fe_server_.get()) {
+    RETURN_IF_ERROR(external_fe_server_->Start());
+    LOG(INFO) << "Impala External Frontend Service listening on "
+              << external_fe_server_->port();
   }
   if (beeswax_server_.get()) {
     RETURN_IF_ERROR(beeswax_server_->Start());
@@ -2493,29 +3123,13 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t
 void ImpalaServer::Join() {
   // The server shuts down by exiting the process, so just block here until the process
   // exits.
-  thrift_be_server_->Join();
-  thrift_be_server_.reset();
+  exec_env_->rpc_mgr()->Join();
 
   if (FLAGS_is_coordinator) {
     beeswax_server_->Join();
     hs2_server_->Join();
     beeswax_server_.reset();
     hs2_server_.reset();
-  }
-}
-
-shared_ptr<ClientRequestState> ImpalaServer::GetClientRequestState(
-    const TUniqueId& query_id) {
-  DCHECK_EQ(this, ExecEnv::GetInstance()->impala_server());
-  ScopedShardedMapRef<std::shared_ptr<ClientRequestState>> map_ref(query_id,
-      &client_request_state_map_);
-  DCHECK(map_ref.get() != nullptr);
-
-  auto entry = map_ref->find(query_id);
-  if (entry == map_ref->end()) {
-    return shared_ptr<ClientRequestState>();
-  } else {
-    return entry->second;
   }
 }
 
@@ -2537,17 +3151,22 @@ Status ImpalaServer::CheckClientRequestSession(
   return Status::OK();
 }
 
-void ImpalaServer::UpdateFilter(TUpdateFilterResult& result,
-    const TUpdateFilterParams& params) {
-  DCHECK(params.__isset.query_id);
-  DCHECK(params.__isset.filter_id);
-  shared_ptr<ClientRequestState> client_request_state =
-      GetClientRequestState(params.query_id);
-  if (client_request_state.get() == nullptr) {
-    LOG(INFO) << "Could not find client request state: " << PrintId(params.query_id);
+void ImpalaServer::UpdateFilter(UpdateFilterResultPB* result,
+    const UpdateFilterParamsPB& params, RpcContext* context) {
+  DCHECK(params.has_query_id());
+  DCHECK(params.has_filter_id());
+  QueryHandle query_handle;
+  Status status = GetQueryHandle(ProtoToQueryId(params.query_id()), &query_handle);
+  if (!status.ok()) {
+    LOG(INFO) << "Could not find query handle for query id: "
+              << PrintId(ProtoToQueryId(params.query_id()));
     return;
   }
-  client_request_state->UpdateFilter(params);
+  ClientRequestState::RetryState retry_state = query_handle->retry_state();
+  if (retry_state != ClientRequestState::RetryState::RETRYING
+      && retry_state != ClientRequestState::RetryState::RETRIED) {
+    query_handle->UpdateFilter(params, context);
+  }
 }
 
 Status ImpalaServer::CheckNotShuttingDown() const {
@@ -2644,7 +3263,10 @@ Status ImpalaServer::StartShutdown(
     }
   }
   LOG(INFO) << "Shutdown complete, going down.";
-  exit(0);
+  // Use _exit here instead since exit() does cleanup which interferes with the shutdown
+  // signal handler thread causing a data race.
+  ShutdownLogging();
+  _exit(0);
 }
 
 // This should never be inlined to prevent it potentially being optimized, e.g.

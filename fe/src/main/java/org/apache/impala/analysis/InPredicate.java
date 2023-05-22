@@ -56,7 +56,7 @@ public class InPredicate extends Predicate {
       if (t.getPrimitiveType() == PrimitiveType.CHAR) continue;
 
       String typeString = t.getPrimitiveType().toString().toLowerCase();
-      if (t.isScalarType(PrimitiveType.VARCHAR)) typeString = "string";
+      if (t.isVarchar() || t.isBinary()) typeString = "string";
 
       db.addBuiltin(ScalarFunction.createBuiltin(IN_ITERATE,
           Lists.newArrayList(t, t), true, Type.BOOLEAN,
@@ -74,7 +74,6 @@ public class InPredicate extends Predicate {
       db.addBuiltin(ScalarFunction.createBuiltin(NOT_IN_SET_LOOKUP,
           Lists.newArrayList(t, t), true, Type.BOOLEAN,
           "impala::InPredicate::NotInSetLookup", prepareFn, closeFn, false));
-
     }
   }
 
@@ -170,7 +169,13 @@ public class InPredicate extends Predicate {
       Preconditions.checkState(fn_.getReturnType().isBoolean());
       castForFunctionCall(false, analyzer.isDecimalV2());
     }
+    computeSelectivity();
+  }
 
+  protected void computeSelectivity() {
+    if (hasValidSelectivityHint()) {
+      return;
+    }
     // TODO: Fix selectivity_ for nested predicate
     Reference<SlotRef> slotRefRef = new Reference<SlotRef>();
     Reference<Integer> idxRef = new Reference<Integer>();

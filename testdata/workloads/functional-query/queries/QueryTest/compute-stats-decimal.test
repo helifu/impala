@@ -13,26 +13,26 @@ compute stats decimal_tbl
 ---- QUERY
 show table stats decimal_tbl
 ---- LABELS
-d6, #Rows, #Files, Size, Bytes Cached, Cache Replication, Format, Incremental Stats, Location
+d6, #Rows, #Files, Size, Bytes Cached, Cache Replication, Format, Incremental Stats, Location, EC POLICY
 ---- RESULTS
-'1',5,1,'375B','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
-'Total',5,1,'375B','0B','','','',''
+'1',5,1,'375B','NOT CACHED','NOT CACHED','TEXT','false',regex:.*,'$ERASURECODE_POLICY'
+'Total',5,1,'375B','0B','','','','',''
 ---- TYPES
-STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
+STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING, STRING
 ====
 ---- QUERY
 show column stats decimal_tbl
 ---- LABELS
-COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
+COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE, #TRUES, #FALSES
 ---- RESULTS
-'d1','DECIMAL(9,0)',4,0,4,4
-'d2','DECIMAL(10,0)',3,0,8,8
-'d3','DECIMAL(20,10)',5,0,16,16
-'d4','DECIMAL(38,38)',1,0,16,16
-'d5','DECIMAL(10,5)',5,0,8,8
-'d6','DECIMAL(9,0)',1,0,4,4
+'d1','DECIMAL(9,0)',4,0,4,4,-1,-1
+'d2','DECIMAL(10,0)',3,0,8,8,-1,-1
+'d3','DECIMAL(20,10)',5,0,16,16,-1,-1
+'d4','DECIMAL(38,38)',1,0,16,16,-1,-1
+'d5','DECIMAL(10,5)',5,0,8,8,-1,-1
+'d6','DECIMAL(9,0)',1,0,4,4,-1,-1
 ---- TYPES
-STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE
+STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE, BIGINT, BIGINT
 ====
 ---- QUERY
 # test compute stats on a mixed-type parquet table
@@ -47,19 +47,19 @@ compute stats mixed_types
 ---- QUERY
 show table stats mixed_types
 ---- LABELS
-#Rows, #Files, Size, Bytes Cached, Cache Replication, Format, Incremental Stats, Location
+#Rows, #Files, Size, Bytes Cached, Cache Replication, Format, Incremental Stats, Location, EC POLICY
 ---- RESULTS
-2,1,regex:.+B,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*
+2,1,regex:.+B,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*,'$ERASURECODE_POLICY'
 ---- TYPES
-BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
+BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING, STRING
 ====
 ---- QUERY
 show column stats mixed_types
 ---- LABELS
-COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
+COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE, #TRUES, #FALSES
 ---- RESULTS
-'a','INT',2,0,4,4
-'b','DECIMAL(10,0)',2,0,8,8
+'a','INT',2,0,4,4,-1,-1
+'b','DECIMAL(10,0)',2,0,8,8,-1,-1
 ---- TYPES
-STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE
+STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE, BIGINT, BIGINT
 ====

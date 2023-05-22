@@ -15,23 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_CATALOG_CATALOG_SERVER_H
-#define IMPALA_CATALOG_CATALOG_SERVER_H
+#pragma once
 
+#include <mutex>
 #include <string>
 #include <vector>
 #include <boost/shared_ptr.hpp>
-#include <boost/thread/mutex.hpp>
 #include <boost/unordered_set.hpp>
 
 #include "gen-cpp/CatalogService.h"
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/Types_types.h"
 #include "catalog/catalog.h"
+#include "kudu/util/web_callback_registry.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/condition-variable.h"
 #include "util/metrics-fwd.h"
 #include "rapidjson/rapidjson.h"
+
+using kudu::HttpStatusCode;
 
 namespace impala {
 
@@ -66,22 +68,31 @@ class CatalogServer {
   /// Returns OK unless some error occurred in which case the status is returned.
   Status Start();
 
-  void RegisterWebpages(Webserver* webserver);
+  /// Registers webpages for the input webserver. If metrics_only is set then only
+  /// '/healthz' page is registered.
+  void RegisterWebpages(Webserver* webserver, bool metrics_only);
 
   /// Returns the Thrift API interface that proxies requests onto the local CatalogService.
-  const boost::shared_ptr<CatalogServiceIf>& thrift_iface() const {
+  const std::shared_ptr<CatalogServiceIf>& thrift_iface() const {
     return thrift_iface_;
   }
   Catalog* catalog() const { return catalog_.get(); }
 
-  /// Add a topic item to pending_topic_updates_. Caller must hold catalog_lock_.
-  /// The return value is true if the operation succeeds and false otherwise.
-  bool AddPendingTopicItem(std::string key, int64_t version, const uint8_t* item_data,
+  /// Adds a topic item to pending_topic_updates_. Caller must hold catalog_lock_.
+  /// Returns the actual size of the item data. Returns a negative value for failures.
+  int AddPendingTopicItem(std::string key, int64_t version, const uint8_t* item_data,
       uint32_t size, bool deleted);
 
+  /// Mark service as started. Should be called only after the thrift server hosting this
+  /// service has started.
+  void MarkServiceAsStarted();
+
  private:
+  /// Indicates whether the catalog service is ready.
+  std::atomic_bool service_started_{false};
+
   /// Thrift API implementation which proxies requests onto this CatalogService.
-  boost::shared_ptr<CatalogServiceIf> thrift_iface_;
+  std::shared_ptr<CatalogServiceIf> thrift_iface_;
   ThriftSerializer thrift_serializer_;
   MetricGroup* metrics_;
   boost::scoped_ptr<Catalog> catalog_;
@@ -101,7 +112,7 @@ class CatalogServer {
 
   /// Protects catalog_update_cv_, pending_topic_updates_,
   /// catalog_objects_to/from_version_, and last_sent_catalog_version.
-  boost::mutex catalog_lock_;
+  std::mutex catalog_lock_;
 
   /// Condition variable used to signal when the catalog_update_gathering_thread_ should
   /// fetch its next set of updates from the JniCatalog. At the end of each statestore
@@ -220,6 +231,10 @@ class CatalogServer {
   ///  ]
   void GetCatalogUsage(rapidjson::Document* document);
 
+  /// Retrieves the catalog operation metrics from FE.
+  void OperationUsageUrlCallback(
+      const Webserver::WebRequest& req, rapidjson::Document* document);
+
   /// Debug webpage handler that is used to dump all the registered metrics of a
   /// table. The caller specifies the "name" parameter which is the fully
   /// qualified table name and this function retrieves all the metrics of that
@@ -233,8 +248,10 @@ class CatalogServer {
   // metastore event processor metrics and adds it to the document
   void EventMetricsUrlCallback(
       const Webserver::WebRequest& req, rapidjson::Document* document);
+
+  /// Raw callback to indicate whether the service is ready.
+  void HealthzHandler(const Webserver::WebRequest& req, std::stringstream* data,
+      HttpStatusCode* response);
 };
 
 }
-
-#endif

@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_UTIL_THREAD_POOL_H
-#define IMPALA_UTIL_THREAD_POOL_H
+#pragma once
 
-#include "util/blocking-queue.h"
+#include <mutex>
 
-#include <boost/thread/mutex.hpp>
 #include <boost/bind/mem_fn.hpp>
 
 #include "util/aligned-new.h"
+#include "util/blocking-queue.h"
 #include "util/condition-variable.h"
 #include "util/thread.h"
 
@@ -125,7 +124,7 @@ class ThreadPool : public CacheLineAligned {
   /// terminate.
   void Shutdown() {
     {
-      boost::lock_guard<boost::mutex> l(lock_);
+      std::lock_guard<std::mutex> l(lock_);
       shutdown_ = true;
     }
     work_queue_.Shutdown();
@@ -146,7 +145,7 @@ class ThreadPool : public CacheLineAligned {
   /// Any work Offer()'ed during DrainAndShutdown may or may not be processed.
   void DrainAndShutdown() {
     {
-      boost::unique_lock<boost::mutex> l(lock_);
+      std::unique_lock<std::mutex> l(lock_);
       // If the ThreadPool is not initialized, then the queue must be empty.
       DCHECK(initialized_ || work_queue_.Size() == 0);
       while (work_queue_.Size() != 0) {
@@ -170,7 +169,7 @@ class ThreadPool : public CacheLineAligned {
         /// Take lock to ensure that DrainAndShutdown() cannot be between checking
         /// GetSize() and wait()'ing when the condition variable is notified.
         /// (It will hang if we notify right before calling wait().)
-        boost::unique_lock<boost::mutex> l(lock_);
+        std::unique_lock<std::mutex> l(lock_);
         empty_cv_.NotifyAll();
       }
     }
@@ -178,7 +177,7 @@ class ThreadPool : public CacheLineAligned {
 
   /// Returns value of shutdown_ under a lock, forcing visibility to threads in the pool.
   bool IsShutdown() {
-    boost::lock_guard<boost::mutex> l(lock_);
+    std::lock_guard<std::mutex> l(lock_);
     return shutdown_;
   }
 
@@ -206,7 +205,7 @@ class ThreadPool : public CacheLineAligned {
   ThreadGroup threads_;
 
   /// Guards shutdown_ and empty_cv_
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// Set to true when Init() has finished spawning the threads.
   bool initialized_ = false;
@@ -347,7 +346,4 @@ class SynchronousThreadPool : public ThreadPool<std::shared_ptr<SynchronousWorkI
     work->WorkerExecute();
   }
 };
-
 }
-
-#endif

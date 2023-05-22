@@ -65,6 +65,12 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <pthread.h>
+
+#include <openssl/crypto.h>
+#include <openssl/err.h>
+#include <openssl/md5.h>
+#include <openssl/sha.h>
+
 #if defined(__MACH__)
 #define SSL_LIB   "libssl.dylib"
 #define CRYPTO_LIB  "libcrypto.dylib"
@@ -162,8 +168,12 @@ static const char *http_500_error = "Internal Server Error";
 #ifndef SSL_OP_NO_TLSv1_1
 #define SSL_OP_NO_TLSv1_1 0x10000000U
 #endif
+#ifndef SSL_OP_NO_TLSv1_2
+#define SSL_OP_NO_TLSv1_2 0x08000000U
+#endif
 
 #define OPENSSL_MIN_VERSION_WITH_TLS_1_1 0x10001000L
+#define OPENSSL_MIN_VERSION_WITH_TLS_1_3 0x10101000L
 
 static const char *month_names[] = {
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -209,7 +219,7 @@ struct socket {
 };
 
 char* SAFE_HTTP_METHODS[] = {
-  "GET", "POST", "HEAD", "PROPFIND", "MKCOL", "OPTIONS" };
+  "GET", "POST", "HEAD", "OPTIONS" };
 
 // See https://www.owasp.org/index.php/Test_HTTP_Methods_(OTG-CONFIG-006) for details.
 #ifdef ALLOW_UNSAFE_HTTP_METHODS
@@ -224,7 +234,7 @@ enum {
   GLOBAL_PASSWORDS_FILE, INDEX_FILES, ENABLE_KEEP_ALIVE, ACCESS_CONTROL_LIST,
   EXTRA_MIME_TYPES, LISTENING_PORTS, DOCUMENT_ROOT, SSL_CERTIFICATE, SSL_PRIVATE_KEY,
   SSL_PRIVATE_KEY_PASSWORD, SSL_GLOBAL_INIT, NUM_THREADS, RUN_AS_USER, REWRITE,
-  HIDE_FILES, REQUEST_TIMEOUT, SSL_VERSION, SSL_CIPHERS, NUM_OPTIONS
+  HIDE_FILES, REQUEST_TIMEOUT, SSL_VERSION, SSL_CIPHERS, TLS_CIPHERSUITES, NUM_OPTIONS
 };
 
 static const char *config_options[] = {
@@ -258,6 +268,7 @@ static const char *config_options[] = {
   "request_timeout_ms", "30000",
   "ssl_min_version", "tlsv1",
   "ssl_ciphers", NULL,
+  "tls_ciphersuites", NULL,
   NULL
 };
 
@@ -870,7 +881,7 @@ int sq_get_bound_addresses(const struct sq_context *ctx, struct sockaddr_in ***a
   *addrs = addr_array;
 
   for (i = 0; i < n; i++) {
-    addr_array[i] = malloc(sizeof(*addr_array[i]));
+    addr_array[i] = malloc(sizeof(struct sockaddr_storage));
     if (addr_array[i] == NULL) {
       cry(fc(ctx), "%s: cannot allocate memory", __func__);
       goto cleanup;
@@ -1516,196 +1527,6 @@ static int is_big_endian(void) {
   return ((char *) &n)[0] == 0;
 }
 
-#ifndef HAVE_MD5
-typedef struct MD5Context {
-  uint32_t buf[4];
-  uint32_t bits[2];
-  unsigned char in[64];
-} MD5_CTX;
-
-static void byteReverse(unsigned char *buf, unsigned longs) {
-  uint32_t t;
-
-  // Forrest: MD5 expect LITTLE_ENDIAN, swap if BIG_ENDIAN
-  if (is_big_endian()) {
-    do {
-      t = (uint32_t) ((unsigned) buf[3] << 8 | buf[2]) << 16 |
-        ((unsigned) buf[1] << 8 | buf[0]);
-      * (uint32_t *) buf = t;
-      buf += 4;
-    } while (--longs);
-  }
-}
-
-#define F1(x, y, z) (z ^ (x & (y ^ z)))
-#define F2(x, y, z) F1(z, x, y)
-#define F3(x, y, z) (x ^ y ^ z)
-#define F4(x, y, z) (y ^ (x | ~z))
-
-#define MD5STEP(f, w, x, y, z, data, s) \
-  ( w += f(x, y, z) + data,  w = w<<s | w>>(32-s),  w += x )
-
-// Start MD5 accumulation.  Set bit count to 0 and buffer to mysterious
-// initialization constants.
-static void MD5Init(MD5_CTX *ctx) {
-  ctx->buf[0] = 0x67452301;
-  ctx->buf[1] = 0xefcdab89;
-  ctx->buf[2] = 0x98badcfe;
-  ctx->buf[3] = 0x10325476;
-
-  ctx->bits[0] = 0;
-  ctx->bits[1] = 0;
-}
-
-static void MD5Transform(uint32_t buf[4], uint32_t const in[16]) {
-  register uint32_t a, b, c, d;
-
-  a = buf[0];
-  b = buf[1];
-  c = buf[2];
-  d = buf[3];
-
-  MD5STEP(F1, a, b, c, d, in[0] + 0xd76aa478, 7);
-  MD5STEP(F1, d, a, b, c, in[1] + 0xe8c7b756, 12);
-  MD5STEP(F1, c, d, a, b, in[2] + 0x242070db, 17);
-  MD5STEP(F1, b, c, d, a, in[3] + 0xc1bdceee, 22);
-  MD5STEP(F1, a, b, c, d, in[4] + 0xf57c0faf, 7);
-  MD5STEP(F1, d, a, b, c, in[5] + 0x4787c62a, 12);
-  MD5STEP(F1, c, d, a, b, in[6] + 0xa8304613, 17);
-  MD5STEP(F1, b, c, d, a, in[7] + 0xfd469501, 22);
-  MD5STEP(F1, a, b, c, d, in[8] + 0x698098d8, 7);
-  MD5STEP(F1, d, a, b, c, in[9] + 0x8b44f7af, 12);
-  MD5STEP(F1, c, d, a, b, in[10] + 0xffff5bb1, 17);
-  MD5STEP(F1, b, c, d, a, in[11] + 0x895cd7be, 22);
-  MD5STEP(F1, a, b, c, d, in[12] + 0x6b901122, 7);
-  MD5STEP(F1, d, a, b, c, in[13] + 0xfd987193, 12);
-  MD5STEP(F1, c, d, a, b, in[14] + 0xa679438e, 17);
-  MD5STEP(F1, b, c, d, a, in[15] + 0x49b40821, 22);
-
-  MD5STEP(F2, a, b, c, d, in[1] + 0xf61e2562, 5);
-  MD5STEP(F2, d, a, b, c, in[6] + 0xc040b340, 9);
-  MD5STEP(F2, c, d, a, b, in[11] + 0x265e5a51, 14);
-  MD5STEP(F2, b, c, d, a, in[0] + 0xe9b6c7aa, 20);
-  MD5STEP(F2, a, b, c, d, in[5] + 0xd62f105d, 5);
-  MD5STEP(F2, d, a, b, c, in[10] + 0x02441453, 9);
-  MD5STEP(F2, c, d, a, b, in[15] + 0xd8a1e681, 14);
-  MD5STEP(F2, b, c, d, a, in[4] + 0xe7d3fbc8, 20);
-  MD5STEP(F2, a, b, c, d, in[9] + 0x21e1cde6, 5);
-  MD5STEP(F2, d, a, b, c, in[14] + 0xc33707d6, 9);
-  MD5STEP(F2, c, d, a, b, in[3] + 0xf4d50d87, 14);
-  MD5STEP(F2, b, c, d, a, in[8] + 0x455a14ed, 20);
-  MD5STEP(F2, a, b, c, d, in[13] + 0xa9e3e905, 5);
-  MD5STEP(F2, d, a, b, c, in[2] + 0xfcefa3f8, 9);
-  MD5STEP(F2, c, d, a, b, in[7] + 0x676f02d9, 14);
-  MD5STEP(F2, b, c, d, a, in[12] + 0x8d2a4c8a, 20);
-
-  MD5STEP(F3, a, b, c, d, in[5] + 0xfffa3942, 4);
-  MD5STEP(F3, d, a, b, c, in[8] + 0x8771f681, 11);
-  MD5STEP(F3, c, d, a, b, in[11] + 0x6d9d6122, 16);
-  MD5STEP(F3, b, c, d, a, in[14] + 0xfde5380c, 23);
-  MD5STEP(F3, a, b, c, d, in[1] + 0xa4beea44, 4);
-  MD5STEP(F3, d, a, b, c, in[4] + 0x4bdecfa9, 11);
-  MD5STEP(F3, c, d, a, b, in[7] + 0xf6bb4b60, 16);
-  MD5STEP(F3, b, c, d, a, in[10] + 0xbebfbc70, 23);
-  MD5STEP(F3, a, b, c, d, in[13] + 0x289b7ec6, 4);
-  MD5STEP(F3, d, a, b, c, in[0] + 0xeaa127fa, 11);
-  MD5STEP(F3, c, d, a, b, in[3] + 0xd4ef3085, 16);
-  MD5STEP(F3, b, c, d, a, in[6] + 0x04881d05, 23);
-  MD5STEP(F3, a, b, c, d, in[9] + 0xd9d4d039, 4);
-  MD5STEP(F3, d, a, b, c, in[12] + 0xe6db99e5, 11);
-  MD5STEP(F3, c, d, a, b, in[15] + 0x1fa27cf8, 16);
-  MD5STEP(F3, b, c, d, a, in[2] + 0xc4ac5665, 23);
-
-  MD5STEP(F4, a, b, c, d, in[0] + 0xf4292244, 6);
-  MD5STEP(F4, d, a, b, c, in[7] + 0x432aff97, 10);
-  MD5STEP(F4, c, d, a, b, in[14] + 0xab9423a7, 15);
-  MD5STEP(F4, b, c, d, a, in[5] + 0xfc93a039, 21);
-  MD5STEP(F4, a, b, c, d, in[12] + 0x655b59c3, 6);
-  MD5STEP(F4, d, a, b, c, in[3] + 0x8f0ccc92, 10);
-  MD5STEP(F4, c, d, a, b, in[10] + 0xffeff47d, 15);
-  MD5STEP(F4, b, c, d, a, in[1] + 0x85845dd1, 21);
-  MD5STEP(F4, a, b, c, d, in[8] + 0x6fa87e4f, 6);
-  MD5STEP(F4, d, a, b, c, in[15] + 0xfe2ce6e0, 10);
-  MD5STEP(F4, c, d, a, b, in[6] + 0xa3014314, 15);
-  MD5STEP(F4, b, c, d, a, in[13] + 0x4e0811a1, 21);
-  MD5STEP(F4, a, b, c, d, in[4] + 0xf7537e82, 6);
-  MD5STEP(F4, d, a, b, c, in[11] + 0xbd3af235, 10);
-  MD5STEP(F4, c, d, a, b, in[2] + 0x2ad7d2bb, 15);
-  MD5STEP(F4, b, c, d, a, in[9] + 0xeb86d391, 21);
-
-  buf[0] += a;
-  buf[1] += b;
-  buf[2] += c;
-  buf[3] += d;
-}
-
-static void MD5Update(MD5_CTX *ctx, unsigned char const *buf, unsigned len) {
-  uint32_t t;
-
-  t = ctx->bits[0];
-  if ((ctx->bits[0] = t + ((uint32_t) len << 3)) < t)
-    ctx->bits[1]++;
-  ctx->bits[1] += len >> 29;
-
-  t = (t >> 3) & 0x3f;
-
-  if (t) {
-    unsigned char *p = (unsigned char *) ctx->in + t;
-
-    t = 64 - t;
-    if (len < t) {
-      memcpy(p, buf, len);
-      return;
-    }
-    memcpy(p, buf, t);
-    byteReverse(ctx->in, 16);
-    MD5Transform(ctx->buf, (uint32_t *) ctx->in);
-    buf += t;
-    len -= t;
-  }
-
-  while (len >= 64) {
-    memcpy(ctx->in, buf, 64);
-    byteReverse(ctx->in, 16);
-    MD5Transform(ctx->buf, (uint32_t *) ctx->in);
-    buf += 64;
-    len -= 64;
-  }
-
-  memcpy(ctx->in, buf, len);
-}
-
-static void MD5Final(unsigned char digest[16], MD5_CTX *ctx) {
-  unsigned count;
-  unsigned char *p;
-  uint32_t *a;
-
-  count = (ctx->bits[0] >> 3) & 0x3F;
-
-  p = ctx->in + count;
-  *p++ = 0x80;
-  count = 64 - 1 - count;
-  if (count < 8) {
-    memset(p, 0, count);
-    byteReverse(ctx->in, 16);
-    MD5Transform(ctx->buf, (uint32_t *) ctx->in);
-    memset(ctx->in, 0, 56);
-  } else {
-    memset(p, 0, count - 8);
-  }
-  byteReverse(ctx->in, 14);
-
-  a = (uint32_t *)ctx->in;
-  a[14] = ctx->bits[0];
-  a[15] = ctx->bits[1];
-
-  MD5Transform(ctx->buf, (uint32_t *) ctx->in);
-  byteReverse((unsigned char *) ctx->buf, 4);
-  memcpy(digest, ctx->buf, 16);
-  memset((char *) ctx, 0, sizeof(*ctx));
-}
-#endif // !HAVE_MD5
-
 // Stringify binary data. Output buffer must be twice as big as input,
 // because each byte takes 2 bytes in string representation
 static void bin2str(char *to, const unsigned char *p, size_t len) {
@@ -1725,15 +1546,15 @@ char *sq_md5(char buf[33], ...) {
   va_list ap;
   MD5_CTX ctx;
 
-  MD5Init(&ctx);
+  MD5_Init(&ctx);
 
   va_start(ap, buf);
   while ((p = va_arg(ap, const char *)) != NULL) {
-    MD5Update(&ctx, (const unsigned char *) p, (unsigned) strlen(p));
+    MD5_Update(&ctx, (const unsigned char *) p, (unsigned) strlen(p));
   }
   va_end(ap);
 
-  MD5Final(hash, &ctx);
+  MD5_Final(hash, &ctx);
   bin2str(buf, hash, sizeof(hash));
   return buf;
 }
@@ -3027,46 +2848,6 @@ static int put_dir(struct sq_connection *conn, const char *path) {
   return res;
 }
 
-static void mkcol(struct sq_connection *conn, const char *path) {
-  int rc, body_len;
-  struct de de;
-  memset(&de.file, 0, sizeof(de.file));
-  sq_stat(conn, path, &de.file);
-
-  if(de.file.modification_time) {
-      send_http_error(conn, 405, "Method Not Allowed",
-                      "mkcol(%s): %s", path, strerror(ERRNO));
-      return;
-  }
-
-  body_len = conn->data_len - conn->request_len;
-  if(body_len > 0) {
-      send_http_error(conn, 415, "Unsupported media type",
-                      "mkcol(%s): %s", path, strerror(ERRNO));
-      return;
-  }
-
-  rc = sq_mkdir(path, 0755);
-
-  if (rc == 0) {
-    conn->status_code = 201;
-    sq_printf(conn, "HTTP/1.1 %d Created\r\n\r\n", conn->status_code);
-  } else if (rc == -1) {
-      if(errno == EEXIST)
-        send_http_error(conn, 405, "Method Not Allowed",
-                      "mkcol(%s): %s", path, strerror(ERRNO));
-      else if(errno == EACCES)
-          send_http_error(conn, 403, "Forbidden",
-                        "mkcol(%s): %s", path, strerror(ERRNO));
-      else if(errno == ENOENT)
-          send_http_error(conn, 409, "Conflict",
-                        "mkcol(%s): %s", path, strerror(ERRNO));
-      else
-          send_http_error(conn, 500, http_500_error,
-                          "fopen(%s): %s", path, strerror(ERRNO));
-  }
-}
-
 static void put_file(struct sq_connection *conn, const char *path) {
   struct file file = STRUCT_FILE_INITIALIZER;
   const char *range;
@@ -3259,204 +3040,17 @@ static void send_options(struct sq_connection *conn) {
 
   #ifdef ALLOW_UNSAFE_HTTP_METHODS
   sq_printf(conn, "%s", "HTTP/1.1 200 OK\r\n"
-            "Allow: GET, POST, HEAD, CONNECT, PUT, DELETE, OPTIONS, PROPFIND, MKCOL\r\n"
+            "Allow: GET, POST, HEAD, CONNECT, PUT, DELETE, OPTIONS\r\n"
             "DAV: 1\r\n"
             "Content-Length: 0\r\n\r\n");
   #else
     sq_printf(conn, "%s", "HTTP/1.1 200 OK\r\n"
-            "Allow: GET, POST, HEAD, OPTIONS, PROPFIND, MKCOL\r\n"
+            "Allow: GET, POST, HEAD, OPTIONS\r\n"
             "Content-Length: 0\r\n\r\n");
   #endif
 }
 
-// Writes PROPFIND properties for a collection element
-static void print_props(struct sq_connection *conn, const char* uri,
-                        struct file *filep) {
-  char mtime[64];
-  gmt_time_string(mtime, sizeof(mtime), &filep->modification_time);
-  conn->num_bytes_sent += sq_printf(conn,
-      "<d:response>"
-       "<d:href>%s</d:href>"
-       "<d:propstat>"
-        "<d:prop>"
-         "<d:resourcetype>%s</d:resourcetype>"
-         "<d:getcontentlength>%" INT64_FMT "</d:getcontentlength>"
-         "<d:getlastmodified>%s</d:getlastmodified>"
-        "</d:prop>"
-        "<d:status>HTTP/1.1 200 OK</d:status>"
-       "</d:propstat>"
-      "</d:response>\n",
-      uri,
-      filep->is_directory ? "<d:collection/>" : "",
-      filep->size,
-      mtime);
-}
-
-static void print_dav_dir_entry(struct de *de, void *data) {
-  char href[PATH_MAX];
-  char href_encoded[PATH_MAX];
-  struct sq_connection *conn = (struct sq_connection *) data;
-  sq_snprintf(conn, href, sizeof(href), "%s%s",
-              conn->request_info.uri, de->file_name);
-  sq_url_encode(href, href_encoded, PATH_MAX-1);
-  print_props(conn, href_encoded, &de->file);
-}
-
-static void handle_propfind(struct sq_connection *conn, const char *path,
-                            struct file *filep) {
-  const char *depth = sq_get_header(conn, "Depth");
-
-  conn->must_close = 1;
-  conn->status_code = 207;
-  sq_printf(conn, "HTTP/1.1 207 Multi-Status\r\n"
-            "Connection: close\r\n"
-            "Content-Type: text/xml; charset=utf-8\r\n\r\n");
-
-  conn->num_bytes_sent += sq_printf(conn,
-      "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-      "<d:multistatus xmlns:d='DAV:'>\n");
-
-  // Print properties for the requested resource itself
-  print_props(conn, conn->request_info.uri, filep);
-
-  // If it is a directory, print directory entries too if Depth is not 0
-  if (filep->is_directory &&
-      !sq_strcasecmp(conn->ctx->config[ENABLE_DIRECTORY_LISTING], "yes") &&
-      (depth == NULL || strcmp(depth, "0") != 0)) {
-    scan_directory(conn, path, conn, &print_dav_dir_entry);
-  }
-
-  conn->num_bytes_sent += sq_printf(conn, "%s\n", "</d:multistatus>");
-}
-
 #if defined(USE_WEBSOCKET)
-
-// START OF SHA-1 code
-// Copyright(c) By Steve Reid <steve@edmweb.com>
-#define SHA1HANDSOFF
-#if defined(__sun)
-#include "solarisfixes.h"
-#endif
-
-union char64long16 { unsigned char c[64]; uint32_t l[16]; };
-
-#define rol(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
-
-static uint32_t blk0(union char64long16 *block, int i) {
-  // Forrest: SHA expect BIG_ENDIAN, swap if LITTLE_ENDIAN
-  if (!is_big_endian()) {
-    block->l[i] = (rol(block->l[i], 24) & 0xFF00FF00) |
-      (rol(block->l[i], 8) & 0x00FF00FF);
-  }
-  return block->l[i];
-}
-
-#define blk(i) (block->l[i&15] = rol(block->l[(i+13)&15]^block->l[(i+8)&15] \
-    ^block->l[(i+2)&15]^block->l[i&15],1))
-#define R0(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk0(block, i)+0x5A827999+rol(v,5);w=rol(w,30);
-#define R1(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk(i)+0x5A827999+rol(v,5);w=rol(w,30);
-#define R2(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0x6ED9EBA1+rol(v,5);w=rol(w,30);
-#define R3(v,w,x,y,z,i) z+=(((w|x)&y)|(w&x))+blk(i)+0x8F1BBCDC+rol(v,5);w=rol(w,30);
-#define R4(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0xCA62C1D6+rol(v,5);w=rol(w,30);
-
-typedef struct {
-    uint32_t state[5];
-    uint32_t count[2];
-    unsigned char buffer[64];
-} SHA1_CTX;
-
-static void SHA1Transform(uint32_t state[5], const unsigned char buffer[64]) {
-  uint32_t a, b, c, d, e;
-  union char64long16 block[1];
-
-  memcpy(block, buffer, 64);
-  a = state[0];
-  b = state[1];
-  c = state[2];
-  d = state[3];
-  e = state[4];
-  R0(a,b,c,d,e, 0); R0(e,a,b,c,d, 1); R0(d,e,a,b,c, 2); R0(c,d,e,a,b, 3);
-  R0(b,c,d,e,a, 4); R0(a,b,c,d,e, 5); R0(e,a,b,c,d, 6); R0(d,e,a,b,c, 7);
-  R0(c,d,e,a,b, 8); R0(b,c,d,e,a, 9); R0(a,b,c,d,e,10); R0(e,a,b,c,d,11);
-  R0(d,e,a,b,c,12); R0(c,d,e,a,b,13); R0(b,c,d,e,a,14); R0(a,b,c,d,e,15);
-  R1(e,a,b,c,d,16); R1(d,e,a,b,c,17); R1(c,d,e,a,b,18); R1(b,c,d,e,a,19);
-  R2(a,b,c,d,e,20); R2(e,a,b,c,d,21); R2(d,e,a,b,c,22); R2(c,d,e,a,b,23);
-  R2(b,c,d,e,a,24); R2(a,b,c,d,e,25); R2(e,a,b,c,d,26); R2(d,e,a,b,c,27);
-  R2(c,d,e,a,b,28); R2(b,c,d,e,a,29); R2(a,b,c,d,e,30); R2(e,a,b,c,d,31);
-  R2(d,e,a,b,c,32); R2(c,d,e,a,b,33); R2(b,c,d,e,a,34); R2(a,b,c,d,e,35);
-  R2(e,a,b,c,d,36); R2(d,e,a,b,c,37); R2(c,d,e,a,b,38); R2(b,c,d,e,a,39);
-  R3(a,b,c,d,e,40); R3(e,a,b,c,d,41); R3(d,e,a,b,c,42); R3(c,d,e,a,b,43);
-  R3(b,c,d,e,a,44); R3(a,b,c,d,e,45); R3(e,a,b,c,d,46); R3(d,e,a,b,c,47);
-  R3(c,d,e,a,b,48); R3(b,c,d,e,a,49); R3(a,b,c,d,e,50); R3(e,a,b,c,d,51);
-  R3(d,e,a,b,c,52); R3(c,d,e,a,b,53); R3(b,c,d,e,a,54); R3(a,b,c,d,e,55);
-  R3(e,a,b,c,d,56); R3(d,e,a,b,c,57); R3(c,d,e,a,b,58); R3(b,c,d,e,a,59);
-  R4(a,b,c,d,e,60); R4(e,a,b,c,d,61); R4(d,e,a,b,c,62); R4(c,d,e,a,b,63);
-  R4(b,c,d,e,a,64); R4(a,b,c,d,e,65); R4(e,a,b,c,d,66); R4(d,e,a,b,c,67);
-  R4(c,d,e,a,b,68); R4(b,c,d,e,a,69); R4(a,b,c,d,e,70); R4(e,a,b,c,d,71);
-  R4(d,e,a,b,c,72); R4(c,d,e,a,b,73); R4(b,c,d,e,a,74); R4(a,b,c,d,e,75);
-  R4(e,a,b,c,d,76); R4(d,e,a,b,c,77); R4(c,d,e,a,b,78); R4(b,c,d,e,a,79);
-  state[0] += a;
-  state[1] += b;
-  state[2] += c;
-  state[3] += d;
-  state[4] += e;
-  a = b = c = d = e = 0;
-  memset(block, '\0', sizeof(block));
-}
-
-static void SHA1Init(SHA1_CTX* context) {
-  context->state[0] = 0x67452301;
-  context->state[1] = 0xEFCDAB89;
-  context->state[2] = 0x98BADCFE;
-  context->state[3] = 0x10325476;
-  context->state[4] = 0xC3D2E1F0;
-  context->count[0] = context->count[1] = 0;
-}
-
-static void SHA1Update(SHA1_CTX* context, const unsigned char* data,
-                       uint32_t len) {
-  uint32_t i, j;
-
-  j = context->count[0];
-  if ((context->count[0] += len << 3) < j)
-    context->count[1]++;
-  context->count[1] += (len>>29);
-  j = (j >> 3) & 63;
-  if ((j + len) > 63) {
-    memcpy(&context->buffer[j], data, (i = 64-j));
-    SHA1Transform(context->state, context->buffer);
-    for ( ; i + 63 < len; i += 64) {
-      SHA1Transform(context->state, &data[i]);
-    }
-    j = 0;
-  }
-  else i = 0;
-  memcpy(&context->buffer[j], &data[i], len - i);
-}
-
-static void SHA1Final(unsigned char digest[20], SHA1_CTX* context) {
-  unsigned i;
-  unsigned char finalcount[8], c;
-
-  for (i = 0; i < 8; i++) {
-    finalcount[i] = (unsigned char)((context->count[(i >= 4 ? 0 : 1)]
-                                     >> ((3-(i & 3)) * 8) ) & 255);
-  }
-  c = 0200;
-  SHA1Update(context, &c, 1);
-  while ((context->count[0] & 504) != 448) {
-    c = 0000;
-    SHA1Update(context, &c, 1);
-  }
-  SHA1Update(context, finalcount, 8);
-  for (i = 0; i < 20; i++) {
-    digest[i] = (unsigned char)
-      ((context->state[i>>2] >> ((3-(i & 3)) * 8) ) & 255);
-  }
-  memset(context, '\0', sizeof(*context));
-  memset(&finalcount, '\0', sizeof(finalcount));
-}
-// END OF SHA1 CODE
 
 static void base64_encode(const unsigned char *src, int src_len, char *dst) {
   static const char *b64 =
@@ -3486,13 +3080,13 @@ static void base64_encode(const unsigned char *src, int src_len, char *dst) {
 static void send_websocket_handshake(struct sq_connection *conn) {
   static const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
   char buf[100], sha[20], b64_sha[sizeof(sha) * 2];
-  SHA1_CTX sha_ctx;
+  SHA_CTX sha_ctx;
 
   sq_snprintf(conn, buf, sizeof(buf), "%s%s",
               sq_get_header(conn, "Sec-WebSocket-Key"), magic);
-  SHA1Init(&sha_ctx);
-  SHA1Update(&sha_ctx, (unsigned char *) buf, strlen(buf));
-  SHA1Final((unsigned char *) sha, &sha_ctx);
+  SHA1_Init(&sha_ctx);
+  SHA1_Update(&sha_ctx, (unsigned char *) buf, strlen(buf));
+  SHA1_Final((unsigned char *) sha, &sha_ctx);
   base64_encode((unsigned char *) sha, sizeof(sha), b64_sha);
   sq_printf(conn, "%s%s%s",
             "HTTP/1.1 101 Switching Protocols\r\n"
@@ -3852,8 +3446,7 @@ int sq_upload(struct sq_connection *conn, const char *destination_dir) {
 static int is_put_or_delete_request(const struct sq_connection *conn) {
   const char *s = conn->request_info.request_method;
   return s != NULL && (!strcmp(s, "PUT") ||
-                       !strcmp(s, "DELETE") ||
-                       !strcmp(s, "MKCOL"));
+                       !strcmp(s, "DELETE"));
 }
 
 static int get_first_ssl_listener_index(const struct sq_context *ctx) {
@@ -3927,8 +3520,6 @@ static void handle_request(struct sq_connection *conn) {
     send_authorization_request(conn);
   } else if (!strcmp(ri->request_method, "PUT")) {
     put_file(conn, path);
-  } else if (!strcmp(ri->request_method, "MKCOL")) {
-    mkcol(conn, path);
   } else if (!strcmp(ri->request_method, "DELETE")) {
       struct de de;
       memset(&de.file, 0, sizeof(de.file));
@@ -3957,8 +3548,6 @@ static void handle_request(struct sq_connection *conn) {
   } else if (file.is_directory && ri->uri[uri_len - 1] != '/') {
     sq_printf(conn, "HTTP/1.1 301 Moved Permanently\r\n"
               "Location: %s/\r\n\r\n", ri->uri);
-  } else if (!strcmp(ri->request_method, "PROPFIND")) {
-    handle_propfind(conn, path, &file);
   } else if (file.is_directory &&
              !substitute_index_file(conn, path, sizeof(path), &file)) {
     if (!sq_strcasecmp(conn->ctx->config[ENABLE_DIRECTORY_LISTING], "yes")) {
@@ -4205,6 +3794,13 @@ static pthread_mutex_t *ssl_mutexes;
 
 static int sslize(struct sq_connection *conn, SSL_CTX *s, int (*func)(SSL *)) {
   return (conn->ssl = SSL_new(s)) != NULL &&
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+  // IMPALA-11195: disable TLS/SSL renegotiation. In version 1.0.2 and prior it's
+  // possible to use the undocumented SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS flag.
+  // For more context, see a note on the SSL_OP_NO_RENEGOTIATION option in the
+  // $OPENSSL_ROOT/CHANGES and https://github.com/openssl/openssl/issues/4739.
+  (conn->ssl->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS) &&
+#endif
     SSL_set_fd(conn->ssl, conn->client.sock) == 1 &&
     func(conn->ssl) == 1;
 }
@@ -4293,6 +3889,12 @@ static int set_ssl_option(struct sq_context *ctx) {
       return 0;
     }
     options |= (SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+  } else if (sq_strcasecmp(ssl_version, "tlsv1.3") == 0) {
+    if (SSLeay() < OPENSSL_MIN_VERSION_WITH_TLS_1_3) {
+      cry(fc(ctx), "Unsupported TLS version: %s", ssl_version);
+      return 0;
+    }
+    options |= (SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_TLSv1_2);
   } else {
     cry(fc(ctx), "%s: unknown SSL version: %s", __func__, ssl_version);
     return 0;
@@ -4313,6 +3915,20 @@ static int set_ssl_option(struct sq_context *ctx) {
     cry(fc(ctx), "SSL_CTX_new (server) error: %s", ssl_error());
     return 0;
   }
+
+#if OPENSSL_VERSION_NUMBER > 0x1010007fL
+  // IMPALA-11195: disable TLS/SSL renegotiation.
+  // See https://www.openssl.org/docs/man1.1.0/man3/SSL_set_options.html for
+  // details. SSL_OP_NO_RENEGOTIATION option was back-ported from 1.1.1-dev to
+  // 1.1.0h, so this is a best-effort approach if the binary compiled with
+  // newer as per information in the CHANGES file for
+  // 'Changes between 1.1.0g and 1.1.0h [27 Mar 2018]':
+  //     Note that if an application built against 1.1.0h headers (or above) is
+  //     run using an older version of 1.1.0 (prior to 1.1.0h) then the option
+  //     will be accepted but nothing will happen, i.e. renegotiation will
+  //     not be prevented.
+  options |= SSL_OP_NO_RENEGOTIATION;
+#endif
 
   if ((SSL_CTX_set_options(ctx->ssl_ctx, options) & options) != options) {
     cry(fc(ctx), "SSL_CTX_set_options (server) error: could not set options (%d)",
@@ -4337,6 +3953,17 @@ static int set_ssl_option(struct sq_context *ctx) {
 
   if (pem != NULL) {
     (void) SSL_CTX_use_certificate_chain_file(ctx->ssl_ctx, pem);
+  }
+
+  if (ctx->config[TLS_CIPHERSUITES] != NULL) {
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+    // Set TLSv1.3 ciphers.
+    if (SSL_CTX_set_ciphersuites(ctx->ssl_ctx, ctx->config[TLS_CIPHERSUITES]) == 0) {
+      cry(fc(ctx), "SSL_CTX_set_ciphersuites: error setting ciphersuites (%s): %s",
+          ctx->config[TLS_CIPHERSUITES], ssl_error());
+      return 0;
+    }
+#endif
   }
 
   if (ctx->config[SSL_CIPHERS] != NULL) {

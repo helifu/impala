@@ -19,7 +19,10 @@
 # in the future will support HS2 connections. Provides tracing around all
 # operations.
 
+from __future__ import absolute_import, division, print_function
 import abc
+import codecs
+from future.utils import with_metaclass
 import logging
 import re
 
@@ -75,8 +78,14 @@ class OperationHandle(object):
 
 
 # Represents an Impala connection.
-class ImpalaConnection(object):
-  __metaclass__ = abc.ABCMeta
+class ImpalaConnection(with_metaclass(abc.ABCMeta, object)):
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    self.close()
+
   @abc.abstractmethod
   def set_configuration_option(self, name, value):
     """Sets a configuraiton option name to the given value"""
@@ -86,7 +95,7 @@ class ImpalaConnection(object):
     """Replaces existing configuration with the given dictionary"""
     assert config_option_dict is not None, "config_option_dict cannot be None"
     self.clear_configuration()
-    for name, value in config_option_dict.iteritems():
+    for name, value in config_option_dict.items():
       self.set_configuration_option(name, value)
 
   @abc.abstractmethod
@@ -285,7 +294,7 @@ class ImpylaHS2Connection(ImpalaConnection):
 
   def clear_configuration(self):
     self.__query_options.clear()
-    if hasattr(tests.common, "current_node"):
+    if hasattr(tests.common, "current_node") and not self._is_hive:
       self.set_configuration_option("client_identifier", tests.common.current_node)
 
   def connect(self):
@@ -298,7 +307,7 @@ class ImpylaHS2Connection(ImpalaConnection):
                                         use_http_transport=self.__use_http_transport,
                                         http_path=self.__http_path, **conn_kwargs)
     # Get the default query options for the session before any modifications are made.
-    self.__cursor = self.__impyla_conn.cursor()
+    self.__cursor = self.__impyla_conn.cursor(convert_types=False)
     self.__default_query_options = {}
     if not self._is_hive:
       self.__cursor.execute("set all")
@@ -323,12 +332,22 @@ class ImpylaHS2Connection(ImpalaConnection):
       if not (self.__use_http_transport and 'NoneType' in str(e)):
         raise
 
+  def get_tables(self, database=None):
+    """Trigger the GetTables() HS2 request on the given database (None means all dbs).
+    Returns a list of (catalogName, dbName, tableName, tableType, tableComment).
+    """
+    LOG.info("-- getting tables for database: {0}".format(database))
+    self.__cursor.get_tables(database_name=database)
+    return self.__cursor.fetchall()
+
   def close_query(self, operation_handle):
     LOG.info("-- closing query for operation handle: {0}".format(operation_handle))
     operation_handle.get_handle().close_operation()
 
   def execute(self, sql_stmt, user=None, profile_format=TRuntimeProfileFormat.STRING):
-    handle = self.execute_async(sql_stmt, user)
+    self.__cursor.execute(sql_stmt, configuration=self.__query_options)
+    handle = OperationHandle(self.__cursor, sql_stmt)
+
     r = None
     try:
       r = self.__fetch_results(handle, profile_format=profile_format)
@@ -368,8 +387,8 @@ class ImpylaHS2Connection(ImpalaConnection):
     """Return the string representation of the query id."""
     guid_bytes = \
         operation_handle.get_handle()._last_operation.handle.operationId.guid
-    return "{0}:{1}".format(guid_bytes[7::-1].encode('hex_codec'),
-                            guid_bytes[16:7:-1].encode('hex_codec'))
+    return "{0}:{1}".format(codecs.encode(guid_bytes[7::-1], 'hex_codec'),
+                            codecs.encode(guid_bytes[16:7:-1], 'hex_codec'))
 
   def get_state(self, operation_handle):
     LOG.info("-- getting state for operation: {0}".format(operation_handle))
@@ -385,8 +404,9 @@ class ImpylaHS2Connection(ImpalaConnection):
 
   def get_exec_summary(self, operation_handle):
     LOG.info("-- getting exec summary operation: {0}".format(operation_handle))
-    raise NotImplementedError(
-        "Not yet implemented for HS2 - summary returned is thrift, not string.")
+    cursor = operation_handle.get_handle()
+    # summary returned is thrift, not string.
+    return cursor.get_summary()
 
   def get_runtime_profile(self, operation_handle, profile_format):
     LOG.info("-- getting runtime profile operation: {0}".format(operation_handle))
@@ -435,10 +455,6 @@ class ImpylaHS2Connection(ImpalaConnection):
         result_tuples = cursor.fetchall()
       else:
         result_tuples = cursor.fetchmany(max_rows)
-    elif self._is_hive:
-      # For Hive statements that have no result set (eg USE), they may still be
-      # running, and we need to wait for them to finish before we can proceed.
-      cursor._wait_to_finish()
 
     if not self._is_hive:
       log = self.get_log(handle)
@@ -472,14 +488,16 @@ class ImpylaHS2ResultSet(object):
   def __convert_result_row(self, result_tuple):
     """Take primitive values from a result tuple and construct the tab-separated string
     that would have been returned via beeswax."""
-    return '\t'.join([self.__convert_result_value(val, type)
-                      for val, type in zip(result_tuple, self.column_types)])
+    return '\t'.join([self.__convert_result_value(val) for val in result_tuple])
 
-  def __convert_result_value(self, val, type):
+  def __convert_result_value(self, val):
     """Take a primitive value from a result tuple and its type and construct the string
     that would have been returned via beeswax."""
     if val is None:
       return 'NULL'
+    if type(val) == float:
+      # Same format as what Beeswax uses in the backend.
+      return "{:.16g}".format(val)
     else:
       return str(val)
 
@@ -496,8 +514,9 @@ def create_connection(host_port, use_kerberos=False, protocol='beeswax',
     c = ImpylaHS2Connection(host_port=host_port, use_kerberos=use_kerberos,
         is_hive=is_hive, use_http_transport=True, http_path='cliservice')
 
-  # A hook in conftest sets tests.common.current_node.
-  if hasattr(tests.common, "current_node"):
+  # A hook in conftest sets tests.common.current_node. Skip for Hive connections since
+  # Hive cannot modify client_identifier at runtime.
+  if hasattr(tests.common, "current_node") and not is_hive:
     c.set_configuration_option("client_identifier", tests.common.current_node)
   return c
 

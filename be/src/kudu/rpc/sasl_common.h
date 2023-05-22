@@ -14,9 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-#ifndef KUDU_RPC_SASL_COMMON_H
-#define KUDU_RPC_SASL_COMMON_H
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +27,13 @@
 #include "kudu/gutil/port.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
+
+#if defined(__APPLE__)
+// Almost all functions in the SASL API are marked as deprecated
+// since macOS 10.11.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif // #if defined(__APPLE__)
 
 namespace kudu {
 
@@ -83,7 +88,9 @@ Status SaslInit(bool kerberos_keytab_provided = false) WARN_UNUSED_RESULT;
 Status DisableSaslInitialization() WARN_UNUSED_RESULT;
 
 // Wrap a call into the SASL library. 'call' should be a lambda which
-// returns a SASL error code.
+// returns a SASL error code, 'conn' is the SASL connection to perform
+// the operation with (might be null), and 'description' is be a description
+// of the SASL call (e.g., the name of the SASL library function).
 //
 // The result is translated into a Status as follows:
 //
@@ -93,7 +100,9 @@ Status DisableSaslInitialization() WARN_UNUSED_RESULT;
 //
 // The Status message is beautified to be more user-friendly compared
 // to the underlying sasl_errdetails() call.
-Status WrapSaslCall(sasl_conn_t* conn, const std::function<int()>& call) WARN_UNUSED_RESULT;
+Status WrapSaslCall(sasl_conn_t* conn,
+                    const std::function<int()>& call,
+                    const char* description) WARN_UNUSED_RESULT;
 
 // Return <ip>;<port> string formatted for SASL library use.
 std::string SaslIpPortString(const Sockaddr& addr);
@@ -140,7 +149,7 @@ Status SaslDecode(sasl_conn_t* conn,
                   Slice ciphertext,
                   Slice* plaintext) WARN_UNUSED_RESULT;
 
-// Deleter for sasl_conn_t instances, for use with gscoped_ptr after calling sasl_*_new()
+// Deleter for sasl_conn_t instances, for use with unique_ptr after calling sasl_*_new().
 struct SaslDeleter {
   inline void operator()(sasl_conn_t* conn) {
     sasl_dispose(&conn);
@@ -155,4 +164,6 @@ void SaslSetMutex();
 } // namespace rpc
 } // namespace kudu
 
-#endif
+#if defined(__APPLE__)
+#pragma GCC diagnostic pop
+#endif // #if defined(__APPLE__)

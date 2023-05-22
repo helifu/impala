@@ -19,6 +19,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <boost/algorithm/string/join.hpp>
 #include <boost/bind.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/scoped_ptr.hpp>
@@ -33,8 +34,10 @@
 #include "runtime/bufferpool/buffer-pool-internal.h"
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
+#include "runtime/mem-tracker.h"
 #include "runtime/query-state.h"
 #include "runtime/test-env.h"
+#include "runtime/tmp-file-mgr.h"
 #include "service/fe-support.h"
 #include "testutil/cpu-util.h"
 #include "testutil/death-test-util.h"
@@ -47,36 +50,42 @@
 
 #include "common/names.h"
 
+using boost::algorithm::join;
 using boost::filesystem::directory_iterator;
 using std::mt19937;
 using std::uniform_int_distribution;
 using std::uniform_real_distribution;
 
 DECLARE_bool(disk_spill_encryption);
-
-// Note: This is the default scratch dir created by impala.
-// FLAGS_scratch_dirs + TmpFileMgr::TMP_SUB_DIR_NAME.
-const string SCRATCH_DIR = "/tmp/impala-scratch";
+DECLARE_string(disk_spill_compression_codec);
+DECLARE_bool(disk_spill_punch_holes);
+DECLARE_string(remote_tmp_file_block_size);
+DECLARE_string(remote_tmp_file_size);
 
 // This suffix is appended to a tmp dir
 const string SCRATCH_SUFFIX = "/impala-scratch";
+
+/// For testing spill to remote.
+static const string LOCAL_BUFFER_PATH = "/tmp/buffer-pool-test-buffer";
 
 namespace impala {
 
 using BufferHandle = BufferPool::BufferHandle;
 using ClientHandle = BufferPool::ClientHandle;
-using FileGroup = TmpFileMgr::FileGroup;
 using PageHandle = BufferPool::PageHandle;
 
 class BufferPoolTest : public ::testing::Test {
  public:
   virtual void SetUp() {
     test_env_.reset(new TestEnv);
+    FLAGS_remote_tmp_file_size = "512KB";
+
     // Don't create global buffer pool in 'test_env_' - we'll create a buffer pool in
     // each test function.
     test_env_->DisableBufferPool();
     ASSERT_OK(test_env_->Init());
     RandTestUtil::SeedRng("BUFFER_POOL_TEST_SEED", &rng_);
+    remote_url_ = test_env_->GetDefaultFsPath("/tmp");
   }
 
   virtual void TearDown() {
@@ -84,7 +93,7 @@ class BufferPoolTest : public ::testing::Test {
       ReservationTracker* tracker = entry.second;
       tracker->Close();
     }
-    for (TmpFileMgr::FileGroup* file_group : file_groups_) {
+    for (TmpFileGroup* file_group : file_groups_) {
       file_group->Close();
     }
     global_reservations_.Close();
@@ -109,12 +118,19 @@ class BufferPoolTest : public ::testing::Test {
       int64_t initial_query_reservation, int64_t query_reservation_limit, mt19937* rng);
 
   /// Create and destroy a page multiple times.
-  void CreatePageLoop(BufferPool* pool, TmpFileMgr::FileGroup* file_group,
+  void CreatePageLoop(BufferPool* pool, TmpFileGroup* file_group,
       ReservationTracker* parent_tracker, int num_ops);
 
  protected:
   /// Reinitialize test_env_ to have multiple temporary directories.
   vector<string> InitMultipleTmpDirs(int num_dirs) {
+    return InitTmpFileMgr(
+        num_dirs, FLAGS_disk_spill_compression_codec, FLAGS_disk_spill_punch_holes);
+  }
+
+  /// Init a new tmp file manager with additional options.
+  vector<string> InitTmpFileMgr(
+      int num_dirs, const string& compression, bool punch_holes) {
     vector<string> tmp_dirs;
     for (int i = 0; i < num_dirs; ++i) {
       const string& dir = Substitute("/tmp/buffer-pool-test.$0", i);
@@ -126,9 +142,40 @@ class BufferPoolTest : public ::testing::Test {
     }
     test_env_.reset(new TestEnv);
     test_env_->DisableBufferPool();
-    test_env_->SetTmpFileMgrArgs(tmp_dirs, false);
+    test_env_->SetTmpFileMgrArgs(tmp_dirs, false, compression, punch_holes);
     EXPECT_OK(test_env_->Init());
     EXPECT_EQ(num_dirs, test_env_->tmp_file_mgr()->NumActiveTmpDevices());
+    return tmp_dirs;
+  }
+
+  /// Init a new tmp file manager with spill to remote options.
+  vector<string> InitTmpFileMgrSpillToRemote(
+      int num_local_dirs, int64_t local_spill_limit, int64_t local_buffer_limit) {
+    vector<string> tmp_dirs;
+    int expected_tmp_dirs_num = num_local_dirs + 2;
+    int expected_active_dev = num_local_dirs + 1;
+    if (local_buffer_limit == -1) {
+      tmp_dirs.push_back(LOCAL_BUFFER_PATH);
+    } else {
+      tmp_dirs.push_back(Substitute(LOCAL_BUFFER_PATH + ":$0", local_buffer_limit));
+    }
+    tmp_dirs.push_back(remote_url_);
+    EXPECT_OK(FileSystemUtil::RemoveAndCreateDirectory(LOCAL_BUFFER_PATH));
+    for (int i = 0; i < num_local_dirs; ++i) {
+      const string& create_dir = Substitute("/tmp/buffer-pool-test.$0", i);
+      // Fix permissions in case old directories were left from previous runs of test.
+      chmod((create_dir + SCRATCH_SUFFIX).c_str(), S_IRWXU);
+      EXPECT_OK(FileSystemUtil::RemoveAndCreateDirectory(create_dir));
+      created_tmp_dirs_.push_back(create_dir);
+      const string& dir = Substitute("/tmp/buffer-pool-test.$0:$1", i, local_spill_limit);
+      tmp_dirs.push_back(dir);
+    }
+    EXPECT_EQ(expected_tmp_dirs_num, tmp_dirs.size());
+    test_env_.reset(new TestEnv);
+    test_env_->DisableBufferPool();
+    test_env_->SetTmpFileMgrArgs(tmp_dirs, false, "", false);
+    EXPECT_OK(test_env_->Init());
+    EXPECT_EQ(expected_active_dev, test_env_->tmp_file_mgr()->NumActiveTmpDevices());
     return tmp_dirs;
   }
 
@@ -149,9 +196,9 @@ class BufferPoolTest : public ::testing::Test {
   }
 
   /// Create a new file group with the default configs.
-  TmpFileMgr::FileGroup* NewFileGroup() {
-    TmpFileMgr::FileGroup* file_group =
-        obj_pool_.Add(new TmpFileMgr::FileGroup(test_env_->tmp_file_mgr(),
+  TmpFileGroup* NewFileGroup() {
+    TmpFileGroup* file_group =
+        obj_pool_.Add(new TmpFileGroup(test_env_->tmp_file_mgr(),
             test_env_->exec_env()->disk_io_mgr(), NewProfile(), TUniqueId()));
     file_groups_.push_back(file_group);
     return file_group;
@@ -310,9 +357,9 @@ class BufferPoolTest : public ::testing::Test {
   void WaitForAllWrites(ClientHandle* client) { client->impl_->WaitForAllWrites(); }
 
   // Remove write permissions on scratch files. Return # of scratch files.
-  static int RemoveScratchPerms() {
+  static int RemoveScratchPerms(const string& scratch_dir) {
     int num_files = 0;
-    directory_iterator dir_it(SCRATCH_DIR);
+    directory_iterator dir_it(scratch_dir);
     for (; dir_it != directory_iterator(); ++dir_it) {
       ++num_files;
       EXPECT_EQ(0, chmod(dir_it->path().c_str(), 0));
@@ -349,13 +396,34 @@ class BufferPoolTest : public ::testing::Test {
 
   // Return whether a pin is in flight for the page.
   static bool PinInFlight(PageHandle* page) {
-    return page->page_->pin_in_flight;
+    return page->page_->pin_in_flight.Load();
   }
 
   // Return the path of the temporary file backing the page.
   static string TmpFilePath(PageHandle* page) {
     return page->page_->write_handle->TmpFilePath();
   }
+
+  // Return a comma-separated string with the paths of the temporary file backing the
+  // pages.
+  static string TmpFilePaths(vector<PageHandle>& pages) {
+    vector<string> paths;
+    for (PageHandle& page : pages) {
+      paths.push_back(TmpFilePath(&page));
+    }
+    return join(paths, ",");
+  }
+
+  // Return a string with the name of the directory and a comma-separated list of scratch
+  // files under the specified scratch directory.
+  string DumpScratchDir(const string& tmp_dir_path) {
+    string scratch_dir_path = tmp_dir_path + SCRATCH_SUFFIX;
+    vector<string> entries;
+    EXPECT_OK(
+        FileSystemUtil::Directory::GetEntryNames(scratch_dir_path, &entries));
+    return "Directory " + scratch_dir_path + ": " + join(entries, ",");
+  }
+
   // Check that the file backing the page has dir as a prefix of its path.
   static bool PageInDir(PageHandle* page, const string& dir) {
     return TmpFilePath(page).find(dir) == 0;
@@ -376,11 +444,13 @@ class BufferPoolTest : public ::testing::Test {
   void TestEvictionPolicy(int64_t page_size);
   void TestCleanPageLimit(int max_clean_pages, bool randomize_core);
   void TestQueryTeardown(bool write_error);
-  void TestWriteError(int write_delay_ms);
+  void TestWriteError(int write_delay_ms, const string& compression, bool punch_holes);
+  void TestTmpFileAllocateError(const string& compression, bool punch_holes);
+  void TestWriteErrorBlacklist(const string& compression, bool punch_holes);
   void TestRandomInternalSingle(int64_t buffer_len, bool multiple_pins);
   void TestRandomInternalMulti(int num_threads, int64_t buffer_len, bool multiple_pins);
   static const int SINGLE_THREADED_TID = -1;
-  void TestRandomInternalImpl(BufferPool* pool, FileGroup* file_group,
+  void TestRandomInternalImpl(BufferPool* pool, TmpFileGroup* file_group,
       MemTracker* parent_mem_tracker, mt19937* rng, int tid, bool multiple_pins);
 
   ObjectPool obj_pool_;
@@ -392,7 +462,7 @@ class BufferPoolTest : public ::testing::Test {
   mt19937 rng_;
 
   /// The file groups created - closed at end of each test.
-  vector<TmpFileMgr::FileGroup*> file_groups_;
+  vector<TmpFileGroup*> file_groups_;
 
   /// Paths of temporary directories created during tests - deleted at end of test.
   vector<string> created_tmp_dirs_;
@@ -401,6 +471,9 @@ class BufferPoolTest : public ::testing::Test {
   /// of the map are protected by query_reservations_lock_.
   unordered_map<int64_t, ReservationTracker*> query_reservations_;
   SpinLock query_reservations_lock_;
+
+  /// URL for remote spilling.
+  string remote_url_;
 };
 
 const int64_t BufferPoolTest::TEST_BUFFER_LEN;
@@ -497,8 +570,8 @@ TEST_F(BufferPoolTest, ConcurrentRegistration) {
   // Launch threads, each with a different set of query IDs.
   thread_group workers;
   for (int i = 0; i < num_threads; ++i) {
-    workers.add_thread(new thread(bind(&BufferPoolTest::RegisterQueriesAndClients, this,
-        &pool, i, queries_per_thread, sum_initial_reservations, reservation_limit,
+    workers.add_thread(new thread(boost::bind(&BufferPoolTest::RegisterQueriesAndClients,
+        this, &pool, i, queries_per_thread, sum_initial_reservations, reservation_limit,
         &thread_rngs[i])));
   }
   workers.join_all();
@@ -576,7 +649,9 @@ void BufferPoolTest::TestBufferAllocation(bool reserved) {
   BufferPool::ClientHandle client;
   ASSERT_OK(pool.RegisterClient("test client", NULL, &global_reservations_, NULL,
       TOTAL_MEM, NewProfile(), &client));
-  if (reserved) ASSERT_TRUE(client.IncreaseReservationToFit(TOTAL_MEM));
+  if (reserved) {
+    ASSERT_TRUE(client.IncreaseReservationToFit(TOTAL_MEM));
+  }
 
   vector<BufferPool::BufferHandle> handles(NUM_BUFFERS);
 
@@ -1067,13 +1142,13 @@ TEST_F(BufferPoolTest, ConcurrentPageCreation) {
 
   BufferPool pool(test_env_->metrics(), TEST_BUFFER_LEN, total_mem, total_mem);
   // Share a file group between the threads.
-  TmpFileMgr::FileGroup* file_group = NewFileGroup();
+  TmpFileGroup* file_group = NewFileGroup();
 
   // Launch threads, each with a different set of query IDs.
   thread_group workers;
   for (int i = 0; i < num_threads; ++i) {
-    workers.add_thread(new thread(bind(&BufferPoolTest::CreatePageLoop, this, &pool,
-        file_group, &global_reservations_, ops_per_thread)));
+    workers.add_thread(new thread(boost::bind(&BufferPoolTest::CreatePageLoop, this,
+        &pool, file_group, &global_reservations_, ops_per_thread)));
   }
 
   // Build debug string to test concurrent iteration over pages_ list.
@@ -1087,7 +1162,7 @@ TEST_F(BufferPoolTest, ConcurrentPageCreation) {
   global_reservations_.Close();
 }
 
-void BufferPoolTest::CreatePageLoop(BufferPool* pool, TmpFileMgr::FileGroup* file_group,
+void BufferPoolTest::CreatePageLoop(BufferPool* pool, TmpFileGroup* file_group,
     ReservationTracker* parent_tracker, int num_ops) {
   BufferPool::ClientHandle client;
   ASSERT_OK(pool->RegisterClient("test client", file_group, parent_tracker, NULL,
@@ -1119,7 +1194,7 @@ TEST_F(BufferPoolTest, SpillingDisabledDcheck) {
   ASSERT_OK(pool.Pin(&client, &handle));
   // It's ok to Unpin() if the pin count remains positive.
   pool.Unpin(&client, &handle);
-  // We didn't pass in a FileGroup, so spilling is disabled and we can't bring the
+  // We didn't pass in a TmpFileGroup, so spilling is disabled and we can't bring the
   // pin count to 0.
   IMPALA_ASSERT_DEBUG_DEATH(pool.Unpin(&client, &handle), "");
 
@@ -1382,10 +1457,10 @@ void BufferPoolTest::TestEvictionPolicy(int64_t page_size) {
       nullptr, total_mem, profile, &client));
   ASSERT_TRUE(client.IncreaseReservation(total_mem));
 
-  RuntimeProfile* buffer_pool_profile = nullptr;
-  vector<RuntimeProfile*> profile_children;
+  RuntimeProfileBase* buffer_pool_profile = nullptr;
+  vector<RuntimeProfileBase*> profile_children;
   profile->GetChildren(&profile_children);
-  for (RuntimeProfile* child : profile_children) {
+  for (RuntimeProfileBase* child : profile_children) {
     if (child->name() == "Buffer pool") {
       buffer_pool_profile = child;
       break;
@@ -1535,7 +1610,9 @@ TEST_F(BufferPoolTest, QueryTeardownWriteError) {
 // Test that the buffer pool handles a write error correctly.  Delete the scratch
 // directory before an operation that would cause a write and test that subsequent API
 // calls return errors as expected.
-void BufferPoolTest::TestWriteError(int write_delay_ms) {
+void BufferPoolTest::TestWriteError(
+    int write_delay_ms, const string& compression, bool punch_holes) {
+  InitTmpFileMgr(1, compression, punch_holes);
   int MAX_NUM_BUFFERS = 2;
   int64_t TOTAL_MEM = MAX_NUM_BUFFERS * TEST_BUFFER_LEN;
   BufferPool pool(test_env_->metrics(), TEST_BUFFER_LEN, TOTAL_MEM, TOTAL_MEM);
@@ -1554,7 +1631,7 @@ void BufferPoolTest::TestWriteError(int write_delay_ms) {
   // Repin the pages
   ASSERT_OK(PinAll(&pool, &client, &pages));
   // Remove permissions to the backing storage so that future writes will fail
-  ASSERT_GT(RemoveScratchPerms(), 0);
+  ASSERT_GT(RemoveScratchPerms(test_env_->tmp_file_mgr()->GetTmpDirPath(0)), 0);
   // Give the first write a chance to fail before the second write starts.
   const int INTERVAL_MS = 10;
   UnpinAll(&pool, &client, &pages, INTERVAL_MS);
@@ -1575,24 +1652,47 @@ void BufferPoolTest::TestWriteError(int write_delay_ms) {
   EXPECT_EQ(TErrorCode::SCRATCH_ALLOCATION_FAILED, error.code());
   EXPECT_FALSE(pages[0].is_pinned());
 
+  // Transferring reservation does not result in an error.
+  bool transferred;
+  EXPECT_OK(
+      client.TransferReservationTo(&global_reservations_, TEST_BUFFER_LEN, &transferred));
+  EXPECT_TRUE(transferred);
+
   DestroyAll(&pool, &client, &pages);
   pool.DeregisterClient(&client);
   global_reservations_.Close();
 }
 
 TEST_F(BufferPoolTest, WriteError) {
-  TestWriteError(0);
+  TestWriteError(0, "", false);
+}
+
+TEST_F(BufferPoolTest, WriteErrorCompression) {
+  TestWriteError(0, "snappy", true);
 }
 
 // Regression test for IMPALA-4842 - inject a delay in the write to
 // reproduce the issue.
 TEST_F(BufferPoolTest, WriteErrorWriteDelay) {
-  TestWriteError(100);
+  TestWriteError(100, "", false);
+}
+
+TEST_F(BufferPoolTest, WriteErrorDelayCompression) {
+  TestWriteError(100, "gzip", true);
 }
 
 // Test error handling when temporary file space cannot be allocated to back an unpinned
 // page.
 TEST_F(BufferPoolTest, TmpFileAllocateError) {
+  TestTmpFileAllocateError("", false);
+}
+
+TEST_F(BufferPoolTest, TmpFileAllocateErrorCompression) {
+  TestTmpFileAllocateError("lz4", true);
+}
+
+void BufferPoolTest::TestTmpFileAllocateError(
+    const string& compression, bool punch_holes) {
   const int MAX_NUM_BUFFERS = 2;
   const int64_t TOTAL_MEM = TEST_BUFFER_LEN * MAX_NUM_BUFFERS;
   BufferPool pool(test_env_->metrics(), TEST_BUFFER_LEN, TOTAL_MEM, TOTAL_MEM);
@@ -1608,7 +1708,7 @@ TEST_F(BufferPoolTest, TmpFileAllocateError) {
   pool.Unpin(&client, pages.data());
   WaitForAllWrites(&client);
   // Remove permissions to the temporary files - subsequent operations will fail.
-  ASSERT_GT(RemoveScratchPerms(), 0);
+  ASSERT_GT(RemoveScratchPerms(test_env_->tmp_file_mgr()->GetTmpDirPath(0)), 0);
   // The write error will happen asynchronously.
   pool.Unpin(&client, &pages[1]);
 
@@ -1622,12 +1722,25 @@ TEST_F(BufferPoolTest, TmpFileAllocateError) {
   pool.DeregisterClient(&client);
 }
 
+TEST_F(BufferPoolTest, WriteErrorBlacklist) {
+  TestWriteErrorBlacklist("", false);
+}
+
+TEST_F(BufferPoolTest, WriteErrorBlacklistHolepunch) {
+  TestWriteErrorBlacklist("", true);
+}
+
+TEST_F(BufferPoolTest, WriteErrorBlacklistCompression) {
+  TestWriteErrorBlacklist("lz4", true);
+}
+
 // Test that scratch devices are blacklisted after a write error. The query that
 // encountered the write error should not allocate more pages on that device, but
 // existing pages on the device will remain in use and future queries will use the device.
-TEST_F(BufferPoolTest, WriteErrorBlacklist) {
+void BufferPoolTest::TestWriteErrorBlacklist(
+    const string& compression, bool punch_holes) {
   // Set up two file groups with two temporary dirs.
-  vector<string> tmp_dirs = InitMultipleTmpDirs(2);
+  vector<string> tmp_dirs = InitTmpFileMgr(2, compression, punch_holes);
   // Simulate two concurrent queries.
   const int TOTAL_QUERIES = 3;
   const int INITIAL_QUERIES = 2;
@@ -1637,7 +1750,7 @@ TEST_F(BufferPoolTest, WriteErrorBlacklist) {
   const int64_t MEM_PER_QUERY = PAGES_PER_QUERY * TEST_BUFFER_LEN;
   BufferPool pool(test_env_->metrics(), TEST_BUFFER_LEN, TOTAL_MEM, TOTAL_MEM);
   global_reservations_.InitRootTracker(NewProfile(), TOTAL_MEM);
-  vector<FileGroup*> file_groups;
+  vector<TmpFileGroup*> file_groups;
   vector<ClientHandle> clients(TOTAL_QUERIES);
   for (int i = 0; i < INITIAL_QUERIES; ++i) {
     file_groups.push_back(NewFileGroup());
@@ -1664,7 +1777,8 @@ TEST_F(BufferPoolTest, WriteErrorBlacklist) {
   const string& good_dir = tmp_dirs[1];
   // Delete one file from first scratch dir for first query to trigger an error.
   PageHandle* error_page = FindPageInDir(pages[ERROR_QUERY], error_dir);
-  ASSERT_TRUE(error_page != NULL) << "Expected a tmp file in dir " << error_dir;
+  ASSERT_TRUE(error_page != NULL)
+      << TmpFilePaths(pages[ERROR_QUERY]) << " not in " << DumpScratchDir(error_dir);
   const string& error_file_path = TmpFilePath(error_page);
   for (int i = 0; i < INITIAL_QUERIES; ++i) {
     ASSERT_OK(PinAll(&pool, &clients[i], &pages[i]));
@@ -1701,19 +1815,26 @@ TEST_F(BufferPoolTest, WriteErrorBlacklist) {
       &pool, &clients[ERROR_QUERY], TEST_BUFFER_LEN, MEM_PER_QUERY, &error_new_pages);
   UnpinAll(&pool, &clients[ERROR_QUERY], &error_new_pages);
   WaitForAllWrites(&clients[ERROR_QUERY]);
-  EXPECT_TRUE(FindPageInDir(error_new_pages, good_dir) != NULL);
-  EXPECT_TRUE(FindPageInDir(error_new_pages, error_dir) == NULL);
+  EXPECT_TRUE(FindPageInDir(error_new_pages, good_dir) != NULL)
+      << TmpFilePaths(error_new_pages) << " not in " << DumpScratchDir(good_dir);
+  EXPECT_TRUE(FindPageInDir(error_new_pages, error_dir) == NULL)
+      << TmpFilePaths(error_new_pages) << " in " << DumpScratchDir(error_dir);
   for (PageHandle& error_new_page : error_new_pages) {
     LOG(INFO) << "Newly created page backed by file " << TmpFilePath(&error_new_page);
-    EXPECT_TRUE(PageInDir(&error_new_page, good_dir));
+    EXPECT_TRUE(PageInDir(&error_new_page, good_dir))
+        << TmpFilePath(&error_new_page) << " not in " << DumpScratchDir(good_dir);
   }
   DestroyAll(&pool, &clients[ERROR_QUERY], &error_new_pages);
 
   ASSERT_OK(PinAll(&pool, &clients[NO_ERROR_QUERY], &pages[NO_ERROR_QUERY]));
+  // IMPALA-10216: Verify data to force Pin to complete before unpinning.
+  VerifyData(pages[NO_ERROR_QUERY], 0);
   UnpinAll(&pool, &clients[NO_ERROR_QUERY], &pages[NO_ERROR_QUERY]);
   WaitForAllWrites(&clients[NO_ERROR_QUERY]);
-  EXPECT_TRUE(FindPageInDir(pages[NO_ERROR_QUERY], good_dir) != NULL);
-  EXPECT_TRUE(FindPageInDir(pages[NO_ERROR_QUERY], error_dir) != NULL);
+  EXPECT_TRUE(FindPageInDir(pages[NO_ERROR_QUERY], good_dir) != NULL)
+      << TmpFilePaths(pages[NO_ERROR_QUERY]) << " not in " << DumpScratchDir(good_dir);
+  EXPECT_TRUE(FindPageInDir(pages[NO_ERROR_QUERY], error_dir) != NULL)
+      << TmpFilePaths(pages[NO_ERROR_QUERY]) << " not in " << DumpScratchDir(error_dir);
 
   // The second client should use the bad directory for new pages since
   // blacklisting is per-query, not global.
@@ -1722,8 +1843,10 @@ TEST_F(BufferPoolTest, WriteErrorBlacklist) {
       &no_error_new_pages);
   UnpinAll(&pool, &clients[NO_ERROR_QUERY], &no_error_new_pages);
   WaitForAllWrites(&clients[NO_ERROR_QUERY]);
-  EXPECT_TRUE(FindPageInDir(no_error_new_pages, good_dir) != NULL);
-  EXPECT_TRUE(FindPageInDir(no_error_new_pages, error_dir) != NULL);
+  EXPECT_TRUE(FindPageInDir(no_error_new_pages, good_dir) != NULL)
+      << TmpFilePaths(no_error_new_pages) << " not in " << DumpScratchDir(good_dir);
+  EXPECT_TRUE(FindPageInDir(no_error_new_pages, error_dir) != NULL)
+      << TmpFilePaths(no_error_new_pages) << " not in " << DumpScratchDir(error_dir);
   DestroyAll(&pool, &clients[NO_ERROR_QUERY], &no_error_new_pages);
 
   // A new query should use the both dirs for backing storage.
@@ -1735,8 +1858,10 @@ TEST_F(BufferPoolTest, WriteErrorBlacklist) {
       &pool, &clients[NEW_QUERY], TEST_BUFFER_LEN, MEM_PER_QUERY, &pages[NEW_QUERY]);
   UnpinAll(&pool, &clients[NEW_QUERY], &pages[NEW_QUERY]);
   WaitForAllWrites(&clients[NEW_QUERY]);
-  EXPECT_TRUE(FindPageInDir(pages[NEW_QUERY], good_dir) != NULL);
-  EXPECT_TRUE(FindPageInDir(pages[NEW_QUERY], error_dir) != NULL);
+  EXPECT_TRUE(FindPageInDir(pages[NEW_QUERY], good_dir) != NULL)
+      << TmpFilePaths(pages[NEW_QUERY]) << " not in " << DumpScratchDir(good_dir);
+  EXPECT_TRUE(FindPageInDir(pages[NEW_QUERY], error_dir) != NULL)
+      << TmpFilePaths(pages[NEW_QUERY]) << " not in " << DumpScratchDir(error_dir);
 
   for (int i = 0; i < TOTAL_QUERIES; ++i) {
     DestroyAll(&pool, &clients[i], &pages[i]);
@@ -1935,6 +2060,40 @@ TEST_F(BufferPoolTest, Multi8Random) {
   TestRandomInternalMulti(8, 8 * 1024, false);
 }
 
+// Test with remote scratch space mixed with two local dirs.
+TEST_F(BufferPoolTest, Multi8RandomSpillToRemoteMix) {
+  // 4M buffer size.
+  InitTmpFileMgrSpillToRemote(2, 8 * 1024, 4 * 1024 * 1024);
+  TestRandomInternalMulti(8, 8 * 1024, true);
+  TestRandomInternalMulti(8, 8 * 1024, false);
+}
+
+// Test with remote scratch space only.
+TEST_F(BufferPoolTest, Multi8RandomSpillToRemote) {
+  // 4M buffer size.
+  InitTmpFileMgrSpillToRemote(0, -1, 4 * 1024 * 1024);
+  TestRandomInternalMulti(8, 8 * 1024, true);
+  TestRandomInternalMulti(8, 8 * 1024, false);
+}
+
+// Sanity test with hole punching and no compression.
+// This will be run with and without encryption because those flags are toggled for the
+// entire test suite.
+TEST_F(BufferPoolTest, RandomHolePunch) {
+  InitTmpFileMgr(2, "", false);
+  TestRandomInternalSingle(8 * 1024, true);
+  TestRandomInternalMulti(4, 8 * 1024, true);
+}
+
+// Sanity test with compression and hole punching.
+// This will be run with and without encryption because those flags are toggled for the
+// entire test suite.
+TEST_F(BufferPoolTest, RandomCompressionHolePunch) {
+  InitTmpFileMgr(2, "lz4", true);
+  TestRandomInternalSingle(8 * 1024, true);
+  TestRandomInternalMulti(4, 8 * 1024, true);
+}
+
 // Single-threaded execution of the TestRandomInternalImpl.
 void BufferPoolTest::TestRandomInternalSingle(
     int64_t min_buffer_len, bool multiple_pins) {
@@ -1958,7 +2117,7 @@ void BufferPoolTest::TestRandomInternalMulti(
   BufferPool pool(&tmp_metrics, min_buffer_len, TOTAL_MEM, TOTAL_MEM);
   global_reservations_.InitRootTracker(NewProfile(), TOTAL_MEM);
   MemTracker global_tracker(TOTAL_MEM);
-  FileGroup* shared_file_group = NewFileGroup();
+  TmpFileGroup* shared_file_group = NewFileGroup();
   thread_group workers;
   vector<mt19937> rngs = RandTestUtil::CreateThreadLocalRngs(num_threads, &rng_);
   for (int i = 0; i < num_threads; ++i) {
@@ -1988,7 +2147,7 @@ void BufferPoolTest::TestRandomInternalMulti(
 /// 'multiple_pins' is true, pages can be pinned multiple times (useful to test this
 /// functionality). Otherwise they are only pinned once (useful to test the case when
 /// memory is more committed).
-void BufferPoolTest::TestRandomInternalImpl(BufferPool* pool, FileGroup* file_group,
+void BufferPoolTest::TestRandomInternalImpl(BufferPool* pool, TmpFileGroup* file_group,
     MemTracker* parent_mem_tracker, mt19937* rng, int tid, bool multiple_pins) {
   // Encrypting and decrypting is expensive - reduce iterations when encryption is on.
   int num_iterations = FLAGS_disk_spill_encryption ? 5000 : 50000;
@@ -2031,7 +2190,9 @@ void BufferPoolTest::TestRandomInternalImpl(BufferPool* pool, FileGroup* file_gr
       int rand_pick = uniform_int_distribution<int>(0, pages.size() - 1)(*rng);
       PageHandle* page = &pages[rand_pick].first;
       if (!client.IncreaseReservationToFit(page->len())) continue;
-      if (!page->is_pinned() || multiple_pins) ASSERT_OK(pool->Pin(&client, page));
+      if (!page->is_pinned() || multiple_pins) {
+        ASSERT_OK(pool->Pin(&client, page));
+      }
       // Block on the pin and verify data for sync pins.
       if (p < 0.35) VerifyData(*page, pages[rand_pick].second);
     } else if (p < 0.70) {
@@ -2284,6 +2445,60 @@ TEST_F(BufferPoolTest, BufferPoolGc) {
   ASSERT_OK(buffer_pool->AllocateBuffer(&client, BUFFER_SIZE, &buffer));
   buffer_pool->FreeBuffer(&client, &buffer);
   buffer_pool->DeregisterClient(&client);
+}
+
+/// IMPALA-9851: Cap the number of pages that can be printed at
+/// BufferPool::Client::DebugString().
+TEST_F(BufferPoolTest, ShortDebugString) {
+  // Allocate pages more than BufferPool::MAX_PAGE_ITER_DEBUG.
+  int num_pages = 105;
+  int64_t max_page_len = TEST_BUFFER_LEN;
+  int64_t total_mem = num_pages * max_page_len;
+  global_reservations_.InitRootTracker(NULL, total_mem);
+  BufferPool pool(test_env_->metrics(), TEST_BUFFER_LEN, total_mem, total_mem);
+  BufferPool::ClientHandle client;
+  ASSERT_OK(pool.RegisterClient("test client", NULL, &global_reservations_, NULL,
+      total_mem, NewProfile(), &client));
+  ASSERT_TRUE(client.IncreaseReservation(total_mem));
+
+  vector<BufferPool::PageHandle> handles(num_pages);
+
+  // Create pages of various valid sizes.
+  for (int i = 0; i < num_pages; ++i) {
+    int64_t page_len = TEST_BUFFER_LEN;
+    int64_t used_before = client.GetUsedReservation();
+    ASSERT_OK(pool.CreatePage(&client, page_len, &handles[i]));
+    ASSERT_TRUE(handles[i].is_open());
+    ASSERT_TRUE(handles[i].is_pinned());
+    const BufferHandle* buffer;
+    ASSERT_OK(handles[i].GetBuffer(&buffer));
+    ASSERT_TRUE(buffer->data() != NULL);
+    ASSERT_EQ(handles[i].len(), page_len);
+    ASSERT_EQ(buffer->len(), page_len);
+    ASSERT_EQ(client.GetUsedReservation(), used_before + page_len);
+  }
+
+  // Verify that only subset of pages are included in DebugString().
+  string page_count_substr = Substitute(
+      "$0 out of $1 pinned pages:", BufferPool::MAX_PAGE_ITER_DEBUG, num_pages);
+  string debug_string = client.DebugString();
+  ASSERT_NE(debug_string.find(page_count_substr), string::npos)
+      << page_count_substr << " not found at BufferPool::Client::DebugString(). "
+      << debug_string;
+
+  // Close the handles and check memory consumption.
+  for (int i = 0; i < num_pages; ++i) {
+    int64_t used_before = client.GetUsedReservation();
+    int page_len = handles[i].len();
+    pool.DestroyPage(&client, &handles[i]);
+    ASSERT_EQ(client.GetUsedReservation(), used_before - page_len);
+  }
+
+  pool.DeregisterClient(&client);
+
+  // All the reservations should be released at this point.
+  ASSERT_EQ(global_reservations_.GetReservation(), 0);
+  global_reservations_.Close();
 }
 } // namespace impala
 

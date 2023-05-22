@@ -21,11 +21,21 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
+import org.apache.impala.catalog.ArrayType;
+import org.apache.impala.catalog.MapType;
+import org.apache.impala.catalog.PrimitiveType;
+import org.apache.impala.catalog.StructField;
+import org.apache.impala.catalog.StructType;
+import org.apache.impala.catalog.Type;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.planner.PlanNode;
+import org.apache.impala.planner.ProcessingCost;
 import org.apache.impala.thrift.TSortingOrder;
+import org.apache.impala.util.ExprUtil;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
@@ -49,6 +59,8 @@ public class SortInfo {
       Expr.FUNCTION_CALL_COST;
 
   private List<Expr> sortExprs_;
+  // List of original sort exprs (bofore smap substitutions)
+  private List<Expr> origSortExprs_;
   private final List<Boolean> isAscOrder_;
   // True if "NULLS FIRST", false if "NULLS LAST", null if not specified.
   private final List<Boolean> nullsFirstParams_;
@@ -60,7 +72,11 @@ public class SortInfo {
   private final List<Expr> materializedExprs_;
   // Maps from exprs materialized into the sort tuple to their corresponding SlotRefs.
   private final ExprSubstitutionMap outputSmap_;
-  private TSortingOrder sortingOrder_;
+  private final TSortingOrder sortingOrder_;
+  // Number of leading keys that should be sorted lexically in sortExprs_. Only used in
+  // pre-insert sort node that uses Z-order. So the Z-order sort node can sort rows
+  // lexically on partition keys, and sort the remaining keys in Z-order.
+  private int numLexicalKeysInZOrder_ = 0;
 
   public SortInfo(List<Expr> sortExprs, List<Boolean> isAscOrder,
       List<Boolean> nullsFirstParams) {
@@ -72,6 +88,7 @@ public class SortInfo {
     Preconditions.checkArgument(sortExprs.size() == isAscOrder.size());
     Preconditions.checkArgument(sortExprs.size() == nullsFirstParams.size());
     sortExprs_ = sortExprs;
+    origSortExprs_ = Expr.cloneList(sortExprs_);
     isAscOrder_ = isAscOrder;
     nullsFirstParams_ = nullsFirstParams;
     materializedExprs_ = new ArrayList<>();
@@ -90,15 +107,21 @@ public class SortInfo {
     sortTupleDesc_ = other.sortTupleDesc_;
     outputSmap_ = other.outputSmap_.clone();
     sortingOrder_ = other.sortingOrder_;
+    numLexicalKeysInZOrder_ = other.numLexicalKeysInZOrder_;
   }
 
   public List<Expr> getSortExprs() { return sortExprs_; }
+  public List<Expr> getOrigSortExprs() { return origSortExprs_; }
   public List<Boolean> getIsAscOrder() { return isAscOrder_; }
   public List<Boolean> getNullsFirstParams() { return nullsFirstParams_; }
   public List<Expr> getMaterializedExprs() { return materializedExprs_; }
   public TupleDescriptor getSortTupleDescriptor() { return sortTupleDesc_; }
   public ExprSubstitutionMap getOutputSmap() { return outputSmap_; }
   public TSortingOrder getSortingOrder() { return sortingOrder_; }
+  public int getNumLexicalKeysInZOrder() { return numLexicalKeysInZOrder_; }
+  public void setNumLexicalKeysInZOrder(int numLexicalKeysInZOrder) {
+    numLexicalKeysInZOrder_ = numLexicalKeysInZOrder;
+  }
 
   /**
    * Gets the list of booleans indicating whether nulls come first or last, independent
@@ -241,7 +264,21 @@ public class SortInfo {
         dstSlotDesc.initFromExpr(srcExpr);
       }
       dstSlotDesc.setSourceExpr(srcExpr);
-      outputSmap_.put(srcExpr.clone(), new SlotRef(dstSlotDesc));
+      SlotRef dstExpr = new SlotRef(dstSlotDesc);
+      Type dstType = dstSlotDesc.getType();
+      if (dstType.isStructType() &&
+          dstSlotDesc.getItemTupleDesc() != null) {
+        try {
+          dstExpr.reExpandStruct(analyzer);
+        } catch (AnalysisException ex) {
+          // Adding SlotRefs shouldn't throw here as the source SlotRef had already been
+          // analysed.
+          Preconditions.checkNotNull(null);
+        }
+      } else if (dstType.isCollectionType()) {
+        dstSlotDesc.setIsMaterializedRecursively(true);
+      }
+      outputSmap_.put(srcExpr.clone(), dstExpr);
       materializedExprs_.add(srcExpr);
     }
   }
@@ -253,9 +290,19 @@ public class SortInfo {
    * operator and 'offset' is the value in the 'OFFSET [x]' clause.
    */
   public long estimateTopNMaterializedSize(long cardinality, long offset) {
+    long totalRows = PlanNode.checkedAdd(cardinality, offset);
+    return estimateMaterializedSize(totalRows);
+  }
+
+  /**
+   * Estimates the size of 'totalRows' rows for this sort materialized in memory.
+   * The method uses the formula <code>estimatedSize = estimated # of rows in memory *
+   * average tuple serialized size</code>.
+   */
+  public long estimateMaterializedSize(long totalRows) {
     getSortTupleDescriptor().computeMemLayout();
     return (long) Math.ceil(getSortTupleDescriptor().getAvgSerializedSize()
-        * (PlanNode.checkedAdd(cardinality, offset)));
+        * totalRows);
   }
 
   /**
@@ -277,5 +324,76 @@ public class SortInfo {
       }
     }
     return result;
+  }
+
+  public ProcessingCost computeProcessingCost(String label, long inputCardinality) {
+    float weight = ExprUtil.computeExprsTotalCost(getSortExprs());
+
+    return ProcessingCost.basicCost(label, inputCardinality, weight);
+  }
+
+  // Collections with variable length data as well as any collections within structs are
+  // currently not allowed in the sorting tuple (see IMPALA-12019 and IMPALA-10939). This
+  // function checks whether the given type is allowed in the sorting tuple: returns an
+  // empty 'Optional' if the type is allowed, or an 'Optional' with an error message if it
+  // is not.
+  public static Optional<String> checkTypeForVarLenCollection(Type type) {
+    final String errorMsg = "Sorting is not supported if the select list contains " +
+      "(possibly nested) collections with variable length data types.";
+
+    if (type.isCollectionType()) {
+      if (type instanceof ArrayType) {
+        ArrayType arrayType = (ArrayType) type;
+        return isAllowedCollectionItemForSorting(arrayType.getItemType())
+            ? Optional.empty() : Optional.of(errorMsg);
+      } else {
+        Preconditions.checkState(type instanceof MapType);
+        MapType mapType = (MapType) type;
+
+        if (!isAllowedCollectionItemForSorting(mapType.getKeyType())) {
+          return Optional.of(errorMsg);
+        }
+
+        return isAllowedCollectionItemForSorting(mapType.getValueType())
+            ? Optional.empty() : Optional.of(errorMsg);
+      }
+    } else if (type.isStructType()) {
+      StructType structType = (StructType) type;
+      return checkStructTypeForVarLenCollection(structType);
+    }
+
+    return Optional.empty();
+  }
+
+  // Helper for checkTypeForVarLenCollection(), see more there.
+  private static Optional<String> checkStructTypeForVarLenCollection(
+      StructType structType) {
+    for (StructField field : structType.getFields()) {
+      Type fieldType = field.getType();
+      if (fieldType.isStructType()) {
+        return checkStructTypeForVarLenCollection((StructType) fieldType);
+      } else if (fieldType.isCollectionType()) {
+        // TODO IMPALA-10939: Once we allow sorting collections in structs, test that
+        // collections containing var-len types are handled correctly.
+        String error = "Sorting is not supported if the select list "
+            + "contains collection(s) nested in struct(s).";
+        return Optional.of(error);
+      }
+    }
+
+    return Optional.empty();
+  }
+
+  private static boolean isAllowedCollectionItemForSorting(Type itemType) {
+    if (itemType.isStructType()) {
+      StructType structType = (StructType) itemType;
+      for (StructField field : structType.getFields()) {
+        Type fieldType = field.getType();
+        if (!isAllowedCollectionItemForSorting(fieldType)) return false;
+      }
+      return true;
+    }
+
+    return !itemType.isComplexType() && !itemType.isVarLenStringType();
   }
 }

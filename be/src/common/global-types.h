@@ -18,13 +18,24 @@
 //
 /// This file contains type definitions that are used throughout the code base.
 
+#pragma once
+
 namespace cctz {
 class time_zone;
 };
 
 namespace impala {
 
+class UniqueIdPB;
+
+// Used to uniquely identify individual impalads.
+typedef UniqueIdPB BackendIdPB;
+
 typedef cctz::time_zone Timezone;
+
+// There is also a "proper" Timezone for UTC, but using nullptr makes some
+// optimizations more convenient.
+constexpr const Timezone * UTCPTR = nullptr;
 
 /// for now, these are simply ints; if we find we need to generate ids in the
 /// backend, we can also introduce separate classes for these to make them

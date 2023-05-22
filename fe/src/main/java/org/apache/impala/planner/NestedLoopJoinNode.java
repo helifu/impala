@@ -25,13 +25,15 @@ import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.JoinOperator;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TNestedLoopJoinNode;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.ExprUtil;
 
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
 /**
@@ -75,7 +77,9 @@ public class NestedLoopJoinNode extends JoinNode {
   }
 
   @Override
-  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
+  public Pair<ResourceProfile, ResourceProfile> computeJoinResourceProfile(
+      TQueryOptions queryOptions) {
+    // TODO: This seems a bug below that the total data is not divided by numInstances_.
     long perInstanceMemEstimate;
     if (getChild(1).getCardinality() == -1 || getChild(1).getAvgRowSize() == -1
         || numNodes_ == 0) {
@@ -84,7 +88,55 @@ public class NestedLoopJoinNode extends JoinNode {
       perInstanceMemEstimate =
           (long) Math.ceil(getChild(1).cardinality_ * getChild(1).avgRowSize_);
     }
-    nodeResourceProfile_ = ResourceProfile.noReservation(perInstanceMemEstimate);
+    ResourceProfile buildProfile = ResourceProfile.noReservation(perInstanceMemEstimate);
+    // Memory requirements for the probe side are minimal - batches are just streamed
+    // through.
+    return Pair.create(ResourceProfile.noReservation(0), buildProfile);
+  }
+
+  @Override
+  public Pair<ProcessingCost, ProcessingCost> computeJoinProcessingCost() {
+    // TODO: Make this general regardless of SingularRowSrcNode exist or not.
+    // TODO: The cost should consider conjuncts_ as well.
+    ProcessingCost probeProcessingCost = ProcessingCost.zero();
+    ProcessingCost buildProcessingCost = ProcessingCost.zero();
+    if (getChild(1) instanceof SingularRowSrcNode) {
+      // Compute the processing cost for lhs.
+      probeProcessingCost =
+          ProcessingCost.basicCost(getDisplayLabel() + "(c0, singularRowSrc) Probe side",
+              getChild(0).getCardinality(), 0);
+
+      // Compute the processing cost for rhs.
+      buildProcessingCost = ProcessingCost.basicCost(
+          getDisplayLabel() + "(c0, singularRowSrc) Build side per probe",
+          getChild(1).getCardinality(), 0);
+      // Multiply by the number of probes
+      buildProcessingCost = ProcessingCost.scaleCost(
+          buildProcessingCost, Math.max(0, getChild(0).getCardinality()));
+    } else {
+      // Assume 'eqJoinConjuncts_' will be applied to all rows from lhs side,
+      // and 'otherJoinConjuncts_' to the resultant rows.
+      float eqJoinPredicateEvalCost = ExprUtil.computeExprsTotalCost(eqJoinConjuncts_);
+      float otherJoinPredicateEvalCost =
+          ExprUtil.computeExprsTotalCost(otherJoinConjuncts_);
+
+      // Compute the processing cost for lhs.
+      probeProcessingCost = ProcessingCost.basicCost(
+          getDisplayLabel() + "(c0, non-singularRowSrc, eqJoinConjuncts_) Probe side",
+          getChild(0).getCardinality(), eqJoinPredicateEvalCost);
+
+      probeProcessingCost = ProcessingCost.sumCost(probeProcessingCost,
+          ProcessingCost.basicCost(getDisplayLabel()
+                  + "(c0, non-singularRowSrc, otherJoinConjuncts_) Probe side",
+              getCardinality(), otherJoinPredicateEvalCost));
+
+      // Compute the processing cost for rhs, assuming 'eqJoinConjuncts_' will be applied
+      // to all rows from rhs side.
+      buildProcessingCost = ProcessingCost.basicCost(
+          getDisplayLabel() + "(c0, non-singularRowSrc) Build side",
+          getChild(1).getCardinality(), eqJoinPredicateEvalCost);
+    }
+    return Pair.create(probeProcessingCost, buildProcessingCost);
   }
 
   @Override
@@ -111,6 +163,10 @@ public class NestedLoopJoinNode extends JoinNode {
         output.append(detailPrefix + "predicates: ")
             .append(Expr.getExplainString(conjuncts_, detailLevel) + "\n");
       }
+      if (!runtimeFilters_.isEmpty()) {
+        output.append(detailPrefix + "runtime filters: ");
+        output.append(getRuntimeFilterExplainString(true, detailLevel));
+      }
     }
     return output.toString();
   }
@@ -118,16 +174,16 @@ public class NestedLoopJoinNode extends JoinNode {
   @Override
   protected void toThrift(TPlanNode msg) {
     msg.node_type = TPlanNodeType.NESTED_LOOP_JOIN_NODE;
-    msg.nested_loop_join_node = new TNestedLoopJoinNode();
-    msg.nested_loop_join_node.join_op = joinOp_.toThrift();
-    for (Expr e: otherJoinConjuncts_) {
-      msg.nested_loop_join_node.addToJoin_conjuncts(e.treeToThrift());
+    msg.join_node = joinNodeToThrift();
+    msg.join_node.nested_loop_join_node = new TNestedLoopJoinNode();
+    for (Expr e : otherJoinConjuncts_) {
+      msg.join_node.nested_loop_join_node.addToJoin_conjuncts(e.treeToThrift());
     }
   }
 
   @Override
   protected String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .addValue(super.debugString())
         .toString();
   }

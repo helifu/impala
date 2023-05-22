@@ -45,6 +45,22 @@ under the License.
 
     <p outputclass="toc inpage"/>
   </conbody>
+  <concept rev="4.0.0" id="fixed_issues_4_0_0">
+    <title>Issues Fixed in <keyword keyref="impala40"/></title>
+    <conbody>
+      <p> For the full list of issues closed in this release, including bug
+        fixes, see the <xref keyref="changelog_40">changelog for <keyword
+            keyref="impala40"/></xref>. </p>
+    </conbody>
+  </concept>
+  <concept rev="3.4.0" id="fixed_issues_3_4_0">
+    <title>Issues Fixed in <keyword keyref="impala34"/></title>
+    <conbody>
+      <p> For the full list of issues closed in this release, including bug
+        fixes, see the <xref keyref="changelog_34">changelog for <keyword
+            keyref="impala34"/></xref>. </p>
+    </conbody>
+  </concept>
   <concept rev="3.3.0" id="fixed_issues_3_3_0">
     <title>Issues Fixed in <keyword keyref="impala33"/></title>
     <conbody>
@@ -134,7 +150,7 @@ under the License.
         <li><xref href="https://issues.apache.org/jira/browse/IMPALA-8061"
             format="html" scope="external">IMPALA-8061</xref> - Impala correctly
             initializes<codeph> S3_ACCESS_VALIDATED</codeph> variable to zero
-          when <codeph>TARGET_FILESYSTEM=3</codeph>.</li>
+          when <codeph>TARGET_FILESYSTEM=s3</codeph>.</li>
         <li><xref href="https://issues.apache.org/jira/browse/IMPALA-8154"
             format="html" scope="external">IMPALA-8154</xref> - Disabled the
             Kerberos<codeph> auth_to_local</codeph> setting to prevent

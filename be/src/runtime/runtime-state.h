@@ -19,10 +19,12 @@
 #ifndef IMPALA_RUNTIME_RUNTIME_STATE_H
 #define IMPALA_RUNTIME_RUNTIME_STATE_H
 
-#include <boost/scoped_ptr.hpp>
+#include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
-#include <string>
+
+#include <boost/scoped_ptr.hpp>
 
 // NOTE: try not to add more headers here: runtime-state.h is included in many many files.
 #include "common/global-types.h"  // for PlanNodeId
@@ -52,24 +54,37 @@ class ThreadResourcePool;
 class TUniqueId;
 class ExecEnv;
 class HBaseTableFactory;
-class TPlanFragmentCtx;
+class TPlanFragment;
 class TPlanFragmentInstanceCtx;
 class QueryState;
+class ConditionVariable;
+class CyclicBarrier;
 
 namespace io {
   class DiskIoMgr;
 }
 
-/// A collection of items that are part of the global state of a query and shared across
-/// all execution nodes of that query. After initialisation, callers must call
-/// ReleaseResources() to ensure that all resources are correctly freed before
-/// destruction.
+/// Shared state for Impala's runtime query execution. Used in two contexts:
+/// * Within execution of a fragment instance to hold shared state for the fragment
+///   instance (i.e. there is a 1:1 relationship with FragmentInstanceState).
+/// * A standalone mode for other cases where query execution infrastructure is used
+///   outside the context of a fragment instance, e.g. tests, evaluation of constant
+///   expressions, etc. In this case the RuntimeState sets up all the required
+///   infrastructure.
+///
+/// RuntimeState is shared between multiple threads and so methods must generally be
+/// thread-safe.
+///
+/// After initialisation, callers must call ReleaseResources() to ensure that all
+/// resources are correctly freed before destruction.
 class RuntimeState {
  public:
   /// query_state, fragment_ctx, and instance_ctx need to be alive at least as long as
   /// the constructed RuntimeState
-  RuntimeState(QueryState* query_state, const TPlanFragmentCtx& fragment_ctx,
-      const TPlanFragmentInstanceCtx& instance_ctx, ExecEnv* exec_env);
+  RuntimeState(QueryState* query_state, const TPlanFragment& fragment,
+      const TPlanFragmentInstanceCtx& instance_ctx,
+      const PlanFragmentCtxPB& fragment_ctx,
+      const PlanFragmentInstanceCtxPB& instance_ctx_pb, ExecEnv* exec_env);
 
   /// RuntimeState for test execution and fe-support.cc. Creates its own QueryState and
   /// installs desc_tbl, if set. If query_ctx.request_pool isn't set, sets it to "test-pool".
@@ -79,10 +94,6 @@ class RuntimeState {
   /// Empty d'tor to avoid issues with scoped_ptr.
   ~RuntimeState();
 
-  /// Initializes the runtime filter bank and claims the initial buffer reservation
-  /// for it.
-  Status InitFilterBank(long runtime_filters_reservation_bytes);
-
   QueryState* query_state() const { return query_state_; }
   /// Return the query's ObjectPool
   ObjectPool* obj_pool() const;
@@ -91,9 +102,16 @@ class RuntimeState {
   int batch_size() const { return query_options().batch_size; }
   bool abort_on_error() const { return query_options().abort_on_error; }
   bool strict_mode() const { return query_options().strict_mode; }
+  bool utf8_mode() const { return query_options().utf8_mode; }
   bool decimal_v2() const { return query_options().decimal_v2; }
+  bool abort_java_udf_on_exception() const {
+     return query_options().abort_java_udf_on_exception;
+  }
   const TQueryCtx& query_ctx() const;
+  const TPlanFragment& fragment() const { return *fragment_; }
   const TPlanFragmentInstanceCtx& instance_ctx() const { return *instance_ctx_; }
+  const PlanFragmentCtxPB& fragment_ctx() const { return *fragment_ctx_; }
+  const PlanFragmentInstanceCtxPB& instance_ctx_pb() const { return *instance_ctx_pb_; }
   const TUniqueId& session_id() const { return query_ctx().session.session_id; }
   const std::string& do_as_user() const { return query_ctx().session.delegated_user; }
   const std::string& connected_user() const {
@@ -102,7 +120,13 @@ class RuntimeState {
   const TimestampValue* now() const { return now_.get(); }
   const TimestampValue* utc_timestamp() const { return utc_timestamp_.get(); }
   void set_now(const TimestampValue* now);
-  const Timezone& local_time_zone() const { return *local_time_zone_; }
+  const Timezone* local_time_zone() const { return local_time_zone_; }
+  const Timezone* time_zone_for_unix_time_conversions() const {
+    return time_zone_for_unix_time_conversions_;
+  }
+  const Timezone* time_zone_for_legacy_parquet_time_conversions() const {
+    return time_zone_for_legacy_parquet_time_conversions_;
+  }
   const TUniqueId& query_id() const { return query_ctx().query_id; }
   const TUniqueId& fragment_instance_id() const {
     return instance_ctx_ != nullptr
@@ -125,78 +149,30 @@ class RuntimeState {
   /// See comment on root_node_id_. We add one to prevent having a hash seed of 0.
   uint32_t fragment_hash_seed() const { return root_node_id_ + 1; }
 
-  RuntimeFilterBank* filter_bank() { return filter_bank_.get(); }
+  RuntimeFilterBank* filter_bank() const;
 
   DmlExecState* dml_exec_state() { return &dml_exec_state_; }
 
   /// Returns runtime state profile
   RuntimeProfile* runtime_profile() { return profile_; }
 
-  /// Returns the LlvmCodeGen object for this fragment instance.
-  LlvmCodeGen* codegen() { return codegen_.get(); }
-
   const std::string& GetEffectiveUser() const;
 
-  /// Add ScalarExpr expression 'expr' to be codegen'd later if it's not disabled by
-  /// query option. If 'is_codegen_entry_point' is true, 'expr' will be an entry
-  /// point into codegen'd evaluation (i.e. it will have a function pointer populated).
-  /// Adding an expr here ensures that it will be codegen'd (i.e. fragment execution
-  /// will fail with an error if the expr cannot be codegen'd).
-  void AddScalarExprToCodegen(ScalarExpr* expr, bool is_codegen_entry_point) {
-    scalar_exprs_to_codegen_.push_back({expr, is_codegen_entry_point});
-  }
-
-  /// Returns true if there are ScalarExpr expressions in the fragments that we want
-  /// to codegen (because they can't be interpreted or based on options/hints).
-  /// This should only be used after the Prepare() phase in which all expressions'
-  /// Prepare() are invoked.
-  bool ScalarExprNeedsCodegen() const { return !scalar_exprs_to_codegen_.empty(); }
-
-  /// Check if codegen was disabled and if so, add a message to the runtime profile.
-  void CheckAndAddCodegenDisabledMessage(RuntimeProfile* profile) {
-    if (CodegenDisabledByQueryOption()) {
-      profile->AddCodegenMsg(false, "disabled by query option DISABLE_CODEGEN");
-    } else if (CodegenDisabledByHint()) {
-      profile->AddCodegenMsg(false, "disabled due to optimization hints");
-    }
-  }
-
-  /// Returns true if there is a hint to disable codegen. This can be true for single node
-  /// optimization or expression evaluation request from FE to BE (see fe-support.cc).
-  /// Note that this internal flag is advisory and it may be ignored if the fragment has
-  /// any UDF which cannot be interpreted. See ScalarExpr::Prepare() for details.
-  inline bool CodegenHasDisableHint() const {
-    return query_ctx().disable_codegen_hint;
-  }
-
-  /// Returns true iff there is a hint to disable codegen and all expressions in the
-  /// fragment can be interpreted. This should only be used after the Prepare() phase
-  /// in which all expressions' Prepare() are invoked.
-  inline bool CodegenDisabledByHint() const {
-    return CodegenHasDisableHint() && !ScalarExprNeedsCodegen();
-  }
-
-  /// Returns true if codegen is disabled by query option.
-  inline bool CodegenDisabledByQueryOption() const {
-    return query_options().disable_codegen;
-  }
-
-  /// Returns true if codegen should be enabled for this fragment. Codegen is enabled
-  /// if all the following conditions hold:
-  /// 1. it's enabled by query option
-  /// 2. it's not disabled by internal hints or there are expressions in the fragment
-  ///    which cannot be interpreted.
-  inline bool ShouldCodegen() const {
-    return !CodegenDisabledByQueryOption() && !CodegenDisabledByHint();
-  }
-
   inline Status GetQueryStatus() {
-    // Do a racy check for query_status_ to avoid unnecessary spinlock acquisition.
-    if (UNLIKELY(!query_status_.ok())) {
-      boost::lock_guard<SpinLock> l(query_status_lock_);
+    if (UNLIKELY(!is_query_status_ok_.Load())) {
+      std::lock_guard<SpinLock> l(query_status_lock_);
       return query_status_;
     }
     return Status::OK();
+  }
+
+  /// Return maximum number of non-fatal error to report to client through coordinator.
+  /// max_errors does not indicate how many errors in total have been recorded, but rather
+  /// how many are distinct. It is defined as the sum of the number of generic errors and
+  /// the number of distinct other errors. Default to 100 if non-positive number is
+  /// specified in max_errors query option.
+  inline int max_errors() const {
+    return query_options().max_errors <= 0 ? 100 : query_options().max_errors;
   }
 
   /// Log an error that will be sent back to the coordinator based on an instance of the
@@ -207,13 +183,13 @@ class RuntimeState {
 
   /// Returns true if the error log has not reached max_errors_.
   bool LogHasSpace() {
-    boost::lock_guard<SpinLock> l(error_log_lock_);
+    std::lock_guard<SpinLock> l(error_log_lock_);
     return error_log_.size() < query_options().max_errors;
   }
 
   /// Returns true if there are entries in the error log.
   bool HasErrors() {
-    boost::lock_guard<SpinLock> l(error_log_lock_);
+    std::lock_guard<SpinLock> l(error_log_lock_);
     return !error_log_.empty();
   }
 
@@ -232,7 +208,27 @@ class RuntimeState {
   Status LogOrReturnError(const ErrorMsg& message);
 
   bool is_cancelled() const { return is_cancelled_.Load(); }
+
+  /// Cancel this runtime state, signalling all condition variables and cancelling all
+  /// barriers added in AddCancellationCV() and AddBarrierToCancel(). This function will
+  /// acquire mutexes added in AddCancellationCV(), so the caller must not hold any locks
+  /// that must acquire after those mutexes in the lock order.
   void Cancel();
+
+  /// Add a condition variable to be signalled when this RuntimeState is cancelled.
+  /// Adding a condition variable multiple times is a no-op. Each distinct 'cv' will be
+  /// signalled once with NotifyAll() when is_cancelled() becomes true. 'mutex' will
+  /// be acquired by the cancelling thread after is_cancelled() becomes true. The caller
+  /// must hold 'mutex' when checking is_cancelled() to avoid a race like IMPALA-9611
+  /// where the notification on 'cv' is lost.
+  /// The condition variable must have query lifetime.
+  void AddCancellationCV(std::mutex* mutex, ConditionVariable* cv);
+
+  /// Add a barrier to be cancelled when this RuntimeState is cancelled. Adding a barrier
+  /// multiple times is a no-op. Each distinct 'cb' will be cancelled with status code
+  /// CANCELLED_INTERNALLY when is_cancelled() becomes true. 'cb' must have query
+  /// lifetime.
+  void AddBarrierToCancel(CyclicBarrier* cb);
 
   RuntimeProfile::Counter* total_storage_wait_timer() {
     return total_storage_wait_timer_;
@@ -264,9 +260,11 @@ class RuntimeState {
 
   /// Sets query_status_ with err_msg if no error has been set yet.
   void SetQueryStatus(const std::string& err_msg) {
-    boost::lock_guard<SpinLock> l(query_status_lock_);
+    std::lock_guard<SpinLock> l(query_status_lock_);
     if (!query_status_.ok()) return;
     query_status_ = Status(err_msg);
+    bool set_query_status_ok_ = is_query_status_ok_.CompareAndSwap(true, false);
+    DCHECK(set_query_status_ok_);
   }
 
   /// Sets query_status_ to MEM_LIMIT_EXCEEDED and logs all the registered trackers.
@@ -287,15 +285,6 @@ class RuntimeState {
   /// called after ReleaseResources().
   Status CheckQueryState();
 
-  /// Create a codegen object accessible via codegen() if it doesn't exist already.
-  Status CreateCodegen();
-
-  /// Codegen all ScalarExpr expressions in 'scalar_exprs_to_codegen_'. If codegen fails
-  /// for any expressions, return immediately with the error status. Once IMPALA-4233 is
-  /// fixed, it's not fatal to fail codegen if the expression can be interpreted.
-  /// TODO: Fix IMPALA-4233
-  Status CodegenScalarExprs();
-
   /// Helper to call QueryState::StartSpilling().
   Status StartSpilling(MemTracker* mem_tracker);
 
@@ -307,20 +296,21 @@ class RuntimeState {
   /// the posix error code of the failed RPC. The target node address and posix error code
   /// will be included in the AuxErrorInfo returned by GetAuxErrorInfo. This method is
   /// idempotent.
-  void SetRPCErrorInfo(TNetworkAddress dest_node, int16_t posix_error_code);
+  void SetRPCErrorInfo(NetworkAddressPB dest_node, int16_t posix_error_code);
 
   /// Returns true if this RuntimeState has any auxiliary error information, false
   /// otherwise. Currently, only SetRPCErrorInfo() sets aux error info.
   bool HasAuxErrorInfo() {
-    boost::lock_guard<SpinLock> l(aux_error_info_lock_);
+    std::lock_guard<SpinLock> l(aux_error_info_lock_);
     return aux_error_info_ != nullptr;
   }
 
   /// Sets the given AuxErrorInfoPB with all relevant aux error info from the fragment
   /// instance associated with this RuntimeState. If no aux error info for this
   /// RuntimeState has been set, this method does nothing. Currently, only
-  /// SetRPCErrorInfo() sets aux error info.
-  void GetAuxErrorInfo(AuxErrorInfoPB* aux_error_info);
+  /// SetRPCErrorInfo() sets aux error info. This method clears aux_error_info_. Calls to
+  /// HasAuxErrorInfo() after this method has been called will return false.
+  void GetUnreportedAuxErrorInfo(AuxErrorInfoPB* aux_error_info);
 
   static const char* LLVM_CLASS_NAME;
 
@@ -337,10 +327,15 @@ class RuntimeState {
   /// Logs error messages.
   ErrorLogMap error_log_;
 
+  /// Track how many error has been printed to VLOG(1).
+  int64_t vlog_1_errors = 0;
+
   /// Global QueryState and original thrift descriptors for this fragment instance.
   QueryState* const query_state_;
-  const TPlanFragmentCtx* const fragment_ctx_;
+  const TPlanFragment* const fragment_;
   const TPlanFragmentInstanceCtx* const instance_ctx_;
+  const PlanFragmentCtxPB* const fragment_ctx_;
+  const PlanFragmentInstanceCtxPB* const instance_ctx_pb_;
 
   /// only populated by the (const QueryCtx&, ExecEnv*, DescriptorTbl*) c'tor
   boost::scoped_ptr<QueryState> local_query_state_;
@@ -356,14 +351,18 @@ class RuntimeState {
   boost::scoped_ptr<TimestampValue> utc_timestamp_;
 
   /// Query-global timezone used as local timezone when executing the query.
-  /// Owned by a static storage member of TimezoneDatabase class. It cannot be nullptr.
+  /// Owned by a static storage member of TimezoneDatabase class.
   const Timezone* local_time_zone_;
 
-  boost::scoped_ptr<LlvmCodeGen> codegen_;
+  /// Query-global timezone used during int<->timestamp conversions. UTC by default, but
+  /// if use_local_tz_for_unix_timestamp_conversions=1, then the local_time_zone_ is used
+  /// instead.
+  const Timezone* time_zone_for_unix_time_conversions_;
 
-  /// Contains all ScalarExpr expressions which need to be codegen'd. The second element
-  /// is true if we want to generate a codegen entry point for this expr.
-  std::vector<std::pair<ScalarExpr*, bool>> scalar_exprs_to_codegen_;
+  /// Query-global timezone used to read INT96 timestamps written by Hive. UTC by default,
+  /// but if convert_legacy_hive_parquet_utc_timestamps=1, then the local_time_zone_ is
+  /// used instead.
+  const Timezone* time_zone_for_legacy_parquet_time_conversions_;
 
   /// Thread resource management object for this fragment's execution.  The runtime
   /// state is responsible for returning this pool to the thread mgr.
@@ -412,6 +411,18 @@ class RuntimeState {
   /// status once it notices is_cancelled_ == true.
   AtomicBool is_cancelled_{false};
 
+  /// Condition variables that will be signalled by Cancel(). Protected by
+  /// 'cancellation_cvs_lock_'.
+  std::vector<std::pair<std::mutex*, ConditionVariable*>> cancellation_cvs_;
+
+  /// Cyclic barriers that will be signalled by Cancel(). Protected by
+  /// 'cancellation_cvs_lock_'.
+  std::vector<CyclicBarrier*> cancellation_cbs_;
+
+  /// Condition variables that will be signalled by Cancel(). Protected by
+  /// 'cancellation_cvs_lock_'.
+  SpinLock cancellation_cvs_lock_;
+
   /// if true, ReleaseResources() was called.
   bool released_resources_ = false;
 
@@ -421,18 +432,17 @@ class RuntimeState {
   SpinLock query_status_lock_;
   Status query_status_;
 
-  /// This is the node id of the root node for this plan fragment. This is used as the
-  /// hash seed and has two useful properties:
-  /// 1) It is the same for all exec nodes in a fragment, so the resulting hash values
-  /// can be shared.
-  /// 2) It is different between different fragments, so we do not run into hash
+  /// True if the query_status_ is OK, false otherwise. Used to check if the
+  /// query_status_ is OK without incurring the overhead of acquiring the
+  /// query_status_lock_.
+  AtomicBool is_query_status_ok_{true};
+
+  /// This is the node id of the root node for this plan fragment.
+  ///
+  /// This is used as the hash seed within the fragment so we do not run into hash
   /// collisions after data partitioning (across fragments). See IMPALA-219 for more
   /// details.
   PlanNodeId root_node_id_ = -1;
-
-  /// Manages runtime filters that are either produced or consumed (or both!) by plan
-  /// nodes that share this runtime state.
-  boost::scoped_ptr<RuntimeFilterBank> filter_bank_;
 
   /// Lock protecting aux_error_info_.
   SpinLock aux_error_info_lock_;
@@ -441,9 +451,11 @@ class RuntimeState {
   /// query_status_ != Status::OK()). Owned by this RuntimeState.
   std::unique_ptr<AuxErrorInfoPB> aux_error_info_;
 
+  /// True if aux_error_info_ has been sent in a status report, false otherwise.
+  bool reported_aux_error_info_ = false;
+
   /// prohibit copies
   RuntimeState(const RuntimeState&);
-
 };
 
 #define RETURN_IF_CANCELLED(state) \

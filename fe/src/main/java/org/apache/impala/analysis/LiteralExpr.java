@@ -60,10 +60,11 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
   }
 
   /**
-   * Returns an analyzed literal of 'type'. Returns null for types that do not have a
-   * LiteralExpr subclass, e.g. TIMESTAMP.
+   * Creates an analyzed literal of 'type' from an unescaped string value. Returns null
+   * for types that do not have a LiteralExpr subclass, e.g. TIMESTAMP.
    */
-  public static LiteralExpr create(String value, Type type) throws AnalysisException {
+  public static LiteralExpr createFromUnescapedStr(String value, Type type)
+      throws AnalysisException {
     if (!type.isValid()) {
       throw new UnsupportedFeatureException("Invalid literal type: " + type.toSql());
     }
@@ -87,7 +88,8 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
       case STRING:
       case VARCHAR:
       case CHAR:
-        e = new StringLiteral(value);
+      case BINARY:
+        e = new StringLiteral(value, type, false);
         break;
       case DATE:
         e = new DateLiteral(value);
@@ -124,7 +126,7 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
       LiteralExpr result = null;
       switch (exprNode.node_type) {
         case FLOAT_LITERAL:
-          result = LiteralExpr.create(
+          result = LiteralExpr.createFromUnescapedStr(
               Double.toString(exprNode.float_literal.value), colType);
           break;
         case DECIMAL_LITERAL:
@@ -140,14 +142,15 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
               exprNode.date_literal.date_string);
           break;
         case INT_LITERAL:
-          result = LiteralExpr.create(
+          result = LiteralExpr.createFromUnescapedStr(
               Long.toString(exprNode.int_literal.value), colType);
           break;
         case STRING_LITERAL:
-          result = LiteralExpr.create(exprNode.string_literal.value, colType);
+          result = LiteralExpr.createFromUnescapedStr(
+              exprNode.string_literal.value, colType);
           break;
         case BOOL_LITERAL:
-          result =  LiteralExpr.create(
+          result =  LiteralExpr.createFromUnescapedStr(
               Boolean.toString(exprNode.bool_literal.value), colType);
           break;
         case NULL_LITERAL:
@@ -195,10 +198,13 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
    * in cases where the corresponding LiteralExpr is not able to represent the evaluation
    * result, e.g., NaN or infinity. Returns null if the expr evaluation encountered errors
    * or warnings in the BE.
+   * If 'keepOriginalIntType' is true, the type of the result will be the same as the type
+   * of 'constExpr'; otherwise for integers a shorter type may be used if it is big enough
+   * to hold the value.
    * TODO: Support non-scalar types.
    */
   public static LiteralExpr createBounded(Expr constExpr, TQueryCtx queryCtx,
-    int maxResultSize) throws AnalysisException {
+    int maxResultSize, boolean keepOriginalIntType) throws AnalysisException {
     Preconditions.checkState(constExpr.isConstant());
     Preconditions.checkState(constExpr.getType().isValid());
     if (constExpr instanceof LiteralExpr) return (LiteralExpr) constExpr;
@@ -221,24 +227,10 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
         if (val.isSetBool_val()) result = new BoolLiteral(val.bool_val);
         break;
       case TINYINT:
-        if (val.isSetByte_val()) {
-          result = new NumericLiteral(BigDecimal.valueOf(val.byte_val));
-        }
-        break;
       case SMALLINT:
-        if (val.isSetShort_val()) {
-          result = new NumericLiteral(BigDecimal.valueOf(val.short_val));
-        }
-        break;
       case INT:
-        if (val.isSetInt_val()) {
-          result = new NumericLiteral(BigDecimal.valueOf(val.int_val));
-        }
-        break;
       case BIGINT:
-        if (val.isSetLong_val()) {
-          result = new NumericLiteral(BigDecimal.valueOf(val.long_val));
-        }
+        result = createIntegerLiteral(val, constExpr.getType(), keepOriginalIntType);
         break;
       case FLOAT:
       case DOUBLE:
@@ -263,6 +255,7 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
       case STRING:
       case VARCHAR:
       case CHAR:
+      case BINARY:
         if (val.isSetBinary_val()) {
           byte[] bytes = new byte[val.binary_val.remaining()];
           val.binary_val.get(bytes);
@@ -308,6 +301,11 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
     return result;
   }
 
+  public static LiteralExpr createBounded(Expr constExpr, TQueryCtx queryCtx,
+    int maxResultSize) throws AnalysisException {
+    return createBounded(constExpr, queryCtx, maxResultSize, false);
+  }
+
   // Order NullLiterals based on the SQL ORDER BY default behavior: NULLS LAST.
   @Override
   public int compareTo(LiteralExpr other) {
@@ -316,5 +314,30 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
     if (Expr.IS_NULL_LITERAL.apply(other)) return 1;
     if (getClass() != other.getClass()) return -1;
     return 0;
+  }
+
+  static private NumericLiteral createIntegerLiteral(TColumnValue val, Type type,
+      boolean keepOriginalIntType) throws SqlCastException {
+    BigDecimal value = null;
+    switch (type.getPrimitiveType()) {
+      case TINYINT:
+        if (val.isSetByte_val()) value = BigDecimal.valueOf(val.byte_val);
+        break;
+      case SMALLINT:
+        if (val.isSetShort_val()) value = BigDecimal.valueOf(val.short_val);
+        break;
+      case INT:
+        if (val.isSetInt_val()) value = BigDecimal.valueOf(val.int_val);
+        break;
+      case BIGINT:
+        if (val.isSetLong_val()) value = BigDecimal.valueOf(val.long_val);
+        break;
+      default:
+        Preconditions.checkState(false,
+            String.format("Integer type expected, got '%s'.", type.toSql()));
+    }
+    if (value == null) return null;
+    return keepOriginalIntType ?
+        new NumericLiteral(value, type) : new NumericLiteral(value);
   }
 }

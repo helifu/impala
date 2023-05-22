@@ -27,7 +27,7 @@
 
 namespace impala {
 
-Status SubplanPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+Status SubplanPlanNode::Init(const TPlanNode& tnode, FragmentState* state) {
   RETURN_IF_ERROR(PlanNode::Init(tnode, state));
   DCHECK_EQ(children_.size(), 2);
   RETURN_IF_ERROR(SetContainingSubplan(state, this, children_[1]));
@@ -35,7 +35,7 @@ Status SubplanPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
 }
 
 Status SubplanPlanNode::SetContainingSubplan(
-    RuntimeState* state, SubplanPlanNode* ancestor, PlanNode* node) {
+    FragmentState* state, SubplanPlanNode* ancestor, PlanNode* node) {
   node->containing_subplan_ = ancestor;
   if (node->tnode_->node_type == TPlanNodeType::SUBPLAN_NODE) {
     // Only traverse the first child and not the second one, because the Subplan
@@ -44,7 +44,7 @@ Status SubplanPlanNode::SetContainingSubplan(
   } else {
     if (node->tnode_->node_type == TPlanNodeType::UNNEST_NODE) {
       UnnestPlanNode* unnest_node = reinterpret_cast<UnnestPlanNode*>(node);
-      RETURN_IF_ERROR(unnest_node->InitCollExpr(state));
+      RETURN_IF_ERROR(unnest_node->InitCollExprs(state));
     }
     int num_children = node->children_.size();
     for (int i = 0; i < num_children; ++i) {

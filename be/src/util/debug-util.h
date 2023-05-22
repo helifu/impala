@@ -15,69 +15,67 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_UTIL_DEBUG_UTIL_H
-#define IMPALA_UTIL_DEBUG_UTIL_H
+#pragma once
 
-#include <ostream>
 #include <string>
-#include <sstream>
+#include <vector>
 
 #include <thrift/protocol/TDebugProtocol.h>
+#include <thrift/Thrift.h>
 
+#include "common/compiler-util.h"
 #include "common/config.h"
-#include "gen-cpp/JniCatalog_types.h"
-#include "gen-cpp/Descriptors_types.h"
-#include "gen-cpp/Exprs_types.h"
+#include "common/status.h"
+#include "gen-cpp/CatalogObjects_types.h"
 #include "gen-cpp/Frontend_types.h"
-#include "gen-cpp/PlanNodes_types.h"
-#include "gen-cpp/RuntimeProfile_types.h"
+#include "gen-cpp/ImpalaInternalService_types.h"
 #include "gen-cpp/ImpalaService_types.h"
+#include "gen-cpp/JniCatalog_types.h"
+#include "gen-cpp/Metrics_types.h"
+#include "gen-cpp/PlanNodes_types.h"
+#include "gen-cpp/Types_types.h"
+#include "gen-cpp/beeswax_types.h"
+#include "gen-cpp/common.pb.h"
 #include "gen-cpp/parquet_types.h"
-
-#include "runtime/descriptors.h" // for SchemaPath
+#include "gutil/macros.h"
 
 namespace impala {
 
+class RowBatch;
 class RowDescriptor;
 class TableDescriptor;
 class TupleDescriptor;
 class Tuple;
 class TupleRow;
-class RowBatch;
 
-// TODO: remove these functions and use operator << after upgrading to Thrift 0.11.0 or
-// higher.
-std::string PrintThriftEnum(const beeswax::QueryState::type& value);
-std::string PrintThriftEnum(const parquet::Encoding::type& value);
-std::string PrintThriftEnum(const TCatalogObjectType::type& value);
-std::string PrintThriftEnum(const TCatalogOpType::type& value);
-std::string PrintThriftEnum(const TDdlType::type& value);
-std::string PrintThriftEnum(const TExplainLevel::type& value);
-std::string PrintThriftEnum(const THdfsCompression::type& value);
-std::string PrintThriftEnum(const THdfsFileFormat::type& value);
-std::string PrintThriftEnum(const THdfsSeqCompressionMode::type& value);
-std::string PrintThriftEnum(const TImpalaQueryOptions::type& value);
-std::string PrintThriftEnum(const TJoinDistributionMode::type& value);
-std::string PrintThriftEnum(const TKuduReadMode::type& value);
-std::string PrintThriftEnum(const TMetricKind::type& value);
-std::string PrintThriftEnum(const TParquetArrayResolution::type& value);
-std::string PrintThriftEnum(const TParquetFallbackSchemaResolution::type& value);
-std::string PrintThriftEnum(const TPlanNodeType::type& value);
-std::string PrintThriftEnum(const TPrefetchMode::type& value);
-std::string PrintThriftEnum(const TReplicaPreference::type& value);
-std::string PrintThriftEnum(const TRuntimeFilterMode::type& value);
-std::string PrintThriftEnum(const TSessionType::type& value);
-std::string PrintThriftEnum(const TStmtType::type& value);
-std::string PrintThriftEnum(const TUnit::type& value);
-std::string PrintThriftEnum(const TParquetTimestampType::type& value);
-std::string PrintThriftEnum(const TTransactionalType::type& value);
+// Forward declaration to avoid including descriptors.h.
+typedef std::vector<int> SchemaPath;
+
+// Used to convert Thrift objects to strings. Thrift defines a 'to_string()' function for
+// each type.
+template<class T>
+std::string PrintValue(const T& value) {
+  return to_string(value);
+}
 
 std::string PrintTuple(const Tuple* t, const TupleDescriptor& d);
 std::string PrintRow(TupleRow* row, const RowDescriptor& d);
 std::string PrintBatch(RowBatch* batch);
-/// Converts id to a string represantation. If necessary, the gdb equivalent is:
+/// Converts id to a string representation. If necessary, the gdb equivalent is:
 ///    printf "%lx:%lx\n", id.hi, id.lo
 std::string PrintId(const TUniqueId& id, const std::string& separator = ":");
+std::string PrintId(const UniqueIdPB& id, const std::string& separator = ":");
+
+/// Converts id to a string representation without using any shared library calls.
+/// Follows Breakpad's guidance for compromised contexts, see
+/// https://github.com/google/breakpad/blob/main/docs/linux_starter_guide.md
+constexpr int TUniqueIdBufferSize = 33;
+void PrintIdCompromised(const TUniqueId& id, char out[TUniqueIdBufferSize],
+    const char separator = ':');
+
+inline ostream& operator<<(ostream& os, const UniqueIdPB& id) {
+  return os << PrintId(id);
+}
 
 /// Returns the fully qualified path, e.g. "database.table.array_col.item.field"
 std::string PrintPath(const TableDescriptor& tbl_desc, const SchemaPath& path);
@@ -134,7 +132,7 @@ std::string GetBackendString();
 /// Tokenize 'debug_actions' into a list of tokenized rows, where columns are separated
 /// by ':' and rows by '|'. i.e. if debug_actions="a:b:c|x:y", then the returned
 /// structure is {{"a", "b", "c"}, {"x", "y"}}
-typedef std::list<std::vector<string>> DebugActionTokens;
+typedef std::vector<std::vector<string>> DebugActionTokens;
 DebugActionTokens TokenizeDebugActions(const string& debug_actions);
 
 /// Tokenize 'action' which has an optional parameter separated by '@'. i.e. "x@y"
@@ -176,6 +174,13 @@ static inline void DebugActionNoFail(
   DebugActionNoFail(query_options.debug_action, label);
 }
 
+/// Map of exception string to the exception throwing function which is used when
+/// executing the EXCEPTION debug action.
+static const std::unordered_map<std::string,std::function<void()>> EXCEPTION_STR_MAP {
+        {"exception",   [](){ throw std::exception(); }},
+        {"bad_alloc",   [](){ throw std::bad_alloc(); }},
+        {"TException", [](){ throw apache::thrift::TException(); }}
+};
 // FILE_CHECKs are conditions that we expect to be true but could fail due to a malformed
 // input file. They differentiate these cases from DCHECKs, which indicate conditions that
 // are true unless there's a bug in Impala. We would ideally always return a bad Status
@@ -189,7 +194,4 @@ static inline void DebugActionNoFail(
 #define FILE_CHECK_LT(a, b) DCHECK_LT(a, b)
 #define FILE_CHECK_GE(a, b) DCHECK_GE(a, b)
 #define FILE_CHECK_LE(a, b) DCHECK_LE(a, b)
-
 }
-
-#endif

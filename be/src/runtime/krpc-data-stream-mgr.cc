@@ -18,15 +18,14 @@
 #include "runtime/krpc-data-stream-mgr.h"
 
 #include <iostream>
+#include <mutex>
 #include <boost/functional/hash.hpp>
-#include <boost/thread/locks.hpp>
-#include <boost/thread/thread.hpp>
 
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/trace.h"
 
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "runtime/exec-env.h"
 #include "runtime/krpc-data-stream-recvr.h"
 #include "runtime/mem-tracker.h"
@@ -64,7 +63,7 @@ DEFINE_int32(datastream_service_num_deserialization_threads, 16,
 DEFINE_int32(datastream_service_deserialization_queue_size, 10000,
     "Number of deferred RPC requests that can be enqueued before being processed by a "
     "deserialization thread.");
-using boost::mutex;
+using std::mutex;
 
 namespace impala {
 
@@ -96,9 +95,11 @@ Status KrpcDataStreamMgr::Init(MemTracker* service_mem_tracker) {
 
 inline uint32_t KrpcDataStreamMgr::GetHashValue(
     const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id) {
-  uint32_t value = RawValue::GetHashValue(&fragment_instance_id.lo, TYPE_BIGINT, 0);
-  value = RawValue::GetHashValue(&fragment_instance_id.hi, TYPE_BIGINT, value);
-  value = RawValue::GetHashValue(&dest_node_id, TYPE_INT, value);
+  uint32_t value = RawValue::GetHashValue(
+      &fragment_instance_id.lo, ColumnType(TYPE_BIGINT), 0);
+  value = RawValue::GetHashValue(
+      &fragment_instance_id.hi, ColumnType(TYPE_BIGINT), value);
+  value = RawValue::GetHashValue(&dest_node_id, ColumnType(TYPE_INT), value);
   return value;
 }
 
@@ -334,13 +335,16 @@ Status KrpcDataStreamMgr::DeregisterRecvr(
   return Status(msg);
 }
 
-void KrpcDataStreamMgr::Cancel(const TUniqueId& finst_id) {
-  VLOG_QUERY << "cancelling active streams for fragment_instance_id="
-             << PrintId(finst_id);
+void KrpcDataStreamMgr::Cancel(const TUniqueId& query_id) {
+  VLOG_QUERY << "cancelling active streams for query_id=" << PrintId(query_id);
   lock_guard<mutex> l(lock_);
+  // Fragment instance IDs are the query ID with the lower bits set to the instance
+  // index. Therefore all finstances for a query are clustered together, starting
+  // after the position in the map where the query_id would be.
   FragmentRecvrSet::iterator iter =
-      fragment_recvr_set_.lower_bound(make_pair(finst_id, 0));
-  while (iter != fragment_recvr_set_.end() && iter->first == finst_id) {
+      fragment_recvr_set_.lower_bound(make_pair(query_id, 0));
+  while (iter != fragment_recvr_set_.end() &&
+         GetQueryId(iter->first) == query_id) {
     bool unused;
     shared_ptr<KrpcDataStreamRecvr> recvr = FindRecvr(iter->first, iter->second, &unused);
     if (recvr != nullptr) {
@@ -362,7 +366,7 @@ void KrpcDataStreamMgr::RespondToTimedOutSender(const std::unique_ptr<ContextTyp
   TUniqueId finst_id;
   finst_id.__set_lo(request->dest_fragment_instance_id().lo());
   finst_id.__set_hi(request->dest_fragment_instance_id().hi());
-  string remote_addr = Substitute(" $0", ctx->rpc_context->remote_address().host());
+  string remote_addr = Substitute(" $0", ctx->rpc_context->remote_address().ToString());
   ErrorMsg msg(TErrorCode::DATASTREAM_SENDER_TIMEOUT, remote_addr, PrintId(finst_id),
       ctx->request->dest_node_id());
   VLOG_QUERY << msg.msg();

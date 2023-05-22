@@ -29,6 +29,7 @@ import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
+import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TEqJoinCondition;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.THashJoinNode;
@@ -36,9 +37,10 @@ import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.util.BitUtil;
+import org.apache.impala.util.ExprUtil;
 
 import com.google.common.base.Joiner;
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
 /**
@@ -117,14 +119,14 @@ public class HashJoinNode extends JoinNode {
 
   @Override
   protected String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("eqJoinConjuncts_", eqJoinConjunctsDebugString())
         .addValue(super.debugString())
         .toString();
   }
 
   private String eqJoinConjunctsDebugString() {
-    Objects.ToStringHelper helper = Objects.toStringHelper(this);
+    MoreObjects.ToStringHelper helper = MoreObjects.toStringHelper(this);
     for (Expr entry: eqJoinConjuncts_) {
       helper.add("lhs" , entry.getChild(0)).add("rhs", entry.getChild(1));
     }
@@ -134,19 +136,30 @@ public class HashJoinNode extends JoinNode {
   @Override
   protected void toThrift(TPlanNode msg) {
     msg.node_type = TPlanNodeType.HASH_JOIN_NODE;
-    msg.hash_join_node = new THashJoinNode();
-    msg.hash_join_node.join_op = joinOp_.toThrift();
-    for (Expr entry: eqJoinConjuncts_) {
+    msg.join_node = joinNodeToThrift();
+    msg.join_node.hash_join_node = new THashJoinNode();
+    msg.join_node.hash_join_node.setEq_join_conjuncts(getThriftEquiJoinConjuncts());
+    for (Expr e: otherJoinConjuncts_) {
+      msg.join_node.hash_join_node.addToOther_join_conjuncts(e.treeToThrift());
+    }
+    msg.join_node.hash_join_node.setHash_seed(getFragment().getHashSeed());
+  }
+
+  /**
+   * Helper to get the equi-join conjuncts in a thrift representation.
+   */
+  public List<TEqJoinCondition> getThriftEquiJoinConjuncts() {
+    List<TEqJoinCondition> equiJoinConjuncts = new ArrayList<>(eqJoinConjuncts_.size());
+    for (Expr entry : eqJoinConjuncts_) {
       BinaryPredicate bp = (BinaryPredicate)entry;
       TEqJoinCondition eqJoinCondition =
           new TEqJoinCondition(bp.getChild(0).treeToThrift(),
               bp.getChild(1).treeToThrift(),
               bp.getOp() == BinaryPredicate.Operator.NOT_DISTINCT);
-      msg.hash_join_node.addToEq_join_conjuncts(eqJoinCondition);
+
+      equiJoinConjuncts.add(eqJoinCondition);
     }
-    for (Expr e: otherJoinConjuncts_) {
-      msg.hash_join_node.addToOther_join_conjuncts(e.treeToThrift());
-    }
+    return equiJoinConjuncts;
   }
 
   @Override
@@ -163,13 +176,16 @@ public class HashJoinNode extends JoinNode {
       }
     }
     if (detailLevel.ordinal() > TExplainLevel.MINIMAL.ordinal()) {
-      output.append(detailPrefix + "hash predicates: ");
-      for (int i = 0; i < eqJoinConjuncts_.size(); ++i) {
-        Expr eqConjunct = eqJoinConjuncts_.get(i);
-        output.append(eqConjunct.toSql());
-        if (i + 1 != eqJoinConjuncts_.size()) output.append(", ");
+      if (!isDeleteRowsJoin_ ||
+          detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
+        output.append(detailPrefix + "hash predicates: ");
+        for (int i = 0; i < eqJoinConjuncts_.size(); ++i) {
+          Expr eqConjunct = eqJoinConjuncts_.get(i);
+          output.append(eqConjunct.toSql());
+          if (i + 1 != eqJoinConjuncts_.size()) output.append(", ");
+        }
+        output.append("\n");
       }
-      output.append("\n");
 
       // Optionally print FK/PK equi-join conjuncts.
       if (joinOp_.isInnerJoin() || joinOp_.isOuterJoin()) {
@@ -202,37 +218,57 @@ public class HashJoinNode extends JoinNode {
     return output.toString();
   }
 
+  /**
+   * Helper method to compute the resource requirements for the join that can be
+   * called from the builder or the join node. Returns a pair of the probe
+   * resource requirements and the build resource requirements.
+   */
   @Override
-  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
-    long perInstanceMemEstimate;
-    long perInstanceDataBytes;
-    int numInstances = fragment_.getNumInstances(queryOptions.getMt_dop());
+  public Pair<ResourceProfile, ResourceProfile> computeJoinResourceProfile(
+      TQueryOptions queryOptions) {
+    long perBuildInstanceMemEstimate;
+    long perBuildInstanceDataBytes;
+    int numInstances = fragment_.getNumInstances();
     if (getChild(1).getCardinality() == -1 || getChild(1).getAvgRowSize() == -1
         || numInstances <= 0) {
-      perInstanceMemEstimate = DEFAULT_PER_INSTANCE_MEM;
-      perInstanceDataBytes = -1;
+      perBuildInstanceMemEstimate = DEFAULT_PER_INSTANCE_MEM;
+      perBuildInstanceDataBytes = -1;
     } else {
-      // TODO: IMPALA-4224: update this once we can share the broadcast join data between
-      // finstances. Currently this implicitly assumes that each instance has a copy of
-      // the hash tables.
-      perInstanceDataBytes = (long) Math.ceil(getChild(1).cardinality_
-          * getChild(1).avgRowSize_);
+      long rhsCard = getChild(1).getCardinality();
+      long rhsNdv = 1;
+      // Calculate the ndv of the right child, which is the multiplication of
+      // the ndv of the right child column
+      for (Expr eqJoinPredicate: eqJoinConjuncts_) {
+        long rhsPdNdv = getNdv(eqJoinPredicate.getChild(1));
+        rhsPdNdv = Math.min(rhsPdNdv, rhsCard);
+        if (rhsPdNdv != -1) {
+          rhsNdv = PlanNode.checkedMultiply(rhsNdv, rhsPdNdv);
+        }
+      }
+      // The memory of the data stored in hash table and
+      // the memory of the hash table‘s structure
+      perBuildInstanceDataBytes = (long) Math.ceil(rhsCard * getChild(1).getAvgRowSize() +
+          BitUtil.roundUpToPowerOf2((long) Math.ceil(3 * rhsCard / 2)) *
+          PlannerContext.SIZE_OF_BUCKET);
+      if (rhsNdv > 1 && rhsNdv < rhsCard) {
+        perBuildInstanceDataBytes += (rhsCard - rhsNdv) *
+            PlannerContext.SIZE_OF_DUPLICATENODE;
+      }
       // Assume the rows are evenly divided among instances.
       if (distrMode_ == DistributionMode.PARTITIONED) {
-        perInstanceDataBytes /= numInstances;
+        perBuildInstanceDataBytes /= numInstances;
       }
-      perInstanceMemEstimate = (long) Math.ceil(
-          perInstanceDataBytes * PlannerContext.HASH_TBL_SPACE_OVERHEAD);
+      perBuildInstanceMemEstimate = perBuildInstanceDataBytes;
     }
 
     // Must be kept in sync with PartitionedHashJoinBuilder::MinReservation() in be.
     final int PARTITION_FANOUT = 16;
-    long minBuffers = PARTITION_FANOUT + 1
-        + (joinOp_ == JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN ? 3 : 0);
+    long minBuildBuffers = PARTITION_FANOUT + 1
+        + (joinOp_ == JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN ? 1 : 0);
 
     long bufferSize = queryOptions.getDefault_spillable_buffer_size();
-    if (perInstanceDataBytes != -1) {
-      long bytesPerBuffer = perInstanceDataBytes / PARTITION_FANOUT;
+    if (perBuildInstanceDataBytes != -1) {
+      long bytesPerBuffer = perBuildInstanceDataBytes / PARTITION_FANOUT;
       // Scale down the buffer size if we think there will be excess free space with the
       // default buffer size, e.g. if the right side is a small dimension table.
       bufferSize = Math.min(bufferSize, Math.max(
@@ -244,12 +280,70 @@ public class HashJoinNode extends JoinNode {
     // to serve as input and output buffers while repartitioning.
     long maxRowBufferSize =
         computeMaxSpillableBufferSize(bufferSize, queryOptions.getMax_row_size());
-    long perInstanceMinMemReservation =
-        bufferSize * (minBuffers - 2) + maxRowBufferSize * 2;
-    nodeResourceProfile_ = new ResourceProfileBuilder()
-        .setMemEstimateBytes(perInstanceMemEstimate)
-        .setMinMemReservationBytes(perInstanceMinMemReservation)
+    long perInstanceBuildMinMemReservation =
+        bufferSize * (minBuildBuffers - 2) + maxRowBufferSize * 2;
+    if (Planner.useMTFragment(queryOptions) && canShareBuild()) {
+      // Ensure we reserve enough memory to hand off to the PartitionedHashJoinNodes for
+      // probe streams when spilling. numInstancePerHost is an upper bound on the number
+      // of PartitionedHashJoinNodes per builder.
+      // TODO: IMPALA-9416: be less conservative here
+      // TODO: In case of compute_processing_cost=false, it is probably OK to stil use
+      //     getNumInstancesPerHost(). Leave this for future work to avoid regression.
+      int numInstancePerHost = queryOptions.compute_processing_cost ?
+          fragment_.getNumInstancesPerHost(queryOptions) :
+          queryOptions.getMt_dop();
+      perInstanceBuildMinMemReservation *= numInstancePerHost;
+    }
+    // Most reservation for probe buffers is obtained from the join builder when
+    // spilling. However, for NAAJ, two additional probe streams are needed that
+    // are used exclusively by the probe side.
+    long perInstanceProbeMinMemReservation = 0;
+    if (joinOp_ == JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN) {
+      // Only one of the NAAJ probe streams is written at a time, so it needs a max-sized
+      // buffer. If the build is integrated, we already have a max sized buffer accounted
+      // for in the build reservation.
+      perInstanceProbeMinMemReservation =
+          hasSeparateBuild() ? maxRowBufferSize + bufferSize : bufferSize * 2;
+    }
+
+    // Almost all resource consumption is in the build, or shared between the build and
+    // the probe. These are accounted for in the build profile.
+    ResourceProfile probeProfile = new ResourceProfileBuilder()
+        .setMemEstimateBytes(0)
+        .setMinMemReservationBytes(perInstanceProbeMinMemReservation)
         .setSpillableBufferBytes(bufferSize)
         .setMaxRowBufferBytes(maxRowBufferSize).build();
+    ResourceProfile buildProfile = new ResourceProfileBuilder()
+        .setMemEstimateBytes(perBuildInstanceMemEstimate)
+        .setMinMemReservationBytes(perInstanceBuildMinMemReservation)
+        .setSpillableBufferBytes(bufferSize)
+        .setMaxRowBufferBytes(maxRowBufferSize).build();
+    return Pair.create(probeProfile, buildProfile);
+  }
+
+  @Override
+  public Pair<ProcessingCost, ProcessingCost> computeJoinProcessingCost() {
+    // TODO: The cost should consider conjuncts_ as well.
+    // Assume 'eqJoinConjuncts_' will be applied to all rows from lhs and rhs side,
+    // and 'otherJoinConjuncts_' to the resultant rows.
+    float eqJoinPredicateEvalCost = ExprUtil.computeExprsTotalCost(eqJoinConjuncts_);
+    float otherJoinPredicateEvalCost =
+        ExprUtil.computeExprsTotalCost(otherJoinConjuncts_);
+
+    // Compute the processing cost for lhs.
+    ProcessingCost probeProcessingCost =
+        ProcessingCost.basicCost(getDisplayLabel() + " Probe side (eqJoinConjuncts_)",
+            getChild(0).getCardinality(), eqJoinPredicateEvalCost);
+    if (otherJoinPredicateEvalCost > 0) {
+      probeProcessingCost = ProcessingCost.sumCost(probeProcessingCost,
+          ProcessingCost.basicCost(getDisplayLabel() + " Probe side(otherJoinConjuncts_)",
+              getCardinality(), otherJoinPredicateEvalCost));
+    }
+
+    // Compute the processing cost for rhs.
+    ProcessingCost buildProcessingCost =
+        ProcessingCost.basicCost(getDisplayLabel() + " Build side",
+            getChild(1).getCardinality(), eqJoinPredicateEvalCost);
+    return Pair.create(probeProcessingCost, buildProcessingCost);
   }
 }

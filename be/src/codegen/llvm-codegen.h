@@ -84,10 +84,14 @@ namespace llvm {
 namespace impala {
 
 class CodegenCallGraph;
+class CodegenFnPtrBase;
 class CodegenSymbolEmitter;
+class FragmentState;
 class ImpalaMCJITMemoryManager;
 class SubExprElimination;
+class Thread;
 class TupleDescriptor;
+class CodeGenCacheKey;
 
 /// Define builder subclass in case we want to change the template arguments later
 class LlvmBuilder : public llvm::IRBuilder<> {
@@ -169,7 +173,7 @@ class LlvmCodeGen {
   /// 'codegen' will contain the created object on success.
   /// 'parent_mem_tracker' - if non-NULL, the CodeGen MemTracker is created under this.
   /// 'id' is used for outputting the IR module for debugging.
-  static Status CreateImpalaCodegen(RuntimeState* state, MemTracker* parent_mem_tracker,
+  static Status CreateImpalaCodegen(FragmentState* state, MemTracker* parent_mem_tracker,
       const std::string& id, boost::scoped_ptr<LlvmCodeGen>* codegen);
 
   ~LlvmCodeGen();
@@ -180,10 +184,14 @@ class LlvmCodeGen {
 
   RuntimeProfile* runtime_profile() { return profile_; }
   RuntimeProfile::Counter* ir_generation_timer() { return ir_generation_timer_; }
+  RuntimeProfile::Counter* main_thread_timer() { return main_thread_timer_; }
   RuntimeProfile::ThreadCounters* llvm_thread_counters() { return llvm_thread_counters_; }
 
   /// Turns on/off optimization passes
   void EnableOptimizations(bool enable);
+
+  std::string DebugCacheEntryString(CodeGenCacheKey& key, bool is_lookup, bool debug_mode,
+      bool success) const;
 
   /// For debugging. Returns the IR that was generated.  If full_module, the
   /// entire module is dumped, including what was loaded from precompiled IR.
@@ -339,6 +347,21 @@ class LlvmCodeGen {
   /// functions.
   Status FinalizeModule();
 
+  /// Start executing 'FinalizeModule' in a separate thread and return.
+  /// 'async_compile_thread_' is set to point to the new 'Thread' object.
+  ///
+  /// Execution of the query starts in interpreted mode in the calling thread while
+  /// compilation is done in 'async_compile_thread_'. When compilation has finished
+  /// function pointers that have been added via 'AddFunctionToJit' will be set to the
+  /// compiled functions and the query will automatically use the codegen'd version the
+  /// next time the corresponding function is called (we always check the codegen'd
+  /// function pointer and fall back to interpreted mode if it is nullptr).
+  ///
+  /// The function pointers are atomic so no locking is needed.
+  ///
+  /// 'Close' calls 'Join' on '*async_compile_thread_' if it is not a nullptr.
+  Status FinalizeModuleAsync(RuntimeProfile::EventSequence* event_sequence);
+
   /// Loads a native or IR function 'fn' with symbol 'symbol' from the builtins or
   /// an external library and puts the result in *llvm_fn. *llvm_fn can be safely
   /// modified in place, because it is either newly generated or cloned. The caller must
@@ -409,8 +432,11 @@ class LlvmCodeGen {
   /// be deleted in FinalizeModule(), otherwise, it returns the function object.
   llvm::Function* FinalizeFunction(llvm::Function* function);
 
+  /// Prunes any unused functions from the module.
+  void PruneModule();
+
   /// Adds the function to be automatically jit compiled when the codegen object is
-  /// finalized. FinalizeModule() will set fn_ptr to point to the jitted function.
+  /// finalized. FinalizeModule() will set *fn_ptr to point to the jitted function.
   ///
   /// Pre-condition: FinalizeFunction() must have been called on the function passed to
   /// this method.
@@ -422,7 +448,7 @@ class LlvmCodeGen {
   /// This will also wrap functions returning DecimalVals in an ABI-compliant wrapper (see
   /// the comment in the .cc file for details). This is so we don't accidentally try to
   /// call non-compliant code from native code.
-  void AddFunctionToJit(llvm::Function* fn, void** fn_ptr);
+  void AddFunctionToJit(llvm::Function* fn, CodegenFnPtrBase* fn_ptr);
 
   /// This will generate a printf call instruction to output 'message' at the builder's
   /// insert point. If 'v1' is non-NULL, it will also be passed to the printf call. Only
@@ -501,9 +527,12 @@ class LlvmCodeGen {
       llvm::BasicBlock** if_block, llvm::BasicBlock** else_block,
       llvm::BasicBlock* insert_before = NULL);
 
-  /// Create a llvm pointer value from 'ptr'.  This is used to pass pointers between
-  /// c-code and code-generated IR.  The resulting value will be of 'type'.
-  llvm::Value* CastPtrToLlvmPtr(llvm::Type* type, const void* ptr);
+  // Creates a PHI node with two incoming blocks that will have the value 'value1' for the
+  // incoming block 'incoming_block1' and the value 'value2' for incoming block
+  // 'incoming_block2'.
+  static llvm::PHINode* CreateBinaryPhiNode(LlvmBuilder* builder, llvm::Value* value1,
+      llvm::Value* value2, llvm::BasicBlock* incoming_block1,
+      llvm::BasicBlock* incoming_block2, std::string name = "");
 
   /// Returns a constant int of 'byte_size' bytes based on 'low_bits' and 'high_bits'
   /// which stand for the lower and upper 64-bits of the constant respectively. For
@@ -512,7 +541,10 @@ class LlvmCodeGen {
   llvm::Constant* GetIntConstant(int byte_size, uint64_t low_bits, uint64_t high_bits);
 
   /// Initialise a constant global string and returns an i8* pointer to it.
-  llvm::Value* GetStringConstant(LlvmBuilder* builder, char* data, int len);
+  llvm::Value* GetStringConstant(LlvmBuilder* builder, const char* data, int len);
+  llvm::Value* GetStringConstant(LlvmBuilder* builder, const std::string& str) {
+    return GetStringConstant(builder, str.c_str(), str.size());
+  }
 
   /// Returns true/false constants (bool type)
   llvm::Constant* true_value() { return true_value_; }
@@ -602,15 +634,20 @@ class LlvmCodeGen {
   /// into the calling function.
   static const int CODEGEN_INLINE_EXPR_BATCH_THRESHOLD = 25;
 
+  /// Name prefix of the thread counters that track async codegen time.
+  static const std::string ASYNC_CODEGEN_THREAD_COUNTERS_PREFIX;
+
  private:
   friend class ExprCodegenTest;
   friend class LlvmCodeGenTest;
   friend class LlvmCodeGenTest_CpuAttrWhitelist_Test;
   friend class LlvmCodeGenTest_HashTest_Test;
   friend class SubExprElimination;
+  friend class CodeGenCache;
+  friend class LlvmCodeGenCacheTest;
 
   /// Top level codegen object. 'module_id' is used for debugging when outputting the IR.
-  LlvmCodeGen(RuntimeState* state, ObjectPool* pool, MemTracker* parent_mem_tracker,
+  LlvmCodeGen(FragmentState* state, ObjectPool* pool, MemTracker* parent_mem_tracker,
       const std::string& module_id);
 
   /// Initializes the jitter and execution engine with the given module.
@@ -620,7 +657,7 @@ class LlvmCodeGen {
   /// 'codegen' will contain the created object on success. The functions in the module
   /// are materialized lazily. Getting a reference to a function via GetFunction() will
   /// materialize the function and its callees recursively.
-  static Status CreateFromFile(RuntimeState* state, ObjectPool* pool,
+  static Status CreateFromFile(FragmentState* state, ObjectPool* pool,
       MemTracker* parent_mem_tracker, const std::string& file,
       const std::string& id, boost::scoped_ptr<LlvmCodeGen>* codegen);
 
@@ -628,7 +665,7 @@ class LlvmCodeGen {
   /// 'codegen' will contain the created object on success. The functions in the module
   /// are materialized lazily. Getting a reference to a function via GetFunction() will
   /// materialize the function and its callees recursively.
-  static Status CreateFromMemory(RuntimeState* state, ObjectPool* pool,
+  static Status CreateFromMemory(FragmentState* state, ObjectPool* pool,
       MemTracker* parent_mem_tracker, const std::string& id,
       boost::scoped_ptr<LlvmCodeGen>* codegen);
 
@@ -673,7 +710,7 @@ class LlvmCodeGen {
   Status LoadIntrinsics();
 
   /// Internal function for unit tests: skips Impala-specific wrapper generation logic.
-  void AddFunctionToJitInternal(llvm::Function* fn, void** fn_ptr);
+  void AddFunctionToJitInternal(llvm::Function* fn, CodegenFnPtrBase* fn_ptr);
 
   /// Verifies the function, e.g., checks that the IR is well-formed.  Returns false if
   /// function is invalid.
@@ -682,8 +719,17 @@ class LlvmCodeGen {
   // Used for testing.
   void ResetVerification() { is_corrupt_ = false; }
 
+  // Lookup the codegen functions from the cache to reduce optimization time.
+  bool LookupCache(CodeGenCacheKey& key);
+
+  // Store the codegen functions to the cache if codegen cache is enabled.
+  Status StoreCache(CodeGenCacheKey& key);
+
   /// Optimizes the module. This includes pruning the module of any unused functions.
   Status OptimizeModule();
+
+  /// Points the function pointers in 'fns_to_jit_compile_' to the compiled functions.
+  void SetFunctionPointers();
 
   /// Clears generated hash fns.  This is only used for testing.
   void ClearHashFns();
@@ -723,6 +769,16 @@ class LlvmCodeGen {
   /// generated is retained by the execution engine.
   void DestroyModule();
 
+  /// Generate a string containing all jitted function names from fns_to_jit_compile_.
+  /// The generation of the string is simply the concatenation of all the names by
+  /// sequence in fns_to_jit_compile_. Would be used in the codegen cache lookup to
+  /// confirm whether a cache entry matches the need of the LlvmCodeGen.
+  std::string GetAllFunctionNames();
+
+  /// Generate and store the hash code of all the function names. Will be used to
+  /// codegen cache only.
+  void GenerateFunctionNamesHashCode();
+
   /// Disable CPU attributes in 'cpu_attrs' that are not present in
   /// the '--llvm_cpu_attr_whitelist' flag. The same attributes in the input are
   /// always present in the output, except "+" is flipped to "-" for the disabled
@@ -755,9 +811,9 @@ class LlvmCodeGen {
   /// Used for determining dependencies when materializing IR functions.
   static CodegenCallGraph shared_call_graph_;
 
-  /// Pointer to the RuntimeState which owns this codegen object. Needed in
+  /// Pointer to the FragmentState which owns this codegen object. Needed in
   /// InlineConstFnAttr() to access the query options.
-  const RuntimeState* state_;
+  const FragmentState* state_;
 
   /// ID used for debugging (can be e.g. the fragment instance ID)
   std::string id_;
@@ -776,6 +832,13 @@ class LlvmCodeGen {
   /// Time spent creating the initial module with the cross-compiled Impala IR.
   RuntimeProfile::Counter* prepare_module_timer_;
 
+  /// Time spent generating module bitcode.
+  RuntimeProfile::Counter* module_bitcode_gen_timer_;
+
+  /// Time spent for codegen cache look up and save.
+  RuntimeProfile::Counter* codegen_cache_lookup_timer_;
+  RuntimeProfile::Counter* codegen_cache_save_timer_;
+
   /// Time spent by ExecNodes while adding IR to the module. Update by
   /// FragmentInstanceState during its 'CODEGEN_START' state.
   RuntimeProfile::Counter* ir_generation_timer_;
@@ -786,6 +849,12 @@ class LlvmCodeGen {
   /// Time spent compiling the module.
   RuntimeProfile::Counter* compile_timer_;
 
+  /// Total codegen time spent in the main thread.
+  RuntimeProfile::Counter* main_thread_timer_;
+
+  /// Total codegen time spent in the compiler (helper) thread.
+  RuntimeProfile::ThreadCounters* compile_thread_counters_;
+
   /// Total size of bitcode modules loaded in bytes.
   RuntimeProfile::Counter* module_bitcode_size_;
 
@@ -794,12 +863,20 @@ class LlvmCodeGen {
   RuntimeProfile::Counter* num_functions_;
   RuntimeProfile::Counter* num_instructions_;
 
+  /// Number of functions that are used and cached.
+  RuntimeProfile::Counter* num_cached_functions_;
+
   /// Aggregated llvm thread counters. Also includes the phase represented by
   /// 'ir_generation_timer_' and hence is also updated by FragmentInstanceState.
   RuntimeProfile::ThreadCounters* llvm_thread_counters_;
 
+  std::unique_ptr<Thread> async_compile_thread_;
+
   /// whether or not optimizations are enabled
   bool optimizations_enabled_;
+
+  /// Whether or not codegen cache is enabled.
+  bool codegen_cache_enabled_ = true;
 
   /// If true, the module is corrupt and we cannot codegen this query.
   /// TODO: we could consider just removing the offending function and attempting to
@@ -823,7 +900,10 @@ class LlvmCodeGen {
   llvm::Module* module_;
 
   /// Execution/Jitting engine.
-  std::unique_ptr<llvm::ExecutionEngine> execution_engine_;
+  std::shared_ptr<llvm::ExecutionEngine> execution_engine_;
+
+  /// Cached Execution/Jitting engine.
+  std::shared_ptr<llvm::ExecutionEngine> execution_engine_cached_;
 
   /// The memory manager used by 'execution_engine_'. Owned by 'execution_engine_'.
   ImpalaMCJITMemoryManager* memory_manager_;
@@ -858,12 +938,13 @@ class LlvmCodeGen {
   std::set<std::string> linked_modules_;
 
   /// The vector of functions to automatically JIT compile after FinalizeModule().
-  std::vector<std::pair<llvm::Function*, void**>> fns_to_jit_compile_;
+  std::vector<std::pair<llvm::Function*, CodegenFnPtrBase*>> fns_to_jit_compile_;
 
-  /// Debug strings that will be outputted by jitted code.  This is a copy of all
-  /// strings passed to CodegenDebugTrace.
-  std::vector<std::string> debug_strings_;
+  /// The hash code generated from all the function names in fns_to_jit_compile_.
+  /// Used by the codegen cache only.
+  uint64_t function_names_hashcode_;
 
+  /// The symbol emitted associated with 'execution_engine_'. Methods on
   /// llvm representation of a few common types.  Owned by context.
   llvm::PointerType* ptr_type_;             // int8_t*
   llvm::Type* void_type_;                   // void

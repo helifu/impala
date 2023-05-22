@@ -23,7 +23,6 @@
 #include <cstdint>
 #include <ctime>
 #include <ostream>
-#include <string>
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -106,7 +105,7 @@ TEST(TestMonoTime, TestTimeSpec) {
   ts.tv_sec = 1;
   ts.tv_nsec = 1;
   MonoTime one_sec_one_nano_actual(ts);
-  ASSERT_EQ(0, one_sec_one_nano_expected.GetDeltaSince(one_sec_one_nano_actual).ToNanoseconds());
+  ASSERT_EQ(0, (one_sec_one_nano_expected - one_sec_one_nano_actual).ToNanoseconds());
 
   MonoDelta zero_sec_two_nanos(MonoDelta::FromNanoseconds(2L));
   zero_sec_two_nanos.ToTimeSpec(&ts);
@@ -127,11 +126,9 @@ TEST(TestMonoTime, TestDeltas) {
   alarm(360);
   const MonoDelta max_delta(MonoDelta::FromSeconds(0.1));
   MonoTime prev(MonoTime::Now());
-  MonoTime next;
   MonoDelta cur_delta;
   do {
-    next = MonoTime::Now();
-    cur_delta = next.GetDeltaSince(prev);
+    cur_delta = MonoTime::Now() - prev;
   } while (cur_delta.LessThan(max_delta));
   alarm(0);
 }
@@ -153,11 +150,9 @@ static void DoTestMonoTimePerf() {
   const MonoDelta max_delta(MonoDelta::FromMilliseconds(500));
   uint64_t num_calls = 0;
   MonoTime prev(MonoTime::Now());
-  MonoTime next;
   MonoDelta cur_delta;
   do {
-    next = MonoTime::Now();
-    cur_delta = next.GetDeltaSince(prev);
+    cur_delta = MonoTime::Now() - prev;
     num_calls++;
   } while (cur_delta.LessThan(max_delta));
   LOG(INFO) << "DoTestMonoTimePerf():"
@@ -170,15 +165,12 @@ TEST(TestMonoTime, TestSleepFor) {
   MonoDelta sleep = MonoDelta::FromMilliseconds(100);
   SleepFor(sleep);
   MonoTime end = MonoTime::Now();
-  MonoDelta actualSleep = end.GetDeltaSince(start);
+  MonoDelta actualSleep = end - start;
   ASSERT_GE(actualSleep.ToNanoseconds(), sleep.ToNanoseconds());
 }
 
 TEST(TestMonoTime, TestSleepForOverflow) {
-  if (!AllowSlowTests()) {
-    LOG(INFO) << "Skipping test because it sleeps for ~4s";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   // This quantity (~4s sleep) overflows a 32-bit integer such that
   // the value becomes 0.
@@ -186,7 +178,7 @@ TEST(TestMonoTime, TestSleepForOverflow) {
   MonoDelta sleep = MonoDelta::FromNanoseconds(1L << 32);
   SleepFor(sleep);
   MonoTime end = MonoTime::Now();
-  MonoDelta actualSleep = end.GetDeltaSince(start);
+  MonoDelta actualSleep = end - start;
   ASSERT_GE(actualSleep.ToNanoseconds(), sleep.ToNanoseconds());
 }
 
@@ -218,6 +210,45 @@ TEST(TestMonoTime, TestOperators) {
     tmp.AddDelta(MonoDelta::FromNanoseconds(-delta.ToNanoseconds()));
     MonoTime m_end = tmp;
     EXPECT_TRUE(m_end.Equals(o_end));
+  }
+
+  // MonoDelta& MonoDelta::operator+=(const MonoDelta& delta);
+  {
+    MonoDelta d0 = MonoDelta::FromNanoseconds(0);
+    MonoDelta d1 = MonoDelta::FromNanoseconds(1);
+    MonoDelta d1_prev = d1;
+    d1 += d0;
+    ASSERT_EQ(d1_prev, d1);
+    ASSERT_EQ(1, d1.ToNanoseconds());
+    d0 += d1;
+    ASSERT_EQ(d1, d0);
+    ASSERT_EQ(1, d0.ToNanoseconds());
+    d1 += d1_prev;
+    ASSERT_EQ(2, d1.ToNanoseconds());
+
+    MonoDelta d2 = MonoDelta::FromNanoseconds(-1);
+    d1 += d2;
+    ASSERT_EQ(1, d1.ToNanoseconds());
+    d2 += d1;
+    ASSERT_EQ(0, d2.ToNanoseconds());
+  }
+
+  // MonoDelta& MonoDelta::operator-=(const MonoDelta& delta);
+  {
+    MonoDelta d0 = MonoDelta::FromNanoseconds(0);
+    MonoDelta d1 = MonoDelta::FromNanoseconds(1);
+    MonoDelta d1_prev = d1;
+    d1 -= d0;
+    ASSERT_EQ(d1_prev, d1);
+    ASSERT_EQ(1, d1.ToNanoseconds());
+    d0 -= d1;
+    ASSERT_EQ(-1, d0.ToNanoseconds());
+
+    MonoDelta d2 = MonoDelta::FromNanoseconds(-2);
+    d0 -= d2;
+    ASSERT_EQ(1, d0.ToNanoseconds());
+    d2 -= d0;
+    ASSERT_EQ(-3, d2.ToNanoseconds());
   }
 
   // bool operator==(const MonoDelta& lhs, const MonoDelta& rhs);
@@ -278,6 +309,61 @@ TEST(TestMonoTime, TestOperators) {
     MonoDelta d21 = MonoDelta::FromNanoseconds(2);
     ASSERT_TRUE(d20.Equals(d21));
     EXPECT_TRUE(d21 >= d20);
+  }
+
+  // MonoDelta operator-(const MonoDelta& lhs, const MonoDelta& rhs);
+  {
+    {
+      MonoDelta d0 = MonoDelta::FromNanoseconds(0);
+      MonoDelta d1 = MonoDelta::FromNanoseconds(1);
+      MonoDelta d01 = d0 - d1;
+      MonoDelta d10 = d1 - d0;
+      EXPECT_EQ(d1, d10);
+      EXPECT_EQ(MonoDelta::FromNanoseconds(-1), d01);
+      EXPECT_EQ(MonoDelta::FromNanoseconds(1), d10);
+      EXPECT_GT(d0, d01);
+      EXPECT_GT(d10, d0);
+      EXPECT_EQ(d1, d10);
+    }
+
+    {
+      MonoDelta d0 = MonoDelta::FromNanoseconds(2);
+      MonoDelta d1 = MonoDelta::FromNanoseconds(2);
+      MonoDelta d01 = d0 - d1;
+      MonoDelta d10 = d1 - d0;
+      EXPECT_EQ(d01, d10);
+      EXPECT_EQ(MonoDelta::FromNanoseconds(0), d01);
+    }
+
+    {
+      MonoDelta d0 = MonoDelta::FromNanoseconds(3);
+      MonoDelta d1 = MonoDelta::FromNanoseconds(-3);
+      MonoDelta d01 = d0 - d1;
+      MonoDelta d10 = d1 - d0;
+      EXPECT_EQ(MonoDelta::FromNanoseconds(6), d01);
+      EXPECT_EQ(MonoDelta::FromNanoseconds(-6), d10);
+    }
+  }
+
+  // MonoDelta operator+(const MonoDelta& lhs, const MonoDelta& rhs);
+  {
+    {
+      MonoDelta d0 = MonoDelta::FromNanoseconds(0);
+      MonoDelta d1 = MonoDelta::FromNanoseconds(1);
+      MonoDelta d01 = d0 + d1;
+      MonoDelta d10 = d1 + d0;
+      EXPECT_EQ(d01, d10);
+      EXPECT_EQ(MonoDelta::FromNanoseconds(1), d01);
+    }
+
+    {
+      MonoDelta d0 = MonoDelta::FromNanoseconds(3);
+      MonoDelta d1 = MonoDelta::FromNanoseconds(-3);
+      MonoDelta d01 = d0 + d1;
+      MonoDelta d10 = d1 + d0;
+      EXPECT_EQ(d01, d10);
+      EXPECT_EQ(MonoDelta::FromNanoseconds(0), d01);
+    }
   }
 
   // bool operator==(const MonoTime& lhs, const MonoTime& rhs);

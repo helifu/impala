@@ -18,10 +18,9 @@
 #ifndef IMPALA_EXPRS_KUDU_PARTITION_EXPR_H_
 #define IMPALA_EXPRS_KUDU_PARTITION_EXPR_H_
 
-#include <kudu/client/client.h>
-#include <kudu/common/partial_row.h>
-
 #include "exprs/scalar-expr.h"
+
+#include <kudu/client/client.h>
 
 namespace impala {
 
@@ -40,26 +39,49 @@ class KuduPartitionExpr : public ScalarExpr {
 
   KuduPartitionExpr(const TExprNode& node);
 
-  virtual Status Init(const RowDescriptor& row_desc, bool is_entry_point,
-      RuntimeState* state) override WARN_UNUSED_RESULT;
+  bool HasFnCtx() const override { return true; }
 
-  virtual IntVal GetIntValInterpreted(
+  Status Init(
+      const RowDescriptor& row_desc, bool is_entry_point, FragmentState* state) override;
+
+  Status OpenEvaluator(FunctionContext::FunctionStateScope scope, RuntimeState* state,
+      ScalarExprEvaluator* eval) const override;
+
+  void CloseEvaluator(FunctionContext::FunctionStateScope scope, RuntimeState* state,
+      ScalarExprEvaluator* eval) const override;
+
+  IntVal GetIntValInterpreted(
       ScalarExprEvaluator* eval, const TupleRow* row) const override;
 
-  virtual Status GetCodegendComputeFnImpl(LlvmCodeGen* codegen, llvm::Function** fn)
-      override WARN_UNUSED_RESULT;
+  virtual Status GetCodegendComputeFnImpl(
+      LlvmCodeGen* codegen, llvm::Function** fn) override;
 
  private:
   TKuduPartitionExpr tkudu_partition_expr_;
 
+  /// Pointer to the Kudu client, shared among ExecEnv and other actors which hold the
+  /// pointer.
+  kudu::client::sp::shared_ptr<kudu::client::KuduClient> client_;
+
   /// Descriptor of the table to use the partiitoning scheme from. Set in Prepare().
   KuduTableDescriptor* table_desc_;
 
-  /// Used to call into Kudu to determine partitions. Set in Prepare().
-  std::unique_ptr<kudu::client::KuduPartitioner> partitioner_;
+  /// Kudu table object, used to construct per-thread partitioner. Thread-safe.
+  kudu::client::sp::shared_ptr<kudu::client::KuduTable> table_;
 
-  /// Stores the col values for each row that is partitioned.
-  std::unique_ptr<kudu::KuduPartialRow> row_;
+  /// Per-thread context for KuduPartitionExpr.
+  struct KuduPartitionExprCtx {
+    /// Used to call into Kudu to determine partitions.
+    std::unique_ptr<kudu::client::KuduPartitioner> partitioner;
+
+    /// Stores the col values for each row that is partitioned.
+    std::unique_ptr<kudu::KuduPartialRow> row;
+  };
+
+  /// Helper function used in codegen. Sets '*row' and '*partitioner' to the values stored
+  /// in the function context.
+  static void SetKuduPartialRowAndPartitioner(ScalarExprEvaluator* eval, int fn_ctx_idx,
+      kudu::KuduPartialRow** row, kudu::client::KuduPartitioner** partitioner);
 };
 
 } // namespace impala

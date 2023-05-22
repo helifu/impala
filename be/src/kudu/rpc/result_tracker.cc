@@ -375,7 +375,7 @@ void ResultTracker::FailAndRespondInternal(const RequestIdPB& request_id,
 
     // It is possible for this method to be called for an RPC that was never actually
     // tracked (though RecordCompletionAndRespond() can't). One such case is when a
-    // follower transaction fails on the TransactionManager, for some reason, before it
+    // follower op fails on the OpDriver, for some reason, before it
     // was tracked. The CompletionCallback still calls this method. In this case, do
     // nothing.
     if (completion_record == nullptr) {
@@ -459,8 +459,8 @@ void ResultTracker::FailAndRespond(const RequestIdPB& request_id,
 
 void ResultTracker::StartGCThread() {
   CHECK(!gc_thread_);
-  CHECK_OK(Thread::Create("server", "result-tracker", &ResultTracker::RunGCThread,
-                          this, &gc_thread_));
+  CHECK_OK(Thread::Create("server", "result-tracker",
+                          [this]() { this->RunGCThread(); }, &gc_thread_));
 }
 
 void ResultTracker::RunGCThread() {
@@ -556,8 +556,7 @@ void ResultTracker::ClientState::GCCompletionRecords(
 }
 
 string ResultTracker::ClientState::ToString() const {
-  auto since_last_heard =
-      MonoTime::Now().GetDeltaSince(last_heard_from);
+  auto since_last_heard = MonoTime::Now() - last_heard_from;
   string result = Substitute("Client State[Last heard from: $0s ago, "
                              "$1 CompletionRecords:",
                              since_last_heard.ToString(),

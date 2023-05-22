@@ -17,18 +17,28 @@
 
 package org.apache.impala.catalog.events;
 
+import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
+import org.apache.hadoop.hive.metastore.api.NotificationEvent;
+import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
 import org.apache.impala.catalog.CatalogException;
-import org.apache.impala.catalog.CatalogServiceCatalog;
+import org.apache.impala.common.Metrics;
+import org.apache.impala.service.CatalogOpExecutor;
 
 /**
  * A test MetastoreEventProcessor which executes in the same thread. Useful for testing
  * functionality of MetastoreEventsProcessor
  */
 public class SynchronousHMSEventProcessorForTests extends MetastoreEventsProcessor {
-  SynchronousHMSEventProcessorForTests(
-      CatalogServiceCatalog catalog, long startSyncFromId, long pollingFrequencyInSec)
-          throws CatalogException {
-    super(catalog, startSyncFromId, pollingFrequencyInSec);
+
+  public SynchronousHMSEventProcessorForTests(
+      CatalogOpExecutor catalogOpExecutor, long startSyncFromId,
+      long pollingFrequencyInSec) throws CatalogException {
+    super(catalogOpExecutor, startSyncFromId, pollingFrequencyInSec);
+  }
+
+  @Override
+  public Metrics getMetrics() {
+    return super.getMetrics();
   }
 
   @Override

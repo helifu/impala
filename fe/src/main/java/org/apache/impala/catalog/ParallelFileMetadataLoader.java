@@ -16,23 +16,35 @@
 // under the License.
 package org.apache.impala.catalog;
 
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Maps;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
+import javax.annotation.Nullable;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.common.ValidTxnList;
+import org.apache.hadoop.hive.common.ValidWriteIdList;
+import org.apache.impala.catalog.HdfsPartition.Builder;
+import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.iceberg.GroupedContentFiles;
 import org.apache.impala.common.FileSystemUtil;
+import org.apache.impala.common.Pair;
 import org.apache.impala.service.BackendConfig;
+import org.apache.impala.thrift.TNetworkAddress;
+import org.apache.impala.util.ListMap;
 import org.apache.impala.util.ThreadNameAnnotator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.MoreExecutors;
 
 
@@ -57,24 +69,95 @@ public class ParallelFileMetadataLoader {
   private static final int MAX_PATH_METADATA_LOADING_ERRORS_TO_LOG = 100;
 
   private final String logPrefix_;
-  private List<FileMetadataLoader> loaders_;
+  private final Map<Path, FileMetadataLoader> loaders_;
+  private final Map<Path, List<HdfsPartition.Builder>> partsByPath_;
   private final FileSystem fs_;
 
-  /**
-   * @param logPrefix informational prefix for log messages
-   * @param fs the filesystem to load from (used to determine appropriate parallelism)
-   * @param loaders the metadata loaders to execute in parallel.
-   */
-  public ParallelFileMetadataLoader(String logPrefix, FileSystem fs,
-      Collection<FileMetadataLoader> loaders) {
-    logPrefix_ = logPrefix;
-    loaders_ = ImmutableList.copyOf(loaders);
+  public ParallelFileMetadataLoader(FileSystem fs,
+      Collection<Builder> partBuilders,
+      ValidWriteIdList writeIdList, ValidTxnList validTxnList, boolean isRecursive,
+      @Nullable ListMap<TNetworkAddress> hostIndex, String debugAction,
+      String logPrefix) {
+    this(fs, partBuilders, writeIdList, validTxnList, isRecursive, hostIndex, debugAction,
+        logPrefix, new GroupedContentFiles(), false);
+  }
 
-    // TODO(todd) in actuality, different partitions could be on different file systems.
-    // We probably should create one pool per filesystem type, and size each of those
-    // pools based on that particular filesystem, so if there's a mixed S3+HDFS table
-    // we do the right thing.
-    fs_ = fs;
+  public ParallelFileMetadataLoader(FileSystem fs,
+      Collection<Builder> partBuilders,
+      ValidWriteIdList writeIdList, ValidTxnList validTxnList, boolean isRecursive,
+      @Nullable ListMap<TNetworkAddress> hostIndex, String debugAction, String logPrefix,
+      GroupedContentFiles icebergFiles, boolean canDataBeOutsideOfTableLocation) {
+    if (writeIdList != null || validTxnList != null) {
+      // make sure that both either both writeIdList and validTxnList are set or both
+      // of them are not.
+      Preconditions.checkState(writeIdList != null && validTxnList != null);
+    }
+    // Group the partitions by their path (multiple partitions may point to the same
+    // path).
+    partsByPath_ = Maps.newHashMap();
+    for (HdfsPartition.Builder p : partBuilders) {
+      Path partPath = FileSystemUtil.createFullyQualifiedPath(new Path(p.getLocation()));
+      partsByPath_.computeIfAbsent(partPath, (path) -> new ArrayList<>())
+          .add(p);
+    }
+    // Create a FileMetadataLoader for each path.
+    loaders_ = Maps.newHashMap();
+    for (Map.Entry<Path, List<HdfsPartition.Builder>> e : partsByPath_.entrySet()) {
+      List<FileDescriptor> oldFds = e.getValue().get(0).getFileDescriptors();
+      FileMetadataLoader loader;
+      HdfsFileFormat format = e.getValue().get(0).getFileFormat();
+      if (format.equals(HdfsFileFormat.ICEBERG)) {
+        loader = new IcebergFileMetadataLoader(e.getKey(), isRecursive, oldFds, hostIndex,
+            validTxnList, writeIdList, Preconditions.checkNotNull(icebergFiles),
+            canDataBeOutsideOfTableLocation);
+      } else {
+        loader = new FileMetadataLoader(e.getKey(), isRecursive, oldFds, hostIndex,
+            validTxnList, writeIdList, format);
+      }
+      // If there is a cached partition mapped to this path, we recompute the block
+      // locations even if the underlying files have not changed.
+      // This is done to keep the cached block metadata up to date.
+      boolean hasCachedPartition = Iterables.any(e.getValue(),
+          HdfsPartition.Builder::isMarkedCached);
+      loader.setForceRefreshBlockLocations(hasCachedPartition);
+      loader.setDebugAction(debugAction);
+      loaders_.put(e.getKey(), loader);
+    }
+    this.logPrefix_ = logPrefix;
+    this.fs_ = fs;
+  }
+
+  /**
+   * Loads the file metadata for the given list of Partitions in the constructor. If the
+   * load is successful also set the fileDescriptors in the HdfsPartition.Builders.
+   * @throws TableLoadingException
+   */
+  void load() throws TableLoadingException {
+    loadInternal();
+
+    // Store the loaded FDs into the partitions.
+    for (Map.Entry<Path, List<HdfsPartition.Builder>> e : partsByPath_.entrySet()) {
+      Path p = e.getKey();
+      FileMetadataLoader loader = loaders_.get(p);
+
+      for (HdfsPartition.Builder partBuilder : e.getValue()) {
+        // Checks if we can reuse the old file descriptors. Partition builders in the list
+        // may have different old file descriptors. We need to verify them one by one.
+        if ((!loader.hasFilesChangedCompareTo(partBuilder.getFileDescriptors()))) {
+          LOG.trace("Detected files unchanged on partition {}",
+              partBuilder.getPartitionName());
+          continue;
+        }
+        partBuilder.clearFileDescriptors();
+        List<FileDescriptor> deleteDescriptors = loader.getLoadedDeleteDeltaFds();
+        if (deleteDescriptors != null && !deleteDescriptors.isEmpty()) {
+          partBuilder.setInsertFileDescriptors(loader.getLoadedInsertDeltaFds());
+          partBuilder.setDeleteFileDescriptors(loader.getLoadedDeleteDeltaFds());
+        } else {
+          partBuilder.setFileDescriptors(loader.getLoadedFds());
+        }
+      }
+    }
   }
 
   /**
@@ -82,25 +165,27 @@ public class ParallelFileMetadataLoader {
    * an exception. However, any successful loaders are guaranteed to complete
    * before any exception is thrown.
    */
-  void load() throws TableLoadingException {
+  private void loadInternal() throws TableLoadingException {
     if (loaders_.isEmpty()) return;
 
     int failedLoadTasks = 0;
     ExecutorService pool = createPool();
     try (ThreadNameAnnotator tna = new ThreadNameAnnotator(logPrefix_)) {
-      List<Future<Void>> futures = new ArrayList<>(loaders_.size());
-      for (FileMetadataLoader loader : loaders_) {
-        futures.add(pool.submit(() -> { loader.load(); return null; }));
+      List<Pair<FileMetadataLoader, Future<Void>>> futures =
+          new ArrayList<>(loaders_.size());
+      for (FileMetadataLoader loader : loaders_.values()) {
+        futures.add(new Pair<>(
+            loader, pool.submit(() -> { loader.load(); return null; })));
       }
 
       // Wait for the loaders to finish.
       for (int i = 0; i < futures.size(); i++) {
         try {
-          futures.get(i).get();
+          futures.get(i).second.get();
         } catch (ExecutionException | InterruptedException e) {
           if (++failedLoadTasks <= MAX_PATH_METADATA_LOADING_ERRORS_TO_LOG) {
             LOG.error(logPrefix_ + " encountered an error loading data for path " +
-                loaders_.get(i).getPartDir(), e);
+                futures.get(i).first.getPartDir(), e);
           }
         }
       }
@@ -139,7 +224,7 @@ public class ParallelFileMetadataLoader {
     poolSize = Math.min(numLoaders, poolSize);
 
     if (poolSize == 1) {
-      return MoreExecutors.sameThreadExecutor();
+      return MoreExecutors.newDirectExecutorService();
     } else {
       LOG.info(logPrefix_ + " using a thread pool of size {}", poolSize);
       return Executors.newFixedThreadPool(poolSize);

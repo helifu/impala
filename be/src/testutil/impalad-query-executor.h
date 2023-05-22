@@ -22,7 +22,6 @@
 #include <string>
 #include <vector>
 #include <boost/scoped_ptr.hpp>
-#include <boost/thread/thread.hpp>
 
 #include "rpc/thrift-client.h"
 #include "common/status.h"
@@ -102,7 +101,7 @@ class ImpaladQueryExecutor {
   std::vector<std::string> exec_options_;
 
   /// Beeswax query handle and result
-  beeswax::QueryHandle query_handle_;
+  beeswax::QueryHandle beeswax_handle_;
   beeswax::Results query_results_;
   beeswax::QueryExplanation query_explanation_;
 

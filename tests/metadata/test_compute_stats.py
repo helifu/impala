@@ -15,19 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 from subprocess import check_call
 
 from tests.common.environ import ImpalaTestClusterProperties
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon,
-    SkipIfLocal, SkipIfCatalogV2)
+from tests.common.skip import SkipIfFS, SkipIfLocal, SkipIfCatalogV2
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
 from CatalogObjects.ttypes import THdfsCompression
+
+import os
 
 
 IMPALA_TEST_CLUSTER_PROPERTIES = ImpalaTestClusterProperties.get_instance()
@@ -49,12 +52,12 @@ class TestComputeStats(ImpalaTestSuite):
         create_uncompressed_text_dimension(cls.get_workload()))
 
   @SkipIfLocal.hdfs_blocks
-  @SkipIfS3.eventually_consistent
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats(self, vector, unique_database):
     self.run_test_case('QueryTest/compute-stats', vector, unique_database)
 
   @SkipIfLocal.hdfs_blocks
-  @SkipIfS3.eventually_consistent
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats_avro(self, vector, unique_database, cluster_properties):
     if cluster_properties.is_catalog_v2_cluster():
       # IMPALA-7308: changed behaviour of various Avro edge cases significantly in the
@@ -65,29 +68,27 @@ class TestComputeStats(ImpalaTestSuite):
       self.run_test_case('QueryTest/compute-stats-avro', vector, unique_database)
 
   @SkipIfLocal.hdfs_blocks
-  @SkipIfS3.eventually_consistent
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats_decimal(self, vector, unique_database):
     # Test compute stats on decimal columns separately so we can vary between platforms
     # with and without write support for decimals (Hive < 0.11 and >= 0.11).
     self.run_test_case('QueryTest/compute-stats-decimal', vector, unique_database)
 
   @SkipIfLocal.hdfs_blocks
-  @SkipIfS3.eventually_consistent
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats_date(self, vector, unique_database):
     # Test compute stats on date columns separately.
     self.run_test_case('QueryTest/compute-stats-date', vector, unique_database)
 
-  @SkipIfS3.eventually_consistent
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats_incremental(self, vector, unique_database):
     self.run_test_case('QueryTest/compute-stats-incremental', vector, unique_database)
 
-  @SkipIfS3.eventually_consistent
   def test_compute_stats_complextype_warning(self, vector, unique_database):
     self.run_test_case('QueryTest/compute-stats-complextype-warning', vector,
         unique_database)
 
   @pytest.mark.execute_serially
-  @SkipIfS3.eventually_consistent
   def test_compute_stats_many_partitions(self, vector):
     # To cut down on test execution time, only run the compute stats test against many
     # partitions if performing an exhaustive test run.
@@ -95,7 +96,6 @@ class TestComputeStats(ImpalaTestSuite):
     self.run_test_case('QueryTest/compute-stats-many-partitions', vector)
 
   @pytest.mark.execute_serially
-  @SkipIfS3.eventually_consistent
   def test_compute_stats_keywords(self, vector):
     """IMPALA-1055: Tests compute stats with a db/table name that are keywords."""
     self.execute_query("drop database if exists `parquet` cascade")
@@ -107,7 +107,6 @@ class TestComputeStats(ImpalaTestSuite):
     finally:
       self.cleanup_db("parquet")
 
-  @SkipIfS3.eventually_consistent
   def test_compute_stats_compression_codec(self, vector, unique_database):
     """IMPALA-8254: Tests that running compute stats with compression_codec set
     should not throw an error."""
@@ -120,11 +119,7 @@ class TestComputeStats(ImpalaTestSuite):
                                           {"compression_codec": c})
         self.execute_query_expect_success(self.client, "drop stats {0}".format(table))
 
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_compute_stats_impala_2201(self, vector, unique_database):
     """IMPALA-2201: Tests that the results of compute incremental stats are properly
     persisted when the data was loaded from Hive with hive.stats.autogather=true.
@@ -170,7 +165,118 @@ class TestComputeStats(ImpalaTestSuite):
     assert(len(show_result.data) == 2)
     assert("1\tpval\t8" in show_result.data[0])
 
-  @SkipIfS3.eventually_consistent
+  @staticmethod
+  def create_load_test_corrupt_stats(self, unique_database, create_load_stmts,
+          table_name, partitions, files):
+    """A helper method for tests against the fix to IMPALA-9744."""
+    # Create and load the Hive table.
+    self.run_stmt_in_hive(create_load_stmts)
+
+    # Make the table visible in Impala.
+    self.execute_query("invalidate metadata %s.%s" % (unique_database, table_name))
+
+    # Formulate a simple query that scans the Hive table.
+    explain_stmt = """
+    explain select * from {0}.{1} where
+    int_col > (select 3*stddev(int_col) from {0}.{1})
+    """.format(unique_database, table_name)
+    explain_result = self.execute_query(explain_stmt)
+
+    # Formulate a template which verifies the number of partitions and the number
+    # of files are per spec.
+    hdfs_physical_properties_template \
+      = """HDFS partitions={0}/{0} files={1}""".format(partitions, files)
+
+    # Check that the template formulated above exists and row count of the table is
+    # not zero, for all scans.
+    for i in range(len(explain_result.data)):
+      if ("SCAN HDFS" in explain_result.data[i]):
+         assert(hdfs_physical_properties_template in explain_result.data[i + 1])
+         assert("cardinality=0" not in explain_result.data[i + 2])
+
+  @SkipIfFS.hive
+  def test_corrupted_stats_in_partitioned_hive_tables(self, vector, unique_database):
+    """IMPALA-9744: Tests that the partition stats corruption in Hive tables
+    (row count=0, partition size>0, persisted when the data was loaded with
+    hive.stats.autogather=true) is handled at the table scan level.
+    """
+    # Unless something drastic changes in Hive and/or Impala, this test should
+    # always succeed.
+    if self.exploration_strategy() != 'exhaustive': pytest.skip()
+
+    # Load from a local data file
+    local_file = os.path.join(os.environ['IMPALA_HOME'],
+                 "testdata/data/alltypes_tiny_pages.parquet")
+    table_name = "partitioned_table_with_corrupted_and_missing_stats"
+
+    # Setting hive.stats.autogather=true after CRTB DDL but before LOAD DML
+    # minimally reproduces the corrupt stats issue.
+    create_load_stmts = """
+      CREATE TABLE {0}.{1} (
+        id int COMMENT 'Add a comment',
+        bool_col boolean,
+        tinyint_col tinyint,
+        smallint_col smallint,
+        int_col int,
+        bigint_col bigint,
+        float_col float,
+        double_col double,
+        date_string_col string,
+        string_col string,
+        timestamp_col timestamp,
+        year int,
+        month int )
+        PARTITIONED BY (decade string)
+        STORED AS PARQUET;
+      set hive.stats.autogather=true;
+      load data local inpath '{2}' into table {0}.{1} partition (decade="corrupt-stats");
+      set hive.stats.autogather=false;
+      load data local inpath '{2}' into table {0}.{1} partition (decade="missing-stats");
+    """.format(unique_database, table_name, local_file)
+
+    self.create_load_test_corrupt_stats(self, unique_database, create_load_stmts,
+            table_name, 2, 2)
+
+  @SkipIfFS.hive
+  def test_corrupted_stats_in_unpartitioned_hive_tables(self, vector, unique_database):
+    """IMPALA-9744: Tests that the stats corruption in unpartitioned Hive
+    tables (row count=0, partition size>0, persisted when the data was loaded
+    with hive.stats.autogather=true) is handled at the table scan level.
+    """
+    # Unless something drastic changes in Hive and/or Impala, this test should
+    # always succeed.
+    if self.exploration_strategy() != 'exhaustive': pytest.skip()
+
+    # Load from a local data file
+    local_file = os.path.join(os.environ['IMPALA_HOME'],
+                 "testdata/data/alltypes_tiny_pages.parquet")
+    table_name = "nonpartitioned_table_with_corrupted_stats"
+
+    # Setting hive.stats.autogather=true prior to CRTB DDL minimally reproduces the
+    # corrupt stats issue.
+    create_load_stmts = """
+      set hive.stats.autogather=true;
+      CREATE TABLE {0}.{1} (
+        id int COMMENT 'Add a comment',
+        bool_col boolean,
+        tinyint_col tinyint,
+        smallint_col smallint,
+        int_col int,
+        bigint_col bigint,
+        float_col float,
+        double_col double,
+        date_string_col string,
+        string_col string,
+        timestamp_col timestamp,
+        year int,
+        month int)
+        STORED AS PARQUET;
+      load data local inpath '{2}' into table {0}.{1};
+    """.format(unique_database, table_name, local_file)
+
+    self.create_load_test_corrupt_stats(self, unique_database, create_load_stmts,
+            table_name, 1, 1)
+
   @SkipIfCatalogV2.stats_pulling_disabled()
   def test_pull_stats_profile(self, vector, unique_database):
     """Checks that the frontend profile includes metrics when computing
@@ -313,3 +419,20 @@ class TestIncompatibleColStats(ImpalaTestSuite):
     self.client.execute("compute stats %s" % table_name)
     result = self.client.execute("select s from %s" % table_name)
     assert len(result.data) == 10
+
+
+# Test column min/max stats currently enabled for Parquet tables.
+class TestParquetComputeColumnMinMax(ImpalaTestSuite):
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestParquetComputeColumnMinMax, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: v.get_value('table_format').file_format == 'parquet')
+
+  def test_compute_stats(self, vector, unique_database):
+    self.run_test_case('QueryTest/compute-stats-column-minmax', vector, unique_database)

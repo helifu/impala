@@ -20,6 +20,7 @@
 # It can be used by other tests (e.g. LdapImpylaHttpTest.java) that start a cluster with
 # an LDAP server to validate Impyla's functionality.
 
+from __future__ import absolute_import, division, print_function
 import argparse
 import logging
 
@@ -36,7 +37,8 @@ def run_query(query, args):
     auth_mechanism = 'LDAP'
   conn = impyla.connect(host=args.host, port=args.port, user=args.user,
                         password=args.password, auth_mechanism=auth_mechanism,
-                        use_http_transport=True, http_path=args.http_path)
+                        use_http_transport=True, http_path=args.http_path,
+                        http_cookie_names=args.http_cookie_names)
   cursor = conn.cursor()
   cursor.execute(query)
   result = cursor.fetchall()
@@ -51,6 +53,7 @@ def main():
   parser.add_argument("--http_path", default="")
   parser.add_argument("--user")
   parser.add_argument("--password")
+  parser.add_argument("--http_cookie_names", default=['impala.auth', 'impala.session.id'])
   parser.add_argument("--query", default="select 42")
   args = parser.parse_args()
   run_query(args.query, args)

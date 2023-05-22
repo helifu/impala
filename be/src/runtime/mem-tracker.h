@@ -15,34 +15,40 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_RUNTIME_MEM_TRACKER_H
-#define IMPALA_RUNTIME_MEM_TRACKER_H
-
-#include <stdint.h>
-#include <map>
+#include <cstdint>
+#include <functional>
+#include <list>
 #include <memory>
+#include <mutex>
+#include <ostream>
 #include <queue>
+#include <string>
+#include <utility>
 #include <vector>
-#include <boost/thread/mutex.hpp>
+
 #include <boost/unordered_map.hpp>
 
-#include "common/logging.h"
 #include "common/atomic.h"
+#include "common/compiler-util.h"
+#include "common/logging.h"
+#include "common/status.h"
 #include "runtime/mem-tracker-types.h"
-#include "util/debug-util.h"
-#include "util/internal-queue.h"
 #include "util/metrics-fwd.h"
 #include "util/runtime-profile-counters.h"
 #include "util/spinlock.h"
 
+#include "gen-cpp/StatestoreService.h" // for TPoolStats
 #include "gen-cpp/Types_types.h" // for TUniqueId
+#include <gtest/gtest_prod.h> // for FRIEND_TEST
 
 namespace impala {
 
+class MetricGroup;
 class ObjectPool;
 struct ReservationTrackerCounters;
-class TQueryOptions;
+class RuntimeState;
 
 /// A MemTracker tracks memory consumption; it contains an optional limit
 /// and can be arranged into a tree structure such that the consumption tracked
@@ -87,7 +93,8 @@ class MemTracker {
   /// included
   /// in LogUsage() output if consumption is 0.
   MemTracker(int64_t byte_limit = -1, const std::string& label = std::string(),
-      MemTracker* parent = nullptr, bool log_usage_if_zero = true);
+      MemTracker* parent = nullptr, bool log_usage_if_zero = true,
+      bool is_query_mem_tracker = false, const TUniqueId& query_id = TUniqueId());
 
   /// C'tor for tracker for which consumption counter is created as part of a profile.
   /// The counter is created with name COUNTER_NAME.
@@ -128,11 +135,9 @@ class MemTracker {
 
   /// Increases consumption of this tracker and its ancestors by 'bytes'.
   void Consume(int64_t bytes) {
+    DCHECK_GE(bytes, 0);
     DCHECK(!closed_) << label_;
-    if (bytes <= 0) {
-      if (bytes < 0) Release(-bytes);
-      return;
-    }
+    if (UNLIKELY(bytes <= 0)) return; // < 0 needed in RELEASE, hits DCHECK in DEBUG
 
     if (consumption_metric_ != nullptr) {
       RefreshConsumptionFromMetric();
@@ -146,25 +151,22 @@ class MemTracker {
     }
   }
 
-  /// Increases/Decreases the consumption of this tracker and the ancestors up to (but
+  /// Increases the consumption of this tracker and the ancestors up to (but
   /// not including) end_tracker. This is useful if we want to move tracking between
   /// trackers that share a common (i.e. end_tracker) ancestor. This happens when we want
   /// to update tracking on a particular mem tracker but the consumption against
   /// the limit recorded in one of its ancestors already happened.
   void ConsumeLocal(int64_t bytes, MemTracker* end_tracker) {
-    DCHECK(!closed_) << label_;
-    DCHECK(consumption_metric_ == nullptr) << "Should not be called on root.";
-    for (MemTracker* tracker : all_trackers_) {
-      if (tracker == end_tracker) return;
-      DCHECK(!tracker->has_limit());
-      DCHECK(!tracker->closed_) << tracker->label_;
-      tracker->consumption_->Add(bytes);
-    }
-    DCHECK(false) << "end_tracker is not an ancestor";
+    DCHECK_GE(bytes, 0);
+    if (UNLIKELY(bytes < 0)) return; // needed in RELEASE, hits DCHECK in DEBUG
+    ChangeConsumption(bytes, end_tracker);
   }
 
+  /// Same as above, but it decreases the consumption.
   void ReleaseLocal(int64_t bytes, MemTracker* end_tracker) {
-    ConsumeLocal(-bytes, end_tracker);
+    DCHECK_GE(bytes, 0);
+    if (UNLIKELY(bytes < 0)) return; // needed in RELEASE, hits DCHECK in DEBUG
+    ChangeConsumption(-bytes, end_tracker);
   }
 
   /// Increases consumption of this tracker and its ancestors by 'bytes' only if
@@ -175,9 +177,11 @@ class MemTracker {
   /// of success. Returns true if the consumption was successfully updated.
   WARN_UNUSED_RESULT
   bool TryConsume(int64_t bytes, MemLimit mode = MemLimit::HARD) {
+    DCHECK_GE(bytes, 0);
     DCHECK(!closed_) << label_;
+    if (UNLIKELY(bytes == 0)) return true;
+    if (UNLIKELY(bytes < 0)) return false; // needed in RELEASE, hits DCHECK in DEBUG
     if (consumption_metric_ != nullptr) RefreshConsumptionFromMetric();
-    if (UNLIKELY(bytes <= 0)) return true;
     int i;
     // Walk the tracker tree top-down.
     for (i = all_trackers_.size() - 1; i >= 0; --i) {
@@ -216,11 +220,9 @@ class MemTracker {
 
   /// Decreases consumption of this tracker and its ancestors by 'bytes'.
   void Release(int64_t bytes) {
+    DCHECK_GE(bytes, 0);
     DCHECK(!closed_) << label_;
-    if (bytes <= 0) {
-      if (bytes < 0) Consume(-bytes);
-      return;
-    }
+    if (UNLIKELY(bytes <= 0)) return; // < 0 needed in RELEASE, hits DCHECK in DEBUG
 
     if (consumption_metric_ != nullptr) {
       RefreshConsumptionFromMetric();
@@ -330,8 +332,8 @@ class MemTracker {
   /// for the process MemTracker.
   /// TODO: once all memory is accounted in ReservationTracker hierarchy, move
   /// reporting there.
-  std::string LogUsage(int max_recursive_depth,
-      const std::string& prefix = "", int64_t* logged_consumption = nullptr);
+  std::string LogUsage(int max_recursive_depth, const std::string& prefix = "",
+      int64_t* logged_consumption = nullptr);
   /// Dumping the process MemTracker is expensive. Limiting the recursive depth
   /// to two levels limits the level of detail to a one-line summary for each query
   /// MemTracker, avoiding all MemTrackers below that level. This provides a summary
@@ -344,6 +346,16 @@ class MemTracker {
   /// Logs the usage of 'limit' number of queries based on maximum total memory
   /// consumption.
   std::string LogTopNQueries(int limit);
+
+  /// Update the following data members in pool_stats for all queries tracked through
+  /// query memory trackers:
+  ///   heavy_memory_queries: the query Ids of top 'limit' queries in memory consumption
+  ///   (in descending order)
+  ///   min_memory_consumed: the minimal memory consumed among all queries
+  ///   max_memory_consumed: the maximal memory consumed among all queries
+  ///   total_memory_consumed: the total memory consumed by all queries
+  ///   num_running: the total number of all queries
+  void UpdatePoolStatsForQueries(int limit, TPoolStats& pool_stats);
 
   /// Log the memory usage when memory limit is exceeded and return a status object with
   /// details of the allocation which caused the limit to be exceeded.
@@ -400,16 +412,53 @@ class MemTracker {
   /// and populates 'min_pq' with 'limit' number of elements (that contain state related
   /// to query MemTrackers) based on maximum total memory consumption.
   void GetTopNQueries(
-      std::priority_queue<pair<int64_t, string>,
-          vector<pair<int64_t, string>>, std::greater<pair<int64_t, string>>>& min_pq,
+      std::priority_queue<pair<int64_t, string>, vector<pair<int64_t, string>>,
+          std::greater<pair<int64_t, string>>>& min_pq,
       int limit);
 
   /// If an ancestor of this tracker is a query MemTracker, return that tracker.
   /// Otherwise return NULL.
   MemTracker* GetQueryMemTracker();
 
+  /// Return the root ancestor of this tracker.
+  MemTracker* GetRootMemTracker();
+
+  /// Increases/Decreases the consumption of this tracker and the ancestors up to (but
+  /// not including) end_tracker.
+  void ChangeConsumption(int64_t bytes, MemTracker* end_tracker) {
+    DCHECK(!closed_) << label_;
+    DCHECK(consumption_metric_ == nullptr) << "Should not be called on root.";
+    for (MemTracker* tracker : all_trackers_) {
+      if (tracker == end_tracker) return;
+      DCHECK(!tracker->has_limit());
+      DCHECK(!tracker->closed_) << tracker->label_;
+      tracker->consumption_->Add(bytes);
+    }
+    DCHECK(false) << "end_tracker is not an ancestor";
+  }
+
+  /// Update the following fields in pool_stats.
+  ///   min_memory_consumed: take the min of min_memory_consumed and mem_consumed
+  ///   max_memory_consumed: take the max of max_memory_consumed and mem_consumed
+  ///   total_memory_consumed: increased by mem_consumed
+  ///   num_running++
+  void UpdatePoolStatsForMemoryConsumed(int64_t mem_consumed, TPoolStats& pool_stats);
+
+  /// Collect the top N queries into a priority queue, and computes the min, the max,
+  /// the total memory consumption, and the total number of all queries that are
+  /// all children query mem trackers. The top element in the queue is the
+  /// min-element such that the remaining elements after a sequence of pop operations
+  /// are the largest in memory consumptions. This method should only be called for
+  /// mem-trackers that are either query mem trackers or higher in the mem tracker
+  /// hierarchy.
+  typedef std::priority_queue<THeavyMemoryQuery, std::vector<THeavyMemoryQuery>,
+      std::greater<THeavyMemoryQuery>>
+      MinPriorityQueue;
+  void GetTopNQueriesAndUpdatePoolStats(
+      MinPriorityQueue& min_pq, int limit, TPoolStats& pool_stats);
+
   /// Lock to protect GcMemory(). This prevents many GCs from occurring at once.
-  boost::mutex gc_lock_;
+  std::mutex gc_lock_;
 
   /// True if this is a Query MemTracker returned from CreateQueryMemTracker().
   bool is_query_mem_tracker_ = false;
@@ -492,6 +541,10 @@ class MemTracker {
 
   /// Metric for limit_.
   IntGauge* limit_metric_;
+
+  friend class AdmissionControllerTest;
+  friend class MemTestTest_TopN_Test;
+  FRIEND_TEST(AdmissionControllerTest, TopNQueryCheck);
 };
 
 /// Global registry for query and pool MemTrackers. Owned by ExecEnv.
@@ -513,10 +566,57 @@ class PoolMemTrackerRegistry {
   /// from this map. Protected by 'pool_to_mem_trackers_lock_'
   typedef boost::unordered_map<std::string, std::unique_ptr<MemTracker>> PoolTrackersMap;
   PoolTrackersMap pool_to_mem_trackers_;
-  /// IMPALA-3068: Use SpinLock instead of boost::mutex so that the lock won't
+  /// IMPALA-3068: Use SpinLock instead of std::mutex so that the lock won't
   /// automatically destroy itself as part of process teardown, which could cause races.
   SpinLock pool_to_mem_trackers_lock_;
 };
-}
 
-#endif
+// An std::allocator that manipulates a MemTracker during allocation
+// and deallocation.
+// This is copied from src/kudu/util/mem_tracker.h
+template <typename T, typename Alloc = std::allocator<T>>
+class MemTrackerAllocator : public Alloc {
+ public:
+  typedef typename Alloc::pointer pointer;
+  typedef typename Alloc::const_pointer const_pointer;
+  typedef typename Alloc::size_type size_type;
+
+  explicit MemTrackerAllocator(std::shared_ptr<MemTracker> mem_tracker)
+    : mem_tracker_(std::move(mem_tracker)) {}
+
+  // This constructor is used for rebinding.
+  template <typename U>
+  MemTrackerAllocator(const MemTrackerAllocator<U>& allocator)
+    : Alloc(allocator), mem_tracker_(allocator.mem_tracker()) {}
+
+  ~MemTrackerAllocator() {}
+
+  pointer allocate(size_type n, const_pointer hint = 0) {
+    // Ideally we'd use TryConsume() here to enforce the tracker's limit.
+    // However, that means throwing bad_alloc if the limit is exceeded, and
+    // it's not clear that the rest of Kudu can handle that.
+    mem_tracker_->Consume(n * sizeof(T));
+    return Alloc::allocate(n, hint);
+  }
+
+  void deallocate(pointer p, size_type n) {
+    Alloc::deallocate(p, n);
+    mem_tracker_->Release(n * sizeof(T));
+  }
+
+  // This allows an allocator<T> to be used for a different type.
+  template <class U>
+  struct rebind {
+    typedef MemTrackerAllocator<U, typename Alloc::template rebind<U>::other> other;
+  };
+
+  const std::shared_ptr<MemTracker>& mem_tracker() const { return mem_tracker_; }
+
+ private:
+  std::shared_ptr<MemTracker> mem_tracker_;
+};
+
+typedef MemTrackerAllocator<char> CharMemTrackerAllocator;
+typedef std::basic_string<char, std::char_traits<char>, CharMemTrackerAllocator>
+    TrackedString;
+}

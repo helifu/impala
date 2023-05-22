@@ -17,6 +17,8 @@
 #
 # Tests for IMPALA-2273
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import os
 import pytest
 import random
@@ -24,7 +26,7 @@ import string
 import subprocess
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon
+from tests.common.skip import SkipIfFS
 
 class TestParquetMaxPageHeader(CustomClusterTestSuite):
   '''This tests large page headers in parquet files. Parquet page header size can
@@ -89,10 +91,10 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
     """Creates a file in HDFS containing two MAX_STRING_LENGTH lines."""
     file_name = os.path.join(dir, file)
     # Create two 10MB long strings.
-    random_text1 = "".join([random.choice(string.letters)
-        for i in xrange(self.MAX_STRING_LENGTH)])
-    random_text2 = "".join([random.choice(string.letters)
-        for i in xrange(self.MAX_STRING_LENGTH)])
+    random_text1 = "".join([random.choice(string.ascii_letters)
+        for i in range(self.MAX_STRING_LENGTH)])
+    random_text2 = "".join([random.choice(string.ascii_letters)
+        for i in range(self.MAX_STRING_LENGTH)])
     put = subprocess.Popen(["hdfs", "dfs", "-put", "-d", "-f", "-", file_name],
         stdin=subprocess.PIPE, bufsize=-1)
     put.stdin.write(random_text1 + "\n")
@@ -100,13 +102,13 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
     put.stdin.close()
     put.wait()
 
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("-max_page_header_size=31457280")
   def test_large_page_header_config(self, vector):
+    # IMPALA-9856: Since this test expect to read a row up to 10 MB in size, we
+    # explicitly set 11 MB MAX_ROW_SIZE here so that it can fit in BufferedPlanRootSink.
+    self.client.set_configuration_option("max_row_size", "11mb")
     result = self.client.execute("select length(max(col)) from {0}"\
         .format(self.PARQUET_TABLE_NAME))
     assert result.data == [str(self.MAX_STRING_LENGTH)]

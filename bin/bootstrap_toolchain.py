@@ -1,4 +1,4 @@
-#!/usr/bin/env impala-python
+#!/usr/bin/env python
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -23,29 +23,24 @@
 # has been sourced by verifying that IMPALA_HOME is set. This script will fail if an
 # expected environment variable is not present.
 #
+# To share a toolchain directory between multiple checkouts of Impala (or to use a
+# cached copy to avoid downloading a new one), it is best to override IMPALA_TOOLCHAIN
+# in bin/impala-config-local.sh or in the environment prior to sourcing
+# bin/impala-config.sh. This sets IMPALA_TOOLCHAIN_PACKAGES_HOME as well as
+# CDP_COMPONENTS_HOME.
+#
 # The following environment variables control the behavior of this script:
-# IMPALA_TOOLCHAIN - Directory in which to place the artifacts. It can be useful to
-#   override this to share a toolchain directory between multiple checkouts of Impala
-#   or to use a cached copy to avoid downloading a new one.
+# IMPALA_TOOLCHAIN_PACKAGES_HOME - Directory in which to place the native-toolchain
+#   packages.
 # IMPALA_TOOLCHAIN_HOST - The host to use for downloading the artifacts
-# CDH_COMPONENTS_HOME - Directory to store CDH Hadoop component artifacts
 # CDP_COMPONENTS_HOME - Directory to store CDP Hadoop component artifacts
-# CDH_BUILD_NUMBER - CDH Hadoop components are built with consistent versions so that
+# CDP_BUILD_NUMBER - CDP Hadoop components are built with consistent versions so that
 #   Hadoop, Hive, Kudu, etc are all built with versions that are compatible with each
 #   other. The way to specify a single consistent set of components is via a build
 #   number. This determines the location in s3 to get the artifacts.
-# CDP_BUILD_NUMBER - The CDP equivalent of a CDH_BUILD_NUMBER.
-# USE_CDP_HIVE - If false, this will use the CDH version of all Hadoop components
-#   (except Ranger, which is CDP only). If true, this will use the CDP version of all
-#   Hadoop components (except Sentry, which is CDH only).
 # DOWNLOAD_CDH_COMPONENTS - When set to true, this script will also download and extract
-#   the CDH/CDP Hadoop components (i.e. Hadoop, Hive, HBase, Sentry, Ranger, etc) into
-#   CDH_COMPONENTS_HOME/CDP_COMPONENTS_HOME as appropriate.
-# USE_CDH_KUDU - Kudu can be downloaded either from the toolchain or as a CDH component,
-#   depending on the value of USE_CDH_KUDU.
-# KUDU_IS_SUPPORTED - If KUDU_IS_SUPPORTED is false, Kudu is disabled and we download
-#   the toolchain Kudu and use the symbols to compile a non-functional stub library so
-#   that Impala has something to link against.
+#   the CDP Hadoop components (i.e. Hadoop, Hive, HBase, Ranger, Ozone, etc) into
+#   CDP_COMPONENTS_HOME as appropriate.
 # IMPALA_<PACKAGE>_VERSION - The version expected for <PACKAGE>. This is typically
 #   configured in bin/impala-config.sh and must exist for every package. This is used
 #   to construct an appropriate URL and expected archive name.
@@ -58,18 +53,15 @@
 #
 # The script is directly executable, and it takes no parameters:
 #     ./bootstrap_toolchain.py
-# It should NOT be run via 'python bootstrap_toolchain.py', as it relies on a specific
-# python environment.
+
+from __future__ import absolute_import, division, print_function
 import logging
 import glob
 import multiprocessing.pool
 import os
+import platform
 import random
 import re
-# TODO: This file should be runnable without using impala-python, and system python
-# does not have 'sh' available. Rework code to avoid importing sh (and anything else
-# that gets in the way).
-import sh
 import shutil
 import subprocess
 import sys
@@ -80,51 +72,72 @@ from collections import namedtuple
 from string import Template
 
 # Maps return values from 'lsb_release -irs' to the corresponding OS labels for both the
-# toolchain and the CDH components.
+# toolchain and the CDP components.
 OsMapping = namedtuple('OsMapping', ['lsb_release', 'toolchain', 'cdh'])
 OS_MAPPING = [
   OsMapping("centos5", "ec2-package-centos-5", None),
   OsMapping("centos6", "ec2-package-centos-6", "redhat6"),
   OsMapping("centos7", "ec2-package-centos-7", "redhat7"),
+  OsMapping("centos8", "ec2-package-centos-8", "redhat8"),
+  OsMapping("rocky8", "ec2-package-centos-8", "redhat8"),
+  OsMapping("almalinux8", "ec2-package-centos-8", "redhat8"),
   OsMapping("redhatenterpriseserver5", "ec2-package-centos-5", None),
   OsMapping("redhatenterpriseserver6", "ec2-package-centos-6", "redhat6"),
   OsMapping("redhatenterpriseserver7", "ec2-package-centos-7", "redhat7"),
+  OsMapping("redhatenterprise8", "ec2-package-centos-8", "redhat8"),
+  OsMapping("redhatenterpriseserver8", "ec2-package-centos-8", "redhat8"),
   OsMapping("debian6", "ec2-package-debian-6", None),
   OsMapping("debian7", "ec2-package-debian-7", None),
   OsMapping("debian8", "ec2-package-debian-8", "debian8"),
   OsMapping("suselinux11", "ec2-package-sles-11", None),
   OsMapping("suselinux12", "ec2-package-sles-12", "sles12"),
-  OsMapping("suse12.2", "ec2-package-sles-12", "sles12"),
-  OsMapping("suse12.3", "ec2-package-sles-12", "sles12"),
+  OsMapping("suse12", "ec2-package-sles-12", "sles12"),
+  OsMapping("suselinux15", "ec2-package-sles-15", "sles15"),
+  OsMapping("suse15", "ec2-package-sles-15", "sles15"),
   OsMapping("ubuntu12.04", "ec2-package-ubuntu-12-04", None),
   OsMapping("ubuntu14.04", "ec2-package-ubuntu-14-04", None),
   OsMapping("ubuntu15.04", "ec2-package-ubuntu-14-04", None),
   OsMapping("ubuntu15.10", "ec2-package-ubuntu-14-04", None),
   OsMapping('ubuntu16.04', "ec2-package-ubuntu-16-04", "ubuntu1604"),
-  OsMapping('ubuntu18.04', "ec2-package-ubuntu-18-04", "ubuntu1804")
+  OsMapping('ubuntu18.04', "ec2-package-ubuntu-18-04", "ubuntu1804"),
+  OsMapping('ubuntu20.04', "ec2-package-ubuntu-20-04", "ubuntu2004")
 ]
+
+
+def get_toolchain_compiler():
+  """Return the <name>-<version> string for the compiler package to use for the
+  toolchain."""
+  # Currently we always use GCC.
+  return "gcc-{0}".format(os.environ["IMPALA_GCC_VERSION"])
 
 
 def wget_and_unpack_package(download_path, file_name, destination, wget_no_clobber):
   if not download_path.endswith("/" + file_name):
     raise Exception("URL {0} does not match with expected file_name {1}"
         .format(download_path, file_name))
+  if "closer.cgi" in download_path:
+    download_path += "?action=download"
   NUM_ATTEMPTS = 3
   for attempt in range(1, NUM_ATTEMPTS + 1):
     logging.info("Downloading {0} to {1}/{2} (attempt {3})".format(
       download_path, destination, file_name, attempt))
     # --no-clobber avoids downloading the file if a file with the name already exists
     try:
-      sh.wget(download_path, directory_prefix=destination, no_clobber=wget_no_clobber)
+      cmd = ["wget", "-q", download_path,
+             "--output-document={0}/{1}".format(destination, file_name)]
+      if wget_no_clobber:
+        cmd.append("--no-clobber")
+      subprocess.check_call(cmd)
       break
-    except Exception, e:
+    except subprocess.CalledProcessError as e:
       if attempt == NUM_ATTEMPTS:
         raise
       logging.error("Download failed; retrying after sleep: " + str(e))
       time.sleep(10 + random.random() * 5)  # Sleep between 10 and 15 seconds.
   logging.info("Extracting {0}".format(file_name))
-  sh.tar(z=True, x=True, f=os.path.join(destination, file_name), directory=destination)
-  sh.rm(os.path.join(destination, file_name))
+  subprocess.check_call(["tar", "xzf", os.path.join(destination, file_name),
+                         "--directory={0}".format(destination)])
+  os.unlink(os.path.join(destination, file_name))
 
 
 class DownloadUnpackTarball(object):
@@ -167,7 +180,8 @@ class DownloadUnpackTarball(object):
       # Clean up any partially-unpacked result.
       if os.path.isdir(unpack_dir):
         shutil.rmtree(unpack_dir)
-      if os.path.isdir(download_dir):
+      # Only delete the download directory if it is a temporary directory
+      if download_dir != self.destination_basedir and os.path.isdir(download_dir):
         shutil.rmtree(download_dir)
       raise
     if self.makedir:
@@ -191,10 +205,11 @@ class TemplatedDownloadUnpackTarball(DownloadUnpackTarball):
 class EnvVersionedPackage(TemplatedDownloadUnpackTarball):
   def __init__(self, name, url_prefix_tmpl, destination_basedir, explicit_version=None,
                archive_basename_tmpl=None, unpack_directory_tmpl=None, makedir=False,
-               template_subs_in={}):
+               template_subs_in={}, target_comp=None):
     template_subs = template_subs_in
     template_subs["name"] = name
-    template_subs["version"] = self.__compute_version(name, explicit_version)
+    template_subs["version"] = self.__compute_version(name, explicit_version,
+        target_comp)
     # The common case is that X.tar.gz unpacks to X directory. archive_basename_tmpl
     # allows overriding the value of X (which defaults to ${name}-${version}).
     # If X.tar.gz unpacks to Y directory, then unpack_directory_tmpl allows overriding Y.
@@ -203,17 +218,19 @@ class EnvVersionedPackage(TemplatedDownloadUnpackTarball):
     archive_name_tmpl = archive_basename_tmpl + ".tar.gz"
     if unpack_directory_tmpl is None:
       unpack_directory_tmpl = archive_basename_tmpl
-    url_tmpl = self.__compute_url(name, archive_name_tmpl, url_prefix_tmpl)
+    url_tmpl = self.__compute_url(name, archive_name_tmpl, url_prefix_tmpl, target_comp)
     super(EnvVersionedPackage, self).__init__(url_tmpl, archive_name_tmpl,
         destination_basedir, unpack_directory_tmpl, makedir, template_subs)
 
-  def __compute_version(self, name, explicit_version):
+  def __compute_version(self, name, explicit_version, target_comp=None):
     if explicit_version is not None:
       return explicit_version
     else:
       # When getting the version from the environment, we need to standardize the name
       # to match expected environment variables.
       std_env_name = name.replace("-", "_").upper()
+      if target_comp:
+        std_env_name += '_' + target_comp.upper()
       version_env_var = "IMPALA_{0}_VERSION".format(std_env_name)
       env_version = os.environ.get(version_env_var)
       if not env_version:
@@ -221,10 +238,12 @@ class EnvVersionedPackage(TemplatedDownloadUnpackTarball):
           name, version_env_var))
       return env_version
 
-  def __compute_url(self, name, archive_name_tmpl, url_prefix_tmpl):
+  def __compute_url(self, name, archive_name_tmpl, url_prefix_tmpl, target_comp=None):
     # The URL defined in the environment (IMPALA_*_URL) takes precedence. If that is
     # not defined, use the standard URL (url_prefix + archive_name)
     std_env_name = name.replace("-", "_").upper()
+    if target_comp:
+      std_env_name += '_' + target_comp.upper()
     url_env_var = "IMPALA_{0}_URL".format(std_env_name)
     url_tmpl = os.environ.get(url_env_var)
     if not url_tmpl:
@@ -234,12 +253,17 @@ class EnvVersionedPackage(TemplatedDownloadUnpackTarball):
 
 class ToolchainPackage(EnvVersionedPackage):
   def __init__(self, name, explicit_version=None, platform_release=None):
-    toolchain_root = os.environ.get("IMPALA_TOOLCHAIN")
-    if not toolchain_root:
+    toolchain_packages_home = os.environ.get("IMPALA_TOOLCHAIN_PACKAGES_HOME")
+    if not toolchain_packages_home:
       logging.error("Impala environment not set up correctly, make sure "
-          "$IMPALA_TOOLCHAIN is set.")
+          "$IMPALA_TOOLCHAIN_PACKAGES_HOME is set.")
       sys.exit(1)
-    compiler = "gcc-{0}".format(os.environ["IMPALA_GCC_VERSION"])
+    target_comp = None
+    if ":" in name:
+      parts = name.split(':')
+      name = parts[0]
+      target_comp = parts[1]
+    compiler = get_toolchain_compiler()
     label = get_platform_release_label(release=platform_release).toolchain
     toolchain_build_id = os.environ["IMPALA_TOOLCHAIN_BUILD_ID"]
     toolchain_host = os.environ["IMPALA_TOOLCHAIN_HOST"]
@@ -250,11 +274,13 @@ class ToolchainPackage(EnvVersionedPackage):
     url_prefix_tmpl = "https://${toolchain_host}/build/${toolchain_build_id}/" + \
         "${name}/${version}-${compiler}/"
     unpack_directory_tmpl = "${name}-${version}"
-    super(ToolchainPackage, self).__init__(name, url_prefix_tmpl, toolchain_root,
+    super(ToolchainPackage, self).__init__(name, url_prefix_tmpl,
+                                           toolchain_packages_home,
                                            explicit_version=explicit_version,
                                            archive_basename_tmpl=archive_basename_tmpl,
                                            unpack_directory_tmpl=unpack_directory_tmpl,
-                                           template_subs_in=template_subs)
+                                           template_subs_in=template_subs,
+                                           target_comp=target_comp)
 
   def needs_download(self):
     # If the directory doesn't exist, we need the download
@@ -279,32 +305,10 @@ class ToolchainPackage(EnvVersionedPackage):
       f.write(self.archive_basename)
 
 
-class CdhComponent(EnvVersionedPackage):
-  def __init__(self, name, explicit_version=None, archive_basename_tmpl=None,
-               unpack_directory_tmpl=None):
-    # Compute the CDH base URL (based on the IMPALA_TOOLCHAIN_HOST and CDH_BUILD_NUMBER)
-    if "IMPALA_TOOLCHAIN_HOST" not in os.environ or "CDH_BUILD_NUMBER" not in os.environ:
-      logging.error("Impala environment not set up correctly, make sure "
-                    "impala-config.sh is sourced.")
-      sys.exit(1)
-    template_subs = {"toolchain_host": os.environ["IMPALA_TOOLCHAIN_HOST"],
-                     "cdh_build_number": os.environ["CDH_BUILD_NUMBER"]}
-    url_prefix_tmpl = "https://${toolchain_host}/build/cdh_components/" + \
-        "${cdh_build_number}/tarballs/"
-
-    # Get the output base directory from CDH_COMPONENTS_HOME
-    destination_basedir = os.environ["CDH_COMPONENTS_HOME"]
-    super(CdhComponent, self).__init__(name, url_prefix_tmpl, destination_basedir,
-                                       explicit_version=explicit_version,
-                                       archive_basename_tmpl=archive_basename_tmpl,
-                                       unpack_directory_tmpl=unpack_directory_tmpl,
-                                       template_subs_in=template_subs)
-
-
 class CdpComponent(EnvVersionedPackage):
   def __init__(self, name, explicit_version=None, archive_basename_tmpl=None,
                unpack_directory_tmpl=None, makedir=False):
-    # Compute the CDH base URL (based on the IMPALA_TOOLCHAIN_HOST and CDP_BUILD_NUMBER)
+    # Compute the CDP base URL (based on the IMPALA_TOOLCHAIN_HOST and CDP_BUILD_NUMBER)
     if "IMPALA_TOOLCHAIN_HOST" not in os.environ or "CDP_BUILD_NUMBER" not in os.environ:
       logging.error("Impala environment not set up correctly, make sure "
                     "impala-config.sh is sourced.")
@@ -323,6 +327,29 @@ class CdpComponent(EnvVersionedPackage):
                                        makedir=makedir, template_subs_in=template_subs)
 
 
+class ApacheComponent(EnvVersionedPackage):
+  def __init__(self, name, explicit_version=None, archive_basename_tmpl=None,
+               unpack_directory_tmpl=None, makedir=False, component_path_tmpl=None):
+    # Compute the apache base URL (based on the APACHE_MIRROR)
+    if "APACHE_COMPONENTS_HOME" not in os.environ:
+      logging.error("Impala environment not set up correctly, make sure "
+                    "impala-config.sh is sourced.")
+      sys.exit(1)
+    template_subs = {"apache_mirror": os.environ["APACHE_MIRROR"]}
+    # Different components have different sub-paths. For example, hive is hive/hive-xxx,
+    # hadoop is hadoop/common/hadoop-xxx. The default is hive format.
+    if component_path_tmpl is None:
+      component_path_tmpl = "${name}/${name}-${version}/"
+    url_prefix_tmpl = "${apache_mirror}/" + component_path_tmpl
+
+    # Get the output base directory from APACHE_COMPONENTS_HOME
+    destination_basedir = os.environ["APACHE_COMPONENTS_HOME"]
+    super(ApacheComponent, self).__init__(name, url_prefix_tmpl, destination_basedir,
+                                       explicit_version=explicit_version,
+                                       archive_basename_tmpl=archive_basename_tmpl,
+                                       unpack_directory_tmpl=unpack_directory_tmpl,
+                                       makedir=makedir, template_subs_in=template_subs)
+
 class ToolchainKudu(ToolchainPackage):
   def __init__(self, platform_label=None):
     super(ToolchainKudu, self).__init__('kudu', platform_release=platform_label)
@@ -337,49 +364,6 @@ class ToolchainKudu(ToolchainPackage):
     if not os.path.exists(os.path.join(self.pkg_directory(), "debug")):
       return True
     # Both the pkg_directory and the debug directory exist
-    return False
-
-
-class CdhKudu(CdhComponent):
-  def __init__(self, platform_label):
-    kudu_archive_tmpl = "kudu-${version}-" + platform_label
-    # IMPALA_KUDU_URL can contain '%(platform_label)', which needs to be replaced
-    # with the platform. We override this in os.environ so that it is picked up
-    # in EnvVersionedPackage.
-    kudu_url = os.environ.get("IMPALA_KUDU_URL")
-    if kudu_url:
-       kudu_url = kudu_url.replace("%(platform_label)", platform_label)
-       os.environ["IMPALA_KUDU_URL"] = kudu_url
-    super(CdhKudu, self).__init__('kudu',
-                                  archive_basename_tmpl=kudu_archive_tmpl,
-                                  unpack_directory_tmpl="kudu-${version}")
-
-  def needs_download(self):
-    # This verifies that the unpack directory exists
-    if super(CdhKudu, self).needs_download():
-      return True
-    # Additional check to distinguish this from the Kudu Java package
-    # Regardless of the actual build type, the 'kudu' tarball will always contain a
-    # 'debug' and a 'release' directory.
-    if not os.path.exists(os.path.join(self.pkg_directory(), "debug")):
-      return True
-    # Both the pkg_directory and the debug directory exist
-    return False
-
-
-class CdhKuduJava(CdhComponent):
-  def __init__(self):
-    super(CdhKuduJava, self).__init__('kudu-java',
-                                      archive_basename_tmpl="kudu-${version}")
-
-  def needs_download(self):
-    # This verify that the unpack directory exists
-    if super(CdhKuduJava, self).needs_download():
-      return True
-    # Additional check to distinguish this from the Kudu package
-    # There should be jars under the kudu directory.
-    if len(glob.glob("{0}/*jar".format(self.pkg_directory()))) == 0:
-      return True
     return False
 
 
@@ -407,34 +391,23 @@ def get_platform_release_label(release=None):
     if lsb_release_cache:
       release = lsb_release_cache
     else:
-      release = "".join(map(lambda x: x.lower(), sh.lsb_release("-irs").split()))
-      # Only need to check against the major release if RHEL or CentOS
-      for platform in ['centos', 'redhatenterpriseserver']:
-        if platform in release:
+      lsb_release = subprocess.check_output(
+          ["lsb_release", "-irs"], universal_newlines=True)
+      release = "".join([x.lower() for x in lsb_release.split()])
+      # Only need to check against the major release if RHEL, CentOS or Suse
+      for distro in ['centos', 'rocky', 'almalinux', 'redhatenterprise',
+                     'redhatenterpriseserver', 'suse']:
+        if distro in release:
           release = release.split('.')[0]
           break
       lsb_release_cache = release
   for mapping in OS_MAPPING:
     if re.search(mapping.lsb_release, release):
       return mapping
-
   raise Exception("Could not find package label for OS version: {0}.".format(release))
 
 
-def check_output(cmd_args):
-  """Run the command and return the output. Raise an exception if the command returns
-     a non-zero return code. Similar to subprocess.check_output() which is only provided
-     in python 2.7.
-  """
-  process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-  stdout, _ = process.communicate()
-  if process.wait() != 0:
-    raise Exception("Command with args '%s' failed with exit code %s:\n%s"
-        % (cmd_args, process.returncode, stdout))
-  return stdout
-
-
-def check_custom_toolchain(toolchain_root, packages):
+def check_custom_toolchain(toolchain_packages_home, packages):
   missing = []
   for p in packages:
     if not os.path.isdir(p.pkg_directory()):
@@ -449,114 +422,6 @@ def check_custom_toolchain(toolchain_root, packages):
     msg += "    https://github.com/cloudera/native-toolchain\n"
     logging.error(msg)
     raise Exception("Toolchain bootstrap failed: required packages were missing")
-
-
-def build_kudu_stub(kudu_dir, gcc_dir):
-  """When Kudu isn't supported, the CentOS 7 Kudu package is downloaded from the
-     toolchain. This replaces the client lib with a stubbed client. The
-     'kudu_dir' specifies the location of the unpacked CentOS 7 Kudu package.
-     The 'gcc_dir' specifies the location of the unpacked GCC/G++."""
-
-  print "Building kudu stub"
-  # Find the client lib files in the Kudu dir. There may be several files with
-  # various extensions. Also there will be a debug version.
-  client_lib_paths = []
-  for path, _, files in os.walk(kudu_dir):
-    for file in files:
-      if not file.startswith("libkudu_client.so"):
-        continue
-      file_path = os.path.join(path, file)
-      if os.path.islink(file_path):
-        continue
-      client_lib_paths.append(file_path)
-  if not client_lib_paths:
-    raise Exception("Unable to find Kudu client lib under '%s'" % kudu_dir)
-
-  # The client stub will be create by inspecting a real client and extracting the
-  # symbols. The choice of which client file to use shouldn't matter.
-  client_lib_path = client_lib_paths[0]
-
-  # Use a newer version of binutils because on older systems the default binutils may
-  # not be able to read the newer binary.
-  binutils_dir = ToolchainPackage("binutils").pkg_directory()
-  nm_path = os.path.join(binutils_dir, "bin", "nm")
-  objdump_path = os.path.join(binutils_dir, "bin", "objdump")
-
-  # Extract the symbols and write the stubbed client source. There is a special method
-  # kudu::client::GetShortVersionString() that is overridden so that the stub can be
-  # identified by the caller.
-  get_short_version_sig = "kudu::client::GetShortVersionString()"
-  nm_out = check_output([nm_path, "--defined-only", "-D", client_lib_path])
-  stub_build_dir = tempfile.mkdtemp()
-  stub_client_src_file = open(os.path.join(stub_build_dir, "kudu_client.cc"), "w")
-  try:
-    stub_client_src_file.write("""
-#include <string>
-
-static const std::string kFakeKuduVersion = "__IMPALA_KUDU_STUB__";
-
-static void KuduNotSupported() {
-    *((char*)0) = 0;
-}
-
-namespace kudu { namespace client {
-std::string GetShortVersionString() { return kFakeKuduVersion; }
-}}
-""")
-    found_start_version_symbol = False
-    cpp_filt_path = os.path.join(binutils_dir, "bin", "c++filt")
-    for line in nm_out.splitlines():
-      addr, sym_type, mangled_name = line.split(" ")
-      # Skip special functions an anything that isn't a strong symbol. Any symbols that
-      # get passed this check must be related to Kudu. If a symbol unrelated to Kudu
-      # (ex: a boost symbol) gets defined in the stub, there's a chance the symbol could
-      # get used and crash Impala.
-      if mangled_name in ["_init", "_fini"] or sym_type not in "Tt":
-        continue
-      demangled_name = check_output([cpp_filt_path, mangled_name]).strip()
-      assert "kudu" in demangled_name, \
-          "Symbol doesn't appear to be related to Kudu: " + demangled_name
-      if demangled_name == get_short_version_sig:
-        found_start_version_symbol = True
-        continue
-      stub_client_src_file.write("""
-extern "C" void %s() {
-  KuduNotSupported();
-}
-""" % mangled_name)
-
-    if not found_start_version_symbol:
-      raise Exception("Expected to find symbol a corresponding to"
-          " %s but it was not found." % get_short_version_sig)
-    stub_client_src_file.flush()
-
-    # The soname is needed to avoid problem in packaging builds. Without the soname,
-    # the library dependency as listed in the impalad binary will be a full path instead
-    # of a short name. Debian in particular has problems with packaging when that happens.
-    objdump_out = check_output([objdump_path, "-p", client_lib_path])
-    for line in objdump_out.splitlines():
-      if "SONAME" not in line:
-        continue
-      # The line that needs to be parsed should be something like:
-      # "  SONAME               libkudu_client.so.0"
-      so_name = line.split()[1]
-      break
-    else:
-      raise Exception("Unable to extract soname from %s" % client_lib_path)
-
-    # Compile the library.
-    stub_client_lib_path = os.path.join(stub_build_dir, "libkudu_client.so")
-    toolchain_root = os.environ.get("IMPALA_TOOLCHAIN")
-    gpp = os.path.join(
-        toolchain_root, "gcc-%s" % os.environ.get("IMPALA_GCC_VERSION"), "bin", "g++")
-    subprocess.check_call([gpp, stub_client_src_file.name, "-shared", "-fPIC",
-        "-Wl,-soname,%s" % so_name, "-o", stub_client_lib_path])
-
-    # Replace the real libs with the stub.
-    for client_lib_path in client_lib_paths:
-      shutil.copyfile(stub_client_lib_path, client_lib_path)
-  finally:
-    shutil.rmtree(stub_build_dir)
 
 
 def execute_many(f, args):
@@ -579,28 +444,47 @@ def create_directory_from_env_var(env_var):
     os.makedirs(dir_name)
 
 
+def get_unique_toolchain_downloads(packages):
+  toolchain_packages = [ToolchainPackage(p) for p in packages]
+  unique_pkg_directories = set()
+  unique_packages = []
+  for p in toolchain_packages:
+    if p.pkg_directory() not in unique_pkg_directories:
+      unique_packages.append(p)
+      unique_pkg_directories.add(p.pkg_directory())
+  return unique_packages
+
+
 def get_toolchain_downloads():
   toolchain_packages = []
   # The LLVM and GCC packages are the largest packages in the toolchain (Kudu is handled
   # separately). Sort them first so their downloads start as soon as possible.
   llvm_package = ToolchainPackage("llvm")
-  llvm_package_asserts = ToolchainPackage("llvm", explicit_version="5.0.1-asserts-p1")
+  llvm_package_asserts = ToolchainPackage(
+      "llvm", explicit_version=os.environ.get("IMPALA_LLVM_DEBUG_VERSION"))
   gcc_package = ToolchainPackage("gcc")
   toolchain_packages += [llvm_package, llvm_package_asserts, gcc_package]
-  toolchain_packages += map(ToolchainPackage,
-      ["avro", "binutils", "boost", "breakpad", "bzip2", "cctz", "cmake", "crcutil",
-       "flatbuffers", "gdb", "gflags", "glog", "gperftools", "gtest", "libev",
-       "libunwind", "lz4", "openldap", "openssl", "orc", "protobuf",
-       "rapidjson", "re2", "snappy", "thrift", "tpc-h", "tpc-ds", "zlib", "zstd"])
-  toolchain_packages += [ToolchainPackage("thrift",
-      explicit_version=os.environ.get("IMPALA_THRIFT11_VERSION"))]
+  toolchain_packages += [ToolchainPackage(p) for p in
+      ["avro", "binutils", "boost", "breakpad", "bzip2", "calloncehack", "cctz",
+       "cloudflarezlib", "cmake", "crcutil", "curl", "flatbuffers", "gdb", "gflags",
+       "glog", "gperftools", "gtest", "jwt-cpp", "libev", "libunwind", "lz4", "openldap",
+       "orc", "protobuf", "python", "rapidjson", "re2", "snappy", "tpc-h", "tpc-ds",
+       "zlib", "zstd"]]
+  python3_package = ToolchainPackage(
+      "python", explicit_version=os.environ.get("IMPALA_PYTHON3_VERSION"))
+  toolchain_packages += [python3_package]
+  toolchain_packages += get_unique_toolchain_downloads(
+      ["thrift:cpp", "thrift:java", "thrift:py"])
+  protobuf_package_clang = ToolchainPackage(
+      "protobuf", explicit_version=os.environ.get("IMPALA_PROTOBUF_CLANG_VERSION"))
+  toolchain_packages += [protobuf_package_clang]
   # Check whether this platform is supported (or whether a valid custom toolchain
   # has been provided).
   if not try_get_platform_release_label() \
      or not try_get_platform_release_label().toolchain:
-    toolchain_root = os.environ.get("IMPALA_TOOLCHAIN")
+    toolchain_packages_home = os.environ.get("IMPALA_TOOLCHAIN_PACKAGES_HOME")
     # This would throw an exception if the custom toolchain were not valid
-    check_custom_toolchain(toolchain_root, toolchain_packages)
+    check_custom_toolchain(toolchain_packages_home, toolchain_packages)
     # Nothing to download
     return []
   return toolchain_packages
@@ -608,89 +492,60 @@ def get_toolchain_downloads():
 
 def get_hadoop_downloads():
   cluster_components = []
-  use_cdp_hive = os.environ["USE_CDP_HIVE"] == "true"
-  if use_cdp_hive:
-    hadoop = CdpComponent("hadoop")
-    hbase = CdpComponent("hbase", archive_basename_tmpl="hbase-${version}-bin",
-                         unpack_directory_tmpl="hbase-${version}")
+  hadoop = CdpComponent("hadoop")
+  hbase = CdpComponent("hbase", archive_basename_tmpl="hbase-${version}-bin",
+                       unpack_directory_tmpl="hbase-${version}")
+
+  use_apache_ozone = os.environ["USE_APACHE_OZONE"] == "true"
+  if use_apache_ozone:
+    ozone = ApacheComponent("ozone", component_path_tmpl="ozone/${version}")
+  else:
+    ozone = CdpComponent("ozone")
+
+  use_apache_hive = os.environ["USE_APACHE_HIVE"] == "true"
+  if use_apache_hive:
+    hive = ApacheComponent("hive", archive_basename_tmpl="apache-hive-${version}-bin")
+    hive_src = ApacheComponent("hive", archive_basename_tmpl="apache-hive-${version}-src")
+  else:
     hive = CdpComponent("hive", archive_basename_tmpl="apache-hive-${version}-bin")
     hive_src = CdpComponent("hive-source",
                             explicit_version=os.environ.get("IMPALA_HIVE_VERSION"),
                             archive_basename_tmpl="hive-${version}-source",
                             unpack_directory_tmpl="hive-${version}")
-    tez = CdpComponent("tez", archive_basename_tmpl="tez-${version}-minimal",
-                       makedir=True)
-    cluster_components.extend([hadoop, hbase, hive, hive_src, tez])
-  else:
-    cluster_components.extend(map(CdhComponent, ["hadoop", "hbase", "hive"]))
-  # Sentry is always CDH
-  cluster_components.append(CdhComponent("sentry"))
-  # Ranger is always CDP
-  cluster_components.append(CdpComponent("ranger",
-                                         archive_basename_tmpl="ranger-${version}-admin"))
 
-  # llama-minikdc is used for testing and not something that Impala needs to be built
-  # against. It does not get updated very frequently unlike the other CDH components.
-  # It is stored in a special location compared to other components.
-  toolchain_host = os.environ["IMPALA_TOOLCHAIN_HOST"]
-  download_path_prefix = "https://{0}/build/cdh_components/".format(toolchain_host)
-  destination_basedir = os.environ["CDH_COMPONENTS_HOME"]
-  cluster_components += [EnvVersionedPackage("llama-minikdc", download_path_prefix,
-      destination_basedir)]
+  tez = CdpComponent("tez", archive_basename_tmpl="tez-${version}-minimal", makedir=True)
+  ranger = CdpComponent("ranger", archive_basename_tmpl="ranger-${version}-admin")
+  use_override_hive = \
+      "HIVE_VERSION_OVERRIDE" in os.environ and os.environ["HIVE_VERSION_OVERRIDE"] != ""
+  # If we are using a locally built Hive we do not have a need to pull hive as a
+  # dependency
+  cluster_components.extend([hadoop, hbase, ozone])
+  if not use_override_hive:
+    cluster_components.extend([hive, hive_src])
+  cluster_components.extend([tez, ranger])
   return cluster_components
 
 
-def get_kudu_downloads(use_kudu_stub):
-  # If Kudu is not supported, we download centos7 kudu to build the kudu stub.
-  # TODO: Should this be from toolchain or CDH? Does it matter?
-  kudu_downloads = []
-  if use_kudu_stub:
-    kudu_downloads += [ToolchainKudu("centos7")]
-  else:
-    use_cdh_kudu = os.getenv("USE_CDH_KUDU") == "true"
-    if use_cdh_kudu:
-      if not try_get_platform_release_label() \
-         or not try_get_platform_release_label().cdh:
-        logging.error("CDH Kudu is not supported on this platform. Set "
-                      "USE_CDH_KUDU=false to use the toolchain Kudu.")
-        sys.exit(1)
-      kudu_downloads += [CdhKudu(get_platform_release_label().cdh)]
-    else:
-      kudu_downloads += [ToolchainKudu()]
-
-  # Independent of the regular Kudu package, there is also a Kudu Java package. This
-  # always needs to be downloaded from the CDH components, because the toolchain
-  # does not produce the Java artifacts.
-  # TODO: Does this make any sense with the Kudu stub?
-  kudu_downloads += [CdhKuduJava()]
-  return kudu_downloads
+def get_kudu_downloads():
+  # Toolchain Kudu includes Java artifacts.
+  return [ToolchainKudu()]
 
 
 def main():
-  """Validates that bin/impala-config.sh has been sourced by verifying that $IMPALA_HOME
-  and $IMPALA_TOOLCHAIN are in the environment. We assume that if these are set, then
-  IMPALA_<PACKAGE>_VERSION environment variables are also set. This will create the
-  directory specified by $IMPALA_TOOLCHAIN if it does not already exist. Then, it will
-  compute what packages need to be downloaded. Packages are only downloaded if they are
-  not already present in $IMPALA_TOOLCHAIN. There are two main categories of packages.
-  Toolchain packages are native packages built using the native toolchain. These are
-  always downloaded. Hadoop component packages are the CDH or CDP builds of Hadoop
-  components such as Hadoop, Hive, HBase, etc. Hadoop component packages are organized
-  as a consistent set of compatible version via a build number (i.e. CDH_BUILD_NUMBER
-  and CDP_BUILD_NUMBER). Hadoop component packages are only downloaded if
-  $DOWNLOAD_CDH_COMPONENTS is true. CDH Hadoop packages are downloaded into
-  $CDH_COMPONENTS_HOME. CDP Hadoop packages are downloaded into $CDP_COMPONENTS_HOME.
-  The versions used for Hadoop components depend on whether USE_CDP_HIVE is true or
-  false. If true, most components get the CDP versions based on the $CDP_BUILD_NUMBER.
-  If false, most components get the CDH versions based on the $CDH_BUILD_NUMBER.
-  The exceptions are:
-  - sentry (always downloaded from $IMPALA_TOOLCHAIN_HOST for a given $CDH_BUILD_NUMBER)
-  - llama-minikdc (always downloaded from $TOOLCHAIN_HOST)
-  - ranger (always downloaded from $IMPALA_TOOLCHAIN_HOST for a given $CDP_BUILD_NUMBER)
-  - kudu (currently always downloaded from $IMPALA_TOOLCHAIN_HOST for a given
-    $CDH_BUILD_NUMBER)
-  If Kudu is not supported on this platform (or KUDU_IS_SUPPORTED=false), then this
-  builds a Kudu stub to allow for compilation without Kudu support.
+  """
+  Validates that bin/impala-config.sh has been sourced by verifying that $IMPALA_HOME
+  and $IMPALA_TOOLCHAIN_PACKAGES_HOME are in the environment. We assume that if these
+  are set, then IMPALA_<PACKAGE>_VERSION environment variables are also set. This will
+  create the directory specified by $IMPALA_TOOLCHAIN_PACKAGES_HOME if it does not
+  already exist. Then, it will compute what packages need to be downloaded. Packages are
+  only downloaded if they are not already present. There are two main categories of
+  packages. Toolchain packages are native packages built using the native toolchain.
+  These are always downloaded. Hadoop component packages are the CDP builds of Hadoop
+  components such as Hadoop, Hive, HBase, etc. Hadoop component packages are organized as
+  a consistent set of compatible version via a build number (i.e. CDP_BUILD_NUMBER).
+  Hadoop component packages are only downloaded if $DOWNLOAD_CDH_COMPONENTS is true. The
+  versions used for Hadoop components come from the CDP versions based on the
+  $CDP_BUILD_NUMBER. CDP Hadoop packages are downloaded into $CDP_COMPONENTS_HOME.
   """
   logging.basicConfig(level=logging.INFO,
       format='%(asctime)s %(threadName)s %(levelname)s: %(message)s')
@@ -703,17 +558,17 @@ def main():
     sys.exit(1)
 
   # Create the toolchain directory if necessary
-  create_directory_from_env_var("IMPALA_TOOLCHAIN")
-
-  use_kudu_stub = os.environ["KUDU_IS_SUPPORTED"] != "true"
+  create_directory_from_env_var("IMPALA_TOOLCHAIN_PACKAGES_HOME")
 
   downloads = []
-  downloads += get_toolchain_downloads()
+  if os.getenv("SKIP_TOOLCHAIN_BOOTSTRAP", "false") != "true":
+    downloads += get_toolchain_downloads()
   kudu_download = None
   if os.getenv("DOWNLOAD_CDH_COMPONENTS", "false") == "true":
-    create_directory_from_env_var("CDH_COMPONENTS_HOME")
     create_directory_from_env_var("CDP_COMPONENTS_HOME")
-    downloads += get_kudu_downloads(use_kudu_stub)
+    create_directory_from_env_var("APACHE_COMPONENTS_HOME")
+    if platform.processor() != "aarch64":
+      downloads += get_kudu_downloads()
     downloads += get_hadoop_downloads()
 
   components_needing_download = [d for d in downloads if d.needs_download()]
@@ -722,12 +577,6 @@ def main():
     component.download()
 
   execute_many(download, components_needing_download)
-
-  if use_kudu_stub:
-    # Find the kudu package directory and the gcc package directory
-    kudu_download = [d for d in downloads if d.name == 'kudu'][0]
-    gcc_download = [d for d in downloads if d.name == 'gcc'][0]
-    build_kudu_stub(kudu_download.pkg_directory(), gcc_download.pkg_directory())
 
 
 if __name__ == "__main__": main()

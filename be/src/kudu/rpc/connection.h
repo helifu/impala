@@ -14,9 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-#ifndef KUDU_RPC_CONNECTION_H
-#define KUDU_RPC_CONNECTION_H
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +22,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -32,13 +31,11 @@
 #include <ev++.h>
 #include <glog/logging.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/connection_id.h"
+#include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
@@ -53,10 +50,12 @@ namespace rpc {
 class DumpConnectionsRequestPB;
 class InboundCall;
 class OutboundCall;
-class RpcConnectionPB;
 class ReactorThread;
+class RpcConnectionPB;
 class RpczStore;
 class SocketStatsPB;
+class TransportDetailsPB;
+
 enum class CredentialsPolicy;
 
 //
@@ -135,7 +134,7 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // Queue a call response back to the client on the server side.
   //
   // This may be called from a non-reactor thread.
-  void QueueResponseForCall(gscoped_ptr<InboundCall> call);
+  void QueueResponseForCall(std::unique_ptr<InboundCall> call);
 
   // Cancel an outbound call by removing any reference to it by CallAwaitingResponse
   // in 'awaiting_responses_'.
@@ -186,6 +185,26 @@ class Connection : public RefCountedThreadSafe<Connection> {
 
   // libev callback when we may write to the socket.
   void WriteHandler(ev::io &watcher, int revents);
+
+  enum ProcessOutboundTransfersResult {
+    // All of the transfers in the queue have been sent successfully.
+    // The queue is now empty.
+    kNoMoreToSend,
+    // Not all transfers were able to be sent. The caller should
+    // ensure that write_io_ is enabled in order to continue attempting
+    // to send transfers.
+    kMoreToSend,
+    // An error occurred trying to write to the connection, and the
+    // connection was destroyed. NOTE: 'this' may be deleted if this
+    // value is returned.
+    kConnectionDestroyed
+  };
+
+  // Process any pending outbound transfers in outbound_transfers_.
+  // Result indicates the state of the connection following the attempt.
+  //
+  // NOTE: This may invoke DestroyConnection() on 'this'.
+  ProcessOutboundTransfersResult ProcessOutboundTransfers();
 
   // Safe to be called from other threads.
   std::string ToString() const;
@@ -275,23 +294,18 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // and ensuring we roll over from INT32_MAX to 0.
   // Negative numbers are reserved for special purposes.
   int32_t GetNextCallId() {
-    int32_t call_id = next_call_id_;
-    if (PREDICT_FALSE(next_call_id_ == std::numeric_limits<int32_t>::max())) {
-      next_call_id_ = 0;
-    } else {
-      next_call_id_++;
-    }
-    return call_id;
+    static constexpr uint32_t kCallIdMask = std::numeric_limits<int32_t>::max(); // 0x7fffffff
+    return static_cast<int32_t>(++call_id_ & kCallIdMask);
   }
 
   // An incoming packet has completed transferring on the server side.
   // This parses the call and delivers it into the call queue.
-  void HandleIncomingCall(gscoped_ptr<InboundTransfer> transfer);
+  void HandleIncomingCall(std::unique_ptr<InboundTransfer> transfer);
 
   // An incoming packet has completed on the client side. This parses the
   // call response, looks up the CallAwaitingResponse, and calls the
   // client callback.
-  void HandleCallResponse(gscoped_ptr<InboundTransfer> transfer);
+  void HandleCallResponse(std::unique_ptr<InboundTransfer> transfer);
 
   // The given CallAwaitingResponse has elapsed its user-defined timeout.
   // Set it to Failed.
@@ -300,13 +314,15 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // Queue a transfer for sending on this connection.
   // We will take ownership of the transfer.
   // This must be called from the reactor thread.
-  void QueueOutbound(gscoped_ptr<OutboundTransfer> transfer);
+  void QueueOutbound(std::unique_ptr<OutboundTransfer> transfer);
 
   // Internal test function for injecting cancellation request when 'call'
   // reaches state specified in 'FLAGS_rpc_inject_cancellation_state'.
   void MaybeInjectCancellation(const std::shared_ptr<OutboundCall> &call);
 
   Status GetSocketStatsPB(SocketStatsPB* pb) const;
+
+  Status GetTransportDetailsPB(TransportDetailsPB* pb) const;
 
   // The reactor thread that created this connection.
   ReactorThread* const reactor_thread_;
@@ -331,7 +347,7 @@ class Connection : public RefCountedThreadSafe<Connection> {
   MonoTime last_activity_time_;
 
   // the inbound transfer, if any
-  gscoped_ptr<InboundTransfer> inbound_;
+  std::unique_ptr<InboundTransfer> inbound_;
 
   // notifies us when our socket is writable.
   ev::io write_io_;
@@ -354,8 +370,9 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // being handled.
   inbound_call_map_t calls_being_handled_;
 
-  // the next call ID to use
-  int32_t next_call_id_;
+  // The internal counter to generate next call ID to use. The call ID is
+  // a signed integer: 31 LSBs of the internal counter are used to represent it.
+  uint32_t call_id_;
 
   // Starts as Status::OK, gets set to a shutdown status upon Shutdown().
   Status shutdown_status_;
@@ -397,5 +414,3 @@ class Connection : public RefCountedThreadSafe<Connection> {
 
 } // namespace rpc
 } // namespace kudu
-
-#endif

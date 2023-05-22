@@ -25,6 +25,17 @@ enum StatestoreServiceVersion {
    V1 = 0
 }
 
+// Description of a single entry in a list of heavy memory usage queries
+struct THeavyMemoryQuery {
+
+  // The memory consumption of the query
+  1: required i64 memory_consumed;
+
+  // The Id of the query
+  2: required Types.TUniqueId queryId;
+}
+
+
 // Structure serialized for the topic AdmissionController::IMPALA_REQUEST_QUEUE_TOPIC.
 // Statistics for a single admission control pool. The topic key is of the form
 // "<pool_name>!<backend_id>".
@@ -42,59 +53,53 @@ struct TPoolStats {
   // execution on this impalad, this value increases by 10G. Any other impalads executing
   // this query will also increment their backend_mem_reserved by 10G.
   3: required i64 backend_mem_reserved;
+
+  // More entries about queries running in the backend.
+  //
+  // List of queries with top-k memory consumptions.
+  4: required list<THeavyMemoryQuery> heavy_memory_queries;
+
+  // Min memory consumption among all queries.
+  5: required i64 min_memory_consumed;
+
+  // Max memory consumption among all queries.
+  6: required i64 max_memory_consumed;
+
+  // Total memory consumption among all queries.
+  7: required i64 total_memory_consumed;
+
+  // The number of queries that have live fragments taking up memory on the host in
+  // a pool. These queries must be tracked by some query mem trackers. In comparison,
+  // num_admitted_running tracks the number of queries admitted in a host.
+  8: required i64 num_running;
 }
 
-// Structure to describe an executor group. We use this to configure the executor group
-// for backends during startup and during cluster membership management.
-struct TExecutorGroupDesc {
-  // The name of the executor group.
-  1: required string name;
-  // The minimum size of the executor group to be considered healthy.
-  2: required i64 min_size;
+struct THostStats {
+  // The mem reserved for a query that is currently executing is its memory limit, if
+  // set (which should be the common case with admission control). Otherwise, if the
+  // query has no limit or the query is finished executing, the current consumption
+  // (tracked by its query mem tracker) is used.
+  1: required i64 mem_reserved;
+
+  // The per host mem admitted only for the queries admitted locally.
+  2: required i64 mem_admitted;
+
+  // The per host number of queries admitted only for the queries admitted locally.
+  3: required i64 num_admitted;
+
+  // The per host number of slots in use for the queries admitted locally.
+  4: required i64 slots_in_use;
 }
 
-// Structure serialised in the Impala backend topic. Each Impalad
-// constructs one TBackendDescriptor, and registers it in the cluster-membership
-// topic. Impalads subscribe to this topic to learn of the location of
-// all other Impalads in the cluster. Impalads can act as coordinators, executors or
-// both.
-struct TBackendDescriptor {
-  // Network address of the thrift based ImpalaInternalService on this backend
-  1: required Types.TNetworkAddress address;
+struct TPerHostStatsUpdateElement {
+    1: required string host_addr;
+    2: required THostStats stats;
+}
 
-  // IP address corresponding to address.hostname. Explicitly including this saves the
-  // cost of resolution at every Impalad (since IP addresses are needed for scheduling)
-  2: required string ip_address;
-
-  // True if this is a coordinator node
-  3: required bool is_coordinator;
-
-  // True if this is an executor node
-  4: required bool is_executor;
-
-  // The address of the debug HTTP server
-  5: optional Types.TNetworkAddress debug_http_address;
-
-  // True if the debug webserver is secured (for correctly generating links)
-  6: optional bool secure_webserver;
-
-  // IP address + port of KRPC based ImpalaInternalService on this backend
-  7: optional Types.TNetworkAddress krpc_address;
-
-  // The amount of memory that can be admitted to this backend (in bytes).
-  8: required i64 admit_mem_limit;
-
-  // True if fragment instances should not be scheduled on this daemon because the
-  // daemon has been quiescing, e.g. if it shutting down.
-  9: required bool is_quiescing;
-
-  // The list of executor groups that this backend belongs to. Only valid if is_executor
-  // is set, and currently must contain exactly one entry.
-  10: required list<TExecutorGroupDesc> executor_groups;
-
-  // The number of admission slots for this backend that can be occupied by running
-  // queries.
-  11: required i64 admission_slots;
+struct TPerHostStatsUpdate {
+  // This stores per-host statistics which are used during admission and by HTTP
+  // handlers to query admission control statistics for currently registered backends.
+  1: required list<TPerHostStatsUpdateElement> per_host_stats;
 }
 
 // Description of a single entry in a topic

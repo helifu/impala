@@ -19,6 +19,8 @@
 
 # Utility code for creating cgroups for the Impala development environment.
 # May be used as a library or as a command-line utility for manual testing.
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import os
 import sys
 import errno
@@ -73,7 +75,7 @@ def create_impala_cgroup_path(instance_num):
   cgroup_path = os.path.join(parent_cgroup, ("impala-%s" % instance_num))
   try:
     os.makedirs(cgroup_path)
-  except OSError, ex:
+  except OSError as ex:
     if ex.errno == errno.EEXIST and os.path.isdir(cgroup_path):
         pass
     else: raise
@@ -81,7 +83,7 @@ def create_impala_cgroup_path(instance_num):
 
 if __name__ == "__main__":
   if options.cluster_size < 0:
-    print 'Please specify a cluster size >= 0'
+    print('Please specify a cluster size >= 0')
     sys.exit(1)
   for i in range(options.cluster_size):
     create_impala_cgroup_path(i)

@@ -22,10 +22,11 @@ import java.util.List;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.analysis.TupleDescriptor;
-import org.apache.impala.analysis.TupleId;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotRef;
+import org.apache.impala.analysis.SortInfo;
+import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.analysis.TupleId;
 import org.apache.impala.thrift.TExecNodePhase;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TExpr;
@@ -33,6 +34,7 @@ import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TUnionNode;
+import org.apache.impala.util.ExprUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,7 +53,7 @@ import com.google.common.base.Preconditions;
 public class UnionNode extends PlanNode {
   private final static Logger LOG = LoggerFactory.getLogger(UnionNode.class);
 
-  // List of union result exprs of the originating UnionStmt. Used for
+  // List of union result exprs of the originating SetOperationStmt. Used for
   // determining passthrough-compatibility of children.
   protected List<Expr> unionResultExprs_;
 
@@ -99,6 +101,8 @@ public class UnionNode extends PlanNode {
    */
   public boolean isConstantUnion() { return resultExprLists_.isEmpty(); }
 
+  public int getFirstNonPassthroughChildIndex() { return firstMaterializedChildIdx_; }
+
   /**
    * Add a child tree plus its corresponding unresolved resultExprs.
    */
@@ -124,6 +128,7 @@ public class UnionNode extends PlanNode {
       // correct iff the child fragments run on sets of nodes that are supersets or
       // subsets of each other, i.e. not just partly overlapping.
       numNodes_ = Math.max(child.getNumNodes(), numNodes_);
+      numInstances_ = Math.max(child.getNumInstances(), numInstances_);
     }
     // Consider estimate valid if we have at least one child with known cardinality, or
     // only constant values.
@@ -135,11 +140,27 @@ public class UnionNode extends PlanNode {
     // The number of nodes of a union node is -1 (invalid) if all the referenced tables
     // are inline views (e.g. select 1 FROM (VALUES(1 x, 1 y)) a FULL OUTER JOIN
     // (VALUES(1 x, 1 y)) b ON (a.x = b.y)). We need to set the correct value.
-    if (numNodes_ == -1) numNodes_ = 1;
+    if (numNodes_ == -1) {
+      numNodes_ = 1;
+      numInstances_ = 1;
+    }
     cardinality_ = capCardinalityAtLimit(cardinality_);
     if (LOG.isTraceEnabled()) {
       LOG.trace("stats Union: cardinality=" + Long.toString(cardinality_));
     }
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    // Compute the cost for materializing child rows and use that to figure out
+    // the total data processed. Assume the costs of processing pass-through rows are 0.
+    float totalMaterializeCost = 0;
+    for (int i = firstMaterializedChildIdx_; i < resultExprLists_.size(); i++) {
+      totalMaterializeCost += ExprUtil.computeExprsTotalCost(resultExprLists_.get(i));
+    }
+
+    processingCost_ =
+        ProcessingCost.basicCost(getDisplayLabel(), cardinality_, totalMaterializeCost);
   }
 
   @Override
@@ -241,6 +262,12 @@ public class UnionNode extends PlanNode {
 
     for (int i = 0; i < children_.size(); i++) {
       if (!isChildPassthrough(analyzer, children_.get(i), resultExprLists_.get(i))) {
+        for (Expr expr : resultExprLists_.get(i)) {
+          Preconditions.checkState(!SortInfo.checkTypeForVarLenCollection(
+              expr.getType()).isPresent(),
+              "only pass-through UNION ALL is supported for collections of "
+              + "variable length types.");
+        }
         newResultExprLists.add(resultExprLists_.get(i));
         newChildren.add(children_.get(i));
       }
@@ -291,7 +318,12 @@ public class UnionNode extends PlanNode {
       Preconditions.checkState(exprList.size() == slots.size());
       List<Expr> newExprList = new ArrayList<>();
       for (int i = 0; i < exprList.size(); ++i) {
-        if (slots.get(i).isMaterialized()) newExprList.add(exprList.get(i));
+        if (slots.get(i).isMaterialized()) {
+          Expr constExpr = exprList.get(i);
+          // Disable codegen for const expressions which will only ever be evaluated once.
+          if (!isInSubplan_) constExpr.disableCodegen();
+          newExprList.add(constExpr);
+        }
       }
       materializedConstExprLists_.add(newExprList);
     }

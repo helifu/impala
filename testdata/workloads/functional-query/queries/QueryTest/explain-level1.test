@@ -19,11 +19,11 @@ row_regex:.*row-size=.* cardinality=.*
 '|'
 '|--03:EXCHANGE [BROADCAST]'
 '|  |'
-'|  01:SCAN HDFS [tpch.orders]'
+'|  01:SCAN $FILESYSTEM_NAME [tpch.orders]'
 row_regex:.*partitions=1/1 files=1 size=.*
 row_regex:.*row-size=.* cardinality=.*
 '|'
-'00:SCAN HDFS [tpch.lineitem]'
+'00:SCAN $FILESYSTEM_NAME [tpch.lineitem]'
 row_regex:.*partitions=1/1 files=1 size=.*
 '   runtime filters: RF000 -> l_orderkey'
 row_regex:.*row-size=.* cardinality=.*
@@ -38,4 +38,12 @@ where t1.month = 1 and t2.year = 2009 and t3.bool_col = false
 ---- RESULTS: VERIFY_IS_SUBSET
 'WARNING: The following tables are missing relevant table and/or column statistics.'
 'functional_avro.alltypes, functional_parquet.alltypessmall'
+====
+---- QUERY
+# Tests the set operation statement rewrite
+explain select year, month from functional.alltypes
+  intersect
+select year, month from functional.alltypes where year=2009;
+---- RESULTS: VERIFY_IS_SUBSET
+'04:HASH JOIN [LEFT SEMI JOIN, PARTITIONED]'
 ====

@@ -15,11 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import map
 import os
 import struct
 
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from functools import reduce
 from parquet.ttypes import ColumnIndex, FileMetaData, OffsetIndex, PageHeader, Type
 from subprocess import check_call
 from thrift.protocol import TCompactProtocol
@@ -41,7 +44,7 @@ def julian_day_to_date(julian_day):
   arbitrarily and can be validated with an online converter like
   http://aa.usno.navy.mil/jdconverter?ID=AA&jd=2457755
   """
-  return date(2017, 01, 01) + timedelta(julian_day - 2457755)
+  return date(2017, 1, 1) + timedelta(julian_day - 2457755)
 
 
 def nanos_to_time(nanos):
@@ -96,7 +99,7 @@ def decode_decimal(schema, value):
   assert schema.type_length == len(value)
   assert schema.type == Type.FIXED_LEN_BYTE_ARRAY
 
-  numeric = Decimal(reduce(lambda x, y: x * 256 + y, map(ord, value)))
+  numeric = Decimal(reduce(lambda x, y: x * 256 + y, list(map(ord, value))))
 
   # Compute two's complement for negative values.
   if (ord(value[0]) > 127):

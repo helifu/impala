@@ -21,16 +21,18 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.impala.analysis.ColumnDef;
 import org.apache.impala.analysis.KuduPartitionParam;
+import org.apache.impala.catalog.events.InFlightEvents;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.thrift.TBriefTableMeta;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TDatabase;
@@ -96,18 +98,53 @@ public class Db extends CatalogObjectImpl implements FeDb {
   // (e.g. can't drop it, can't add tables to it, etc).
   private boolean isSystemDb_ = false;
 
-  // maximum number of catalog versions to store for in-flight events for this database
-  private static final int MAX_NUMBER_OF_INFLIGHT_EVENTS = 10;
+  // tracks the in-flight metastore events for this db
+  private final InFlightEvents inFlightEvents_ = new InFlightEvents();
 
-  // FIFO list of versions for all the in-flight metastore events in this database
-  // This queue can only grow up to MAX_NUMBER_OF_INFLIGHT_EVENTS size. Anything which
-  // is attempted to be added to this list when its at maximum capacity is ignored
-  private final LinkedList<Long> versionsForInflightEvents_ = new LinkedList<>();
+  // lock to make sure modifications to the Db object are atomically done along with
+  // its associated HMS operation (eg. alterDbOwner or commentOnDb)
+  private final ReentrantLock dbLock_ = new ReentrantLock();
+
+  // if this Db is created by catalogd and if events processing is ACTIVE then
+  // this field represents the event id pertaining to the creation of this database
+  // in hive metastore. Defaults to -1 for already existing databases or if events
+  // processing is disabled.
+  private long createEventId_ = -1;
+
+  // this field represents the last event id in metastore upto which this db is synced
+  // It is used if the flag sync_to_latest_event_on_ddls is set to true.
+  // Making it as volatile so that read and write of this variable are thread safe.
+  // As an example, EventProcessor can check if it needs to process a db event or not
+  // by reading this flag and without acquiring read lock on db object
+  private volatile long lastSyncedEventId_ = -1;
 
   public Db(String name, org.apache.hadoop.hive.metastore.api.Database msDb) {
     setMetastoreDb(name, msDb);
     tableCache_ = new CatalogObjectCache<>();
     functions_ = new HashMap<>();
+  }
+
+  public long getCreateEventId() { return createEventId_; }
+
+  public void setCreateEventId(long eventId) {
+    // TODO: Add a preconditions check for eventId < lastSycnedEventId
+    createEventId_ = eventId;
+    LOG.debug("createEventId_ for db: {} set to: {}", getName(), createEventId_);
+    if (lastSyncedEventId_ < eventId) {
+      setLastSyncedEventId(eventId);
+    }
+  }
+
+  public long getLastSyncedEventId() {
+    return lastSyncedEventId_;
+  }
+
+  public void setLastSyncedEventId(long eventId) {
+    // TODO: Add a preconditions check for eventId >= createEventId_
+    LOG.debug("lastSyncedEventId_ for db: {} set from {} to {}", getName(),
+        lastSyncedEventId_, eventId);
+    lastSyncedEventId_ = eventId;
+
   }
 
   public void setIsSystemDb(boolean b) { isSystemDb_ = b; }
@@ -142,6 +179,8 @@ public class Db extends CatalogObjectImpl implements FeDb {
     if (msDb.getParameters() == null) return false;
     return msDb.getParameters().remove(k) != null;
   }
+
+  public ReentrantLock getLock() { return dbLock_; }
 
   @Override // FeDb
   public boolean isSystemDb() { return isSystemDb_; }
@@ -199,11 +238,11 @@ public class Db extends CatalogObjectImpl implements FeDb {
 
   @Override
   public FeKuduTable createKuduCtasTarget(
-      org.apache.hadoop.hive.metastore.api.Table msTbl,
-      List<ColumnDef> columnDefs, List<ColumnDef> primaryKeyColumnDefs,
-      List<KuduPartitionParam> kuduPartitionParams) {
-    return KuduTable.createCtasTarget(this, msTbl, columnDefs, primaryKeyColumnDefs,
-        kuduPartitionParams);
+      org.apache.hadoop.hive.metastore.api.Table msTbl, List<ColumnDef> columnDefs,
+      List<ColumnDef> primaryKeyColumnDefs, boolean isPrimaryKeyUnique,
+      List<KuduPartitionParam> kuduPartitionParams) throws ImpalaRuntimeException {
+    return KuduTable.createCtasTarget(this, msTbl, columnDefs, isPrimaryKeyUnique,
+        primaryKeyColumnDefs, kuduPartitionParams);
   }
 
   @Override
@@ -460,6 +499,12 @@ public class Db extends CatalogObjectImpl implements FeDb {
     catalogObject.setDb(toThrift());
   }
 
+  public TCatalogObject toMinimalTCatalogObject() {
+    TCatalogObject min = new TCatalogObject(getCatalogObjectType(), getCatalogVersion());
+    min.setDb(new TDatabase(getName()));
+    return min;
+  }
+
   /**
    * Get partial information about this DB in order to service CatalogdMetaProvider
    * running in a remote impalad.
@@ -478,8 +523,22 @@ public class Db extends CatalogObjectImpl implements FeDb {
       // instead to avoid this copy.
       resp.db_info.hms_database = getMetaStoreDb().deepCopy();
     }
-    if (selector.want_table_names) {
-      resp.db_info.table_names = getAllTableNames();
+    if (selector.want_brief_meta_of_tables) {
+      List<TBriefTableMeta> briefTableMetaList = Lists.newArrayListWithCapacity(
+          tableCache_.keySet().size());
+      for (Table tbl : tableCache_.getValues()) {
+        TBriefTableMeta meta = new TBriefTableMeta(tbl.getName());
+        meta.setTblType(tbl.getTableType());
+        meta.setComment(tbl.getTableComment());
+        org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable();
+        if (msTbl != null) {
+          // This is only used in old versions of impalad. Set it in case of rolling
+          // upgrade.
+          meta.setMsType(msTbl.getTableType());
+        }
+        briefTableMetaList.add(meta);
+      }
+      resp.db_info.brief_meta_of_tables = briefTableMetaList;
     }
     if (selector.want_function_names) {
       resp.db_info.function_names = ImmutableList.copyOf(functions_.keySet());
@@ -501,46 +560,46 @@ public class Db extends CatalogObjectImpl implements FeDb {
   }
 
   /**
-   * Gets the current list of versions for in-flight events for this database
-   */
-  public List<Long> getVersionsForInflightEvents() {
-    return Collections.unmodifiableList(versionsForInflightEvents_);
-  }
-
-  /**
    * Removes a given version from the collection of version numbers for in-flight events
    * @param versionNumber version number to remove from the collection
    * @return true if version was successfully removed, false if didn't exist
    */
   public boolean removeFromVersionsForInflightEvents(long versionNumber) {
-    return versionsForInflightEvents_.remove(versionNumber);
+    Preconditions.checkState(dbLock_.isHeldByCurrentThread(),
+        "removeFromVersionsForInflightEvents called without getting the db lock for "
+            + getName() + " database.");
+    return inFlightEvents_.remove(false, versionNumber);
   }
 
   /**
    * Adds a version number to the collection of versions for in-flight events. If the
    * collection is already at the max size defined by
-   * <code>MAX_NUMBER_OF_INFLIGHT_EVENTS</code>, then it ignores the given version and
-   * does not add it
+   * <code>InflightEvents.MAX_NUMBER_OF_INFLIGHT_EVENTS</code>, then it ignores the
+   * given version and does not add it
    * @param versionNumber version number to add
-   * @return True if version number was added, false if the collection is at its max
-   * capacity
    */
-  public boolean addToVersionsForInflightEvents(long versionNumber) {
-    if (versionsForInflightEvents_.size() >= MAX_NUMBER_OF_INFLIGHT_EVENTS) {
-      LOG.warn(String.format("Number of versions to be stored for database %s is at "
-              + " its max capacity %d. Ignoring add request for version number %d. This "
-              + "could cause unnecessary database invalidation when the event is "
-              + "processed",
-          getName(), MAX_NUMBER_OF_INFLIGHT_EVENTS, versionNumber));
-      return false;
+  public void addToVersionsForInflightEvents(long versionNumber) {
+    Preconditions.checkState(dbLock_.isHeldByCurrentThread(),
+        "addToVersionsForInFlightEvents called without getting the db lock for "
+            + getName() + " database.");
+    if (!inFlightEvents_.add(false, versionNumber)) {
+      LOG.warn(String.format("Could not add version %s to the list of in-flight "
+          + "events. This could cause unnecessary database %s invalidation when the "
+          + "event is processed", versionNumber, getName()));
     }
-    versionsForInflightEvents_.add(versionNumber);
-    return true;
   }
 
   @Override // FeDb
   public String getOwnerUser() {
     org.apache.hadoop.hive.metastore.api.Database db = getMetaStoreDb();
     return db == null ? null : db.getOwnerName();
+  }
+
+  /**
+   *
+   * @return True if dbLock_ is held by current thread
+   */
+  public boolean isLockHeldByCurrentThread() {
+    return dbLock_.isHeldByCurrentThread();
   }
 }

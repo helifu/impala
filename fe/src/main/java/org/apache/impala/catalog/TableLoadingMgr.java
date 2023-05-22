@@ -36,6 +36,7 @@ import org.apache.impala.util.HdfsCachingUtil;
 import org.apache.log4j.Logger;
 
 import com.google.common.base.Preconditions;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
 * Class that manages scheduling the loading of table metadata from the Hive Metastore and
@@ -148,7 +149,8 @@ public class TableLoadingMgr {
   // (no work will be rejected, but memory consumption is unbounded). If this thread
   // dies it will be automatically restarted.
   // The tables to process are read from the resfreshThreadWork_ queue.
-  ExecutorService asyncRefreshThread_ = Executors.newSingleThreadExecutor();
+  ExecutorService asyncRefreshThread_ = Executors.newSingleThreadExecutor(
+      new ThreadFactoryBuilder().setNameFormat("TableAsyncRefreshThread").build());
 
   // Tables for the async refresh thread to process. Synchronization must be handled
   // externally.
@@ -162,7 +164,8 @@ public class TableLoadingMgr {
     catalog_ = catalog;
     tblLoader_ = new TableLoader(catalog_);
     numLoadingThreads_ = numLoadingThreads;
-    tblLoadingPool_ = Executors.newFixedThreadPool(numLoadingThreads_);
+    tblLoadingPool_ = Executors.newFixedThreadPool(numLoadingThreads_,
+        new ThreadFactoryBuilder().setNameFormat("TableLoadingThread-%d").build());
 
     // Start the background table loading submitter threads.
     startTableLoadingSubmitterThreads();
@@ -230,7 +233,8 @@ public class TableLoadingMgr {
    * the same underlying loading task (Future) will be used, helping to prevent duplicate
    * loads of the same table.
    */
-  public LoadRequest loadAsync(final TTableName tblName, final String reason)
+  public LoadRequest loadAsync(final TTableName tblName, final long createdEventId,
+      final String reason)
       throws DatabaseNotFoundException {
     final Db parentDb = catalog_.getDb(tblName.getDb_name());
     if (parentDb == null) {
@@ -241,7 +245,7 @@ public class TableLoadingMgr {
     FutureTask<Table> tableLoadTask = new FutureTask<Table>(new Callable<Table>() {
         @Override
         public Table call() throws Exception {
-          return tblLoader_.load(parentDb, tblName.table_name, reason);
+          return tblLoader_.load(parentDb, tblName.table_name, createdEventId, reason);
         }});
 
     FutureTask<Table> existingValue = loadingTables_.putIfAbsent(tblName, tableLoadTask);
@@ -264,7 +268,9 @@ public class TableLoadingMgr {
    */
   private void startTableLoadingSubmitterThreads() {
     ExecutorService submitterLoadingPool =
-        Executors.newFixedThreadPool(numLoadingThreads_);
+      Executors.newFixedThreadPool(numLoadingThreads_,
+          new ThreadFactoryBuilder()
+              .setNameFormat("TableLoadingSubmitterThread-%d").build());
     try {
       for (int i = 0; i < numLoadingThreads_; ++i) {
         submitterLoadingPool.execute(new Runnable() {
@@ -305,7 +311,7 @@ public class TableLoadingMgr {
       // TODO: Instead of calling "getOrLoad" here we could call "loadAsync". We would
       // just need to add a mechanism for moving loaded tables into the Catalog.
       catalog_.getOrLoadTable(tblName.getDb_name(), tblName.getTable_name(),
-          "background load");
+          "background load", null);
     } catch (CatalogException e) {
       // Ignore.
     } finally {

@@ -25,6 +25,7 @@ namespace cpp impala
 namespace java org.apache.impala.thrift
 
 include "CatalogObjects.thrift"
+include "Data.thrift"
 include "ExecStats.thrift"
 include "Exprs.thrift"
 include "Types.thrift"
@@ -76,7 +77,8 @@ enum TDebugAction {
   // A floating point number in range [0.0, 1.0] that gives the probability of denying
   // each reservation increase request after the initial reservation.
   SET_DENY_RESERVATION_PROBABILITY = 4
-  // Delay for a short amount of time: 100ms
+  // Delay for a short amount of time: 100ms or the specified number of seconds in the
+  // optional parameter.
   DELAY = 5
 }
 
@@ -111,11 +113,30 @@ struct TRuntimeFilterTargetDesc {
   // type of the targeted column.
   6: optional string kudu_col_name
   7: optional Types.TColumnType kudu_col_type;
+
+  // The low and high value as seen in the column stats of the targeted column.
+  8: optional Data.TColumnValue low_value
+  9: optional Data.TColumnValue high_value
+
+  // Indicates if the low and high value in column stats are present
+  10: optional bool is_min_max_value_present
+
+  // Indicates if the column is actually stored in the data files (unlike partition
+  // columns in regular Hive tables)
+  11: optional bool is_column_in_data_file
 }
 
 enum TRuntimeFilterType {
   BLOOM = 0
   MIN_MAX = 1
+  IN_LIST = 2
+}
+
+// The level of filtering of enabled min/max filters to be applied to Parquet scan nodes.
+enum TMinmaxFilteringLevel {
+  ROW_GROUP = 1
+  PAGE = 2
+  ROW = 3
 }
 
 // Specification of a runtime filter.
@@ -123,7 +144,7 @@ struct TRuntimeFilterDesc {
   // Filter unique id (within a query)
   1: required i32 filter_id
 
-  // Expr on which the filter is built on a hash join.
+  // Expr on which the filter is built on a hash or nested loop join.
   2: required Exprs.TExpr src_expr
 
   // List of targets for this runtime filter
@@ -154,9 +175,15 @@ struct TRuntimeFilterDesc {
   // The type of runtime filter to build.
   10: required TRuntimeFilterType type
 
+  // The comparison operator between targets and src_expr
+  11: required ExternalDataSource.TComparisonOp compareOp
+
   // The size of the filter based on the ndv estimate and the min/max limit specified in
   // the query options. Should be greater than zero for bloom filters, zero otherwise.
-  11: optional i64 filter_size_bytes
+  12: optional i64 filter_size_bytes
+
+  // The ID of the plan node that produces this filter.
+  13: optional Types.TPlanNodeId src_node_id
 }
 
 // The information contained in subclasses of ScanNode captured in two separate
@@ -166,7 +193,8 @@ struct TRuntimeFilterDesc {
 // - T<subclass>: all other operational parameters that are the same across
 //   all plan fragments
 
-// Specification of subsection of a single hdfs file.
+// Specification of a subsection of a single HDFS file. Corresponds to HdfsFileSpiltPB and
+// should be kept in sync with it.
 struct THdfsFileSplit {
   // File name (not the full path).  The path is assumed to be relative to the
   // 'location' of the THdfsPartition referenced by partition_id.
@@ -190,17 +218,25 @@ struct THdfsFileSplit {
   // last modified time of the file
   7: required i64 mtime
 
-  // whether this file is erasure-coded
-  8: required bool is_erasure_coded
+  // Whether the HDFS file is stored with erasure coding.
+  8: optional bool is_erasure_coded
 
   // Hash of the partition's path. This must be hashed with a hash algorithm that is
   // consistent across different processes and machines. This is currently using
   // Java's String.hashCode(), which is consistent. For testing purposes, this can use
   // any consistent hash.
   9: required i32 partition_path_hash
+
+  // The absolute path of the file, it's used only when data files are outside of
+  // the Iceberg table location (IMPALA-11507).
+  10: optional string absolute_path
+
+  // Whether the HDFS file is stored with transparent data encryption.
+  11: optional bool is_encrypted
 }
 
-// key range for single THBaseScanNode
+// Key range for single THBaseScanNode. Corresponds to HBaseKeyRangePB and should be kept
+// in sync with it.
 // TODO: does 'binary' have an advantage over string? strings can
 // already store binary data
 struct THBaseKeyRange {
@@ -236,12 +272,22 @@ struct TFileSplitGeneratorSpec {
 }
 
 // Specification of an individual data range which is held in its entirety
-// by a storage server.
+// by a storage server. Corresponds to ScanRangePB and should be kept in sync with it.
 struct TScanRange {
   // one of these must be set for every TScanRange
   1: optional THdfsFileSplit hdfs_file_split
   2: optional THBaseKeyRange hbase_key_range
   3: optional binary kudu_scan_token
+  4: optional binary file_metadata
+}
+
+// Specification of an overlap predicate desc.
+//  filter_id: id of the filter
+//  slot_index: the index of a slot descriptor in minMaxTuple where the min value is
+//              stored. The slot next to it (at index +1) stores the max value.
+struct TOverlapPredicateDesc {
+  1: required i32 filter_id
+  2: required i32 slot_index
 }
 
 struct THdfsScanNode {
@@ -267,12 +313,12 @@ struct THdfsScanNode {
   // TODO: Remove this option when the MT scan node supports all file formats.
   6: optional bool use_mt_scan_node
 
-  // Conjuncts that can be evaluated against parquet::Statistics using the tuple
-  // referenced by 'min_max_tuple_id'.
-  7: optional list<Exprs.TExpr> min_max_conjuncts
+  // Conjuncts that can be pushed down to the ORC reader, or be evaluated against
+  // parquet::Statistics using the tuple referenced by 'stats_tuple_id'.
+  7: optional list<Exprs.TExpr> stats_conjuncts
 
-  // Tuple to evaluate 'min_max_conjuncts' against.
-  8: optional Types.TTupleId min_max_tuple_id
+  // Tuple to evaluate 'stats_conjuncts' against.
+  8: optional Types.TTupleId stats_tuple_id
 
   // The conjuncts that are eligible for dictionary filtering.
   9: optional map<Types.TSlotId, list<i32>> dictionary_filter_conjuncts
@@ -280,6 +326,18 @@ struct THdfsScanNode {
   // The byte offset of the slot for Parquet metadata if Parquet count star optimization
   // is enabled.
   10: optional i32 parquet_count_star_slot_offset
+
+  // If true, the backend only needs to return one row per partition.
+  11: optional bool is_partition_key_scan
+
+  // The list of file formats that this scan node may need to process. It is possible that
+  // in some fragment instances not all will actually occur. This list can be used to
+  // codegen code remotely for other impalad's as it contains all file formats that may be
+  // needed for this scan node.
+  12: required set<CatalogObjects.THdfsFileFormat> file_formats;
+
+  // The overlap predicates
+  13: optional list<TOverlapPredicateDesc> overlap_predicate_descs
 }
 
 struct TDataSourceScanNode {
@@ -338,6 +396,7 @@ struct TEqJoinCondition {
   3: required bool is_not_distinct_from;
 }
 
+// Different join operations supported by backend join operations.
 enum TJoinOp {
   INNER_JOIN = 0
   LEFT_OUTER_JOIN = 1
@@ -358,21 +417,38 @@ enum TJoinOp {
 }
 
 struct THashJoinNode {
-  1: required TJoinOp join_op
-
   // equi-join predicates
-  2: required list<TEqJoinCondition> eq_join_conjuncts
+  1: required list<TEqJoinCondition> eq_join_conjuncts
 
   // non equi-join predicates
-  3: optional list<Exprs.TExpr> other_join_conjuncts
+  2: optional list<Exprs.TExpr> other_join_conjuncts
+
+  // Hash seed to use. Must be the same as the join builder's hash seed, if there is
+  // a separate join build. Must be positive.
+  3: optional i32 hash_seed
 }
 
 struct TNestedLoopJoinNode {
-  1: required TJoinOp join_op
-
   // Join conjuncts (both equi-join and non equi-join). All other conjuncts that are
   // evaluated at the join node are stored in TPlanNode.conjuncts.
-  2: optional list<Exprs.TExpr> join_conjuncts
+  1: optional list<Exprs.TExpr> join_conjuncts
+}
+
+// Top-level struct for a join node. Elements that are shared between the different
+// join implementations are top-level variables and elements that are specific to a
+// join implementation live in a specialized struct.
+struct TJoinNode {
+  1: required TJoinOp join_op
+
+  // Tuples in build row.
+  2: optional list<Types.TTupleId> build_tuples
+
+  // Nullable tuples in build row.
+  3: optional list<bool> nullable_build_tuples
+
+  // One of these must be set.
+  4: optional THashJoinNode hash_join_node
+  5: optional TNestedLoopJoinNode nested_loop_join_node
 }
 
 struct TAggregator {
@@ -408,6 +484,9 @@ struct TAggregationNode {
   // If true, this is the first AggregationNode in a aggregation plan with multiple
   // Aggregators and the entire input to this node should be passed to each Aggregator.
   3: required bool replicate_input
+
+  // Set to true if this aggregation can complete early
+  4: required bool fast_limit_check
 }
 
 struct TSortInfo {
@@ -421,6 +500,10 @@ struct TSortInfo {
   4: optional list<Exprs.TExpr> sort_tuple_slot_exprs
   // The sorting order used in SORT BY clauses.
   5: required Types.TSortingOrder sorting_order
+  // Number of the leading lexical keys in the ordering exprs. Only used in Z-order
+  // for the pre-insert sort node to sort rows lexically on partition keys first, and
+  // sort the remaining columns in Z-order.
+  6: optional i32 num_lexical_keys_in_zorder
 }
 
 enum TSortType {
@@ -432,14 +515,37 @@ enum TSortType {
 
   // Divide the input into batches, each of which is sorted individually.
   PARTIAL = 2
+
+  // Return the first N sorted elements from each partition.
+  PARTITIONED_TOPN = 3
 }
 
 struct TSortNode {
   1: required TSortInfo sort_info
   2: required TSortType type
   // This is the number of rows to skip before returning results.
-  // Not used with TSortType::PARTIAL.
+  // Not used with TSortType::PARTIAL or TSortType::PARTITIONED_TOPN.
   3: optional i64 offset
+
+  // Estimated bytes of input that will go into this sort node across all backends.
+  // -1 if such estimate is unavailable.
+  4: optional i64 estimated_full_input_size
+
+  // Whether to include ties for the last place in the Top-N
+  5: optional bool include_ties
+
+  // If include_ties is true, the limit including ties.
+  6: optional i64 limit_with_ties
+
+  // Max number of rows to return per partition.
+  // Used only with TSortType::PARTITIONED_TOPN
+  7: optional i64 per_partition_limit
+  // Used only with TSortType::PARTITIONED_TOPN - expressions over
+  // the sort tuple to use as the partition key.
+  8: optional list<Exprs.TExpr> partition_exprs
+  // Used only with TSortType::PARTITIONED_TOPN - sort info for ordering
+  // within a partition.
+  9: optional TSortInfo intra_partition_sort_info
 }
 
 enum TAnalyticWindowType {
@@ -553,9 +659,9 @@ struct TExchangeNode {
 }
 
 struct TUnnestNode {
-  // Expr that returns the in-memory collection to be scanned.
-  // Currently always a SlotRef into an array-typed slot.
-  1: required Exprs.TExpr collection_expr
+  // Exprs that return the in-memory collections to be scanned.
+  // Currently always SlotRefs into array-typed slots.
+  1: required list<Exprs.TExpr> collection_exprs
 }
 
 struct TCardinalityCheckNode {
@@ -596,8 +702,7 @@ struct TPlanNode {
   10: optional THBaseScanNode hbase_scan_node
   11: optional TKuduScanNode kudu_scan_node
   12: optional TDataSourceScanNode data_source_node
-  13: optional THashJoinNode hash_join_node
-  14: optional TNestedLoopJoinNode nested_loop_join_node
+  13: optional TJoinNode join_node
   15: optional TAggregationNode agg_node
   16: optional TSortNode sort_node
   17: optional TUnionNode union_node

@@ -27,6 +27,7 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -36,7 +37,7 @@ import java.util.Map;
 
 import org.apache.impala.testutil.ImpalaJdbcClient;
 import org.apache.impala.testutil.TestUtils;
-import org.apache.impala.util.Metrics;
+import org.apache.impala.testutil.WebClient;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.Test;
@@ -301,6 +302,20 @@ public class JdbcTest extends JdbcTestBase {
     assertFalse(rs.next());
     rs.close();
 
+    // validate BINARY column
+    rs = con_.getMetaData().getColumns(null, "functional", "binary_tbl", null);
+    assertTrue(rs.next());
+    assertEquals("Incorrect type", Types.INTEGER, rs.getInt("DATA_TYPE"));
+    assertEquals(10, rs.getInt("COLUMN_SIZE"));
+    assertTrue(rs.next());
+    assertEquals("Incorrect type", Types.VARCHAR, rs.getInt("DATA_TYPE"));
+    assertEquals(Integer.MAX_VALUE, rs.getInt("COLUMN_SIZE"));
+    assertTrue(rs.next());
+    assertEquals("Incorrect type", Types.BINARY, rs.getInt("DATA_TYPE"));
+    assertEquals(Integer.MAX_VALUE, rs.getInt("COLUMN_SIZE"));
+    assertFalse(rs.next());
+    rs.close();
+
     // Validate complex types STRUCT/MAP/ARRAY.
     // To be consistent with Hive's behavior, the TYPE_NAME field is populated
     // with the primitive type name for scalar types, and with the full toSql()
@@ -428,19 +443,18 @@ public class JdbcTest extends JdbcTestBase {
     ResultSet rs = con_.getMetaData().getPrimaryKeys(null, "functional", "parent_table");
     ResultSetMetaData md = rs.getMetaData();
     assertEquals("Incorrect number of columns seen", 6, md.getColumnCount());
-    // TODO (IMPALA-9158): Remove this check.
-    if (!TestUtils.isCatalogV2Enabled("localhost", 25020)) {
-      int pkCount = 0;
-      while (rs.next()) {
-        pkCount++;
-        assertEquals("", rs.getString("TABLE_CAT"));
-        assertEquals("functional", rs.getString("TABLE_SCHEM"));
-        assertEquals("parent_table", rs.getString("TABLE_NAME"));
-        assertTrue(pkList.contains(rs.getString("COLUMN_NAME")));
-        assertTrue(rs.getString("PK_NAME").length() > 0);
-      }
-      assertEquals(2, pkCount);
+    int pkCount = 0;
+    while (rs.next()) {
+      pkCount++;
+      assertEquals("", rs.getString("TABLE_CAT"));
+      assertEquals("functional", rs.getString("TABLE_SCHEM"));
+      assertEquals("parent_table", rs.getString("TABLE_NAME"));
+      // functional.parent_table should always return only two primary keys.
+      assertTrue(pkCount <= 2);
+      assertEquals(pkList.get(pkCount - 1), rs.getString("COLUMN_NAME"));
+      assertTrue(rs.getString("PK_NAME").length() > 0);
     }
+    assertEquals(2, pkCount);
   }
 
   @Test
@@ -451,24 +465,24 @@ public class JdbcTest extends JdbcTestBase {
     ResultSetMetaData md = rs.getMetaData();
     assertEquals("Incorrect number of columns seen for primary key.",
         14, md.getColumnCount());
-    // TODO (IMPALA-9158): Remove this check.
-    if (!TestUtils.isCatalogV2Enabled("localhost", 25020)) {
-      List<String> colList = new ArrayList<>(Arrays.asList("id", "year"));
-      int fkCount = 0;
-      while (rs.next()) {
-        fkCount++;
-        assertEquals("", rs.getString("PKTABLE_CAT"));
-        assertEquals("functional", rs.getString("PKTABLE_SCHEM"));
-        assertEquals("parent_table", rs.getString("PKTABLE_NAME"));
-        assertTrue(colList.contains(rs.getString("PKCOLUMN_NAME")));
-        assertTrue(rs.getString("FK_NAME").length() > 0);
-        assertEquals("", rs.getString("FKTABLE_CAT"));
-        assertEquals("functional", rs.getString("FKTABLE_SCHEM"));
-        assertEquals("child_table", rs.getString("FKTABLE_NAME"));
-        assertTrue(colList.contains(rs.getString("FKCOLUMN_NAME")));
-      }
-      assertEquals(2, fkCount);
+    List<String> colList = new ArrayList<>(Arrays.asList("id", "year"));
+    int fkCount = 0;
+    while (rs.next()) {
+      fkCount++;
+      assertEquals("", rs.getString("PKTABLE_CAT"));
+      assertEquals("functional", rs.getString("PKTABLE_SCHEM"));
+      assertEquals("parent_table", rs.getString("PKTABLE_NAME"));
+      // functional.child_table should always return only two foreign keys for
+      // parent_table.
+      assertTrue(fkCount <= 2);
+      assertEquals(colList.get(fkCount - 1), rs.getString("PKCOLUMN_NAME"));
+      assertTrue(rs.getString("FK_NAME").length() > 0);
+      assertEquals("", rs.getString("FKTABLE_CAT"));
+      assertEquals("functional", rs.getString("FKTABLE_SCHEM"));
+      assertEquals("child_table", rs.getString("FKTABLE_NAME"));
+      assertTrue(colList.contains(rs.getString("FKCOLUMN_NAME")));
     }
+    assertEquals(2, fkCount);
   }
 
   @Test
@@ -573,10 +587,10 @@ public class JdbcTest extends JdbcTestBase {
     ResultSet rs = con_.createStatement().executeQuery("select user()");
     try {
       // We expect exactly one result row with a NULL inside the first column.
-      // The user() function returns NULL because we currently cannot set the user
-      // when establishing the Jdbc connection.
+      // The user() function returns 'anonymous' because we currently cannot set the user
+      // when establishing the Jdbc connection and it falls back to --anonymous_user_name.
       assertTrue(rs.next());
-      assertNull(rs.getString(1));
+      assertEquals("anonymous", rs.getString(1));
       assertFalse(rs.next());
     } finally {
       rs.close();
@@ -602,7 +616,7 @@ public class JdbcTest extends JdbcTestBase {
   @Test
   public void testConcurrentSessionMixedIdleTimeout() throws Exception {
     // Test for concurrent idle sessions' expiration with mixed timeout durations.
-    Metrics metrics = new Metrics();
+    WebClient client = new WebClient();
 
     List<Integer> timeoutPeriods = Arrays.asList(0, 3, 15);
     List<Connection> connections = new ArrayList<>();
@@ -613,9 +627,9 @@ public class JdbcTest extends JdbcTestBase {
           createConnection(ImpalaJdbcClient.getNoAuthConnectionStr(connectionType_)));
     }
 
-    Long numOpenSessions = (Long)metrics.getMetric(
+    Long numOpenSessions = (Long)client.getMetric(
         "impala-server.num-open-hiveserver2-sessions");
-    Long numExpiredSessions = (Long)metrics.getMetric(
+    Long numExpiredSessions = (Long)client.getMetric(
         "impala-server.num-sessions-expired");
 
     for (int i = 0; i < connections.size(); ++i) {
@@ -629,9 +643,9 @@ public class JdbcTest extends JdbcTestBase {
       lastTimeSessionActive.add(System.currentTimeMillis() / 1000);
     }
 
-    assertEquals(numOpenSessions, (Long)metrics.getMetric(
+    assertEquals(numOpenSessions, (Long)client.getMetric(
         "impala-server.num-open-hiveserver2-sessions"));
-    assertEquals(numExpiredSessions, (Long)metrics.getMetric(
+    assertEquals(numExpiredSessions, (Long)client.getMetric(
         "impala-server.num-sessions-expired"));
 
     for (int timeout : timeoutPeriods) {
@@ -666,9 +680,9 @@ public class JdbcTest extends JdbcTestBase {
         }
       }
 
-      assertEquals(numOpenSessions, (Long)metrics.getMetric(
+      assertEquals(numOpenSessions, (Long)client.getMetric(
           "impala-server.num-open-hiveserver2-sessions"));
-      assertEquals(numExpiredSessions, (Long)metrics.getMetric(
+      assertEquals(numExpiredSessions, (Long)client.getMetric(
           "impala-server.num-sessions-expired"));
     }
 
@@ -678,6 +692,30 @@ public class JdbcTest extends JdbcTestBase {
 
     for (Connection connection : connections) {
       assertNull("Connection is not null", connection);
+    }
+  }
+
+  /**
+   * test the query options in connection URL take effect.
+   */
+  @Test
+  public void testSetQueryOptionsInConnectionURL() throws Exception {
+    String divideZeroSQL = "SELECT CAST(1 AS DECIMAL)/0";
+    String connStr = ImpalaJdbcClient.getNoAuthConnectionStr(connectionType_);
+    connStr += "?DECIMAL_V2=false";
+    try (Connection connection = createConnection(connStr)) {
+      Statement stmt = connection.createStatement();
+      try (ResultSet rs = stmt.executeQuery(divideZeroSQL);) {
+        // DECIMAL_V2=false, no exception is expected to be thrown
+        rs.next();
+      }
+      stmt.execute("SET DECIMAL_V2=true");
+      try (ResultSet rs = stmt.executeQuery(divideZeroSQL);) {
+        // DECIMAL_V2=true, an exception is expected to be thrown
+        rs.next();
+      } catch (SQLException e) {
+        assertTrue(e.getMessage().contains("UDF ERROR: Cannot divide decimal by zero"));
+      }
     }
   }
 }

@@ -10,8 +10,8 @@ set num_scanner_threads=2;
 select * from (select * from functional_parquet.alltypes limit 10) A,
  (select * from functional_parquet.alltypes limit 10) B;
 ---- RUNTIME_PROFILE
-row_regex: .*Per-Host Resource Estimates: Memory=64MB.*
-row_regex: .*Cluster Memory Admitted: 64.00 MB.*
+row_regex: .*Per-Host Resource Estimates: Memory=68MB.*
+row_regex: .*Cluster Memory Admitted: 68.00 MB.*
 ====
 ---- QUERY
 # No mem_limit set
@@ -47,8 +47,8 @@ set num_scanner_threads=2;
 select * from functional_parquet.alltypes A, functional_parquet.alltypes B where
  A.int_col = B.int_col limit 1;
 ---- RUNTIME_PROFILE
-row_regex: .*Per-Host Resource Estimates: Memory=67MB.*
-row_regex: .*Cluster Memory Admitted: 66.94 MB.*
+row_regex: .*Per-Host Resource Estimates: Memory=68MB.*
+row_regex: .*Cluster Memory Admitted: 67.88 MB.*
 ====
 ---- QUERY
 # No mem_limit set
@@ -85,7 +85,7 @@ row_regex: .*Cluster Memory Admitted: 200.00 MB.*
 ====
 ---- QUERY
 # mem_limit is set
-# No lower bound enforced based on largest min_reservation (32.09 MB for this query)
+# No lower bound enforced based on largest min_reservation (36.09 MB for this query)
 set request_pool=poolLowMinLimit;
 set mem_limit=27mb;
 select * from functional_parquet.alltypes limit 1;
@@ -164,5 +164,4 @@ Select 1;
 ---- CATCH
 Rejected query from pool root.maxMemLessThanMinLimit: Invalid pool config: the
  min_query_mem_limit 2621440001 is greater than the max_mem_resources 2621440000
- (configured statically)
 ====

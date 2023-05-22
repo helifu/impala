@@ -27,23 +27,19 @@ cd "$ROOT_DIR"
 
 source ./bin/bootstrap_system.sh
 
-# Following install instructions from
-# https://docs.docker.com/install/linux/docker-ce/ubuntu/#install-docker-ce-1
-sudo apt-get install -y apt-transport-https ca-certificates curl \
-     gnupg-agent software-properties-common
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-# Bail if the fingerprint isn't what we expected.
-sudo apt-key fingerprint 0EBFCD88 | \
-  grep '9DC8 5822 9FC7 DD38 854A  E2D8 8D81 803C 0EBF CD88'
-sudo add-apt-repository \
-   "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
-   $(lsb_release -cs) stable"
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-sudo service docker restart
-sudo groupadd -f docker
-sudo usermod -aG docker $USER
+# Install docker
+./bin/jenkins/install_docker.sh
+
+# Preserve some important environment variables so that they are available to
+# dockerized-impala-run-tests.sh.
+# NOTE: A Jenkins job can also call dockerized-impala-preserve-vars.py directly
+# to preserve additional variables.
+./bin/jenkins/dockerized-impala-preserve-vars.py \
+    EE_TEST EE_TEST_FILES JDBC_TEST EXPLORATION_STRATEGY CMAKE_BUILD_TYPE \
+    IMPALA_DOCKER_USE_JAVA11
 
 # Execute the tests using su to re-login so that group change made above
-# setup_docker takes effect.
-sudo su $USER -c "./bin/jenkins/dockerized-impala-run-tests.sh"
+# setup_docker takes effect. This does a full re-login and does not stay
+# in the current directory, so change back to $IMPALA_HOME (resolved in
+# the current environment) before executing the script.
+sudo su - $USER -c "cd ${IMPALA_HOME} && ./bin/jenkins/dockerized-impala-run-tests.sh"

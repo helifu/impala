@@ -67,7 +67,8 @@ public class RangerAuthorizationFactory implements AuthorizationFactory {
         "Ranger application ID is empty. Set the Ranger application ID using " +
             "impalad and catalogd --ranger_app_id flag.");
     return new RangerAuthorizationConfig(backendConfig.getRangerServiceType(),
-        backendConfig.getRangerAppId(), backendConfig.getBackendCfg().getServer_name());
+        backendConfig.getRangerAppId(), backendConfig.getBackendCfg().getServer_name(),
+        null, null, null);
   }
 
   @Override
@@ -94,9 +95,14 @@ public class RangerAuthorizationFactory implements AuthorizationFactory {
   @Override
   public AuthorizationManager newAuthorizationManager(CatalogServiceCatalog catalog) {
     RangerAuthorizationConfig config = (RangerAuthorizationConfig) authzConfig_;
-    RangerImpalaPlugin plugin = new RangerImpalaPlugin(config.getServiceType(),
+    RangerImpalaPlugin plugin = RangerImpalaPlugin.getInstance(config.getServiceType(),
         config.getAppId());
-    plugin.init();
     return new RangerCatalogdAuthorizationManager(() -> plugin, catalog);
+  }
+
+  @Override
+  public boolean supportsTableMasking() {
+    return BackendConfig.INSTANCE.isColumnMaskingEnabled()
+        || BackendConfig.INSTANCE.isRowFilteringEnabled();
   }
 }

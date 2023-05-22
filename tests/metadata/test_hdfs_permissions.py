@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfLocal,
-                               SkipIfCatalogV2)
+from tests.common.skip import SkipIfFS, SkipIfLocal, SkipIfCatalogV2
 from tests.common.test_dimensions import (
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
@@ -28,9 +28,7 @@ TEST_TBL = 'read_only_tbl'
 TBL_LOC = '%s/%s' % (WAREHOUSE, TEST_TBL)
 
 
-@SkipIfS3.hdfs_acls
-@SkipIfABFS.hdfs_acls
-@SkipIfADLS.hdfs_acls
+@SkipIfFS.hdfs_acls
 @SkipIfLocal.hdfs_client
 class TestHdfsPermissions(ImpalaTestSuite):
   @classmethod
@@ -67,7 +65,7 @@ class TestHdfsPermissions(ImpalaTestSuite):
     try:
       self.client.execute('insert into table %s select 1' % TEST_TBL)
       assert False, 'Expected INSERT INTO read-only table to fail'
-    except Exception, e:
+    except Exception as e:
       assert re.search('does not have WRITE access to HDFS location: .*/read_only_tbl',
                        str(e))
     # Should still be able to query this table without any errors.
@@ -88,7 +86,7 @@ class TestHdfsPermissions(ImpalaTestSuite):
           'insert into table functional_seq.alltypes '
           'partition(year, month) select * from functional.alltypes limit 0')
       assert False, 'Expected INSERT INTO read-only partition to fail'
-    except Exception, e:
+    except Exception as e:
       assert re.search(
           'does not have WRITE access to HDFS location: .*/alltypes_seq',
           str(e))

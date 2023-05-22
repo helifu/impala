@@ -38,7 +38,6 @@ add_library(Service
   impala-beeswax-server.cc
   impala-hs2-server.cc
   impala-http-handler.cc
-  impala-internal-service.cc
   impalad-main.cc
   impala-server.cc
   query-options.cc
@@ -57,13 +56,25 @@ add_dependencies(ServiceTests gen-deps)
 add_library(fesupport SHARED
   fe-support.cc
 )
+
+# Hide all symbols from compression libraries so that users of this libfesupport.so
+# don't have conflicts with libhadoop or other libraries.
+# TODO: This should also hide most other symbols as a precaution.
+set(LINK_FLAGS "-Wl,--exclude-libs=libbz2")
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,--exclude-libs=liblz4")
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,--exclude-libs=libsnappy")
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,--exclude-libs=libz")
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,--exclude-libs=libzstd")
+set_target_properties(fesupport
+  PROPERTIES
+  LINK_FLAGS "${LINK_FLAGS}")
 add_dependencies(fesupport gen-deps)
 
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL")
   target_link_libraries(fesupport "-Wl,--whole-archive \
-    $ENV{IMPALA_TOOLCHAIN}/llvm-$ENV{IMPALA_LLVM_DEBUG_VERSION}/lib/clang/$ENV{IMPALA_LLVM_UBSAN_BASE_VERSION}/lib/linux/libclang_rt.ubsan_standalone_cxx-x86_64.a \
-    $ENV{IMPALA_TOOLCHAIN}/llvm-$ENV{IMPALA_LLVM_DEBUG_VERSION}/lib/clang/$ENV{IMPALA_LLVM_UBSAN_BASE_VERSION}/lib/linux/libclang_rt.ubsan_standalone-x86_64.a \
+    $ENV{IMPALA_TOOLCHAIN_PACKAGES_HOME}/llvm-$ENV{IMPALA_LLVM_DEBUG_VERSION}/lib/clang/$ENV{IMPALA_LLVM_UBSAN_BASE_VERSION}/lib/linux/libclang_rt.ubsan_standalone_cxx-${CMAKE_SYSTEM_PROCESSOR}.a \
+    $ENV{IMPALA_TOOLCHAIN_PACKAGES_HOME}/llvm-$ENV{IMPALA_LLVM_DEBUG_VERSION}/lib/clang/$ENV{IMPALA_LLVM_UBSAN_BASE_VERSION}/lib/linux/libclang_rt.ubsan_standalone-${CMAKE_SYSTEM_PROCESSOR}.a \
     -Wl,--no-whole-archive")
 endif()
 
@@ -83,6 +94,7 @@ add_executable(unifiedbetests
 # the impalad binary.
 set (STATESTORED_SYMLINK ${EXECUTABLE_OUTPUT_PATH}/statestored)
 set (CATALOGD_SYMLINK ${EXECUTABLE_OUTPUT_PATH}/catalogd)
+set (ADMISSIOND_SYMLINK ${EXECUTABLE_OUTPUT_PATH}/admissiond)
 
 ADD_CUSTOM_COMMAND(
   OUTPUT ${STATESTORED_SYMLINK}
@@ -92,10 +104,15 @@ ADD_CUSTOM_COMMAND(
   OUTPUT ${CATALOGD_SYMLINK}
   COMMAND ${CMAKE_COMMAND} -E create_symlink impalad ${CATALOGD_SYMLINK}
   DEPENDS impalad)
+ADD_CUSTOM_COMMAND(
+  OUTPUT ${ADMISSIOND_SYMLINK}
+  COMMAND ${CMAKE_COMMAND} -E create_symlink impalad ${ADMISSIOND_SYMLINK}
+  DEPENDS impalad)
 ADD_CUSTOM_TARGET(statestored ALL DEPENDS ${STATESTORED_SYMLINK})
 ADD_CUSTOM_TARGET(catalogd ALL DEPENDS ${CATALOGD_SYMLINK})
+ADD_CUSTOM_TARGET(admissiond ALL DEPENDS ${ADMISSIOND_SYMLINK})
 
-ADD_CUSTOM_TARGET(daemons DEPENDS impalad statestored catalogd fesupport)
+ADD_CUSTOM_TARGET(daemons DEPENDS impalad statestored catalogd admissiond fesupport)
 
 # This permits libraries loaded by dlopen to link to the symbols in the program.
 set_target_properties(impalad PROPERTIES LINK_FLAGS -rdynamic)

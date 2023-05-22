@@ -22,60 +22,80 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/exprs")
 # where to put generated binaries
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/exprs")
 
-add_library(Exprs
-  agg-fn.cc
-  agg-fn-evaluator.cc
+set(MURMURHASH_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/murmurhash")
+
+add_library(ExprsIr
   agg-fn-evaluator-ir.cc
   aggregate-functions-ir.cc
-  anyval-util.cc
   bit-byte-functions-ir.cc
-  case-expr.cc
-  cast-format-expr.cc
   cast-functions-ir.cc
-  compound-predicates.cc
   compound-predicates-ir.cc
-  conditional-functions.cc
   conditional-functions-ir.cc
+  datasketches-functions-ir.cc
   date-functions-ir.cc
   decimal-functions-ir.cc
   decimal-operators-ir.cc
+  hive-udf-call-ir.cc
+  iceberg-functions-ir.cc
+  in-predicate-ir.cc
+  is-null-predicate-ir.cc
+  kudu-partition-expr-ir.cc
+  like-predicate-ir.cc
+  mask-functions-ir.cc
+  math-functions-ir.cc
+  operators-ir.cc
+  scalar-expr-ir.cc
+  scalar-expr-evaluator-ir.cc
+  string-functions-ir.cc
+  timestamp-functions-ir.cc
+  tuple-is-null-predicate-ir.cc
+  udf-builtins-ir.cc
+  utility-functions-ir.cc
+)
+add_dependencies(ExprsIr gen-deps)
+
+add_library(Exprs
+  agg-fn.cc
+  agg-fn-evaluator.cc
+  anyval-util.cc
+  case-expr.cc
+  cast-format-expr.cc
+  compound-predicates.cc
+  conditional-functions.cc
+  datasketches-common.cc
   expr.cc
   hive-udf-call.cc
-  in-predicate-ir.cc
   is-not-empty-predicate.cc
-  is-null-predicate-ir.cc
   kudu-partition-expr.cc
   like-predicate.cc
-  like-predicate-ir.cc
   literal.cc
-  math-functions-ir.cc
+  ${MURMURHASH_SRC_DIR}/MurmurHash3.cpp
   null-literal.cc
-  operators-ir.cc
-  scalar-expr.cc
   scalar-expr-evaluator.cc
-  scalar-expr-ir.cc
+  scalar-expr.cc
   slot-ref.cc
   string-functions.cc
-  string-functions-ir.cc
   timestamp-functions.cc
-  timestamp-functions-ir.cc
   timezone_db.cc
   tuple-is-null-predicate.cc
   scalar-fn-call.cc
   udf-builtins.cc
-  udf-builtins-ir.cc
   utility-functions.cc
-  utility-functions-ir.cc
   valid-tuple-id.cc
 )
-add_dependencies(Exprs gen-deps gen_ir_descriptions)
+add_dependencies(Exprs gen-deps)
 
 add_library(ExprsTests STATIC
+  datasketches-test.cc
   expr-test.cc
+  iceberg-functions-test.cc
   timezone_db-test.cc
 )
 add_dependencies(ExprsTests gen-deps)
 
+ADD_UNIFIED_BE_LSAN_TEST(datasketches-test
+ "TestDataSketchesHll.*:TestDataSketchesKll.*:TestDataSketchesCpc.*:TestDataSketchesTheta.*")
+ADD_UNIFIED_BE_LSAN_TEST(iceberg-functions-test "TestIcebergFunctions.*")
 ADD_UNIFIED_BE_LSAN_TEST(expr-test "Instantiations/ExprTest.*")
 # Exception to unified be tests: custom main initiailizes LLVM
 ADD_BE_LSAN_TEST(expr-codegen-test)

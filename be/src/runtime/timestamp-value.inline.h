@@ -26,11 +26,19 @@
 #include <chrono>
 
 #include "exprs/timezone_db.h"
-#include "kudu/util/int128.h"
 #include "gutil/walltime.h"
+#include "kudu/util/int128.h"
+#include "runtime/datetime-simple-date-format-parser.h"
+#include "runtime/timestamp-parse-util.h"
+#include "udf/udf.h"
 #include "util/arithmetic-util.h"
 
 namespace impala {
+
+using datetime_parse_util::DateTimeFormatContext;
+using datetime_parse_util::SimpleDateFormatTokenizer;
+using impala_udf::FunctionContext;
+using impala_udf::StringVal;
 
 template <int32_t TICKS_PER_SEC>
 inline TimestampValue TimestampValue::UtcFromUnixTimeTicks(int64_t unix_time_ticks) {
@@ -46,7 +54,7 @@ inline TimestampValue TimestampValue::UtcFromUnixTimeMicros(int64_t unix_time_mi
 }
 
 inline TimestampValue TimestampValue::FromUnixTimeMicros(int64_t unix_time_micros,
-    const Timezone& local_tz) {
+    const Timezone* local_tz) {
   int64_t ts_seconds = SplitTime<MICROS_PER_SEC>(&unix_time_micros);
   TimestampValue result = FromUnixTime(ts_seconds, local_tz);
   if (result.HasDate()) result.time_ += boost::posix_time::microseconds(unix_time_micros);
@@ -58,7 +66,7 @@ inline TimestampValue TimestampValue::UtcFromUnixTimeMillis(int64_t unix_time_mi
 }
 
 inline TimestampValue TimestampValue::FromSubsecondUnixTime(
-    double unix_time, const Timezone& local_tz) {
+    double unix_time, const Timezone* local_tz) {
   int64_t unix_time_whole = unix_time;
   int64_t nanos = (unix_time - unix_time_whole) / ONE_BILLIONTH;
   return FromUnixTimeNanos(unix_time_whole, nanos, local_tz);
@@ -70,7 +78,7 @@ inline TimestampValue TimestampValue::UtcFromUnixTimeLimitedRangeNanos(
 }
 
 inline TimestampValue TimestampValue::FromUnixTimeNanos(time_t unix_time, int64_t nanos,
-    const Timezone& local_tz) {
+    const Timezone* local_tz) {
   unix_time =
       ArithmeticUtil::AsUnsigned<std::plus>(unix_time, SplitTime<NANOS_PER_SEC>(&nanos));
   TimestampValue result = FromUnixTime(unix_time, local_tz);
@@ -170,23 +178,21 @@ inline bool TimestampValue::UtcToUnixTimeLimitedRangeNanos(
   return true;
 }
 
-/// Converts to Unix time (seconds since the Unix epoch) representation. The time
-/// zone interpretation of the TimestampValue instance is determined by
-/// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
-/// instance is interpreted as a value in the 'local_tz' time zone. If the flag is false,
-/// UTC is assumed.
+/// Converts to Unix time (seconds since the Unix epoch) representation.
 /// Returns false if the conversion failed (unix_time will be undefined), otherwise
 /// true.
-inline bool TimestampValue::ToUnixTime(const Timezone& local_tz,
+inline bool TimestampValue::ToUnixTime(const Timezone* local_tz,
     time_t* unix_time) const {
   DCHECK(unix_time != nullptr);
   if (UNLIKELY(!HasDateAndTime())) return false;
 
-  if (!FLAGS_use_local_tz_for_unix_timestamp_conversions) return UtcToUnixTime(unix_time);
+  if (local_tz == UTCPTR) {
+    return UtcToUnixTime(unix_time);
+  }
 
   cctz::civil_second cs(date_.year(), date_.month(), date_.day(), time_.hours(),
       time_.minutes(), time_.seconds());
-  cctz::time_point<cctz::sys_seconds> tp = cctz::convert(cs, local_tz);
+  cctz::time_point<cctz::sys_seconds> tp = cctz::convert(cs, *local_tz);
   cctz::sys_seconds seconds = tp.time_since_epoch();
   *unix_time = seconds.count();
   return true;
@@ -196,7 +202,7 @@ inline bool TimestampValue::ToUnixTime(const Timezone& local_tz,
 /// TimestampValue instance is determined as above.
 /// Returns false if the conversion failed (unix_time will be undefined), otherwise
 /// true.
-inline bool TimestampValue::ToSubsecondUnixTime(const Timezone& local_tz,
+inline bool TimestampValue::ToSubsecondUnixTime(const Timezone* local_tz,
     double* unix_time) const {
   DCHECK(unix_time != nullptr);
   time_t temp;
@@ -208,6 +214,25 @@ inline bool TimestampValue::ToSubsecondUnixTime(const Timezone& local_tz,
   return true;
 }
 
+inline StringVal TimestampValue::ToStringVal(
+    FunctionContext* ctx, const DateTimeFormatContext& dt_ctx) const {
+  int max_length = dt_ctx.fmt_out_len;
+  StringVal sv(ctx, max_length);
+  int written = TimestampParser::Format(
+      dt_ctx, date_, time_, max_length, reinterpret_cast<char*>(sv.ptr));
+  if (UNLIKELY(written < 0)) {
+    sv.is_null = true;
+  } else {
+    sv.Resize(ctx, written);
+  }
+  return sv;
+}
+
+inline StringVal TimestampValue::ToStringVal(FunctionContext* ctx) const {
+  const DateTimeFormatContext* dt_ctx =
+      SimpleDateFormatTokenizer::GetDefaultTimestampFormatContext(time_);
+  return ToStringVal(ctx, *dt_ctx);
+}
 }
 
 #endif

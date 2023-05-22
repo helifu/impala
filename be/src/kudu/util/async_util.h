@@ -16,13 +16,11 @@
 // under the License.
 //
 // Utility functions which are handy when doing async/callback-based programming.
-
 #pragma once
 
 #include <functional>
 #include <memory>
 
-#include "kudu/gutil/bind.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/status.h"
@@ -44,7 +42,7 @@ namespace kudu {
 class Synchronizer {
  public:
   Synchronizer()
-    : data_(std::make_shared<Data>()) {
+      : data_(std::make_shared<Data>()) {
   }
 
   void StatusCB(const Status& status) {
@@ -52,11 +50,8 @@ class Synchronizer {
   }
 
   StatusCallback AsStatusCallback() {
-    return Bind(Data::Callback, std::weak_ptr<Data>(data_));
-  }
-
-  StdStatusCallback AsStdStatusCallback() {
-    return std::bind(Data::Callback, std::weak_ptr<Data>(data_), std::placeholders::_1);
+    std::weak_ptr<Data> w_data(data_);
+    return [w_data](const Status& s) { Data::Callback(w_data, s); };
   }
 
   Status Wait() const {
@@ -66,6 +61,13 @@ class Synchronizer {
 
   Status WaitFor(const MonoDelta& delta) const {
     if (PREDICT_FALSE(!data_->latch.WaitFor(delta))) {
+      return Status::TimedOut("timed out while waiting for the callback to be called");
+    }
+    return data_->status;
+  }
+
+  Status WaitUntil(const MonoTime& deadline) const {
+    if (PREDICT_FALSE(!data_->latch.WaitUntil(deadline))) {
       return Status::TimedOut("timed out while waiting for the callback to be called");
     }
     return data_->status;

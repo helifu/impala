@@ -20,6 +20,9 @@
 # This should be moved into the test/util folder eventually. The problem is this
 # module depends on db_connection which use some query generator classes.
 
+from __future__ import absolute_import, division, print_function
+from builtins import int, range, zip
+from future.utils import with_metaclass
 import hdfs
 import logging
 import os
@@ -29,23 +32,26 @@ import subprocess
 from abc import ABCMeta, abstractproperty
 from cm_api.api_client import ApiResource as CmApiResource
 from collections import defaultdict
+from collections import OrderedDict
 from contextlib import contextmanager
-from ordereddict import OrderedDict
 from getpass import getuser
-from itertools import izip
+from io import BytesIO
 from multiprocessing.pool import ThreadPool
 from random import choice
-from StringIO import StringIO
-from sys import maxint
+from sys import maxsize
 from tempfile import mkdtemp
 from threading import Lock
 from time import mktime, strptime
-from urlparse import urlparse
 from xml.etree.ElementTree import parse as parse_xml
 from zipfile import ZipFile
 
+try:
+  from urllib.parse import urlparse
+except ImportError:
+  from urlparse import urlparse
 
-from db_connection import HiveConnection, ImpalaConnection
+from tests.comparison.db_connection import HiveConnection, ImpalaConnection
+from tests.common.environ import HIVE_MAJOR_VERSION
 from tests.common.errors import Timeout
 from tests.util.shell_util import shell as local_shell
 from tests.util.parse_util import parse_glog, parse_mem_to_mb
@@ -63,13 +69,11 @@ CM_CLEAR_PORT = 7180
 CM_TLS_PORT = 7183
 
 
-class Cluster(object):
+class Cluster(with_metaclass(ABCMeta, object)):
   """This is a base class for clusters. Cluster classes provide various methods for
      interacting with a cluster. Ideally the various cluster implementations provide
      the same set of methods so any cluster implementation can be chosen at runtime.
   """
-
-  __metaclass__ = ABCMeta
 
   def __init__(self):
     self._hadoop_configs = None
@@ -208,9 +212,8 @@ class MiniCluster(Cluster):
       shutil.copy(os.path.join(other_conf_dir, file_name), self._local_hadoop_conf_dir)
 
   def _get_node_conf_dir(self):
-    return os.path.join(os.environ["IMPALA_HOME"], "testdata", "cluster",
-                        "cdh%s" % os.environ["CDH_MAJOR_VERSION"], "node-1",
-                        "etc", "hadoop", "conf")
+    return os.path.join(os.environ["IMPALA_CLUSTER_NODES_DIR"],
+                        "node-1", "etc", "hadoop", "conf")
 
   def _get_other_conf_dir(self):
     return os.path.join(os.environ["IMPALA_HOME"], "fe", "src", "test",
@@ -226,7 +229,7 @@ class MiniCluster(Cluster):
     hs2_base_port = 21050
     web_ui_base_port = 25000
     impalads = [MiniClusterImpalad(hs2_base_port + p, web_ui_base_port + p)
-                for p in xrange(self.num_impalads)]
+                for p in range(self.num_impalads)]
     self._impala = Impala(self, impalads)
 
 class MiniHiveCluster(MiniCluster):
@@ -322,7 +325,7 @@ class CmCluster(Cluster):
 
   def _init_local_hadoop_conf_dir(self):
     self._local_hadoop_conf_dir = mkdtemp()
-    data = StringIO(self.cm.get("/clusters/%s/services/%s/clientConfig"
+    data = BytesIO(self.cm.get("/clusters/%s/services/%s/clientConfig"
       % (self.cm_cluster.name, self._find_service("HIVE").name)))
     zip_file = ZipFile(data)
     for name in zip_file.namelist():
@@ -501,8 +504,16 @@ class Hive(Service):
   @property
   def warehouse_dir(self):
     if not self._warehouse_dir:
-      self._warehouse_dir = urlparse(
-        self.cluster.get_hadoop_config("hive.metastore.warehouse.dir")).path
+      # Starting in Hive 3, there is a separate directory for external tables. Since
+      # all non-transactional tables are external tables with HIVE-22158, most of the
+      # test tables are located here. To avoid disruption, we use this as the warehouse
+      # directory. Hive 2 doesn't have this distinction and is unchanged.
+      if HIVE_MAJOR_VERSION > 2:
+        self._warehouse_dir = urlparse(
+          self.cluster.get_hadoop_config("hive.metastore.warehouse.external.dir")).path
+      else:
+        self._warehouse_dir = urlparse(
+          self.cluster.get_hadoop_config("hive.metastore.warehouse.dir")).path
     return self._warehouse_dir
 
   def connect(self, db_name=None):
@@ -606,7 +617,7 @@ class Impala(Service):
       return dict.fromkeys(stopped_impalads)
     messages = OrderedDict()
     impalads_with_message = dict()
-    for i, message in izip(stopped_impalads, self.for_each_impalad(
+    for i, message in zip(stopped_impalads, self.for_each_impalad(
         lambda i: i.find_last_crash_message(start_time), impalads=stopped_impalads)):
       if message:
         impalads_with_message[i] = "%s crashed:\n%s" % (i.host_name, message)
@@ -620,9 +631,9 @@ class Impala(Service):
       impalads = self.impalads
     promise = self._thread_pool.map_async(func, impalads)
     # Python doesn't handle ctrl-c well unless a timeout is provided.
-    results = promise.get(maxint)
+    results = promise.get(maxsize)
     if as_dict:
-      results = dict(izip(impalads, results))
+      results = dict(zip(impalads, results))
     return results
 
   def restart(self):
@@ -646,9 +657,7 @@ class CmImpala(Impala):
       raise Exception("Failed to restart Impala: %s" % command.resultMessage)
 
 
-class Impalad(object):
-
-  __metaclass__ = ABCMeta
+class Impalad(with_metaclass(ABCMeta, object)):
 
   def __init__(self):
     self.impala = None
@@ -786,7 +795,7 @@ class Impalad(object):
     if not pid:
       raise Exception("Impalad at %s is not running" % self.label)
     mem_kb = self.shell("ps --no-header -o rss -p %s" % pid)
-    return int(mem_kb) / 1024
+    return int(mem_kb) // 1024
 
   def _read_web_page(self, relative_url, params={}, timeout_secs=DEFAULT_TIMEOUT):
     if "json" not in params:
@@ -865,7 +874,7 @@ class MiniClusterImpalad(Impalad):
       return int(pid)
 
   def find_process_mem_mb_limit(self):
-    return long(self.get_metric("mem-tracker.process.limit")["value"]) / 1024 ** 2
+    return int(self.get_metric("mem-tracker.process.limit")["value"]) // 1024 ** 2
 
   def find_core_dump_dir(self):
     raise NotImplementedError()
@@ -907,7 +916,7 @@ class CmImpalad(Impalad):
       return int(pid)
 
   def find_process_mem_mb_limit(self):
-    return self._get_cm_config("impalad_memory_limit", value_type=int) / 1024 ** 2
+    return self._get_cm_config("impalad_memory_limit", value_type=int) // 1024 ** 2
 
   def find_core_dump_dir(self):
     return self._get_cm_config("core_dump_dir")

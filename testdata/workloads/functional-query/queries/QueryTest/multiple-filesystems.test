@@ -25,9 +25,9 @@ STRING
 ---- QUERY
 show table stats tinytable_like
 ---- RESULTS
-3,1,'38B','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+3,1,'38B','NOT CACHED','NOT CACHED','TEXT','false',regex:.*,'$ERASURECODE_POLICY'
 ---- TYPES
-BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
+BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING, STRING
 ====
 ---- QUERY
 create external table tinytable_copy (a string, b string)
@@ -120,14 +120,14 @@ INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, STRING, STRING, TIM
 # Note: intentionally not using $SECONDARY_FILESYSTEM so that the partition points
 # to the default filesystem.
 alter table alltypes add partition(year=2010, month=3)
-location '/test-warehouse/alltypes_parquet/year=2010/month=3'
+location '$WAREHOUSE_LOCATION_PREFIX/test-warehouse/alltypes_parquet/year=2010/month=3'
 ---- RESULTS
 ====
 ---- QUERY
 # Note: intentionally not using $SECONDARY_FILESYSTEM so that the partition points
 # to the default filesystem.
 alter table alltypes add partition(year=2010, month=4)
-location '/test-warehouse/alltypes_parquet/year=2010/month=4'
+location '$WAREHOUSE_LOCATION_PREFIX/test-warehouse/alltypes_parquet/year=2010/month=4'
 ---- RESULTS
 ====
 ---- QUERY
@@ -158,13 +158,13 @@ STRING
 ---- QUERY
 show table stats alltypes
 ---- RESULTS
-'2009','1',310,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*
-'2009','2',280,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*
-'2010','3',310,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*
-'2010','4',300,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*
-'Total','',1200,4,regex:.+KB,'0B','','','',''
+'2009','1',310,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*,'$ERASURECODE_POLICY'
+'2009','2',280,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*,'$ERASURECODE_POLICY'
+'2010','3',310,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*,'$ERASURECODE_POLICY'
+'2010','4',300,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*,'$ERASURECODE_POLICY'
+'Total','',1200,4,regex:.+KB,'0B','','','','',''
 ---- TYPES
-STRING, STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
+STRING, STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING, STRING
 ====
 ---- QUERY
 drop table alltypes
@@ -187,7 +187,7 @@ INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, STRING, STRING, TIM
 # Note: intentionally not using $SECONDARY_FILESYSTEM so that the partition points
 # to the default filesystem.
 alter table alltypes add partition(year=2009, month=5)
-location '/test-warehouse/alltypes_parquet/year=2009/month=5'
+location '$WAREHOUSE_LOCATION_PREFIX/test-warehouse/alltypes_parquet/year=2009/month=5'
 ---- RESULTS
 ====
 ---- QUERY
@@ -199,7 +199,7 @@ location '$SECONDARY_FILESYSTEM/multi_fs_tests/$DATABASE.db/alltypes_parquet/yea
 # Note: intentionally not using $SECONDARY_FILESYSTEM so that the partition points
 # to the default filesystem.
 alter table alltypes add partition(year=2010, month=5)
-location '/test-warehouse/alltypes_parquet/year=2010/month=5'
+location '$WAREHOUSE_LOCATION_PREFIX/test-warehouse/alltypes_parquet/year=2010/month=5'
 ---- RESULTS
 ====
 ---- QUERY
@@ -238,13 +238,13 @@ STRING
 ---- QUERY
 show table stats alltypes
 ---- RESULTS
-'2009','5',310,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*
-'2009','6',300,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*
-'2010','2',280,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*
-'2010','5',310,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*
-'Total','',1200,4,regex:.+KB,'0B','','','',''
+'2009','5',310,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*,'$ERASURECODE_POLICY'
+'2009','6',300,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*,'$ERASURECODE_POLICY'
+'2010','2',280,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*,'$ERASURECODE_POLICY'
+'2010','5',310,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false',regex:.*,'$ERASURECODE_POLICY'
+'Total','',1200,4,regex:.+KB,'0B','','','','',''
 ---- TYPES
-STRING, STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
+STRING, STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING, STRING
 ====
 ---- QUERY
 drop table alltypes
@@ -300,13 +300,13 @@ select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col,
 float_col, double_col, date_string_col, string_col, timestamp_col
 from functional.alltypes where year = 2009 and month = 1
 ---- RESULTS
-year=2009/month=1/: 310
+year=2009/month=1: 310
 ====
 ---- QUERY
 # ADD PARTITION on the default filesystem.
 # Point to unique database so we don't overwrite someone else's data.
 alter table alltypes_multipart_insert add partition(year=2009, month=2)
-location '/test-warehouse/$DATABASE.db/alltypes_multipart_insert/year=2009/month=2'
+location '$WAREHOUSE_LOCATION_PREFIX/test-warehouse/$DATABASE.db/alltypes_multipart_insert/year=2009/month=2'
 ---- RESULTS
 ====
 ---- QUERY
@@ -315,7 +315,7 @@ select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col,
 float_col, double_col, date_string_col, string_col, timestamp_col
 from functional.alltypes where year = 2009 and month = 2
 ---- RESULTS
-year=2009/month=2/: 280
+year=2009/month=2: 280
 ====
 ---- QUERY
 select * from alltypes_multipart_insert where id%100=0 order by id;

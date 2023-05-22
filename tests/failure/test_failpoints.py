@@ -18,18 +18,19 @@
 # Injects failures  at specific locations in each of the plan nodes. Currently supports
 # two types of failures - cancellation of the query and a failure test hook.
 #
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
-import os
 import re
-from collections import defaultdict
 from time import sleep
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
+from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite, LOG
-from tests.common.skip import SkipIf, SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, \
-    SkipIfLocal
+from tests.common.skip import SkipIf, SkipIfFS
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
+from tests.verifiers.metric_verifier import MetricVerifier
 
 FAILPOINT_ACTIONS = ['FAIL', 'CANCEL', 'MEM_LIMIT_EXCEEDED']
 # Not included:
@@ -52,15 +53,16 @@ QUERIES = [
   "select 1 from alltypessmall order by id limit 100",
   "select * from alltypessmall union all select * from alltypessmall",
   "select row_number() over (partition by int_col order by id) from alltypessmall",
-  "select c from (select id c from alltypessmall order by id limit 10) v where c = 1"
+  "select c from (select id c from alltypessmall order by id limit 10) v where c = 1",
+  """SELECT STRAIGHT_JOIN *
+           FROM alltypes t1
+                  JOIN /*+broadcast*/ alltypesagg t2 ON t1.id = t2.id
+           WHERE t2.int_col < 1000"""
 ]
 
-@SkipIf.skip_hbase # -skip_hbase argument specified
-@SkipIfS3.hbase # S3: missing coverage: failures
-@SkipIfABFS.hbase
-@SkipIfADLS.hbase
-@SkipIfIsilon.hbase # ISILON: missing coverage: failures.
-@SkipIfLocal.hbase
+
+@SkipIf.skip_hbase  # -skip_hbase argument specified
+@SkipIfFS.hbase  # missing coverage: failures
 class TestFailpoints(ImpalaTestSuite):
   @classmethod
   def get_workload(cls):
@@ -100,14 +102,7 @@ class TestFailpoints(ImpalaTestSuite):
     location = vector.get_value('location')
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
 
-    try:
-      plan_node_ids = self.__parse_plan_nodes_from_explain(query, vector)
-    except ImpalaBeeswaxException as e:
-      if "MT_DOP not supported" in str(e):
-        pytest.xfail(reason="MT_DOP not supported.")
-      else:
-        raise e
-
+    plan_node_ids = self.__parse_plan_nodes_from_explain(query, vector)
     for node_id in plan_node_ids:
       debug_action = '%d:%s:%s' % (node_id, location, FAILPOINT_ACTION_MAP[action])
       # IMPALA-7046: add jitter to backend startup to exercise various failure paths.
@@ -127,6 +122,11 @@ class TestFailpoints(ImpalaTestSuite):
     # injected.
     del vector.get_value('exec_option')['debug_action']
     self.execute_query(query, vector.get_value('exec_option'))
+
+    # Detect any hung fragments left from this test.
+    for impalad in ImpalaCluster.get_e2e_test_cluster().impalads:
+      verifier = MetricVerifier(impalad.service)
+      verifier.wait_for_metric("impala-server.num-fragments-in-flight", 0)
 
   def __parse_plan_nodes_from_explain(self, query, vector):
     """Parses the EXPLAIN <query> output and returns a list of node ids.
@@ -151,6 +151,11 @@ class TestFailpoints(ImpalaTestSuite):
     result = self.execute_query_expect_failure(self.client, query,
         query_options={'debug_action': debug_action})
     assert "Error during scheduling" in str(result)
+
+    # Fail Exec() in the coordinator.
+    debug_action = 'EXEC_SERIALIZE_FRAGMENT_INFO:FAIL@1.0'
+    self.execute_query_expect_failure(self.client, query,
+        query_options={'debug_action': debug_action})
 
     # Fail the Prepare() phase of all fragment instances.
     debug_action = 'FIS_IN_PREPARE:FAIL@1.0'

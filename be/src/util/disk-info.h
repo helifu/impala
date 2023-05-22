@@ -15,14 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_UTIL_DISK_INFO_H
-#define IMPALA_UTIL_DISK_INFO_H
-
+#include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
 
-#include <boost/cstdint.hpp>
 #include "common/logging.h"
 
 namespace impala {
@@ -32,10 +31,12 @@ namespace impala {
 /// configuration.
 /// This information is pulled from /proc/partitions.
 /// TODO: datanode information not implemented
+///
+/// Arguments are used for mocking disk info in tests.
 class DiskInfo {
  public:
   /// Initialize DiskInfo.  Just be called before any other functions.
-  static void Init();
+  static void Init(std::string proc = "/proc", std::string sys = "/sys");
 
   /// Returns the number of (logical) disks on the system
   static int num_disks() {
@@ -100,7 +101,7 @@ class DiskInfo {
   /// mapping of devices names to disk ids
   static std::map<std::string, int> disk_name_to_disk_id_;
 
-  static void GetDeviceNames();
+  static void GetDeviceNames(const std::string& proc, const std::string &sys);
 
   /// See if 'name_in' is an NVME device. If it is, set 'basename_out' to the base
   /// NVME device name (i.e. nvme0n1p1 -> nvme0n1) and return true. Otherwise,
@@ -108,4 +109,3 @@ class DiskInfo {
   static bool TryNVMETrim(const std::string& name_in, std::string* basename_out);
 };
 }
-#endif

@@ -15,11 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from subprocess import check_call
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3
+from tests.common.skip import SkipIfFS
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.util.filesystem_utils import get_fs_path
 
@@ -76,12 +77,16 @@ class TestRewrittenFile(ImpalaTestSuite):
     result = self.client.execute("select count(*) from %s.%s" % (db_name, table_name))
     assert result.data == [str(expected_new_count)]
 
-  @SkipIfS3.jira(reason="IMPALA-2512")
+  @SkipIfFS.read_past_eof
   def test_new_file_shorter(self, vector, unique_database):
     """Rewrites an existing file with a new shorter file."""
     # Full error is something like:
     #   Metadata for file '...' appears stale. Try running "refresh
     #   unique_database_name.new_file_shorter" to reload the file metadata.
+    # IMPALA-2512: Error message could also be something like
+    #   Query aborted:Disk I/O error on ...:27001: Error seeking ...
+    #   between 0 and ... for '...'
+    # TODO: find a better way to detect stale file meta and remove skip markers.
     table_name = "new_file_shorter"
     self.__overwrite_file_and_query(unique_database, table_name,
       self.LONG_FILE, self.SHORT_FILE, 'appears stale.', self.SHORT_FILE_NUM_ROWS)

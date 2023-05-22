@@ -23,7 +23,11 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
+import org.apache.impala.analysis.TableRef.ZippingUnnestType;
+import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.iceberg.IcebergMetadataTable;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.util.AcidUtils;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -34,7 +38,6 @@ import com.google.common.collect.Lists;
  * the class it implements the Iterable interface.
  */
 public class FromClause extends StmtNode implements Iterable<TableRef> {
-
   private final List<TableRef> tableRefs_;
 
   private boolean analyzed_ = false;
@@ -50,21 +53,80 @@ public class FromClause extends StmtNode implements Iterable<TableRef> {
   public FromClause() { tableRefs_ = new ArrayList<>(); }
   public List<TableRef> getTableRefs() { return tableRefs_; }
 
+  public boolean isAnalyzed() { return analyzed_; }
+
+  @Override
+  public boolean resolveTableMask(Analyzer analyzer) throws AnalysisException {
+    boolean hasChanges = false;
+    for (int i = 0; i < size(); ++i) {
+      TableRef origRef = get(i);
+      if (origRef instanceof InlineViewRef) {
+        hasChanges |= ((InlineViewRef) origRef).getViewStmt().resolveTableMask(analyzer);
+        // Skip local views
+        if (!((InlineViewRef) origRef).isCatalogView()) continue;
+      }
+      TableRef newRef = analyzer.resolveTableMask(origRef);
+      if (newRef == origRef) continue;
+      set(i, newRef);
+      hasChanges = true;
+      Preconditions.checkState(newRef.isTableMaskingView(),
+          "resolved table mask should be a view");
+    }
+    return hasChanges;
+  }
+
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     if (analyzed_) return;
 
+    TableRef firstZippingUnnestRef = null;
     TableRef leftTblRef = null;  // the one to the left of tblRef
+    boolean hasJoiningUnnest = false;
     for (int i = 0; i < tableRefs_.size(); ++i) {
       TableRef tblRef = tableRefs_.get(i);
-      // Replace non-InlineViewRef table refs with a BaseTableRef or ViewRef.
+      if (IcebergMetadataTable.isIcebergMetadataTable(tblRef.getPath())) {
+        analyzer.addMetadataVirtualTable(tblRef.getPath());
+      }
       tblRef = analyzer.resolveTableRef(tblRef);
       tableRefs_.set(i, Preconditions.checkNotNull(tblRef));
       tblRef.setLeftTblRef(leftTblRef);
       tblRef.analyze(analyzer);
       leftTblRef = tblRef;
+      if (tblRef instanceof CollectionTableRef) {
+        checkTopLevelComplexAcidScan(analyzer, (CollectionTableRef)tblRef);
+        if (firstZippingUnnestRef != null && tblRef.isZippingUnnest() &&
+            firstZippingUnnestRef.getResolvedPath().getRootTable() !=
+            tblRef.getResolvedPath().getRootTable()) {
+          throw new AnalysisException("Not supported to do zipping unnest on " +
+              "arrays from different tables.");
+        }
+        if (!tblRef.isZippingUnnest()) {
+          hasJoiningUnnest = true;
+        } else {
+          if (!isPathForArrayType(tblRef)) {
+            throw new AnalysisException("Unnest operator is only supported for arrays. " +
+                ToSqlUtils.getPathSql(tblRef.getPath()));
+          }
+          if (firstZippingUnnestRef == null) firstZippingUnnestRef = tblRef;
+          analyzer.addZippingUnnestTupleId((CollectionTableRef)tblRef);
+          analyzer.increaseZippingUnnestCount();
+        }
+      }
+    }
+    if (hasJoiningUnnest && firstZippingUnnestRef != null) {
+      throw new AnalysisException(
+          "Providing zipping and joining unnests together is not supported.");
     }
     analyzed_ = true;
+  }
+
+  private boolean isPathForArrayType(TableRef tblRef) {
+    Preconditions.checkNotNull(tblRef);
+    Preconditions.checkState(!tblRef.getResolvedPath().getMatchedTypes().isEmpty());
+    Type resolvedType =
+        tblRef.getResolvedPath().getMatchedTypes().get(
+            tblRef.getResolvedPath().getMatchedTypes().size() - 1);
+    return resolvedType.isArrayType();
   }
 
   public void collectFromClauseTableRefs(List<TableRef> tblRefs) {
@@ -86,6 +148,19 @@ public class FromClause extends StmtNode implements Iterable<TableRef> {
     }
   }
 
+  private void checkTopLevelComplexAcidScan(Analyzer analyzer,
+      CollectionTableRef collRef) {
+    if (collRef.getCollectionExpr() != null) return;
+    // Don't do any checks of the collection that came from a view as getTable() would
+    // return null in that case.
+    if (collRef.getTable() == null) return;
+    if (!AcidUtils.isFullAcidTable(
+        collRef.getTable().getMetaStoreTable().getParameters())) {
+      return;
+    }
+    analyzer.setHasTopLevelAcidCollectionTableRef();
+  }
+
   @Override
   public FromClause clone() {
     List<TableRef> clone = new ArrayList<>();
@@ -101,13 +176,18 @@ public class FromClause extends StmtNode implements Iterable<TableRef> {
         TableRef newTblRef = new TableRef(origTblRef);
         // Use the fully qualified raw path to preserve the original resolution.
         // Otherwise, non-fully qualified paths might incorrectly match a local view.
-        // TODO for 2.3: This full qualification preserves analysis state which is
+        // TODO(IMPALA-9286): This full qualification preserves analysis state which is
         // contrary to the intended semantics of reset(). We could address this issue by
         // changing the WITH-clause analysis to register local views that have
         // fully-qualified table refs, and then remove the full qualification here.
-        newTblRef.rawPath_ = origTblRef.getResolvedPath().getFullyQualifiedRawPath();
+        Path oldPath = origTblRef.getResolvedPath();
+        if (oldPath.getRootDesc() == null
+            || !oldPath.getRootDesc().getType().isCollectionStructType()) {
+          newTblRef.rawPath_ = oldPath.getFullyQualifiedRawPath();
+        }
         set(i, newTblRef);
       }
+      // recurse for views
       get(i).reset();
     }
     this.analyzed_ = false;
@@ -124,7 +204,25 @@ public class FromClause extends StmtNode implements Iterable<TableRef> {
     if (!tableRefs_.isEmpty()) {
       builder.append(" FROM ");
       for (int i = 0; i < tableRefs_.size(); ++i) {
-        builder.append(tableRefs_.get(i).toSql(options));
+        TableRef tblRef = tableRefs_.get(i);
+        if (tblRef.getZippingUnnestType() ==
+            ZippingUnnestType.FROM_CLAUSE_ZIPPING_UNNEST) {
+          // Go through all the consecutive table refs for zipping unnest and put them in
+          // the same "UNNEST()".
+          if (i != 0) builder.append(", ");
+          builder.append("UNNEST(");
+          boolean first = true;
+          while(i < tableRefs_.size() && tblRef.getZippingUnnestType() ==
+              ZippingUnnestType.FROM_CLAUSE_ZIPPING_UNNEST) {
+            if (!first) builder.append(", ");
+            if (first) first = false;
+            builder.append(ToSqlUtils.getPathSql(tblRef.getPath()));
+            if (++i < tableRefs_.size()) tblRef = tableRefs_.get(i);
+          }
+          builder.append(")");
+        }
+        if (i >= tableRefs_.size()) break;
+        builder.append(tblRef.toSql(options));
       }
     }
     return builder.toString();
@@ -138,4 +236,5 @@ public class FromClause extends StmtNode implements Iterable<TableRef> {
   public TableRef get(int i) { return tableRefs_.get(i); }
   public void set(int i, TableRef tableRef) { tableRefs_.set(i, tableRef); }
   public void add(TableRef t) { tableRefs_.add(t); }
+  public void add(int i, TableRef t) { tableRefs_.add(i, t); }
 }

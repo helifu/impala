@@ -17,16 +17,11 @@
 
 # Targeted Impala HBase Tests
 
+from __future__ import absolute_import, division, print_function
 import pytest
 
-from tests.common.skip import (
-    SkipIfIsilon,
-    SkipIfS3,
-    SkipIfABFS,
-    SkipIfADLS,
-    SkipIfLocal)
-
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.common.skip import SkipIfFS
 
 class TestHBaseQueries(ImpalaTestSuite):
   @classmethod
@@ -64,11 +59,7 @@ class TestHBaseQueries(ImpalaTestSuite):
   def test_hbase_inserts(self, vector):
     self.run_test_case('QueryTest/hbase-inserts', vector)
 
-  @SkipIfIsilon.hive
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_hbase_col_filter(self, vector, unique_database):
     """IMPALA-7929: test query with table created with hive and mapped to hbase. The key
     column doesn't have qualifier and the query with predicate on key column name should

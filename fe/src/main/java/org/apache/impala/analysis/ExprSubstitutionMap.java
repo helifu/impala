@@ -71,6 +71,20 @@ public final class ExprSubstitutionMap {
   }
 
   /**
+   * Same as get() but start at index 'hint'
+   */
+  public Expr getWithHint(Expr lhsExpr, int hint) {
+    for (int i = hint; i < lhs_.size(); ++i) {
+      if (lhsExpr.equals(lhs_.get(i))) return rhs_.get(i);
+    }
+    if (lhs_.size() < hint) hint = lhs_.size();
+    for (int i = 0; i < hint; ++i) {
+      if (lhsExpr.equals(lhs_.get(i))) return rhs_.get(i);
+    }
+    return null;
+  }
+
+  /**
    * Returns true if the smap contains a mapping for lhsExpr.
    */
   public boolean containsMappingFor(Expr lhsExpr) {
@@ -186,8 +200,8 @@ public final class ExprSubstitutionMap {
       for (int j = i + 1; j < other.lhs_.size(); ++j) {
         Expr a = other.lhs_.get(i);
         Expr b = other.lhs_.get(j);
-        Expr finalA = get(a);
-        Expr finalB = get(b);
+        Expr finalA = getWithHint(a, i);
+        Expr finalB = getWithHint(b, j);
         if (finalA == null || finalB == null) {
           if (LOG.isTraceEnabled()) {
             if (finalA == null) {
@@ -212,5 +226,42 @@ public final class ExprSubstitutionMap {
       }
     }
     return true;
+  }
+
+  /**
+   * Remove expressions that are not used according to baseTblSMap
+   */
+  public void trim(ExprSubstitutionMap baseTblSMap, Analyzer analyzer) {
+    Preconditions.checkState(size() == baseTblSMap.size());
+    for (int i = size() - 1; i >= 0; --i) {
+      final Expr baseTblExpr = baseTblSMap.getRhs().get(i);
+      List<SlotId> slotIds = new ArrayList<>();
+      baseTblExpr.getIds(null, slotIds);
+      // Struct children are allowed to be non-materialised because the query may only
+      // concern a subset of the fields of the struct. In this case we do not remove the
+      // entry from this 'ExprSubstitutionMap', only if none of the children are
+      // materialised.
+      if (!baseTblExpr.getType().isStructType()) {
+        for (SlotId id: slotIds) {
+          if (!analyzer.getSlotDesc(id).isMaterialized()) {
+            lhs_.remove(i);
+            rhs_.remove(i);
+            break;
+          }
+        }
+      } else { // If it is a struct, remove iff none of the children are materialised.
+        boolean foundMaterialized = false;
+        for (SlotId id: slotIds) {
+          if (analyzer.getSlotDesc(id).isMaterialized()) {
+            foundMaterialized = true;
+            break;
+          }
+        }
+        if (!foundMaterialized) {
+          lhs_.remove(i);
+          rhs_.remove(i);
+        }
+      }
+    }
   }
 }

@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import os
 import pytest
 import random
@@ -82,7 +84,7 @@ class TestUdfConcurrency(CustomClusterTestSuite):
     try:
       setup_client.execute(setup_query)
     except Exception as e:
-      print "Unable to create initial function: {0}".format(setup_query)
+      print("Unable to create initial function: {0}".format(setup_query))
       raise
 
     errors = []
@@ -113,11 +115,11 @@ class TestUdfConcurrency(CustomClusterTestSuite):
 
     # create threads to use native function.
     runner_threads = []
-    for i in xrange(num_uses):
+    for i in range(num_uses):
       runner_threads.append(threading.Thread(target=use_fn_method))
 
     # create threads to drop/create native functions.
-    for i in xrange(num_loads):
+    for i in range(num_loads):
       runner_threads.append(threading.Thread(target=load_fn_method))
 
     # launch all runner threads.
@@ -126,7 +128,7 @@ class TestUdfConcurrency(CustomClusterTestSuite):
     # join all threads.
     for t in runner_threads: t.join()
 
-    for e in errors: print e
+    for err in errors: print(err)
 
     # Checks that no impalad has crashed.
     assert cluster.num_responsive_coordinators() == exp_num_coordinators
@@ -167,13 +169,13 @@ class TestUdfConcurrency(CustomClusterTestSuite):
       s = create_fn_to_use.format(unique_database, udf_tgt_path)
       setup_client.execute(s)
     except Exception as e:
-      print e
+      print(e)
       assert False
     for i in range(0, num_drops):
       try:
         setup_client.execute(create_fn_to_drop.format(unique_database, i, udf_tgt_path))
       except Exception as e:
-        print e
+        print(e)
         assert False
 
     errors = []
@@ -208,5 +210,5 @@ class TestUdfConcurrency(CustomClusterTestSuite):
     for t in runner_threads: t.join()
 
     # Check for any errors.
-    for e in errors: print e
+    for err in errors: print(err)
     assert len(errors) == 0

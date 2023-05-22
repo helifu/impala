@@ -15,11 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import getpass
 import pytest
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfFS
 from tests.common.test_dimensions import (
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
@@ -33,11 +34,7 @@ PYWEBHDFS_TMP_DIR = 'tmp/test_encryption_load_data'
 TMP_DIR = '/%s' % (PYWEBHDFS_TMP_DIR)
 
 
-@SkipIfS3.hdfs_encryption
-@SkipIfABFS.hdfs_encryption
-@SkipIfADLS.hdfs_encryption
-@SkipIfIsilon.hdfs_encryption
-@SkipIfLocal.hdfs_encryption
+@SkipIfFS.hdfs_encryption
 @pytest.mark.execute_serially
 class TestHdfsEncryption(ImpalaTestSuite):
   ''' Tests LOAD DATA commands work between HDFS encryption zones.
@@ -147,7 +144,6 @@ class TestHdfsEncryption(ImpalaTestSuite):
     else:
       self.client.execute('load data inpath \'%s\' into table tbl ' % (TMP_DIR))
 
-  @SkipIfIsilon.hdfs_encryption
   @pytest.mark.execute_serially
   def test_drop_partition_encrypt(self):
     """Verifies if alter <tbl> drop partition purge works in case
@@ -218,7 +214,6 @@ class TestHdfsEncryption(ImpalaTestSuite):
     assert not self.hdfs_client.exists("test-warehouse/{0}.db/t1/j=3/j3.txt".format(TEST_DB))
     assert not self.hdfs_client.exists("test-warehouse/{0}.db/t1/j=3".format(TEST_DB))
 
-  @SkipIfIsilon.hdfs_encryption
   @pytest.mark.execute_serially
   def test_drop_table_encrypt(self):
     """Verifies if drop <table> purge works in a case where Trash directory and table

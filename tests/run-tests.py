@@ -22,6 +22,7 @@
 # executing the remaining tests in parallel. To run only some of
 # these, use --skip-serial, --skip-stress, or --skip-parallel.
 # All additional command line options are passed to py.test.
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_service import ImpaladService
 from tests.conftest import configure_logging
@@ -44,10 +45,10 @@ VALID_TEST_DIRS = ['failure', 'query_test', 'stress', 'unittests', 'aux_query_te
 # new dir to the list of valid test dirs above. All dirs unders tests/ must be placed
 # into one of these lists, otherwise the script will throw an error. This list can be
 # removed once IMPALA-4417 has been resolved.
-TEST_HELPER_DIRS = ['aux_parquet_data_load', 'test-hive-udfs', 'comparison', 'benchmark',
+TEST_HELPER_DIRS = ['aux_parquet_data_load', 'comparison', 'benchmark',
                      'custom_cluster', 'util', 'experiments', 'verifiers', 'common',
                      'performance', 'beeswax', 'aux_custom_cluster_tests',
-                     'authorization']
+                     'authorization', 'test-hive-udfs']
 
 TEST_DIR = os.path.join(os.environ['IMPALA_HOME'], 'tests')
 RESULT_DIR = os.path.join(os.environ['IMPALA_EE_TEST_LOGS_DIR'], 'results')
@@ -165,7 +166,7 @@ def build_test_args(base_name, valid_dirs=VALID_TEST_DIRS):
 
   ignored_dirs = build_ignore_dir_arg_list(valid_dirs=valid_dirs)
   logging_args = []
-  for arg, log in LOGGING_ARGS.iteritems():
+  for arg, log in LOGGING_ARGS.items():
     logging_args.extend([arg, os.path.join(RESULT_DIR, log.format(base_name))])
 
   if valid_dirs != ['verifiers']:
@@ -226,16 +227,16 @@ def build_ignore_dir_arg_list(valid_dirs):
 def print_metrics(substring):
   """Prints metrics with the given substring in the name"""
   for impalad in ImpalaCluster.get_e2e_test_cluster().impalads:
-    print ">" * 80
+    print(">" * 80)
     port = impalad.get_webserver_port()
     cert = impalad._get_webserver_certificate_file()
-    print "connections metrics for impalad at port {0}:".format(port)
+    print("connections metrics for impalad at port {0}:".format(port))
     debug_info = json.loads(ImpaladService(impalad.hostname, webserver_port=port,
         webserver_certificate_file=cert).read_debug_webpage('metrics?json'))
     for metric in debug_info['metric_group']['metrics']:
       if substring in metric['name']:
-        print json.dumps(metric, indent=1)
-    print "<" * 80
+        print(json.dumps(metric, indent=1))
+    print("<" * 80)
 
 
 def detect_and_remove_flag(flag):
@@ -265,7 +266,7 @@ if __name__ == "__main__":
 
   def run(args):
     """Helper to print out arguments of test_executor before invoking."""
-    print "Running TestExecutor with args: %s" % (args,)
+    print("Running TestExecutor with args: %s" % (args,))
     test_executor.run_tests(args)
 
   os.chdir(TEST_DIR)
@@ -282,22 +283,44 @@ if __name__ == "__main__":
     run(sys.argv[1:])
   else:
     print_metrics('connections')
+
+    # If using sharding, it is useful to include it in the output filenames so that
+    # different shards don't overwrite each other. If not using sharding, use the
+    # normal filenames. This does not validate the shard_tests argument.
+    shard_identifier = ""
+    shard_arg = None
+    for idx, arg in enumerate(sys.argv):
+      # This deliberately does not stop at the first occurrence. It continues through
+      # all the arguments to find the last occurrence of shard_tests.
+      if arg == "--shard_tests":
+        # Form 1: --shard_tests N/M (space separation => grab next argument)
+        assert idx + 1 < len(sys.argv), "shard_args expects an argument"
+        shard_arg = sys.argv[idx + 1]
+      elif "--shard_tests=" in arg:
+        # Form 2: --shard_tests=N/M
+        shard_arg = arg.replace("--shard_tests=", "")
+
+    if shard_arg:
+      # The shard argument is "N/M" where N <= M. Convert to a string that can be used
+      # in a filename.
+      shard_identifier = "_shard_{0}".format(shard_arg.replace("/", "_"))
+
     # First run query tests that need to be executed serially
     if not skip_serial:
       base_args = ['-m', 'execute_serially']
-      run(base_args + build_test_args('serial'))
+      run(base_args + build_test_args("serial{0}".format(shard_identifier)))
       print_metrics('connections')
 
     # Run the stress tests tests
     if not skip_stress:
       base_args = ['-m', 'stress', '-n', NUM_STRESS_CLIENTS]
-      run(base_args + build_test_args('stress'))
+      run(base_args + build_test_args("stress{0}".format(shard_identifier)))
       print_metrics('connections')
 
     # Run the remaining query tests in parallel
     if not skip_parallel:
       base_args = ['-m', 'not execute_serially and not stress', '-n', NUM_CONCURRENT_TESTS]
-      run(base_args + build_test_args('parallel'))
+      run(base_args + build_test_args("parallel{0}".format(shard_identifier)))
 
     # The total number of tests executed at this point is expected to be >0
     # If it is < 0 then the script needs to exit with a non-zero
@@ -306,7 +329,8 @@ if __name__ == "__main__":
       sys.exit(1)
 
     # Finally, validate impalad/statestored metrics.
-    args = build_test_args(base_name='verify-metrics', valid_dirs=['verifiers'])
+    args = build_test_args(base_name="verify-metrics{0}".format(shard_identifier),
+                           valid_dirs=['verifiers'])
     args.append('verifiers/test_verify_metrics.py')
     run(args)
 

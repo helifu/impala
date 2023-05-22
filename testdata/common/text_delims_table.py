@@ -18,8 +18,12 @@
 # under the License.
 
 # Functions for generating test files with specific length, and ended with all
-# permutation (with replacement) of items in suffix_list.
+# permutation (with replacement) of items in suffix_list. When run from the
+# command line, will generate data files in the specified directory and a
+# print a SQL load statement to incorporate into dataload SQL script generation.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from shutil import rmtree
 from optparse import OptionParser
 from contextlib import contextmanager
@@ -32,7 +36,7 @@ parser.add_option("--only_newline", dest="only_newline", default=False, action="
 parser.add_option("--file_len", dest="file_len", type="int")
 
 def generate_testescape_files(table_location, only_newline, file_len):
-  data = ''.join(["1234567890" for _ in xrange(1 + file_len / 10)])
+  data = ''.join(["1234567890" for _ in range(1 + file_len // 10)])
 
   suffix_list = ["\\", ",", "a"]
   if only_newline:
@@ -55,4 +59,9 @@ if __name__ == "__main__":
   if not options.table_dir:
     parser.error("--table_dir option must be specified")
 
+  # Generate data locally, and output the SQL load command for use in dataload
   generate_testescape_files(options.table_dir, options.only_newline, options.file_len)
+
+  print ("LOAD DATA LOCAL INPATH '%s' "
+         "OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};"
+         % options.table_dir)

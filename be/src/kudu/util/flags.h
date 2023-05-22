@@ -21,11 +21,9 @@
 #include <string>
 #include <unordered_map>
 
-#include "kudu/util/status.h"
+#include <gflags/gflags.h>
 
-namespace google {
-  struct CommandLineFlagInfo;
-}
+#include "kudu/util/status.h"
 
 namespace kudu {
 
@@ -54,6 +52,11 @@ int ParseCommandLineFlags(int* argc, char*** argv, bool remove_flags);
 // google::ParseCommandLineNonHelpFlags().
 void HandleCommonFlags();
 
+// Verifies that the flags are allowed to be set and valid.
+// Should be called after logging is initialized. Otherwise
+// logging will write to stderr.
+void ValidateFlags();
+
 enum class EscapeMode {
   HTML,
   NONE
@@ -70,7 +73,10 @@ typedef std::unordered_map<std::string, google::CommandLineFlagInfo> GFlagsMap;
 // Get all the flags different from their defaults. The output is a nicely
 // formatted string with --flag=value pairs per line. Redact any flags that
 // are tagged as sensitive, if redaction is enabled.
-std::string GetNonDefaultFlags(const GFlagsMap& default_flags);
+std::string GetNonDefaultFlags();
+
+// Same as 'GetNonDefaultFlags' but returns the output as a map.
+GFlagsMap GetNonDefaultFlagsMap();
 
 GFlagsMap GetFlagsMap();
 
@@ -84,6 +90,8 @@ Status ParseTriState(const char* flag_name, const std::string& flag_value,
     TriStateFlag* tri_state);
 
 std::string CheckFlagAndRedact(const google::CommandLineFlagInfo& flag, EscapeMode mode);
+
+bool GetBooleanEnvironmentVariable(const char* env_var_name);
 
 } // namespace kudu
 #endif /* KUDU_UTIL_FLAGS_H */

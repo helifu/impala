@@ -21,8 +21,6 @@
 
 #include "runtime/runtime-filter.h"
 
-#include <boost/thread.hpp>
-
 #include "runtime/raw-value.inline.h"
 #include "util/bloom-filter.h"
 #include "util/min-max-filter.h"
@@ -30,30 +28,29 @@
 
 namespace impala {
 
-inline const RuntimeFilter* RuntimeFilterBank::GetRuntimeFilter(int32_t filter_id) {
-  boost::lock_guard<boost::mutex> l(runtime_filter_lock_);
-  RuntimeFilterMap::iterator it = consumed_filters_.find(filter_id);
-  if (it == consumed_filters_.end()) return NULL;
-  return it->second;
-}
-
 inline bool RuntimeFilter::AlwaysTrue() const {
-  if (is_bloom_filter()) {
-    return HasFilter() && bloom_filter_.Load() == BloomFilter::ALWAYS_TRUE_FILTER;
-  } else {
-    DCHECK(is_min_max_filter());
-    return HasFilter() && min_max_filter_.Load()->AlwaysTrue();
+  switch (filter_desc().type) {
+    case TRuntimeFilterType::BLOOM:
+      return HasFilter() && bloom_filter_.Load() == BloomFilter::ALWAYS_TRUE_FILTER;
+    case TRuntimeFilterType::MIN_MAX:
+      return HasFilter() && min_max_filter_.Load()->AlwaysTrue();
+    case TRuntimeFilterType::IN_LIST:
+      return HasFilter() && in_list_filter_.Load()->AlwaysTrue();
   }
+  return false;
 }
 
 inline bool RuntimeFilter::AlwaysFalse() const {
-  if (is_bloom_filter()) {
-    return bloom_filter_.Load() != BloomFilter::ALWAYS_TRUE_FILTER
-        && bloom_filter_.Load()->AlwaysFalse();
-  } else {
-    DCHECK(is_min_max_filter());
-    return min_max_filter_.Load() != nullptr && min_max_filter_.Load()->AlwaysFalse();
+  switch (filter_desc().type) {
+    case TRuntimeFilterType::BLOOM:
+      return bloom_filter_.Load() != BloomFilter::ALWAYS_TRUE_FILTER
+             && bloom_filter_.Load()->AlwaysFalse();
+    case TRuntimeFilterType::MIN_MAX:
+      return min_max_filter_.Load() != nullptr && min_max_filter_.Load()->AlwaysFalse();
+    case TRuntimeFilterType::IN_LIST:
+      return in_list_filter_.Load() != nullptr && in_list_filter_.Load()->AlwaysFalse();
   }
+  return false;
 }
 
 }

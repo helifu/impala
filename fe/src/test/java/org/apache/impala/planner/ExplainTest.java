@@ -107,7 +107,8 @@ public class ExplainTest extends FrontendTestBase {
 
     HdfsScanNode hdfsScanNode =
         new HdfsScanNode(PlanNodeId.createGenerator().getNextId(), tupleDescriptor,
-            new ArrayList<>(), partitions, mockTableRef, null, new ArrayList<>());
+            new ArrayList<>(), partitions, mockTableRef, null, new ArrayList<>(),
+            false);
 
     Analyzer mockAnalyer = createMockAnalyzer();
 
@@ -157,6 +158,7 @@ public class ExplainTest extends FrontendTestBase {
     HdfsPartition.FileDescriptor mockFileDesc = mock(HdfsPartition.FileDescriptor.class);
     when(mockFileDesc.getFileLength()).thenReturn(1L);
     when(mockFileDesc.getRelativePath()).thenReturn("");
+    when(mockFileDesc.getPath()).thenReturn("");
     mockFilesDescs.add(mockFileDesc);
 
     when(mockHdfsPartition.getLocationPath())

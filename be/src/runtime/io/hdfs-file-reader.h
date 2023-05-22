@@ -34,10 +34,11 @@ public:
 
   ~HdfsFileReader();
 
-  virtual Status Open(bool use_file_handle_cache) override;
+  virtual Status Open() override;
   virtual Status ReadFromPos(DiskQueue* queue, int64_t file_offset, uint8_t* buffer,
       int64_t bytes_to_read, int64_t* bytes_read, bool* eof) override;
   virtual void Close() override;
+  virtual bool SupportsDelayedOpen() const override { return true; }
   virtual void ResetState() override;
   virtual std::string DebugString() const override;
 
@@ -50,6 +51,12 @@ public:
   virtual void CachedFile(uint8_t** data, int64_t* length) override;
 
 private:
+
+  /// Performs the actual work of opening a file handle. When using a file handle or data
+  /// cache, opening a file handle is delayed until remote data needs to be read. Not
+  /// thread safe, claim lock_ before calling.
+  Status DoOpen();
+
   /// Probes 'remote_data_cache' for a hit. The requested file's name and mtime
   /// are stored in 'scan_range_'. 'file_offset' is the offset into the file to read
   /// and 'bytes_to_read' is the number of bytes requested. On success, copies the
@@ -77,6 +84,11 @@ private:
   /// Update counters with HDFS read statistics from 'hdfs_file'. If 'log_stats' is
   /// true, the statistics are logged.
   void GetHdfsStatistics(hdfsFile hdfs_file, bool log_stats);
+
+  /// Return a string that contains the block indexes and list of hosts where
+  /// each block resides. i.e. [0] { hdfshost1, hdfshost2, hdfshost3 }
+
+  std::string GetHostList(int64_t file_offset, int64_t bytes_to_read) const;
 
   /// Hadoop filesystem that contains the file being read.
   hdfsFS const hdfs_fs_;

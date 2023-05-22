@@ -17,10 +17,13 @@
 
 #include "kudu/util/env_util.h"
 
+#include <fnmatch.h>
+
 #include <algorithm>
-#include <cstdint>
 #include <cerrno>
+#include <cstdint>
 #include <ctime>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -30,15 +33,16 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "kudu/gutil/bind.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
 #include "kudu/util/env.h"
+#include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
-#include "kudu/util/slice.h"
 #include "kudu/util/path_util.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
 DEFINE_int64(disk_reserved_bytes_free_for_testing, -1,
@@ -70,6 +74,18 @@ TAG_FLAG(disk_reserved_override_prefix_2_bytes_free_for_testing, unsafe);
 TAG_FLAG(disk_reserved_override_prefix_1_bytes_free_for_testing, runtime);
 TAG_FLAG(disk_reserved_override_prefix_2_bytes_free_for_testing, runtime);
 
+DEFINE_double(env_inject_full, 0.0,
+              "Fraction of the time that space checks on certain paths will "
+              "yield the posix code ENOSPC.");
+TAG_FLAG(env_inject_full, hidden);
+
+DEFINE_string(env_inject_full_globs, "*",
+              "Comma-separated list of glob patterns specifying which paths "
+              "return with space errors.");
+TAG_FLAG(env_inject_full_globs, hidden);
+
+
+using kudu::fault_injection::MaybeTrue;
 using std::pair;
 using std::shared_ptr;
 using std::string;
@@ -78,7 +94,25 @@ using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
+
 namespace kudu {
+
+namespace {
+// Returns whether the path specified by 'data_dir' should be considered full.
+bool ShouldInjectSpaceError(const string& data_dir) {
+  if (PREDICT_FALSE(MaybeTrue(FLAGS_env_inject_full))) {
+    vector<string> globs =
+        strings::Split(FLAGS_env_inject_full_globs, ",", strings::SkipEmpty());
+    for (const auto& glob : globs) {
+      if (fnmatch(glob.c_str(), data_dir.c_str(), 0) == 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+} // anonymous namespace
+
 namespace env_util {
 
 Status OpenFileForWrite(Env* env, const string& path,
@@ -97,8 +131,14 @@ Status OpenFileForWrite(const WritableFileOptions& opts,
 
 Status OpenFileForRandom(Env *env, const string &path,
                          shared_ptr<RandomAccessFile> *file) {
+  return OpenFileForRandom(RandomAccessFileOptions(), env, path, file);
+}
+
+Status OpenFileForRandom(const RandomAccessFileOptions& opts,
+                         Env* env, const string& path,
+                         shared_ptr<RandomAccessFile>* file) {
   unique_ptr<RandomAccessFile> r;
-  RETURN_NOT_OK(env->NewRandomAccessFile(path, &r));
+  RETURN_NOT_OK(env->NewRandomAccessFile(opts, path, &r));
   file->reset(r.release());
   return Status::OK();
 }
@@ -106,7 +146,7 @@ Status OpenFileForRandom(Env *env, const string &path,
 Status OpenFileForSequential(Env *env, const string &path,
                              shared_ptr<SequentialFile> *file) {
   unique_ptr<SequentialFile> r;
-  RETURN_NOT_OK(env->NewSequentialFile(path, &r));
+  RETURN_NOT_OK(env->NewSequentialFile(SequentialFileOptions(), path, &r));
   file->reset(r.release());
   return Status::OK();
 }
@@ -127,22 +167,27 @@ static void OverrideBytesFreeWithTestingFlags(const string& path, int64_t* bytes
   }
 }
 
-Status VerifySufficientDiskSpace(Env *env, const std::string& path,
-                                 int64_t requested_bytes, int64_t reserved_bytes) {
-  const int64_t kOnePercentReservation = -1;
+Status VerifySufficientDiskSpace(Env *env, const std::string& path, int64_t requested_bytes,
+                                 int64_t reserved_bytes, int64_t* available_bytes) {
   DCHECK_GE(requested_bytes, 0);
-
+  if (ShouldInjectSpaceError(path)) {
+    if (available_bytes) {
+      *available_bytes = 0;
+    }
+    return Status::IOError(Env::kInjectedFailureStatusMsg, "", ENOSPC);
+  }
+  const int64_t kOnePercentReservation = -1;
   SpaceInfo space_info;
   RETURN_NOT_OK(env->GetSpaceInfo(path, &space_info));
-  int64_t available_bytes = space_info.free_bytes;
+  int64_t free_bytes = space_info.free_bytes;
 
   // Allow overriding these values by tests.
   if (PREDICT_FALSE(FLAGS_disk_reserved_bytes_free_for_testing > -1)) {
-    available_bytes = FLAGS_disk_reserved_bytes_free_for_testing;
+    free_bytes = FLAGS_disk_reserved_bytes_free_for_testing;
   }
   if (PREDICT_FALSE(FLAGS_disk_reserved_override_prefix_1_bytes_free_for_testing != -1 ||
                     FLAGS_disk_reserved_override_prefix_2_bytes_free_for_testing != -1)) {
-    OverrideBytesFreeWithTestingFlags(path, &available_bytes);
+    OverrideBytesFreeWithTestingFlags(path, &free_bytes);
   }
 
   // If they requested a one percent reservation, calculate what that is in bytes.
@@ -150,10 +195,14 @@ Status VerifySufficientDiskSpace(Env *env, const std::string& path,
     reserved_bytes = space_info.capacity_bytes / 100;
   }
 
-  if (available_bytes - requested_bytes < reserved_bytes) {
+  if (available_bytes) {
+    *available_bytes = free_bytes;
+  }
+
+  if (free_bytes - requested_bytes < reserved_bytes) {
     return Status::IOError(Substitute("Insufficient disk space to allocate $0 bytes under path $1 "
                                       "($2 bytes available vs $3 bytes reserved)",
-                                      requested_bytes, path, available_bytes, reserved_bytes),
+                                      requested_bytes, path, free_bytes, reserved_bytes),
                            "", ENOSPC);
   }
   return Status::OK();
@@ -191,11 +240,18 @@ Status CreateDirsRecursively(Env* env, const string& path) {
 Status CopyFile(Env* env, const string& source_path, const string& dest_path,
                 WritableFileOptions opts) {
   unique_ptr<SequentialFile> source;
-  RETURN_NOT_OK(env->NewSequentialFile(source_path, &source));
+  // Both the source and the destination files are treated as insensitive,
+  // because if they're encrypted, it would be unnecessary to decrypt and
+  // re-encrypt it. This way, we make a byte for byte copy of the file
+  // regardless if it's encrypted.
+  SequentialFileOptions source_opts;
+  source_opts.is_sensitive = false;
+  RETURN_NOT_OK(env->NewSequentialFile(source_opts, source_path, &source));
   uint64_t size;
   RETURN_NOT_OK(env->GetFileSize(source_path, &size));
 
   unique_ptr<WritableFile> dest;
+  opts.is_sensitive = false;
   RETURN_NOT_OK(env->NewWritableFile(opts, dest_path, &dest));
   RETURN_NOT_OK(dest->PreAllocate(size));
 
@@ -266,7 +322,11 @@ static Status DeleteTmpFilesRecursivelyCb(Env* env,
 }
 
 Status DeleteTmpFilesRecursively(Env* env, const string& path) {
-  return env->Walk(path, Env::PRE_ORDER, Bind(&DeleteTmpFilesRecursivelyCb, env));
+  return env->Walk(
+      path, Env::PRE_ORDER,
+      [env](Env::FileType type, const string& dirname, const string& basename) {
+        return DeleteTmpFilesRecursivelyCb(env, type, dirname, basename);
+      });
 }
 
 Status IsDirectoryEmpty(Env* env, const string& path, bool* is_empty) {

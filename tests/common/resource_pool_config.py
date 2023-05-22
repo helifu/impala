@@ -20,6 +20,7 @@
 # the tests it is used for. However, it is generic enough that it can be extended if
 # more functionality is required for adding tests.
 
+from __future__ import absolute_import, division, print_function
 import os
 from time import sleep, time
 import xml.etree.ElementTree as ET
@@ -29,10 +30,17 @@ class ResourcePoolConfig(object):
 
   # Mapping of config strings used in the llama_site file with those used on the impala
   # metrics debug page. Add to this dictionary if other configs are need for tests.
-  CONFIG_TO_METRIC_STR_MAPPING = {'max-query-mem-limit': 'pool-max-query-mem-limit'}
+  CONFIG_TO_METRIC_STR_MAPPING = {
+      'max-query-mem-limit': 'pool-max-query-mem-limit',
+      'max-query-cpu-core-per-node-limit': 'pool-max-query-cpu-core-per-node-limit',
+      'max-query-cpu-core-coordinator-limit': 'pool-max-query-cpu-core-coordinator-limit'}
 
-  def __init__(self, impala_service, llama_site_path):
+  """'impala_service' should point to an impalad to be used for running queries.
+  'ac_service' should point to the service running the admission controller and is used
+  for checking metrics values on the debug webui."""
+  def __init__(self, impala_service, ac_service, llama_site_path):
     self.impala_service = impala_service
+    self.ac_service = ac_service
     self.llama_site_path = llama_site_path
     tree = ET.parse(llama_site_path)
     self.root = tree.getroot()
@@ -61,9 +69,10 @@ class ResourcePoolConfig(object):
     metric_key = "admission-controller.{0}.root.{1}".format(metric_str, pool_name)
     start_time = time()
     while (time() - start_time < timeout):
+      client.execute("set enable_trivial_query_for_admission=false")
       handle = client.execute_async("select 'wait_for_config_change'")
       client.close_query(handle)
-      current_val = str(self.impala_service.get_metric_value(metric_key))
+      current_val = str(self.ac_service.get_metric_value(metric_key))
       if current_val == target_val:
         return
       sleep(0.1)
@@ -90,7 +99,7 @@ class ResourcePoolConfig(object):
         if pool_name == name.split('.')[-1] and pool_attribute in name:
           return property
       except Exception as e:
-        print "Current DOM element being inspected: \n{0}".format(ET.dump(property))
+        print("Current DOM element being inspected: \n{0}".format(ET.dump(property)))
         raise e
     assert False, "{0} attribute not found for pool {1} in the config XML:\n{2}".format(
       pool_attribute, pool_name, ET.dump(xml_root))

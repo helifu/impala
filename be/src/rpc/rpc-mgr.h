@@ -25,6 +25,7 @@
 #include "rpc/impala-service-pool.h"
 
 #include "gen-cpp/Types_types.h"
+#include "gen-cpp/common.pb.h"
 
 namespace kudu {
 namespace rpc {
@@ -100,11 +101,15 @@ namespace impala {
 /// certificates, and encryption is enabled and marked as required.
 class RpcMgr {
  public:
-  RpcMgr(bool use_tls = false) : use_tls_(use_tls) {}
+  RpcMgr(bool use_tls = false);
+
+  /// The following two are initialized in the constructor and always valid to call.
+  bool IsKrpcUsingUDS() const { return krpc_use_uds_; }
+  const UdsAddressUniqueIdPB& GetUdsAddressUniqueId() { return uds_addr_unique_id_; }
 
   /// Initializes the reactor threads, and prepares for sending outbound RPC requests. All
   /// services will be started on 'address', which must be a resolved IP address.
-  Status Init(const TNetworkAddress& address) WARN_UNUSED_RESULT;
+  Status Init(const NetworkAddressPB& address) WARN_UNUSED_RESULT;
 
   bool is_inited() const { return messenger_.get() != nullptr; }
 
@@ -130,8 +135,8 @@ class RpcMgr {
   ///
   /// It is an error to call this after StartServices() has been called.
   Status RegisterService(int32_t num_service_threads, int32_t service_queue_depth,
-      kudu::rpc::GeneratedServiceIf* service_ptr, MemTracker* service_mem_tracker)
-      WARN_UNUSED_RESULT;
+      kudu::rpc::GeneratedServiceIf* service_ptr, MemTracker* service_mem_tracker,
+      MetricGroup* rpc_metrics) WARN_UNUSED_RESULT;
 
   /// Returns true if the given 'remote_user' in RpcContext 'context' is authorized to
   /// access 'service_name' registered with this RpcMgr. Authorization is only enforced
@@ -148,8 +153,11 @@ class RpcMgr {
   /// 'hostname' has to match the hostname used in the Kerberos principal of the
   /// destination host if Kerberos is enabled. 'P' must descend from kudu::rpc::Proxy.
   template <typename P>
-  Status GetProxy(const TNetworkAddress& address, const std::string& hostname,
+  Status GetProxy(const NetworkAddressPB& address, const std::string& hostname,
       std::unique_ptr<P>* proxy) WARN_UNUSED_RESULT;
+
+  /// Wait until all reactor threads complete execution.
+  void Join();
 
   /// Shut down all previously registered services. All service pools are shut down.
   /// All acceptor and reactor threads within the messenger are also shut down.
@@ -224,8 +232,18 @@ class RpcMgr {
   /// be configured to use TLS if this is set.
   const bool use_tls_;
 
-  /// The host/port the rpc services are run on.
-  TNetworkAddress address_;
+  /// The network address the krpc services are run on.
+  NetworkAddressPB address_;
+
+  /// The following three variables are initialized in the constructor and wouldn't be
+  /// changed.
+  /// True if use Unix Domain Socket for krpc.
+  bool krpc_use_uds_;
+  /// True if UDS configuration is invalid.
+  bool invalid_uds_config_ = false;
+
+  /// Unique ID for setting UDS address.
+  UdsAddressUniqueIdPB uds_addr_unique_id_ = UdsAddressUniqueIdPB::IP_ADDRESS;
 };
 
 } // namespace impala

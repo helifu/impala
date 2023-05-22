@@ -15,22 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
-#include <boost/filesystem.hpp>
-#include <gutil/strings/numbers.h>
-#include <gutil/strings/substitute.h>
-#include <gutil/strings/util.h>
 
-#include "exec/kudu-util.h"
+#include <memory>
+#include <regex>
+#include <string>
+#include <vector>
+
+#include <boost/filesystem.hpp>
+
+#include "common/status.h"
+#include "gen-cpp/ErrorCodes_types.h"
 #include "gutil/macros.h"
-#include "runtime/io/error-converter.h"
+#include "gutil/strings/numbers.h"
+#include "gutil/strings/substitute.h"
+#include "gutil/strings/util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/path_util.h"
-#include "util/filesystem-util.h"
+#include "kudu/util/slice.h"
+#include "runtime/io/error-converter.h"
+#include "util/debug-util.h"
 #include "util/error-util.h"
+#include "util/filesystem-util.h"
+#include "util/kudu-status-util.h"
 #include "util/scope-exit-trigger.h"
 #include "util/uid-util.h"
 
@@ -72,13 +86,10 @@ Status FileSystemUtil::RemoveAndCreateDirectory(const string& directory) {
     // the check for existence above and the removal here. If the directory is removed in
     // this window, we may get "no_such_file_or_directory" error which is fine.
     //
-    // There is a bug in boost library (as of version 1.6) which may lead to unexpected
-    // exceptions even though we are using the no-exceptions interface. See IMPALA-2846.
-    try {
-      filesystem::remove_all(directory, errcode);
-    } catch (filesystem::filesystem_error& e) {
-      errcode = e.code();
-    }
+    // Since unexpected exceptions from the no-exceptions interface (Ticket #7307) was
+    // fixed in boost 1.63.0, revert the code change made by IMPALA-2846 + IMPALA-9571
+    // when upgrading boost to 1.74.0.
+    filesystem::remove_all(directory, errcode);
     if (errcode != errc::success &&
         errcode != errc::no_such_file_or_directory) {
       return Status(ErrorMsg(TErrorCode::RUNTIME_ERROR, Substitute("Encountered error "
@@ -96,13 +107,7 @@ Status FileSystemUtil::RemoveAndCreateDirectory(const string& directory) {
 Status FileSystemUtil::RemovePaths(const vector<string>& directories) {
   for (int i = 0; i < directories.size(); ++i) {
     error_code errcode;
-    // There is a bug in boost library (as of version 1.6) which may lead to unexpected
-    // exceptions even though we are using the no-exceptions interface. See IMPALA-2846.
-    try {
-      filesystem::remove_all(directories[i], errcode);
-    } catch (filesystem::filesystem_error& e) {
-      errcode = e.code();
-    }
+    filesystem::remove_all(directories[i], errcode);
     if (errcode != errc::success) {
       return Status(ErrorMsg(TErrorCode::RUNTIME_ERROR, Substitute(
           "Encountered error removing directory $0: $1", directories[i],
@@ -154,6 +159,23 @@ Status FileSystemUtil::VerifyIsDirectory(const string& directory_path) {
   if (!is_dir) {
     return Status(ErrorMsg(TErrorCode::RUNTIME_ERROR, Substitute(
         "Path $0 is not a directory", directory_path)));
+  }
+  return Status::OK();
+}
+
+Status FileSystemUtil::PathExists(const std::string& path, bool* exists) {
+  error_code errcode;
+  *exists = filesystem::exists(path, errcode);
+  if (errcode != errc::success) {
+    // Need to check for no_such_file_or_directory error case - Boost's exists() sometimes
+    // returns an error when it should simply return false.
+    if (errcode == errc::no_such_file_or_directory) {
+      *exists = false;
+      return Status::OK();
+    }
+    return Status(ErrorMsg(TErrorCode::RUNTIME_ERROR, Substitute(
+        "Encountered exception while checking existence of path $0: $1",
+        path, errcode.message())));
   }
   return Status::OK();
 }
@@ -290,14 +312,18 @@ bool FileSystemUtil::Directory::GetNextEntryName(string* entry_name, EntryType t
 }
 
 Status FileSystemUtil::Directory::GetEntryNames(const string& path,
-    vector<string>* entry_names, int max_result_size, EntryType type) {
+    vector<string>* entry_names, int max_result_size, EntryType type,
+    const string& regex) {
   DCHECK(entry_names != nullptr);
 
   Directory dir(path);
   entry_names->clear();
+  std::regex entry_regex(regex);
   string entry_name;
   while ((max_result_size <= 0 || entry_names->size() < max_result_size) &&
-      dir.GetNextEntryName(&entry_name, type)) {
+         dir.GetNextEntryName(&entry_name, type)) {
+    // If there is a regex and the regex doesn't match, skip this entry
+    if (regex.size() != 0 && !std::regex_match(entry_name, entry_regex)) continue;
     entry_names->push_back(entry_name);
   }
 
@@ -401,6 +427,25 @@ Status FileSystemUtil::CheckHolePunch(const string& path) {
         offset));
   }
 
+  return Status::OK();
+}
+
+Status FileSystemUtil::ApproximateFileSize(
+    const std::string& path, uintmax_t& file_size) {
+  bool exist = false;
+  RETURN_IF_ERROR(PathExists(path, &exist));
+  if (!exist) {
+    return Status(
+        ErrorMsg(TErrorCode::RUNTIME_ERROR, Substitute("Path $0 does not exist!", path)));
+  } else {
+    error_code errcode;
+    file_size = filesystem::file_size(path, errcode);
+    if (errcode != errc::success) {
+      return Status(ErrorMsg(TErrorCode::RUNTIME_ERROR,
+          Substitute("Encountered exception while checking file size of path $0: $1",
+              path, errcode.message())));
+    }
+  }
   return Status::OK();
 }
 

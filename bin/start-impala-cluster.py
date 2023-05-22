@@ -20,6 +20,8 @@
 # Starts up an Impala cluster (ImpalaD + State Store) with the specified number of
 # ImpalaD instances. Each ImpalaD runs on a different port allowing this to be run
 # on a single machine.
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import getpass
 import itertools
 import json
@@ -32,23 +34,23 @@ from datetime import datetime
 from getpass import getuser
 from time import sleep, time
 from optparse import OptionParser, SUPPRESS_HELP
-from subprocess import call, check_call
+from subprocess import call, check_call, check_output
 from testdata.common import cgroups
 from tests.common.environ import build_flavor_timeout
 from tests.common.impala_cluster import (ImpalaCluster, DEFAULT_BEESWAX_PORT,
-    DEFAULT_HS2_PORT, DEFAULT_BE_PORT, DEFAULT_KRPC_PORT, DEFAULT_HS2_HTTP_PORT,
+    DEFAULT_HS2_PORT, DEFAULT_KRPC_PORT, DEFAULT_HS2_HTTP_PORT,
     DEFAULT_STATE_STORE_SUBSCRIBER_PORT, DEFAULT_IMPALAD_WEBSERVER_PORT,
     DEFAULT_STATESTORED_WEBSERVER_PORT, DEFAULT_CATALOGD_WEBSERVER_PORT,
-    DEFAULT_CATALOGD_JVM_DEBUG_PORT, DEFAULT_IMPALAD_JVM_DEBUG_PORT,
+    DEFAULT_ADMISSIOND_WEBSERVER_PORT, DEFAULT_CATALOGD_JVM_DEBUG_PORT,
+    DEFAULT_EXTERNAL_FE_PORT, DEFAULT_IMPALAD_JVM_DEBUG_PORT,
     find_user_processes, run_daemon)
 
-logging.basicConfig(level=logging.ERROR, format="%(asctime)s %(threadName)s: %(message)s",
-    datefmt="%H:%M:%S")
 LOG = logging.getLogger(os.path.splitext(os.path.basename(__file__))[0])
 LOG.setLevel(level=logging.DEBUG)
 
 KUDU_MASTER_HOSTS = os.getenv("KUDU_MASTER_HOSTS", "127.0.0.1")
 DEFAULT_IMPALA_MAX_LOG_FILES = os.environ.get("IMPALA_MAX_LOG_FILES", 10)
+INTERNAL_LISTEN_HOST = os.getenv("INTERNAL_LISTEN_HOST", "localhost")
 
 # Options
 parser = OptionParser()
@@ -71,6 +73,9 @@ parser.add_option("--state_store_args", dest="state_store_args", action="append"
 parser.add_option("--catalogd_args", dest="catalogd_args", action="append",
                   type="string", default=[],
                   help="Additional arguments to pass to the Catalog Service at startup")
+parser.add_option("--admissiond_args", dest="admissiond_args",
+                  action="append", type="string", default=[], help="Additional arguments "
+                  "to pass to the Admission Control Service at startup")
 parser.add_option("--kill", "--kill_only", dest="kill_only", action="store_true",
                   default=False, help="Instead of starting the cluster, just kill all"
                   " the running impalads and the statestored.")
@@ -124,6 +129,28 @@ parser.add_option("--data_cache_dir", dest="data_cache_dir", default=None,
 parser.add_option("--data_cache_size", dest="data_cache_size", default=0,
                   help="This specifies the maximum storage usage of the IO data cache "
                        "each Impala daemon can use.")
+parser.add_option("--data_cache_eviction_policy", dest="data_cache_eviction_policy",
+                  default="LRU", help="This specifies the cache eviction policy to use "
+                  "for the data cache")
+parser.add_option("--data_cache_num_async_write_threads",
+                  dest="data_cache_num_async_write_threads", default=0,
+                  help="This specifies the number of asynchronous write threads for the "
+                  "data cache, with 0 set means synchronous writes.")
+parser.add_option("--data_cache_enable_tracing", dest="data_cache_enable_tracing",
+                  action="store_true", default=False,
+                  help="If the data cache is enabled, this enables tracing accesses.")
+parser.add_option("--enable_admission_service", dest="enable_admission_service",
+                  action="store_true", default=False,
+                  help="If true, enables the Admissison Control Service - the cluster "
+                  "will be launched with an admissiond and all coordinators configured "
+                  "to use it for admission control.")
+parser.add_option("--enable_external_fe_support", dest="enable_external_fe_support",
+                  action="store_true", default=False,
+                  help="If true, impalads will start with the external_fe_port defined.")
+parser.add_option("--geospatial_library", dest="geospatial_library",
+                  action="store", default="HIVE_ESRI",
+                  help="Sets which implementation of geospatial libraries should be "
+                  "initialized")
 
 # For testing: list of comma-separated delays, in milliseconds, that delay impalad catalog
 # replica initialization. The ith delay is applied to the ith impalad.
@@ -139,7 +166,6 @@ options, args = parser.parse_args()
 IMPALA_HOME = os.environ["IMPALA_HOME"]
 CORE_SITE_PATH = os.path.join(IMPALA_HOME, "fe/src/test/resources/core-site.xml")
 KNOWN_BUILD_TYPES = ["debug", "release", "latest"]
-IMPALA_LZO = os.environ["IMPALA_LZO"]
 # The location in the container where the cache is always mounted.
 DATA_CACHE_CONTAINER_PATH = "/opt/impala/cache"
 
@@ -151,7 +177,7 @@ KUDU_RPC_TIMEOUT = build_flavor_timeout(0, slow_build_timeout=60000)
 
 # HTTP connections don't keep alive their associated sessions. We increase the timeout
 # during builds to make spurious session expiration less likely.
-DISCONNECTED_SESSION_TIMEOUT = 3600
+DISCONNECTED_SESSION_TIMEOUT = 60 * 60 * 6
 
 def check_process_exists(binary, attempts=1):
   """Checks if a process exists given the binary name. The `attempts` count allows us to
@@ -218,8 +244,8 @@ def choose_impalad_ports(instance_num):
   return {'beeswax_port': DEFAULT_BEESWAX_PORT + instance_num,
           'hs2_port': DEFAULT_HS2_PORT + instance_num,
           'hs2_http_port': DEFAULT_HS2_HTTP_PORT + instance_num,
-          'be_port': DEFAULT_BE_PORT + instance_num,
           'krpc_port': DEFAULT_KRPC_PORT + instance_num,
+          'external_fe_port': DEFAULT_EXTERNAL_FE_PORT + instance_num,
           'state_store_subscriber_port':
               DEFAULT_STATE_STORE_SUBSCRIBER_PORT + instance_num,
           'webserver_port': DEFAULT_IMPALAD_WEBSERVER_PORT + instance_num}
@@ -230,10 +256,11 @@ def build_impalad_port_args(instance_num):
       "-beeswax_port={beeswax_port} "
       "-hs2_port={hs2_port} "
       "-hs2_http_port={hs2_http_port} "
-      "-be_port={be_port} "
       "-krpc_port={krpc_port} "
       "-state_store_subscriber_port={state_store_subscriber_port} "
       "-webserver_port={webserver_port}")
+  if options.enable_external_fe_support:
+    IMPALAD_PORTS += " -external_fe_port={external_fe_port}"
   return IMPALAD_PORTS.format(**choose_impalad_ports(instance_num))
 
 
@@ -282,13 +309,20 @@ def build_catalogd_arg_list():
       combine_arg_list_opts(options.catalogd_args))
 
 
+def build_admissiond_arg_list():
+  """Build a list of command line arguments to pass to the admissiond."""
+  return (build_logging_args("admissiond") + build_kerberos_args("admissiond") +
+      combine_arg_list_opts(options.admissiond_args))
+
+
 def build_impalad_arg_lists(cluster_size, num_coordinators, use_exclusive_coordinators,
-    remap_ports, start_idx=0):
+    remap_ports, start_idx=0, admissiond_host=INTERNAL_LISTEN_HOST):
   """Build the argument lists for impala daemons in the cluster. Returns a list of
   argument lists, one for each impala daemon in the cluster. Each argument list is
   a list of strings. 'num_coordinators' and 'use_exclusive_coordinators' allow setting
   up the cluster with dedicated coordinators.  If 'remap_ports' is true, the impalad
-  ports are changed from their default values to avoid port conflicts."""
+  ports are changed from their default values to avoid port conflicts. If the admission
+  service is enabled, 'admissiond_host' is the hostname for the admissiond."""
   # TODO: currently we build a big string blob then split it. It would be better to
   # build up the lists directly.
 
@@ -375,6 +409,38 @@ def build_impalad_arg_lists(cluster_size, num_coordinators, use_exclusive_coordi
       args = "-data_cache={dir}:{quota} {args}".format(
           dir=data_cache_path_arg, quota=options.data_cache_size, args=args)
 
+      # Add the eviction policy
+      args = "-data_cache_eviction_policy={policy} {args}".format(
+          policy=options.data_cache_eviction_policy, args=args)
+
+      # Add the number of async write threads.
+      args = "-data_cache_num_async_write_threads={num_threads} {args}".format(
+          num_threads=options.data_cache_num_async_write_threads, args=args)
+
+      # Add access tracing arguments if requested
+      if options.data_cache_enable_tracing:
+        tracing_args = ""
+        if options.docker_network is None:
+          # To avoid collisions in log files, use different data_cache_trace_dir values
+          # for different Impalads. The default directory is fine for the docker-based
+          # tests.
+          data_cache_trace_dir = "{log_dir}/data_cache_traces_{impalad_num}".format(
+              log_dir=options.log_dir, impalad_num=i)
+          tracing_args = "-data_cache_trace_dir={trace_dir} {tracing_args}".format(
+              trace_dir=data_cache_trace_dir, tracing_args=tracing_args)
+
+        tracing_args = "-data_cache_enable_tracing=true {tracing_args}".format(
+            tracing_args=tracing_args)
+        args = "{tracing_args} {args}".format(tracing_args=tracing_args, args=args)
+
+    if options.enable_admission_service:
+      args = "{args} -admission_service_host={host}".format(
+          args=args, host=admissiond_host)
+
+    if "geospatial_library" not in args:
+      args = "{args} -geospatial_library={geospatial_library}".format(
+          args=args, geospatial_library=options.geospatial_library)
+
     # Appended at the end so they can override previous args.
     if i < len(per_impalad_args):
       args = "{args} {per_impalad_args}".format(
@@ -385,10 +451,10 @@ def build_impalad_arg_lists(cluster_size, num_coordinators, use_exclusive_coordi
 
 def build_kerberos_args(daemon):
   """If the cluster is kerberized, returns arguments to pass to daemon process.
-  daemon should either be "impalad", "catalogd" or "statestored"."""
+  daemon should either be "impalad", "catalogd", "statestored", or "admissiond"."""
   # Note: this code has probably bit-rotted but is preserved in case someone needs to
   # revive the kerberized minicluster.
-  assert daemon in ("impalad", "catalogd", "statestored")
+  assert daemon in ("impalad", "catalogd", "statestored", "admissiond")
   if call([os.path.join(IMPALA_HOME, "testdata/cluster/admin"), "is_kerberized"]) != 0:
     return []
   args = ["-keytab_file={0}".format(os.getenv("KRB5_KTNAME")),
@@ -400,11 +466,12 @@ def build_kerberos_args(daemon):
     args.append("-principal={0}".format(os.getenv("MINIKDC_PRINC_IMPALA_BE")))
   if os.getenv("MINIKDC_DEBUG", "") == "true":
     args.append("-krb5_debug_file=/tmp/{0}.krb5_debug".format(daemon))
+  return args
 
 
 def compute_impalad_mem_limit(cluster_size):
   # Set mem_limit of each impalad to the smaller of 12GB or
-  # 1/cluster_size (typically 1/3) of 70% of system memory.
+  # 1/cluster_size (typically 1/3) of 70% of available memory.
   #
   # The default memory limit for an impalad is 80% of the total system memory. On a
   # mini-cluster with 3 impalads that means 240%. Since having an impalad be OOM killed
@@ -416,7 +483,9 @@ def compute_impalad_mem_limit(cluster_size):
   # memory choice here to max out at 12GB. This should be sufficient for tests.
   #
   # Beware that ASAN builds use more memory than regular builds.
-  mem_limit = int(0.7 * psutil.virtual_memory().total / cluster_size)
+  physical_mem_gb = psutil.virtual_memory().total // 1024 // 1024 // 1024
+  available_mem = int(os.getenv("IMPALA_CLUSTER_MAX_MEM_GB", str(physical_mem_gb)))
+  mem_limit = int(0.7 * available_mem * 1024 * 1024 * 1024 / cluster_size)
   return min(12 * 1024 * 1024 * 1024, mem_limit)
 
 class MiniClusterOperations(object):
@@ -426,10 +495,10 @@ class MiniClusterOperations(object):
   """
   def get_cluster(self):
     """Return an ImpalaCluster instance."""
-    return ImpalaCluster()
+    return ImpalaCluster(use_admission_service=options.enable_admission_service)
 
   def kill_all_daemons(self, force=False):
-    kill_matching_processes(["catalogd", "impalad", "statestored"], force)
+    kill_matching_processes(["catalogd", "impalad", "statestored", "admissiond"], force)
 
   def kill_all_impalads(self, force=False):
     kill_matching_processes(["impalad"], force=force)
@@ -439,6 +508,9 @@ class MiniClusterOperations(object):
 
   def kill_statestored(self, force=False):
     kill_matching_processes(["statestored"], force=force)
+
+  def kill_admissiond(self, force=False):
+    kill_matching_processes(["admissiond"], force=force)
 
   def start_statestore(self):
     LOG.info("Starting State Store logging to {log_dir}/statestored.INFO".format(
@@ -459,6 +531,15 @@ class MiniClusterOperations(object):
       raise RuntimeError("Unable to start catalogd. Check log or file permissions"
                          " for more details.")
 
+  def start_admissiond(self):
+    LOG.info("Starting Admission Control Service logging to {log_dir}/admissiond.INFO"
+        .format(log_dir=options.log_dir))
+    output_file = os.path.join(options.log_dir, "admissiond-out.log")
+    run_daemon_with_options("admissiond", build_admissiond_arg_list(), output_file)
+    if not check_process_exists("admissiond", 10):
+      raise RuntimeError("Unable to start admissiond. Check log or file permissions"
+                         " for more details.")
+
   def start_impalads(self, cluster_size, num_coordinators, use_exclusive_coordinators,
                      start_idx=0):
     """Start 'cluster_size' impalad instances. The first 'num_coordinator' instances will
@@ -476,7 +557,7 @@ class MiniClusterOperations(object):
         cluster_size, num_coordinators, use_exclusive_coordinators, remap_ports=True,
         start_idx=start_idx)
     assert cluster_size == len(impalad_arg_lists)
-    for i in xrange(start_idx, start_idx + cluster_size):
+    for i in range(start_idx, start_idx + cluster_size):
       service_name = impalad_service_name(i)
       LOG.info("Starting Impala Daemon logging to {log_dir}/{service_name}.INFO".format(
           log_dir=options.log_dir, service_name=service_name))
@@ -507,18 +588,20 @@ class DockerMiniClusterOperations(object):
 
   def get_cluster(self):
     """Return an ImpalaCluster instance."""
-    return ImpalaCluster(docker_network=self.network_name)
+    return ImpalaCluster(docker_network=self.network_name,
+        use_admission_service=options.enable_admission_service)
 
   def kill_all_daemons(self, force=False):
     self.kill_statestored(force=force)
     self.kill_catalogd(force=force)
+    self.kill_admissiond(force=force)
     self.kill_all_impalads(force=force)
 
   def kill_all_impalads(self, force=False):
     # List all running containers on the network and kill those with the impalad name
     # prefix to make sure that no running container are left over from previous clusters.
     container_name_prefix = self.__gen_container_name__("impalad")
-    for container_id, info in self.__get_network_info__()["Containers"].iteritems():
+    for container_id, info in self.__get_network_info__()["Containers"].items():
       container_name = info["Name"]
       if container_name.startswith(container_name_prefix):
         LOG.info("Stopping container {0}".format(container_name))
@@ -530,6 +613,9 @@ class DockerMiniClusterOperations(object):
   def kill_statestored(self, force=False):
     self.__stop_container__("statestored")
 
+  def kill_admissiond(self, force=False):
+    self.__stop_container__("admissiond")
+
   def start_statestore(self):
     self.__run_container__("statestored", build_statestored_arg_list(),
         {DEFAULT_STATESTORED_WEBSERVER_PORT: DEFAULT_STATESTORED_WEBSERVER_PORT})
@@ -538,17 +624,22 @@ class DockerMiniClusterOperations(object):
     self.__run_container__("catalogd", build_catalogd_arg_list(),
           {DEFAULT_CATALOGD_WEBSERVER_PORT: DEFAULT_CATALOGD_WEBSERVER_PORT})
 
+  def start_admissiond(self):
+    self.__run_container__("admissiond", build_admissiond_arg_list(),
+          {DEFAULT_ADMISSIOND_WEBSERVER_PORT: DEFAULT_ADMISSIOND_WEBSERVER_PORT})
+
   def start_impalads(self, cluster_size, num_coordinators, use_exclusive_coordinators):
-    impalad_arg_lists = build_impalad_arg_lists(
-        cluster_size, num_coordinators, use_exclusive_coordinators, remap_ports=False)
+    impalad_arg_lists = build_impalad_arg_lists(cluster_size, num_coordinators,
+        use_exclusive_coordinators, remap_ports=False, admissiond_host="admissiond")
     assert cluster_size == len(impalad_arg_lists)
     mem_limit = compute_impalad_mem_limit(cluster_size)
-    for i in xrange(cluster_size):
+    for i in range(cluster_size):
       chosen_ports = choose_impalad_ports(i)
       port_map = {DEFAULT_BEESWAX_PORT: chosen_ports['beeswax_port'],
                   DEFAULT_HS2_PORT: chosen_ports['hs2_port'],
                   DEFAULT_HS2_HTTP_PORT: chosen_ports['hs2_http_port'],
-                  DEFAULT_IMPALAD_WEBSERVER_PORT: chosen_ports['webserver_port']}
+                  DEFAULT_IMPALAD_WEBSERVER_PORT: chosen_ports['webserver_port'],
+                  DEFAULT_EXTERNAL_FE_PORT: chosen_ports['external_fe_port']}
       self.__run_container__("impalad_coord_exec", impalad_arg_lists[i], port_map, i,
           mem_limit=mem_limit, supports_data_cache=True)
 
@@ -582,7 +673,7 @@ class DockerMiniClusterOperations(object):
       port_args = ["-P"]
     else:
       port_args = ["-p{dst}:{src}".format(src=src, dst=dst)
-                   for src, dst in port_map.iteritems()]
+                   for src, dst in port_map.items()]
     # Impersonate the current user for operations against the minicluster. This is
     # necessary because the user name inside the container is "root".
     # TODO: pass in the actual options
@@ -596,6 +687,8 @@ class DockerMiniClusterOperations(object):
       image_tag = daemon + "_debug"
     else:
       image_tag = daemon
+    if os.getenv('IMPALA_DOCKER_USE_JAVA11', '') == "true":
+      image_tag += "_java11"
     host_name = self.__gen_host_name__(daemon, instance)
     container_name = self.__gen_container_name__(daemon, instance)
     # Mount configuration into container so that we don't need to rebuild container
@@ -622,12 +715,6 @@ class DockerMiniClusterOperations(object):
     # Run the container as the current user.
     user_args = ["--user", "{0}:{1}".format(os.getuid(), os.getgid())]
 
-    # Allow loading LZO plugin, if built.
-    lzo_lib_dir = os.path.join(IMPALA_LZO, "build")
-    if os.path.isdir(lzo_lib_dir):
-      mount_args += ["--mount",
-                     "type=bind,src={0},dst=/opt/impala/lib/plugins".format(lzo_lib_dir)]
-
     mem_limit_args = []
     if mem_limit is not None:
       mem_limit_args = ["--memory", str(mem_limit)]
@@ -637,7 +724,8 @@ class DockerMiniClusterOperations(object):
       mount_args + mem_limit_args + [image_tag] + args)
     LOG.info("Running command {0}".format(run_cmd))
     check_call(run_cmd)
-    port_mapping = check_output(["docker", "port", container_name])
+    port_mapping = check_output(["docker", "port", container_name],
+                                universal_newlines=True)
     LOG.info("Launched container {0} with port mapping:\n{1}".format(
         container_name, port_mapping))
 
@@ -655,7 +743,8 @@ class DockerMiniClusterOperations(object):
 
   def __get_network_info__(self):
     """Get the output of "docker network inspect" as a python data structure."""
-    output = check_output(["docker", "network", "inspect", self.network_name])
+    output = check_output(["docker", "network", "inspect", self.network_name],
+                          universal_newlines=True)
     # Only one network should be present in the top level array.
     return json.loads(output)[0]
 
@@ -696,14 +785,12 @@ def validate_options():
 
 
 if __name__ == "__main__":
+  logging.basicConfig(level=logging.ERROR, format="%(asctime)s %(threadName)s: %(message)s",
+    datefmt="%H:%M:%S")
   validate_options()
   if options.docker_network is None:
     cluster_ops = MiniClusterOperations()
   else:
-    if sys.version_info < (2, 7):
-      raise Exception("Docker minicluster only supported on Python 2.7+")
-    # We use some functions in the docker code that don't exist in Python 2.6.
-    from subprocess import check_output
     cluster_ops = DockerMiniClusterOperations(options.docker_network)
 
   # If core-site.xml is missing, it likely means that we are missing config
@@ -754,6 +841,8 @@ if __name__ == "__main__":
     else:
       cluster_ops.start_statestore()
       cluster_ops.start_catalogd()
+      if options.enable_admission_service:
+        cluster_ops.start_admissiond()
       cluster_ops.start_impalads(options.cluster_size, options.num_coordinators,
                                  options.use_exclusive_coordinators)
     # Sleep briefly to reduce log spam: the cluster takes some time to start up.
@@ -767,7 +856,7 @@ if __name__ == "__main__":
     # Check for the cluster to be ready.
     impala_cluster.wait_until_ready(expected_cluster_size,
         expected_cluster_size - expected_catalog_delays)
-  except Exception, e:
+  except Exception as e:
     LOG.exception("Error starting cluster")
     sys.exit(1)
 

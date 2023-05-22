@@ -23,10 +23,26 @@
 #include <vector>
 #endif
 
+#include "kudu/util/group_varint-inl.h"
+
+#include <boost/preprocessor/arithmetic/dec.hpp>
+#include <boost/preprocessor/arithmetic/inc.hpp>
+#include <boost/preprocessor/control/iif.hpp>
+#include <boost/preprocessor/control/while.hpp>
+#include <boost/preprocessor/list/fold_left.hpp>
+#include <boost/preprocessor/logical/bitand.hpp>
+#include <boost/preprocessor/logical/bool.hpp>
+#include <boost/preprocessor/logical/compl.hpp>
+#include <boost/preprocessor/seq/elem.hpp>
+#include <boost/preprocessor/seq/fold_left.hpp>
+#include <boost/preprocessor/seq/size.hpp>
+#include <boost/preprocessor/tuple/elem.hpp>
+#include <boost/preprocessor/variadic/elem.hpp>
+#include <boost/tti/has_template.hpp>
+#include <boost/utility/binary.hpp>
 #include <gtest/gtest.h>
 
 #include "kudu/util/faststring.h"
-#include "kudu/util/group_varint-inl.h"
 #ifdef NDEBUG
 #include "kudu/util/stopwatch.h"
 #endif
@@ -56,6 +72,7 @@ static void DoTestRoundTripGVI32(
 
   const uint8_t *end;
 
+#ifndef __aarch64__
   if (use_sse) {
     end = DecodeGroupVarInt32_SSE(
       buf.data(), &ret[0], &ret[1], &ret[2], &ret[3]);
@@ -63,6 +80,9 @@ static void DoTestRoundTripGVI32(
     end = DecodeGroupVarInt32(
       buf.data(), &ret[0], &ret[1], &ret[2], &ret[3]);
   }
+#else
+  end = DecodeGroupVarInt32(buf.data(), &ret[0], &ret[1], &ret[2], &ret[3]);
+#endif //__aarch64__
 
   ASSERT_EQ(a, ret[0]);
   ASSERT_EQ(b, ret[1]);

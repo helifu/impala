@@ -17,6 +17,10 @@
 
 package org.apache.impala.analysis;
 
+import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
+
 import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
@@ -33,6 +37,8 @@ import com.google.common.base.Preconditions;
 import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
 import static org.apache.impala.analysis.ToSqlOptions.REWRITTEN;
 import static org.apache.impala.analysis.ToSqlOptions.SHOW_IMPLICIT_CASTS;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Tests that the ExprRewriter framework covers all clauses as well as nested statements.
@@ -112,6 +118,14 @@ public class ExprRewriterTest extends AnalyzerTest {
     Assert.assertEquals(0, exprToTrue_.getNumChanges());
   }
 
+  private Expr analyze(String query) {
+    AnalysisContext ctx = createAnalysisCtx();
+    ctx.getQueryOptions().setDecimal_v2(true);
+    ctx.getQueryOptions().setEnable_expr_rewrites(false);
+    return ((SelectStmt) AnalyzesOk(query, ctx)).getSelectList()
+        .getItems().get(0).getExpr();
+  }
+
   // Select statement with all clauses that has 11 rewritable Expr trees.
   // We expect a total of 23 exprs to be changed.
   private final String stmt_ =
@@ -135,8 +149,8 @@ public class ExprRewriterTest extends AnalyzerTest {
         stmt_, stmt_), 47, 23);
     // Constant select.
     RewritesOk("select 1, 2, 3, 4", 4, 4);
-    // Values stmt.
-    RewritesOk("values(1, '2', 3, 4.1), (1, '2', 3, 4.1)", 8, 8);
+    // Values stmt - expression rewrites are disabled.
+    RewritesOk("values(1, '2', 3, 4.1), (1, '2', 3, 4.1)", 0, 0);
     // Test WHERE-clause subqueries.
     RewritesOk("select id, int_col from functional.alltypes a " +
         "where exists (select 1 from functional.alltypes " +
@@ -160,18 +174,16 @@ public class ExprRewriterTest extends AnalyzerTest {
     RewritesOk("insert into functional.alltypes (id, int_col, float_col, bigint_col) " +
       "partition(year=2009,month=10) " + stmt_, 23, 11);
 
-    if (RuntimeEnv.INSTANCE.isKuduSupported()) {
-      // Update.
-      RewritesOk("update t2 set name = 'test' from " +
-          "functional.alltypes t1 join functional_kudu.dimtbl t2 on (t1.id = t2.id) " +
-          "where t2.id < 10", 10, 5);
-      RewritesOk("update functional_kudu.dimtbl set name = 'test', zip = 4711 " +
-          "where exists (" + stmt_ + ")", 28, 16);
-      // Delete.
-      RewritesOk("delete a from " +
-          "functional_kudu.testtbl a join functional.testtbl b on a.zip = b.zip", 4, 2);
-      RewritesOk("delete functional_kudu.testtbl where exists (" + stmt_ + ")", 24, 12);
-    }
+    // Update.
+    RewritesOk("update t2 set name = 'test' from " +
+        "functional.alltypes t1 join functional_kudu.dimtbl t2 on (t1.id = t2.id) " +
+        "where t2.id < 10", 10, 5);
+    RewritesOk("update functional_kudu.dimtbl set name = 'test', zip = 4711 " +
+        "where exists (" + stmt_ + ")", 28, 16);
+    // Delete.
+    RewritesOk("delete a from " +
+        "functional_kudu.testtbl a join functional.testtbl b on a.zip = b.zip", 4, 2);
+    RewritesOk("delete functional_kudu.testtbl where exists (" + stmt_ + ")", 24, 12);
   }
 
   /**
@@ -327,27 +339,50 @@ public class ExprRewriterTest extends AnalyzerTest {
         "INSERT INTO TABLE functional.alltypes(id) " +
         "PARTITION (`year`=2009, `month`=10) SELECT 2");
 
-    if (RuntimeEnv.INSTANCE.isKuduSupported()) {
-      // Update.
-      assertToSql(ctx,
-          "update functional_kudu.alltypes "
-              + "set string_col = 'test' where id = (select 1 + 1)",
-          "UPDATE functional_kudu.alltypes SET string_col = 'test' "
-              + "FROM functional_kudu.alltypes WHERE id = (SELECT 1 + 1)",
-          "UPDATE functional_kudu.alltypes SET string_col = 'test' "
-              + "FROM functional_kudu.alltypes LEFT SEMI JOIN (SELECT 2) `$a$1` (`$c$1`) "
-              + "ON id = `$a$1`.`$c$1` WHERE id = (SELECT 2)");
+    // Update.
+    assertToSql(ctx,
+        "update functional_kudu.alltypes "
+            + "set string_col = 'test' where id = (select 1 + 1)",
+        "UPDATE functional_kudu.alltypes SET string_col = 'test' "
+            + "FROM functional_kudu.alltypes WHERE id = (SELECT 1 + 1)",
+        "UPDATE functional_kudu.alltypes SET string_col = 'test' "
+            + "FROM functional_kudu.alltypes LEFT SEMI JOIN (SELECT 2) `$a$1` (`$c$1`) "
+            + "ON id = `$a$1`.`$c$1` WHERE id = (SELECT 2)");
 
-      // Delete
-      assertToSql(ctx,
-          "delete functional_kudu.alltypes "
-              + "where id = (select 1 + 1)",
-          "DELETE FROM functional_kudu.alltypes "
-              + "WHERE id = (SELECT 1 + 1)",
-          "DELETE functional_kudu.alltypes "
-              + "FROM functional_kudu.alltypes LEFT SEMI JOIN (SELECT 2) `$a$1` (`$c$1`) "
-              + "ON id = `$a$1`.`$c$1` WHERE id = (SELECT 2)");
-    }
+    // Delete
+    assertToSql(ctx,
+        "delete functional_kudu.alltypes "
+            + "where id = (select 1 + 1)",
+        "DELETE FROM functional_kudu.alltypes "
+            + "WHERE id = (SELECT 1 + 1)",
+        "DELETE functional_kudu.alltypes "
+            + "FROM functional_kudu.alltypes LEFT SEMI JOIN (SELECT 2) `$a$1` (`$c$1`) "
+            + "ON id = `$a$1`.`$c$1` WHERE id = (SELECT 2)");
+
+    //-------------------------
+    // Test || rewrites.
+    //-------------------------
+    assertToSql(ctx,
+        "select * from functional.alltypes where "
+            + "int_col = 1 || int_col = 2 "
+            + "|| tinyint_col > 5 || (string_col || string_col) = 'testtest'",
+        "SELECT * FROM functional.alltypes WHERE "
+            + "int_col = 1 OR int_col = 2 "
+            + "OR tinyint_col > 5 OR (concat(string_col, string_col)) = 'testtest'",
+        "SELECT * FROM functional.alltypes WHERE "
+            + "int_col IN (1, 2) "
+            + "OR tinyint_col > 5 OR concat(string_col, string_col) = 'testtest'");
+
+    assertToSql(ctx,
+        "select int_col = 1 || int_col = 2, string_col || 'test' "
+            + "from functional.alltypes where "
+            + "(bool_col || id = 2) || (string_col || 'test') = 'testtest'",
+        "SELECT int_col = 1 OR int_col = 2, concat(string_col, 'test') "
+            + "FROM functional.alltypes WHERE "
+            + "(bool_col OR id = 2) OR (concat(string_col, 'test')) = 'testtest'",
+        "SELECT int_col IN (1, 2), concat(string_col, 'test') "
+            + "FROM functional.alltypes WHERE "
+            + "bool_col OR id = 2 OR concat(string_col, 'test') = 'testtest'");
 
     // We don't do any rewrite for WITH clause.
     StatementBase stmt = (StatementBase) AnalyzesOk("with t as (select 1 + 1) " +
@@ -458,8 +493,6 @@ public class ExprRewriterTest extends AnalyzerTest {
         + "values(" + data + ")";
     String expectedToSql = "INSERT INTO TABLE "
         + "functional.alltypesnopart(" + columnName + ") "
-        + "SELECT CAST(" + data + " AS " + castColumn + ")"
-        + " UNION "
         + "SELECT CAST(" + data + " AS " + castColumn + ")";
     assertToSqlWithImplicitCasts(ctx, query, expectedToSql);
   }
@@ -478,5 +511,128 @@ public class ExprRewriterTest extends AnalyzerTest {
     String actual = stmt.toSql(SHOW_IMPLICIT_CASTS);
     Assert.assertEquals("Bad sql with implicit casts from original query:\n" + query,
         expectedToSqlWithImplicitCasts, actual);
+  }
+
+  @Test
+  public void TestToSqlWithAppxCountDistinctAndDefaultNdvs() {
+    TQueryOptions options = new TQueryOptions();
+    options.setEnable_expr_rewrites(true);
+
+    AnalysisContext ctx = createAnalysisCtx(options);
+
+    //----------------------
+    // Test query rewrites.
+    //----------------------
+    String countDistinctSql = "SELECT count(DISTINCT id) FROM functional.alltypes";
+
+    // No rewrite
+    assertToSql(ctx, countDistinctSql, countDistinctSql, countDistinctSql);
+
+    // Rewrite to ndv
+    options.setAppx_count_distinct(true);
+    assertToSql(createAnalysisCtx(options), countDistinctSql, countDistinctSql,
+            "SELECT ndv(id) FROM functional.alltypes");
+
+    // Rewrite to ndv(10)
+    options.setDefault_ndv_scale(10);
+    assertToSql(createAnalysisCtx(options), countDistinctSql, countDistinctSql,
+            "SELECT ndv(id, 10) FROM functional.alltypes");
+
+    String ndvSql = "SELECT ndv(id) FROM functional.alltypes";
+
+    // No rewrite
+    options.setDefault_ndv_scale(2);
+    assertToSql(createAnalysisCtx(options), ndvSql, ndvSql, ndvSql);
+
+    // Rewrite ndv scale
+    options.setDefault_ndv_scale(9);
+    assertToSql(createAnalysisCtx(options), ndvSql, ndvSql,
+            "SELECT ndv(id, 9) FROM functional.alltypes");
+
+    //-----------------------------------------------------------------------------------
+    // Test complex sql which has all 3 types of functions.
+    // NDV(<expr>) | NDV(<expr>, <scale>) | COUNT(DISTINCT <expr>)
+    //
+    // For coverage, we have these scenarios:
+    // CASE 1: DEFAULT_NDV_SCALE=5(same as the value in original sql),
+    //         APPX_COUNT_DISTINCT=True
+    // CASE 2: DEFAULT_NDV_SCALE=5, APPX_COUNT_DISTINCT=False
+    // CASE 3: DEFAULT_NDV_SCALE=9(different with original), APPX_COUNT_DISTINCT=True
+    // CASE 4: DEFAULT_NDV_SCALE=3, APPX_COUNT_DISTINCT=False
+    // CASE 5: DEFAULT_NDV_SCALE=2, APPX_COUNT_DISTINCT=True
+    // CASE 6: DEFAULT_NDV_SCALE=2, APPX_COUNT_DISTINCT=False
+    //-----------------------------------------------------------------------------------
+    String sql1 = "SELECT ndv(id), ndv(id, 5), count(DISTINCT id) FROM " +
+            "functional.alltypes";
+
+    // CASE 1
+    options.setDefault_ndv_scale(5).setAppx_count_distinct(true);
+    assertToSql(createAnalysisCtx(options), sql1, sql1,
+            "SELECT ndv(id, 5), ndv(id, 5), ndv(id, 5) FROM functional.alltypes");
+
+    // CASE 2
+    options.setDefault_ndv_scale(5).setAppx_count_distinct(false);
+    assertToSql(createAnalysisCtx(options), sql1, sql1,
+            "SELECT ndv(id, 5), ndv(id, 5), count(DISTINCT id)" +
+                    " FROM functional.alltypes");
+
+    // CASE 3
+    options.setDefault_ndv_scale(9).setAppx_count_distinct(true);
+    assertToSql(createAnalysisCtx(options), sql1, sql1,
+            "SELECT ndv(id, 9), ndv(id, 5), ndv(id, 9) FROM functional.alltypes");
+
+    // CASE 4
+    options.setDefault_ndv_scale(3).setAppx_count_distinct(false);
+    assertToSql(createAnalysisCtx(options), sql1, sql1,
+            "SELECT ndv(id, 3), ndv(id, 5), count(DISTINCT id) " +
+                    "FROM functional.alltypes");
+
+    // CASE 5
+    options.setDefault_ndv_scale(2).setAppx_count_distinct(true);
+    assertToSql(createAnalysisCtx(options), sql1, sql1,
+            "SELECT ndv(id), ndv(id, 5), ndv(id) FROM functional.alltypes");
+
+    // CASE 6
+    options.setDefault_ndv_scale(2).setAppx_count_distinct(false);
+    assertToSql(createAnalysisCtx(options), sql1, sql1,
+            "SELECT ndv(id), ndv(id, 5), count(DISTINCT id) FROM functional.alltypes");
+
+  }
+
+  @Test
+  public void TestShouldConvertToCNF() {
+    TQueryOptions options = new TQueryOptions();
+    options.setEnable_expr_rewrites(false);
+    AnalysisContext ctx = createAnalysisCtx(options);
+
+    // Positive tests
+    List<String> convertablePredicates = Arrays.asList("select (1=cast(1 as int))",
+        "select (cast(d_date_sk as int) = 10) from tpcds_parquet.date_dim",
+        "select (d_date_sk = d_year) from tpcds_parquet.date_dim",
+        "select (d_date_sk between 1 and 10) from tpcds_parquet.date_dim",
+        "select (d_date_sk in (1,2,10)) from tpcds_parquet.date_dim",
+        "select (d_date_sk is null) from tpcds_parquet.date_dim", "select (cos(1) = 1.1)",
+        "select (cast(d_date_sk as int) * 2 = 10) from tpcds_parquet.date_dim",
+        "select ((2 = cast(1 as int)) and (cos(1) = 1))",
+        "select ((2 = cast(1 as int)) or (cast(0 as int) is not null))",
+        "select (sin(cos(2*pi())))");
+
+    for (String query: convertablePredicates) {
+      Expr expr = analyze(query);
+      assertTrue("Should convert to CNF: "+query, expr.shouldConvertToCNF());
+    }
+
+    // Negative tests
+    List<String> inconvertablePredicates = Arrays.asList(
+        "select (upper(d_day_name) = 'A') from tpcds_parquet.date_dim",
+        "select (d_day_name like '%A') from tpcds_parquet.date_dim",
+        "select (coalesce(d_date_sk, -1) = d_year) from tpcds_parquet.date_dim",
+        "select (log10(cast(1 + length(upper(d_day_name)) as double)) > 1.0) from "
+         + "tpcds_parquet.date_dim");
+
+    for (String query: inconvertablePredicates) {
+      Expr expr = analyze(query);
+      assertFalse("Should not convert to CNF: "+query, expr.shouldConvertToCNF());
+    }
   }
 }

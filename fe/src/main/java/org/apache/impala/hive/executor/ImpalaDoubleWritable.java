@@ -35,4 +35,9 @@ public class ImpalaDoubleWritable extends DoubleWritable {
 
   @Override
   public void set(double v) { UnsafeUtil.UNSAFE.putDouble(ptr_, v); }
+
+  @Override
+  public String toString() {
+    return Double.toString(get());
+  }
 }

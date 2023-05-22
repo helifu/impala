@@ -1,0 +1,454 @@
+====
+---- QUERY
+select id, int_array from complextypestbl
+---- RESULTS
+1,'[1,2,3]'
+2,'[null,1,2,null,3,null]'
+3,'[]'
+4,'NULL'
+5,'NULL'
+6,'NULL'
+7,'NULL'
+8,'[-1]'
+---- TYPES
+bigint,string
+====
+---- QUERY
+select id, int_array from complextypestbl where id=1
+---- RESULTS
+1,'[1,2,3]'
+---- TYPES
+bigint,string
+====
+---- QUERY
+select id, int_array, int_array_array from complextypestbl
+---- RESULTS
+8,'[-1]','[[-1,-2],[]]'
+1,'[1,2,3]','[[1,2],[3,4]]'
+2,'[null,1,2,null,3,null]','[[null,1,2,null],[3,null,4],[],null]'
+3,'[]','[null]'
+4,'NULL','[]'
+5,'NULL','NULL'
+6,'NULL','NULL'
+7,'NULL','[null,[5,6]]'
+---- TYPES
+bigint,string,string
+====
+---- QUERY
+# Same collection used twice in a select list.
+select id, int_array, int_array from complextypestbl
+---- RESULTS
+1,'[1,2,3]','[1,2,3]'
+2,'[null,1,2,null,3,null]','[null,1,2,null,3,null]'
+3,'[]','[]'
+4,'NULL','NULL'
+5,'NULL','NULL'
+6,'NULL','NULL'
+7,'NULL','NULL'
+8,'[-1]','[-1]'
+---- TYPES
+bigint,string,string
+====
+---- QUERY
+# Same collection used from two versions of the same table/
+select t1.id, t1.int_array, t2.int_array
+ from complextypestbl t1 join complextypestbl t2
+ on t1.id = t2.id
+---- RESULTS
+3,'[]','[]'
+5,'NULL','NULL'
+7,'NULL','NULL'
+8,'[-1]','[-1]'
+1,'[1,2,3]','[1,2,3]'
+2,'[null,1,2,null,3,null]','[null,1,2,null,3,null]'
+4,'NULL','NULL'
+6,'NULL','NULL'
+---- TYPES
+bigint,string,string
+====
+---- QUERY
+select id, int_array from complextypestbl union all select id, int_array from complextypestbl
+---- RESULTS
+1,'[1,2,3]'
+2,'[null,1,2,null,3,null]'
+3,'[]'
+4,'NULL'
+5,'NULL'
+6,'NULL'
+7,'NULL'
+8,'[-1]'
+1,'[1,2,3]'
+2,'[null,1,2,null,3,null]'
+3,'[]'
+4,'NULL'
+5,'NULL'
+6,'NULL'
+7,'NULL'
+8,'[-1]'
+---- TYPES
+bigint,string
+====
+---- QUERY
+# TODO: only UNION ALL, is supported, UNION currently crashes Impala. UNION needs
+#       several utility functions in the BE, so for now we should reject it in the FE
+select id, int_array from complextypestbl union select id, int_array from complextypestbl;
+---- CATCH
+IllegalStateException: UNION, EXCEPT and INTERSECT are not supported for collection types
+====
+---- QUERY
+# Changing a column to a different type leads "non-pass-through" union that does a
+# deepcopy on the tuple, which is only implemented for collections of fixed-length types
+# in BE for arrays.
+select id, int_array from complextypestbl
+  union all select cast(id as tinyint), int_array from complextypestbl
+---- RESULTS
+1,'[1,2,3]'
+2,'[null,1,2,null,3,null]'
+3,'[]'
+4,'NULL'
+5,'NULL'
+6,'NULL'
+7,'NULL'
+8,'[-1]'
+1,'[1,2,3]'
+2,'[null,1,2,null,3,null]'
+3,'[]'
+4,'NULL'
+5,'NULL'
+6,'NULL'
+7,'NULL'
+8,'[-1]'
+---- TYPES
+bigint,string
+====
+---- QUERY
+# Changing a column to a different type leads "non-pass-through" union that does a
+# deepcopy on the tuple, which is only implemented for collections of fixed-length types
+# in BE for arrays.
+select id, int_array_array from complextypestbl
+  union all select cast(id as tinyint), int_array_array from complextypestbl
+---- CATCH
+IllegalStateException: only pass-through UNION ALL is supported for collections of variable length types.
+====
+---- QUERY
+# Constants in the select list of unions also lead to "non-pass-through" union but
+# collections of fixed length types are allowed.
+select 1, int_array from complextypestbl
+  union all select 2, int_array from complextypestbl;
+---- RESULTS
+1,'[-1]'
+1,'[1,2,3]'
+1,'[null,1,2,null,3,null]'
+1,'[]'
+1,'NULL'
+1,'NULL'
+1,'NULL'
+1,'NULL'
+2,'[-1]'
+2,'[1,2,3]'
+2,'[null,1,2,null,3,null]'
+2,'[]'
+2,'NULL'
+2,'NULL'
+2,'NULL'
+2,'NULL'
+---- TYPES
+tinyint,string
+====
+---- QUERY
+# Constants in the select list of unions also lead to "non-pass-through" union and
+# collections of variable length types are not allowed yet.
+select 1, int_array_array from complextypestbl
+  union all select 2, int_array_array from complextypestbl;
+---- CATCH
+IllegalStateException: only pass-through UNION ALL is supported for collections of variable length types.
+====
+---- QUERY
+select 1 from (select int_array from complextypestbl) s
+---- RESULTS
+1
+1
+1
+1
+1
+1
+1
+1
+---- TYPES
+tinyint
+====
+---- QUERY
+select id, int_array from (select id, int_array from complextypestbl) s;
+---- RESULTS
+1,'[1,2,3]'
+2,'[null,1,2,null,3,null]'
+3,'[]'
+4,'NULL'
+5,'NULL'
+6,'NULL'
+7,'NULL'
+8,'[-1]'
+---- TYPES
+bigint,string
+====
+---- QUERY
+with s as (select id, t.int_array from complextypestbl t)
+select id, int_array from s;
+---- RESULTS
+1,'[1,2,3]'
+2,'[null,1,2,null,3,null]'
+3,'[]'
+4,'NULL'
+5,'NULL'
+6,'NULL'
+7,'NULL'
+8,'[-1]'
+---- TYPES
+bigint,string
+====
+---- QUERY
+select id, int_array from complextypes_arrays_only_view;
+---- RESULTS
+1,'[1,2,3]'
+2,'[null,1,2,null,3,null]'
+3,'[]'
+4,'NULL'
+5,'NULL'
+6,'NULL'
+7,'NULL'
+8,'[-1]'
+---- TYPES
+bigint,string
+====
+---- QUERY
+# Unnesting array returned by view.
+select id, a.item from complextypes_arrays_only_view v, v.int_array a;
+---- RESULTS
+8,-1
+1,1
+1,2
+1,3
+2,NULL
+2,1
+2,2
+2,NULL
+2,3
+2,NULL
+---- TYPES
+bigint,int
+====
+---- QUERY
+# Unnesting array returned from WITH clause and predicate in inner query.
+with v as (select id, int_array from complextypestbl where id=1)
+select v.id, a.item from v, v.int_array a;
+---- RESULTS
+1,1
+1,2
+1,3
+---- TYPES
+bigint,int
+====
+---- QUERY
+# Unnesting array returned from WITH clause and predicate in outer query.
+with v as (select id, int_array from complextypestbl)
+select v.id, a.item from v, v.int_array a where id=1;
+---- RESULTS
+1,1
+1,2
+1,3
+---- TYPES
+bigint,int
+====
+---- QUERY
+# Unnesting array returned from WITH clause on item.
+with v as (select id, int_array from complextypestbl)
+select v.id, a.item from v, v.int_array a where  a.item=1
+---- RESULTS
+1,1
+2,1
+---- TYPES
+bigint,int
+====
+---- QUERY
+# Unnesting array returned by view wrapped in inline view.
+select v.id, a.item from
+  (select id, int_array from complextypes_arrays_only_view) v, v.int_array a;
+---- RESULTS
+8,-1
+1,1
+1,2
+1,3
+2,NULL
+2,1
+2,2
+2,NULL
+2,3
+2,NULL
+---- TYPES
+bigint,int
+====
+---- QUERY
+# Unnesting array returned by view wrapped in inline view + WITH clause.
+with v2 as (select id, int_array from complextypes_arrays_only_view)
+select v.id, a.item from (select id, int_array from v2) v, v.int_array a;
+---- RESULTS
+8,-1
+1,1
+1,2
+1,3
+2,NULL
+2,1
+2,2
+2,NULL
+2,3
+2,NULL
+---- TYPES
+bigint,int
+====
+---- QUERY
+# Unnesting array returned by view wrapped in inline view + WITH clause.
+with v2 as (select id, int_array from complextypes_arrays_only_view)
+select v.id, a.item from
+  (select id, int_array from v2 where id=1) v, v.int_array a
+  where a.item=1;
+---- RESULTS
+1,1
+---- TYPES
+bigint,int
+====
+---- QUERY
+select item from unnest(complextypestbl.int_array_array)
+---- RESULTS
+'[-1,-2]'
+'[]'
+'[1,2]'
+'[3,4]'
+'[null,1,2,null]'
+'[3,null,4]'
+'[]'
+'NULL'
+'NULL'
+'NULL'
+'[5,6]'
+---- TYPES
+string
+====
+---- QUERY
+select id, a.item from complextypes_arrays_only_view t left join t.int_array a;
+---- RESULTS
+1,1
+1,2
+1,3
+2,NULL
+2,1
+2,2
+2,NULL
+2,3
+2,NULL
+3,NULL
+4,NULL
+5,NULL
+6,NULL
+7,NULL
+8,-1
+---- TYPES
+BIGINT,INT
+====
+---- QUERY
+select id, a2.item from complextypes_arrays_only_view v, v.int_array_array a1, a1.item a2;
+---- RESULTS
+1,1
+1,2
+1,3
+1,4
+2,NULL
+2,1
+2,2
+2,NULL
+2,3
+2,NULL
+2,4
+7,5
+7,6
+8,-1
+8,-2
+---- TYPES
+BIGINT,INT
+====
+---- QUERY
+# IMPALA-11052: allow using collections returned from views as non-relative table refs
+select item from complextypes_arrays_only_view.int_array
+---- CATCH
+AnalysisException: Non-relative collections are currently not supported on collections from views.
+====
+---- QUERY
+# IMPALA-11052: allow using collections returned from views as non-relative table refs
+with s as (select int_array a from complextypestbl t)
+select item from s.a
+---- CATCH
+AnalysisException: Could not resolve table reference: 's.a
+====
+---- QUERY
+# IMPALA-11280. There is a join involved here by using the IN operator, and multiple
+# arrays are unnested. Checks that the predicate on an unnested array is evaluated
+# correctly.
+select id, unnested_arr1, unnested_arr2
+from (
+    select id, unnest(arr1) as unnested_arr1, unnest(arr2) as unnested_arr2
+    from complextypes_arrays
+    where id % 2 = 1 and id in (select id from alltypestiny)
+) a
+where a.unnested_arr1 < 5;
+---- RESULTS
+1,1,'one'
+1,2,'two'
+1,3,'three'
+1,4,'four'
+7,1,'NULL'
+7,2,'NULL'
+---- TYPES
+INT,INT,STRING
+====
+---- QUERY
+# Similar as above but here the join is explicitly included in the query string and is not
+# a result of a query rewrite.
+select a.id, unnested_arr1, unnested_arr2
+from (
+    select cta.id, unnest(arr1) as unnested_arr1, unnest(arr2) as unnested_arr2
+    from functional_parquet.complextypes_arrays cta
+        left join functional_parquet.alltypestiny ti on cta.id = ti.id
+    where cta.id % 2 = 1) a
+where a.unnested_arr1 < 5;
+---- RESULTS
+1,1,'one'
+1,2,'two'
+1,3,'three'
+1,4,'four'
+7,1,'NULL'
+7,2,'NULL'
+---- TYPES
+INT,INT,STRING
+====
+---- QUERY
+# Regression test for:
+#   IMPALA-11434: "More than 1 2d arrays in select list causes analysis error"
+select id, arr_int_1d, arr_int_2d, arr_int_3d, arr_string_1d, arr_string_2d, arr_string_3d from collection_tbl;
+---- RESULTS
+1,'[1,2,null]','[[1,2,null],[3]]','[[[1,2,null],[3]],[[4]]]','["1","2",null]','[["1","2",null],["3"]]','[[["1","2",null],["3"]],[["4"]]]'
+---- TYPES
+INT,STRING,STRING,STRING,STRING,STRING,STRING
+====
+---- QUERY
+# Regression test for:
+#   IMPALA-11567: "Error in left outer join if the right side is a subquery with complex types"
+select a.id, b.arr_int_1d, b.arr_int_2d
+from alltypestiny a left outer join
+  (select id, arr_int_1d, arr_int_2d from collection_tbl) b
+on a.id = b.id where a.id < 3;
+---- RESULTS
+0,'NULL','NULL'
+1,'[1,2,null]','[[1,2,null],[3]]'
+2,'NULL','NULL'
+---- TYPES
+INT,STRING,STRING
+=====

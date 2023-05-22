@@ -33,12 +33,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableCollection;
+import com.google.common.collect.ImmutableMap;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
-import org.apache.hadoop.hive.metastore.api.Partition;
+import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
+import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
 import org.apache.impala.authorization.AuthorizationChecker;
@@ -49,19 +55,29 @@ import org.apache.impala.catalog.CatalogDeltaLog;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogObjectCache;
 import org.apache.impala.catalog.Function;
+import org.apache.impala.catalog.HdfsCachePool;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.HdfsPartitionLocationCompressor;
+import org.apache.impala.catalog.HdfsStorageDescriptor;
 import org.apache.impala.catalog.ImpaladCatalog.ObjectUpdateSequencer;
 import org.apache.impala.catalog.Principal;
 import org.apache.impala.catalog.PrincipalPrivilege;
+import org.apache.impala.catalog.SqlConstraints;
+import org.apache.impala.catalog.VirtualColumn;
+import org.apache.impala.catalog.local.LocalIcebergTable.TableParams;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.service.FrontendProfile;
+import org.apache.impala.service.MetadataOp;
 import org.apache.impala.thrift.CatalogLookupStatus;
 import org.apache.impala.thrift.TBackendGflags;
+import org.apache.impala.thrift.TBriefTableMeta;
 import org.apache.impala.thrift.TCatalogInfoSelector;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TDbInfoSelector;
 import org.apache.impala.thrift.TErrorCode;
@@ -72,14 +88,20 @@ import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
 import org.apache.impala.thrift.THdfsFileDesc;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TPartialPartitionInfo;
+import org.apache.impala.thrift.TPartialTableInfo;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableInfoSelector;
 import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.thrift.TUnit;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
 import org.apache.impala.thrift.TUpdateCatalogCacheResponse;
+import org.apache.impala.thrift.TValidWriteIdList;
+import org.apache.impala.util.AcidUtils;
+import org.apache.impala.util.IcebergUtil;
 import org.apache.impala.util.ListMap;
 import org.apache.impala.util.TByteBuffer;
+import org.apache.impala.util.ThreadNameAnnotator;
+import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
@@ -88,7 +110,6 @@ import org.ehcache.sizeof.SizeOf;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Stopwatch;
@@ -200,7 +221,7 @@ public class CatalogdMetaProvider implements MetaProvider {
   private static final String CATALOG_FETCH_PREFIX = "CatalogFetch";
   private static final String DB_LIST_STATS_CATEGORY = "DatabaseList";
   private static final String DB_METADATA_STATS_CATEGORY = "Databases";
-  private static final String TABLE_NAMES_STATS_CATEGORY = "TableNames";
+  private static final String TABLE_LIST_STATS_CATEGORY = "TableList";
   private static final String TABLE_METADATA_CACHE_CATEGORY = "Tables";
   private static final String PARTITION_LIST_STATS_CATEGORY = "PartitionLists";
   private static final String PARTITIONS_STATS_CATEGORY = "Partitions";
@@ -317,6 +338,11 @@ public class CatalogdMetaProvider implements MetaProvider {
       new CatalogObjectCache<>();
   private AtomicReference<? extends AuthorizationChecker> authzChecker_;
 
+  // Cache of known HDFS cache pools. Allows for checking the existence
+  // of pools without hitting HDFS. This is _not_ "fetch-on-demand".
+  private final CatalogObjectCache<HdfsCachePool> hdfsCachePools_ =
+      new CatalogObjectCache<>(false);
+
   public CatalogdMetaProvider(TBackendGflags flags) {
     Preconditions.checkArgument(flags.isSetLocal_catalog_cache_expiration_s());
     Preconditions.checkArgument(flags.isSetLocal_catalog_cache_mb());
@@ -348,6 +374,11 @@ public class CatalogdMetaProvider implements MetaProvider {
   }
 
   @Override
+  public Iterable<HdfsCachePool> getHdfsCachePools() {
+    return hdfsCachePools_;
+  }
+
+  @Override
   public AuthorizationPolicy getAuthPolicy() {
     return authPolicy_;
   }
@@ -372,7 +403,7 @@ public class CatalogdMetaProvider implements MetaProvider {
       throws TException {
     TGetPartialCatalogObjectResponse resp;
     byte[] ret = null;
-    Stopwatch sw = new Stopwatch().start();
+    Stopwatch sw = Stopwatch.createStarted();
     try {
       ret = FeSupport.GetPartialCatalogObject(new TSerializer().serialize(req));
     } catch (InternalException e) {
@@ -442,7 +473,7 @@ public class CatalogdMetaProvider implements MetaProvider {
     // around invalidation (IMPALA-7534). Namely, we have the following interleaving to
     // worry about:
     //
-    //  Thread 1: loadTableNames() misses and sends a request to fetch table names
+    //  Thread 1: loadTableList() misses and sends a request to fetch table names
     //  Catalogd: sends a response with table list ['foo']
     //  Thread 2:    creates a table 'bar'
     //  Catalogd:    returns an invalidation for the table name list
@@ -479,10 +510,11 @@ public class CatalogdMetaProvider implements MetaProvider {
     // NOTE: we don't need to perform this dance for cache keys which embed a version
     // number, because invalidation is not handled by removing cache entries, but
     // rather by bumping top-level version numbers.
-    Stopwatch sw = new Stopwatch().start();
+    Stopwatch sw = Stopwatch.createStarted();
     boolean hit = false;
     boolean isPiggybacked = false;
-    try {
+    try (ThreadNameAnnotator tna = new ThreadNameAnnotator(
+        "LoadWithCaching for " + itemString)) {
       CompletableFuture<Object> f = new CompletableFuture<Object>();
       // NOTE: the Cache ensures that this is an atomic operation of either returning
       // an existing value or inserting our own. Only one thread can think it is the
@@ -579,7 +611,7 @@ public class CatalogdMetaProvider implements MetaProvider {
             req.catalog_info_selector.want_db_names = true;
             TGetPartialCatalogObjectResponse resp = sendRequest(req);
             checkResponse(resp.catalog_info != null && resp.catalog_info.db_names != null,
-                req, "missing table names");
+                req, "missing database names");
             return ImmutableList.copyOf(resp.catalog_info.db_names);
           }
     });
@@ -619,7 +651,7 @@ public class CatalogdMetaProvider implements MetaProvider {
   public Database loadDb(final String dbName) throws TException {
     return loadWithCaching("database metadata for " + dbName,
         DB_METADATA_STATS_CATEGORY,
-        new DbCacheKey(dbName, DbCacheKey.DbInfoType.HMS_METADATA),
+        new DbCacheKey(dbName.toLowerCase(), DbCacheKey.DbInfoType.HMS_METADATA),
         new Callable<Database>() {
           @Override
           public Database call() throws Exception {
@@ -634,22 +666,28 @@ public class CatalogdMetaProvider implements MetaProvider {
   }
 
   @Override
-  public ImmutableList<String> loadTableNames(final String dbName)
+  public ImmutableCollection<TBriefTableMeta> loadTableList(final String dbName)
       throws MetaException, UnknownDBException, TException {
-    return loadWithCaching("table names for database " + dbName,
-        TABLE_NAMES_STATS_CATEGORY,
-        new DbCacheKey(dbName, DbCacheKey.DbInfoType.TABLE_NAMES),
-        new Callable<ImmutableList<String>>() {
+    ImmutableMap<String, TBriefTableMeta> res = loadWithCaching(
+        "table list of database " + dbName, TABLE_LIST_STATS_CATEGORY,
+        new DbCacheKey(dbName.toLowerCase(), DbCacheKey.DbInfoType.TABLE_LIST),
+        new Callable<ImmutableMap<String, TBriefTableMeta>>() {
           @Override
-          public ImmutableList<String> call() throws Exception {
+          public ImmutableMap<String, TBriefTableMeta> call() throws Exception {
             TGetPartialCatalogObjectRequest req = newReqForDb(dbName);
-            req.db_info_selector.want_table_names = true;
+            req.db_info_selector.want_brief_meta_of_tables = true;
             TGetPartialCatalogObjectResponse resp = sendRequest(req);
-            checkResponse(resp.db_info != null && resp.db_info.table_names != null,
+            checkResponse(
+                resp.db_info != null && resp.db_info.brief_meta_of_tables != null,
                 req, "missing expected table names");
-            return ImmutableList.copyOf(resp.db_info.table_names);
+            ImmutableMap.Builder<String, TBriefTableMeta> map = ImmutableMap.builder();
+            for (TBriefTableMeta meta : resp.db_info.brief_meta_of_tables) {
+              map.put(meta.getName(), meta);
+            }
+            return map.build();
           }
       });
+    return res.values();
   }
 
   private TGetPartialCatalogObjectRequest newReqForTable(String dbName,
@@ -675,8 +713,8 @@ public class CatalogdMetaProvider implements MetaProvider {
   @Override
   public Pair<Table, TableMetaRef> loadTable(final String dbName, final String tableName)
       throws NoSuchObjectException, MetaException, TException {
-    // TODO(todd) need to lower case?
-    TableCacheKey cacheKey = new TableCacheKey(dbName, tableName);
+    TableCacheKey cacheKey = new TableCacheKey(dbName.toLowerCase(),
+        tableName.toLowerCase());
     TableMetaRefImpl ref = loadWithCaching(
         "table metadata for " + dbName + "." + tableName,
         TABLE_METADATA_CACHE_CATEGORY,
@@ -686,22 +724,76 @@ public class CatalogdMetaProvider implements MetaProvider {
           public TableMetaRefImpl call() throws Exception {
             TGetPartialCatalogObjectRequest req = newReqForTable(dbName, tableName);
             req.table_info_selector.want_hms_table = true;
+            // To be consistent with implementation in legacy catalog mode, we eagerly
+            // load constraint information whenever a table is loaded.
+            req.table_info_selector.want_table_constraints = true;
             TGetPartialCatalogObjectResponse resp = sendRequest(req);
             checkResponse(resp.table_info != null && resp.table_info.hms_table != null,
                 req, "missing expected HMS table");
             addTableMetadatStorageLoadTimeToProfile(
                 resp.table_info.storage_metadata_load_time_ns);
+            List<SQLPrimaryKey> primaryKeys = resp.table_info.sql_constraints == null ?
+                new ArrayList<>() : resp.table_info.sql_constraints.getPrimary_keys();
+            List<SQLForeignKey> foreignKeys = resp.table_info.sql_constraints == null ?
+                new ArrayList<>() : resp.table_info.sql_constraints.getForeign_keys();
             return new TableMetaRefImpl(
-                dbName, tableName, resp.table_info.hms_table, resp.object_version_number);
+                dbName, tableName, resp.table_info.hms_table, resp.object_version_number,
+                new SqlConstraints(primaryKeys, foreignKeys),
+                resp.table_info.valid_write_ids, resp.table_info.is_marked_cached,
+                resp.table_info.partition_prefixes, resp.table_info.virtual_columns);
            }
       });
+    // The table list is populated based on tables in a given Db in catalogd. If a table
+    // is not loaded at the time in catalogd, we assume that the table type is "TABLE" and
+    // comment is empty (See MetadataOp.getTableType and MetadataOp.getTableComment()).
+    // However, after issuing this load request, if we find that our assumption was
+    // incorrect, we need to invalidate the table list immediately. The table list gets
+    // invalidated automatically when we receive the catalog topic-update but until then,
+    // all the getTables calls will show incorrect table type and comment for this table.
+    // TODO: consider removing this after IMPALA-9670.
+    invalidateStaleTableList(dbName.toLowerCase(), ref);
     return Pair.create(ref.msTable_, (TableMetaRef)ref);
+  }
+
+  /**
+   * Invalidate table list of the given DB if it's loaded and it contains stale
+   * type/comment comparing to the newly loaded msTable.
+   */
+  private void invalidateStaleTableList(final String dbName,
+      final TableMetaRefImpl latestMeta) {
+    Preconditions.checkNotNull(latestMeta.msTable_, "loaded table should have a msTable");
+    DbCacheKey dbKey = new DbCacheKey(dbName, DbCacheKey.DbInfoType.TABLE_LIST);
+    Object dbValue = cache_.getIfPresent(dbKey);
+    if (dbValue instanceof ImmutableMap) {
+      TBriefTableMeta cachedMeta = ((ImmutableMap<String, TBriefTableMeta>) dbValue).get(
+          latestMeta.tableName_);
+      String latestComment = MetadataOp.getTableComment(latestMeta.msTable_);
+      boolean hasStaleComment = !StringUtils.equals(latestComment, cachedMeta.comment);
+      // It's possible that the cached type is null (due to previously unloaded) and the
+      // latest msType we get is a table type (e.g. MANAGED_TABLE, EXTERNAL_TABLE).
+      // This is the most usual case and we don't consider the cached type is stale since
+      // they have the same result after applying MetadataOp.getImpalaTableType().
+      boolean hasStaleType =
+          MetadataOp.getImpalaTableType(cachedMeta.msType) !=
+          MetadataOp.getImpalaTableType(latestMeta.msTable_.getTableType());
+      if (hasStaleType || hasStaleComment) {
+        List<String> invalidated = new ArrayList<>();
+        invalidateCacheForDb(dbName, ImmutableList.of(DbCacheKey.DbInfoType.TABLE_LIST),
+            invalidated);
+        if (!invalidated.isEmpty()) {
+          Preconditions.checkState(invalidated.size() == 1);
+          LOG.debug("Invalidated stale {} after loading table {}: hasStaleType={}, " +
+                  "hasStaleComment={}",
+              invalidated.get(0), latestMeta.tableName_, hasStaleType, hasStaleComment);
+        }
+      }
+    }
   }
 
   @Override
   public List<ColumnStatisticsObj> loadTableColumnStatistics(final TableMetaRef table,
       List<String> colNames) throws TException {
-    Stopwatch sw = new Stopwatch().start();
+    Stopwatch sw = Stopwatch.createStarted();
     List<ColumnStatisticsObj> ret = Lists.newArrayListWithCapacity(colNames.size());
     // Look up in cache first, keeping track of which ones are missing.
     // We can't use 'loadWithCaching' since we need to fetch several entries batched
@@ -791,6 +883,12 @@ public class CatalogdMetaProvider implements MetaProvider {
   }
 
   @Override
+  public SqlConstraints loadConstraints(
+      final TableMetaRef table, Table msTbl) {
+    return ((TableMetaRefImpl) table).sqlConstraints_;
+  }
+
+  @Override
   public Map<String, PartitionMetadata> loadPartitionsByRefs(TableMetaRef table,
       List<String> partitionColumnNames,
       ListMap<TNetworkAddress> hostIndex,
@@ -798,10 +896,22 @@ public class CatalogdMetaProvider implements MetaProvider {
       throws MetaException, TException {
     Preconditions.checkArgument(table instanceof TableMetaRefImpl);
     TableMetaRefImpl refImpl = (TableMetaRefImpl)table;
-    Stopwatch sw = new Stopwatch().start();
+    Stopwatch sw = Stopwatch.createStarted();
     // Load what we can from the cache.
     Map<PartitionRef, PartitionMetadata> refToMeta = loadPartitionsFromCache(refImpl,
         hostIndex, partitionRefs);
+    if (BackendConfig.INSTANCE.isAutoCheckCompaction()) {
+      // If any partitions are stale after compaction, they will be removed from refToMeta
+      List<PartitionRef> stalePartitions = directProvider_.checkLatestCompaction(
+          refImpl.dbName_, refImpl.tableName_, refImpl, refToMeta);
+      cache_.invalidateAll(stalePartitions.stream()
+          .map(PartitionRefImpl.class::cast)
+          .map(PartitionRefImpl::getId)
+          .map(PartitionCacheKey::new)
+          .collect(Collectors.toList()));
+      LOG.debug("Checked the latest compaction id for {}.{}", refImpl.dbName_,
+          refImpl.tableName_);
+    }
 
     final int numHits = refToMeta.size();
     final int numMisses = partitionRefs.size() - numHits;
@@ -816,11 +926,11 @@ public class CatalogdMetaProvider implements MetaProvider {
           refImpl, hostIndex, missingRefs);
       refToMeta.putAll(fromCatalogd);
       // Write back to the cache.
-      storePartitionsInCache(refImpl, hostIndex, fromCatalogd);
+      storePartitionsInCache(hostIndex, fromCatalogd);
     }
     sw.stop();
-    addStatsToProfile(PARTITIONS_STATS_CATEGORY, refToMeta.size(), numMisses, sw);
-    LOG.trace("Request for partitions of {}: hit {}/{}", table, refToMeta.size(),
+    addStatsToProfile(PARTITIONS_STATS_CATEGORY, numHits, numMisses, sw);
+    LOG.trace("Request for partitions of {}: hit {}/{}", table, numHits,
         partitionRefs.size());
 
     // Convert the returned map to be by-name instead of by-ref.
@@ -848,6 +958,9 @@ public class CatalogdMetaProvider implements MetaProvider {
     req.table_info_selector.partition_ids = ids;
     req.table_info_selector.want_partition_metadata = true;
     req.table_info_selector.want_partition_files = true;
+    if (BackendConfig.INSTANCE.isAutoCheckCompaction()) {
+      req.table_info_selector.valid_write_ids = table.validWriteIds_;
+    }
     // TODO(todd): fetch incremental stats on-demand for compute-incremental-stats.
     req.table_info_selector.want_partition_stats = true;
     TGetPartialCatalogObjectResponse resp = sendRequest(req);
@@ -864,30 +977,43 @@ public class CatalogdMetaProvider implements MetaProvider {
     for (int i = 0; i < ids.size(); i++) {
       PartitionRef partRef = partRefs.get(i);
       TPartialPartitionInfo part = resp.table_info.partitions.get(i);
-      Partition msPart = part.getHms_partition();
-      if (msPart == null) {
+      HdfsStorageDescriptor hdfsStorageDescriptor = null;
+      HdfsPartitionLocationCompressor.Location location;
+      if (part.isSetHdfs_storage_descriptor()) {
+        Preconditions.checkNotNull(part.location, "location should not be null");
+        hdfsStorageDescriptor = HdfsStorageDescriptor.fromThrift(
+            part.hdfs_storage_descriptor, table.tableName_);
+        location = table.getPartitionLocationCompressor().new Location(part.location);
+      } else {
         checkResponse(table.msTable_.getPartitionKeysSize() == 0, req,
-            "Should not return a partition with missing HMS partition unless " +
+            "Should not return a partition with missing partition meta unless " +
             "the table is unpartitioned");
-        msPart = DirectMetaProvider.msTableToPartition(table.msTable_);
+        // For the only partition of a nonpartitioned table, reuse table-level metadata.
+        try {
+          hdfsStorageDescriptor = HdfsStorageDescriptor.fromStorageDescriptor(
+              table.tableName_, table.msTable_.getSd());
+        } catch (HdfsStorageDescriptor.InvalidStorageDescriptorException e) {
+          Preconditions.checkState(false, "Failed to create HdfsStorageDescriptor " +
+              "using sd of table");
+        }
+        location = table.getPartitionLocationCompressor().new Location(
+            table.msTable_.getSd().getLocation());
+        part.setHms_parameters(table.msTable_.getParameters());
       }
 
       // Transform the file descriptors to the caller's index.
       checkResponse(part.file_descriptors != null, req, "missing file descriptors");
-      List<FileDescriptor> fds = Lists.newArrayListWithCapacity(
-          part.file_descriptors.size());
-      for (THdfsFileDesc thriftFd: part.file_descriptors) {
-        FileDescriptor fd = FileDescriptor.fromThrift(thriftFd);
-        // The file descriptors returned via the RPC use host indexes that reference
-        // the 'network_addresses' list in the RPC. However, the caller may have already
-        // loaded some addresses into 'hostIndex'. So, the returned FDs need to be
-        // remapped to point to the caller's 'hostIndex' instead of the list in the
-        // RPC response.
-        fds.add(fd.cloneWithNewHostIndex(resp.table_info.network_addresses, hostIndex));
-      }
-      PartitionMetadataImpl metaImpl = new PartitionMetadataImpl(msPart,
-          ImmutableList.copyOf(fds), part.getPartition_stats(),
-          part.has_incremental_stats);
+      ImmutableList<FileDescriptor> fds = convertThriftFdList(part.file_descriptors,
+          resp.table_info.network_addresses, hostIndex);
+      ImmutableList<FileDescriptor> insertFds = convertThriftFdList(
+          part.insert_file_descriptors, resp.table_info.network_addresses, hostIndex);
+      ImmutableList<FileDescriptor> deleteFds = convertThriftFdList(
+          part.delete_file_descriptors, resp.table_info.network_addresses, hostIndex);
+      PartitionMetadataImpl metaImpl = new PartitionMetadataImpl(part.getHms_parameters(),
+          part.write_id, hdfsStorageDescriptor,
+          fds, insertFds, deleteFds, part.getPartition_stats(),
+          part.has_incremental_stats, part.is_marked_cached, location,
+          part.last_compaction_id);
 
       checkResponse(partRef != null, req, "returned unexpected partition id %s", part.id);
 
@@ -898,6 +1024,64 @@ public class CatalogdMetaProvider implements MetaProvider {
       }
     }
     return ret;
+  }
+
+  @Override
+  public TPartialTableInfo loadIcebergTable(final TableMetaRef table) throws TException {
+    Preconditions.checkArgument(table instanceof TableMetaRefImpl);
+    TableMetaRefImpl tableRef = (TableMetaRefImpl)table;
+    String itemStr = "iceberg metadata for " + tableRef.dbName_ + "."
+        + tableRef.tableName_;
+    IcebergMetaCacheKey cacheKey = new IcebergMetaCacheKey(tableRef);
+    return loadWithCaching(itemStr, TABLE_METADATA_CACHE_CATEGORY, cacheKey,
+        new Callable<TPartialTableInfo>() {
+          @Override
+          public TPartialTableInfo call() throws Exception {
+            TGetPartialCatalogObjectRequest req = newReqForTable(table);
+            req.table_info_selector.want_iceberg_table = true;
+            TGetPartialCatalogObjectResponse resp = sendRequest(req);
+            checkResponse(resp.table_info != null &&
+                resp.table_info.iceberg_table != null, req,
+                "missing Iceberg table metadata");
+            return resp.getTable_info();
+          }
+    });
+  }
+
+  @Override
+  public org.apache.iceberg.Table loadIcebergApiTable(final TableMetaRef table,
+      TableParams params, Table msTable) throws TException {
+    Preconditions.checkArgument(table instanceof TableMetaRefImpl);
+    TableMetaRefImpl tableRef = (TableMetaRefImpl)table;
+    String itemStr = "iceberg api table for " + tableRef.dbName_ + "."
+        + tableRef.tableName_;
+    IcebergApiTableCacheKey cacheKey = new IcebergApiTableCacheKey(tableRef);
+    return loadWithCaching(itemStr, TABLE_METADATA_CACHE_CATEGORY, cacheKey,
+        new Callable<org.apache.iceberg.Table>() {
+          @Override
+          public org.apache.iceberg.Table call() throws Exception {
+            return IcebergUtil.loadTable(
+                params.getIcebergCatalog(),
+                IcebergUtil.getIcebergTableIdentifier(msTable),
+                params.getIcebergCatalogLocation(),
+                msTable.getParameters());
+          }
+        });
+    }
+
+  private ImmutableList<FileDescriptor> convertThriftFdList(List<THdfsFileDesc> thriftFds,
+      List<TNetworkAddress> networkAddresses, ListMap<TNetworkAddress> hostIndex) {
+    List<FileDescriptor> fds = Lists.newArrayListWithCapacity(thriftFds.size());
+    for (THdfsFileDesc thriftFd: thriftFds) {
+      FileDescriptor fd = FileDescriptor.fromThrift(thriftFd);
+      // The file descriptors returned via the RPC use host indexes that reference
+      // the 'network_addresses' list in the RPC. However, the caller may have already
+      // loaded some addresses into 'hostIndex'. So, the returned FDs need to be
+      // remapped to point to the caller's 'hostIndex' instead of the list in the
+      // RPC response.
+      fds.add(fd.cloneWithNewHostIndex(networkAddresses, hostIndex));
+    }
+    return ImmutableList.copyOf(fds);
   }
 
   /**
@@ -915,7 +1099,7 @@ public class CatalogdMetaProvider implements MetaProvider {
         partitionRefs.size());
     for (PartitionRef ref: partitionRefs) {
       PartitionRefImpl prefImpl = (PartitionRefImpl)ref;
-      PartitionCacheKey cacheKey = new PartitionCacheKey(table, prefImpl.getId());
+      PartitionCacheKey cacheKey = new PartitionCacheKey(prefImpl.getId());
       PartitionMetadataImpl val = (PartitionMetadataImpl)getIfPresent(cacheKey);
       if (val == null) continue;
 
@@ -931,12 +1115,12 @@ public class CatalogdMetaProvider implements MetaProvider {
    * Write back the partitions in 'metas' into the cache. The file descriptors in these
    * partitions must be relative to the 'hostIndex'.
    */
-  private void storePartitionsInCache(TableMetaRefImpl table,
-      ListMap<TNetworkAddress> hostIndex, Map<PartitionRef, PartitionMetadata> metas) {
+  private void storePartitionsInCache(ListMap<TNetworkAddress> hostIndex,
+      Map<PartitionRef, PartitionMetadata> metas) {
     for (Map.Entry<PartitionRef, PartitionMetadata> e: metas.entrySet()) {
       PartitionRefImpl prefImpl = (PartitionRefImpl)e.getKey();
       PartitionMetadataImpl metaImpl = (PartitionMetadataImpl)e.getValue();
-      PartitionCacheKey cacheKey = new PartitionCacheKey(table, prefImpl.getId());
+      PartitionCacheKey cacheKey = new PartitionCacheKey(prefImpl.getId());
       PartitionMetadataImpl cacheVal = metaImpl.cloneRelativeToHostIndex(hostIndex,
           cacheHostIndex_);
       cache_.put(cacheKey, cacheVal);
@@ -1026,6 +1210,8 @@ public class CatalogdMetaProvider implements MetaProvider {
   public synchronized TUpdateCatalogCacheResponse updateCatalogCache(
       TUpdateCatalogCacheRequest req) {
     if (req.isSetCatalog_service_id()) {
+      // Requests from processing statestore updates won't have this. Only requests from
+      // DDLs will set this. See more details in ImpalaServer::ProcessCatalogUpdateResult.
       witnessCatalogServiceId(req.catalog_service_id);
     }
 
@@ -1035,14 +1221,18 @@ public class CatalogdMetaProvider implements MetaProvider {
     Long nextCatalogVersion = null;
 
     ObjectUpdateSequencer authObjectSequencer = new ObjectUpdateSequencer();
+    ObjectUpdateSequencer hdfsCachePoolSequencer = new ObjectUpdateSequencer();
 
     Pair<Boolean, ByteBuffer> update;
+    int maxMessageSize = BackendConfig.INSTANCE.getThriftRpcMaxMessageSize();
+    final TConfiguration config = new TConfiguration(maxMessageSize,
+        TConfiguration.DEFAULT_MAX_FRAME_SIZE, TConfiguration.DEFAULT_RECURSION_DEPTH);
     while ((update = FeSupport.NativeGetNextCatalogObjectUpdate(req.native_iterator_ptr))
         != null) {
       boolean isDelete = update.first;
       TCatalogObject obj = new TCatalogObject();
       try {
-        obj.read(new TBinaryProtocol(new TByteBuffer(update.second)));
+        obj.read(new TBinaryProtocol(new TByteBuffer(config, update.second)));
       } catch (TException e) {
         // TODO(todd) include the bad key here! currently the JNI bridge doesn't expose
         // the key in any way.
@@ -1059,7 +1249,25 @@ public class CatalogdMetaProvider implements MetaProvider {
         continue;
       }
 
+      if (!isDelete && obj.type == TCatalogObjectType.HDFS_PARTITION) {
+        // Skip if this is the update for a new partition.
+        if (!obj.hdfs_partition.isSetPrev_id()) continue;
+        // This is an update from an existing partiton. Invalidate the previous partition
+        // instance by resetting the id to the previous one.
+        obj.hdfs_partition.setId(obj.hdfs_partition.prev_id);
+        obj.hdfs_partition.unsetPrev_id();
+      }
       invalidateCacheForObject(obj);
+
+      if (obj.type == TCatalogObjectType.HDFS_CACHE_POOL) {
+        // HdfsCachePools have no dependency to each other. But we can't update
+        // hdfsCachePools_ directly since a new catalog service id (due to catalogd
+        // restart) will cause hdfsCachePools_ to be clear (see mode details in
+        // witnessCatalogServiceId()). So we have to deal with HDFS_CACHE_POOL objects
+        // after the CATALOG object.
+        hdfsCachePoolSequencer.add(obj, isDelete);
+        continue;
+      }
 
       // The sequencing of updates to authorization objects is important since they
       // may be cross-referential. So, just add them to the sequencer which ensures
@@ -1068,6 +1276,7 @@ public class CatalogdMetaProvider implements MetaProvider {
           obj.type == TCatalogObjectType.PRIVILEGE ||
           obj.type == TCatalogObjectType.AUTHZ_CACHE_INVALIDATION) {
         authObjectSequencer.add(obj, isDelete);
+        continue;
       }
 
       // Handle CATALOG objects. These are sent only via the updates published via
@@ -1084,8 +1293,21 @@ public class CatalogdMetaProvider implements MetaProvider {
           // Detected a new reset() finishes in Catalogd, clear the cache in case some
           // tables are skipped in this topic update.
           cache_.invalidateAll();
+          // Don't need to clear hdfsCachePools_ if this comes from a catalogd restart,
+          // because we already clear it in witnessCatalogServiceId().
+          // Shouldn't clear hdfsCachePools_ if this comes from a global invalidation,
+          // because HdfsCachePool updates may already come in the previous statestore
+          // update (see how the version lock is held in CatalogServiceCatalog.reset()).
+          // Clear hdfsCachePools_ will also clear them.
         }
       }
+    }
+
+    for (TCatalogObject obj : hdfsCachePoolSequencer.getUpdatedObjects()) {
+      updateHdfsCachePools(obj, /*isDelete=*/false);
+    }
+    for (TCatalogObject obj : hdfsCachePoolSequencer.getDeletedObjects()) {
+      updateHdfsCachePools(obj, /*isDelete=*/true);
     }
 
     for (TCatalogObject obj : authObjectSequencer.getUpdatedObjects()) {
@@ -1115,6 +1337,29 @@ public class CatalogdMetaProvider implements MetaProvider {
       return new TUpdateCatalogCacheResponse(catalogServiceId_,
           lastResetCatalogVersion_.get() + 1, lastSeenCatalogVersion_.get());
     }
+  }
+
+  private void updateHdfsCachePools(TCatalogObject obj, boolean isDelete) {
+    Preconditions.checkState(obj.type == TCatalogObjectType.HDFS_CACHE_POOL);
+    String poolName = obj.getCache_pool().getPool_name();
+    if (isDelete) {
+      HdfsCachePool existingItem = hdfsCachePools_.get(poolName);
+      if (existingItem != null
+          && existingItem.getCatalogVersion() <= obj.getCatalog_version()) {
+        hdfsCachePools_.remove(poolName);
+        LOG.trace("Removed HdfsCachePool {}", poolName);
+      }
+      return;
+    }
+    HdfsCachePool cachePool = new HdfsCachePool(obj.getCache_pool());
+    cachePool.setCatalogVersion(obj.getCatalog_version());
+    if (hdfsCachePools_.add(cachePool)) {
+      LOG.trace("Added HdfsCachePool name={}, version={}", poolName,
+          obj.getCatalog_version());
+      return;
+    }
+    LOG.warn("Ignored stale HdfsCachePool update: name={}, version={}", poolName,
+        obj.getCatalog_version());
   }
 
   private void updateAuthPolicy(TCatalogObject obj, boolean isDelete) {
@@ -1184,6 +1429,10 @@ public class CatalogdMetaProvider implements MetaProvider {
         }
         catalogServiceId_ = serviceId;
         cache_.invalidateAll();
+        // Clear cached items from the previous catalogd instance. Otherwise, we'll
+        // ignore new updates from the new catalogd instance since they have lower
+        // versions.
+        hdfsCachePools_.clear();
         // TODO(todd): we probably need to invalidate the auth policy too.
         // we are probably better off detecting this at a higher level and
         // reinstantiating the metaprovider entirely, similar to how ImpaladCatalog
@@ -1219,8 +1468,12 @@ public class CatalogdMetaProvider implements MetaProvider {
       // DB, so we'll be coarse-grained here and invalidate the DB table list when
       // any table change happens. It's relatively cheap to re-fetch this.
       invalidateCacheForDb(obj.table.db_name,
-          ImmutableList.of(DbCacheKey.DbInfoType.TABLE_NAMES),
+          ImmutableList.of(DbCacheKey.DbInfoType.TABLE_LIST),
           invalidated);
+      break;
+    case HDFS_PARTITION:
+      invalidateCacheForPartition(obj.hdfs_partition.db_name, obj.hdfs_partition.tbl_name,
+          obj.hdfs_partition.partition_name, obj.hdfs_partition.id, invalidated);
       break;
     case FUNCTION:
       // Same as above: if we see a function, it might be new or deleted and we should
@@ -1243,11 +1496,10 @@ public class CatalogdMetaProvider implements MetaProvider {
         invalidated.add("list of database names");
       }
       invalidateCacheForDb(obj.db.db_name, ImmutableList.of(
-          DbCacheKey.DbInfoType.TABLE_NAMES,
+          DbCacheKey.DbInfoType.TABLE_LIST,
           DbCacheKey.DbInfoType.HMS_METADATA,
           DbCacheKey.DbInfoType.FUNCTION_NAMES), invalidated);
       break;
-
     default:
       break;
     }
@@ -1263,9 +1515,8 @@ public class CatalogdMetaProvider implements MetaProvider {
    */
   private void invalidateCacheForDb(String dbName, Iterable<DbCacheKey.DbInfoType> types,
       List<String> invalidated) {
-    // TODO(todd) check whether we need to lower-case/canonicalize dbName?
     for (DbCacheKey.DbInfoType type: types) {
-      DbCacheKey key = new DbCacheKey(dbName, type);
+      DbCacheKey key = new DbCacheKey(dbName.toLowerCase(), type);
       if (cache_.asMap().remove(key) != null) {
         invalidated.add(type + " for DB " + dbName);
       }
@@ -1278,10 +1529,22 @@ public class CatalogdMetaProvider implements MetaProvider {
    */
   private void invalidateCacheForTable(String dbName, String tblName,
       List<String> invalidated) {
-    // TODO(todd) check whether we need to lower-case/canonicalize dbName and tblName?
-    TableCacheKey key = new TableCacheKey(dbName, tblName);
+    TableCacheKey key = new TableCacheKey(dbName.toLowerCase(), tblName.toLowerCase());
     if (cache_.asMap().remove(key) != null) {
       invalidated.add("table " + dbName + "." + tblName);
+    }
+  }
+
+  /**
+   * Invalidate cached metadata for the given partition. If anything was invalidated, adds
+   * a human-readable string to 'invalidated' indicating the invalidated metadata.
+   */
+  private void invalidateCacheForPartition(String dbName, String tblName, String partName,
+      long partitionId, List<String> invalidated) {
+    PartitionCacheKey key = new PartitionCacheKey(partitionId);
+    if (cache_.asMap().remove(key) != null) {
+      invalidated.add(String.format("partition %s.%s:%s (id=%d)",
+          dbName, tblName, partName, partitionId));
     }
   }
 
@@ -1324,17 +1587,39 @@ public class CatalogdMetaProvider implements MetaProvider {
   }
 
   public static class PartitionMetadataImpl implements PartitionMetadata {
-    private final Partition msPartition_;
+    private final Map<String, String> hmsParameters_;
+    private final long writeId_;
+    private final HdfsStorageDescriptor hdfsStorageDescriptor_;
+    // Prefix-compressed location. The corresponding prefix map, i.e. the
+    // HdfsPartitionLocationCompressor object is in the corresponding TableMetaRefImpl
+    // object. TableMetaRefImpl may be evicted. But when this partition is accessed,
+    // we can assure that the table meta is already loaded, so the prefix map won't be
+    // missing.
+    private final HdfsPartitionLocationCompressor.Location location_;
     private final ImmutableList<FileDescriptor> fds_;
+    private final ImmutableList<FileDescriptor> insertFds_;
+    private final ImmutableList<FileDescriptor> deleteFds_;
     private final byte[] partitionStats_;
     private final boolean hasIncrementalStats_;
+    private final boolean isMarkedCached_;
+    private final long lastCompactionId_;
 
-    public PartitionMetadataImpl(Partition msPartition, ImmutableList<FileDescriptor> fds,
-        byte[] partitionStats, boolean hasIncrementalStats) {
-      this.msPartition_ = Preconditions.checkNotNull(msPartition);
+    public PartitionMetadataImpl(Map<String, String> hmsParameters, long writeId,
+        HdfsStorageDescriptor hdfsStorageDescriptor, ImmutableList<FileDescriptor> fds,
+        ImmutableList<FileDescriptor> insertFds, ImmutableList<FileDescriptor> deleteFds,
+        byte[] partitionStats, boolean hasIncrementalStats, boolean isMarkedCached,
+        HdfsPartitionLocationCompressor.Location location, long lastCompactionId) {
+      this.hmsParameters_ = hmsParameters;
+      this.writeId_ = writeId;
+      this.hdfsStorageDescriptor_ = hdfsStorageDescriptor;
+      this.location_ = location;
       this.fds_ = fds;
+      this.insertFds_ = insertFds;
+      this.deleteFds_ = deleteFds;
       this.partitionStats_ = partitionStats;
       this.hasIncrementalStats_ = hasIncrementalStats;
+      this.isMarkedCached_ = isMarkedCached;
+      this.lastCompactionId_ = lastCompactionId;
     }
 
     /**
@@ -1344,22 +1629,59 @@ public class CatalogdMetaProvider implements MetaProvider {
     public PartitionMetadataImpl cloneRelativeToHostIndex(
         ListMap<TNetworkAddress> origIndex,
         ListMap<TNetworkAddress> dstIndex) {
-      List<FileDescriptor> fds = Lists.newArrayListWithCapacity(fds_.size());
-      for (FileDescriptor fd: fds_) {
-        fds.add(fd.cloneWithNewHostIndex(origIndex.getList(), dstIndex));
+      ImmutableList<FileDescriptor> fds = cloneFdsRelativeToHostIndex(
+          fds_, origIndex, dstIndex);
+      ImmutableList<FileDescriptor> insertFds = cloneFdsRelativeToHostIndex(
+          insertFds_, origIndex, dstIndex);
+      ImmutableList<FileDescriptor> deleteFds = cloneFdsRelativeToHostIndex(
+          deleteFds_, origIndex, dstIndex);
+      return new PartitionMetadataImpl(hmsParameters_, writeId_, hdfsStorageDescriptor_,
+          fds, insertFds, deleteFds, partitionStats_, hasIncrementalStats_,
+          isMarkedCached_, location_, lastCompactionId_);
+    }
+
+    private static ImmutableList<FileDescriptor> cloneFdsRelativeToHostIndex(
+        ImmutableList<FileDescriptor> fds, ListMap<TNetworkAddress> origIndex,
+        ListMap<TNetworkAddress> dstIndex) {
+      List<FileDescriptor> ret = Lists.newArrayListWithCapacity(fds.size());
+      for (FileDescriptor fd: fds) {
+        ret.add(fd.cloneWithNewHostIndex(origIndex.getList(), dstIndex));
       }
-      return new PartitionMetadataImpl(msPartition_, ImmutableList.copyOf(fds),
-          partitionStats_, hasIncrementalStats_);
+      return ImmutableList.copyOf(ret);
     }
 
     @Override
-    public Partition getHmsPartition() {
-      return msPartition_;
+    public Map<String, String> getHmsParameters() { return hmsParameters_; }
+
+    @Override
+    public long getWriteId() { return writeId_; }
+
+    @Override
+    public HdfsStorageDescriptor getInputFormatDescriptor() {
+      return hdfsStorageDescriptor_;
     }
+
+    @Override
+    public HdfsPartitionLocationCompressor.Location getLocation() { return location_; }
 
     @Override
     public ImmutableList<FileDescriptor> getFileDescriptors() {
-      return fds_;
+      if (insertFds_.isEmpty()) return fds_;
+      List<FileDescriptor> ret = Lists.newArrayListWithCapacity(
+          insertFds_.size() + deleteFds_.size());
+      ret.addAll(insertFds_);
+      ret.addAll(deleteFds_);
+      return ImmutableList.copyOf(ret);
+    }
+
+    @Override
+    public ImmutableList<FileDescriptor> getInsertFileDescriptors() {
+      return insertFds_;
+    }
+
+    @Override
+    public ImmutableList<FileDescriptor> getDeleteFileDescriptors() {
+      return deleteFds_;
     }
 
     @Override
@@ -1367,6 +1689,12 @@ public class CatalogdMetaProvider implements MetaProvider {
 
     @Override
     public boolean hasIncrementalStats() { return hasIncrementalStats_; }
+
+    @Override
+    public boolean isMarkedCached() { return isMarkedCached_; }
+
+    @Override
+    public long getLastCompactionId() { return lastCompactionId_; }
   }
 
   /**
@@ -1378,6 +1706,8 @@ public class CatalogdMetaProvider implements MetaProvider {
   private static class TableMetaRefImpl implements TableMetaRef {
     private final String dbName_;
     private final String tableName_;
+    // SQL constraints for the table, populated during loadTable().
+    private final SqlConstraints sqlConstraints_;
 
     /**
      * Stash the HMS Table object since we need this in order to handle some strange
@@ -1387,22 +1717,78 @@ public class CatalogdMetaProvider implements MetaProvider {
     private final Table msTable_;
 
     /**
+     * List of virtual columns of this table.
+     */
+    List<VirtualColumn> virtualColumns_ = new ArrayList<>();
+
+    /**
      * The version of the table when we first loaded it. Subsequent requests about
      * the table are verified against this version.
      */
     private final long catalogVersion_;
 
+    /**
+     * Valid write id list of ACID tables.
+     */
+    private final TValidWriteIdList validWriteIds_;
+
+    /**
+     * True if this table's is marked as cached by hdfs caching. See comments in
+     * LocalFsTable.
+     */
+    private final boolean isMarkedCached_;
+
+    private final HdfsPartitionLocationCompressor partitionLocationCompressor_;
+
     public TableMetaRefImpl(String dbName, String tableName,
-        Table msTable, long catalogVersion) {
+        Table msTable, long catalogVersion, SqlConstraints sqlConstraints,
+        TValidWriteIdList validWriteIds, boolean isMarkedCached,
+        List<String> locationPrefixes, List<TColumn> tvirtCols) {
       this.dbName_ = dbName;
       this.tableName_ = tableName;
       this.msTable_ = msTable;
       this.catalogVersion_ = catalogVersion;
+      this.sqlConstraints_ = sqlConstraints;
+      this.validWriteIds_ = validWriteIds;
+      this.isMarkedCached_ = isMarkedCached;
+      // Non-hdfs tables will have null locationPrefixes.
+      this.partitionLocationCompressor_ = (locationPrefixes == null) ? null :
+          new HdfsPartitionLocationCompressor(
+              msTable.getPartitionKeysSize(), locationPrefixes);
+      for (TColumn tvCol : tvirtCols) {
+        virtualColumns_.add(VirtualColumn.fromThrift(tvCol));
+      }
     }
 
     @Override
     public String toString() {
       return String.format("TableMetaRef %s.%s@%d", dbName_, tableName_, catalogVersion_);
+    }
+
+    @Override
+    public boolean isPartitioned() {
+      return msTable_.getPartitionKeysSize() != 0;
+    }
+
+    @Override
+    public boolean isMarkedCached() { return isMarkedCached_; }
+
+    public HdfsPartitionLocationCompressor getPartitionLocationCompressor() {
+      return partitionLocationCompressor_;
+    }
+
+    public List<String> getPartitionPrefixes() {
+      return partitionLocationCompressor_.getPrefixes();
+    }
+
+    @Override
+    public boolean isTransactional() {
+      return AcidUtils.isTransactionalTable(msTable_.getParameters());
+    }
+
+    @Override
+    public List<VirtualColumn> getVirtualColumns() {
+      return virtualColumns_;
     }
   }
 
@@ -1509,9 +1895,7 @@ public class CatalogdMetaProvider implements MetaProvider {
 
     @Override
     public boolean equals(Object obj) {
-      if (obj == null || !(obj instanceof ColStatsCacheKey)) {
-        return false;
-      }
+      if (!(obj instanceof ColStatsCacheKey)) return false;
       ColStatsCacheKey other = (ColStatsCacheKey)obj;
       return super.equals(obj) && colName_.equals(other.colName_);
     }
@@ -1531,34 +1915,26 @@ public class CatalogdMetaProvider implements MetaProvider {
   /**
    * Key for caching information about a single partition.
    *
-   * TODO(todd): currently this inherits from VersionedTableCacheKey. This means that, if
-   * a table's version number changes, all of its partitions must be reloaded. However,
-   * since partition IDs are globally unique within a catalogd instance, we could
-   * optimize this to just key based on the partition ID. However, currently, there are
-   * some cases where partitions are mutated in place rather than replaced with a new ID.
-   * We need to eliminate those or add a partition sequence number before we can make
-   * this optimization.
+   * Values for these keys are 'PartitionMetadataImpl' objects.
    */
-  private static class PartitionCacheKey extends VersionedTableCacheKey {
+  @Immutable
+  private static class PartitionCacheKey {
     private final long partId_;
 
-    PartitionCacheKey(TableMetaRefImpl table, long partId) {
-      super(table);
+    PartitionCacheKey(long partId) {
       partId_ = partId;
     }
 
     @Override
     public int hashCode() {
-      return Objects.hashCode(super.hashCode(), partId_);
+      return Objects.hashCode(partId_, getClass());
     }
 
     @Override
     public boolean equals(Object obj) {
-      if (obj == null || !(obj instanceof PartitionCacheKey)) {
-        return false;
-      }
+      if (!(obj instanceof PartitionCacheKey)) return false;
       PartitionCacheKey other = (PartitionCacheKey)obj;
-      return super.equals(obj) && partId_ == other.partId_;
+      return partId_ == other.partId_;
     }
   }
 
@@ -1569,8 +1945,8 @@ public class CatalogdMetaProvider implements MetaProvider {
     static enum DbInfoType {
       /** Cache the HMS Database object */
       HMS_METADATA,
-      /** Cache an ImmutableList<String> for table names within the DB */
-      TABLE_NAMES,
+      /** Cache an ImmutableList<BriefTableMeta> for table names within the DB */
+      TABLE_LIST,
       /** Cache an ImmutableList<String> for function names within the DB */
       FUNCTION_NAMES
     }
@@ -1594,6 +1970,30 @@ public class CatalogdMetaProvider implements MetaProvider {
       if (getClass() != obj.getClass()) return false;
       DbCacheKey other = (DbCacheKey) obj;
       return dbName_.equals(other.dbName_) && type_ == other.type_;
+    }
+  }
+
+  /**
+   * Cache key for an entry storing Iceberg table metadata.
+   *
+   * Values for these keys are 'TPartialTableInfo' objects.
+   */
+  private static class IcebergMetaCacheKey extends VersionedTableCacheKey {
+
+    public IcebergMetaCacheKey(TableMetaRefImpl table) {
+      super(table);
+    }
+  }
+
+  /**
+   * Cache key for an entry storing Iceberg API metadata.
+   *
+   * Values for these keys are 'org.apache.iceberg.Table' objects.
+   */
+  private static class IcebergApiTableCacheKey extends VersionedTableCacheKey {
+
+    public IcebergApiTableCacheKey(TableMetaRefImpl table) {
+      super(table);
     }
   }
 
@@ -1621,5 +2021,12 @@ public class CatalogdMetaProvider implements MetaProvider {
       }
       return (int)size;
     }
+  }
+
+  @Override
+  public TValidWriteIdList getValidWriteIdList(TableMetaRef ref) {
+    Preconditions.checkArgument(ref instanceof TableMetaRefImpl,
+        "table ref %s was not created by CatalogdMetaProvider", ref);
+    return ((TableMetaRefImpl)ref).validWriteIds_;
   }
 }

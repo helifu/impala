@@ -10,6 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import absolute_import, division, print_function
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_dimensions import create_single_exec_option_dimension
@@ -126,3 +127,11 @@ class TestScratchLimit(ImpalaTestSuite):
     exec_option['scratch_limit'] = '0'
     for query in self.spilling_queries:
       self.execute_query_expect_success(self.client, query, exec_option)
+
+  def test_result_spooling_and_varying_scratch_limit(self, vector):
+    """
+    IMPALA-9856 make result spooling default. Since result spooling depends on ability to
+    spill to disk, query option scratch_limit may affect memory configuration of result
+    spooling feature. This test vary scratch_limit and verify the memory adjustment.
+    """
+    self.run_test_case('QueryTest/scratch-limit', vector)

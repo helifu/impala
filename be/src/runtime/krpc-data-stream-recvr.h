@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_RUNTIME_KRPC_DATA_STREAM_RECVR_H
-#define IMPALA_RUNTIME_KRPC_DATA_STREAM_RECVR_H
+#pragma once
 
+#include <mutex>
 #include <boost/scoped_ptr.hpp>
-#include <boost/thread/mutex.hpp>
 
 #include "common/object-pool.h"
 #include "common/status.h"
@@ -28,6 +27,7 @@
 #include "runtime/descriptors.h"
 #include "runtime/runtime-state.h"
 #include "util/tuple-row-compare.h"
+#include "runtime/sorted-run-merger.h"
 
 namespace kudu {
 namespace rpc {
@@ -104,7 +104,8 @@ class KrpcDataStreamRecvr {
   /// the specified row comparator. Fetches the first batches from the individual sender
   /// queues. The exprs used in less_than must have already been prepared and opened.
   /// Called from fragment instance execution threads only.
-  Status CreateMerger(const TupleRowComparator& less_than);
+  Status CreateMerger(const TupleRowComparator& less_than,
+      const CodegenFnPtr<SortedRunMerger::HeapifyHelperFn>& codegend_heapify_helper_fn);
 
   /// Fill output_batch with the next batch of rows obtained by merging the per-sender
   /// input streams. Must only be called if is_merging_ is true. Called from fragment
@@ -301,5 +302,3 @@ class KrpcDataStreamRecvr {
 };
 
 } // namespace impala
-
-#endif // IMPALA_RUNTIME_KRPC_DATA_STREAM_RECVR_H

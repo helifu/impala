@@ -44,6 +44,7 @@ import org.apache.impala.thrift.TAlterDbSetOwnerParams;
 import org.apache.impala.thrift.TAlterDbType;
 import org.apache.impala.thrift.TCreateDbParams;
 import org.apache.impala.thrift.TDdlExecRequest;
+import org.apache.impala.thrift.TDdlQueryOptions;
 import org.apache.impala.thrift.TDdlType;
 import org.apache.impala.thrift.TDropDbParams;
 import org.apache.impala.thrift.TOwnerType;
@@ -86,11 +87,9 @@ public class AlterDatabaseTest {
    */
   @BeforeClass
   public static void setUpTest() throws ImpalaException {
-    catalog_ = new ImpaladTestCatalog(CatalogServiceTestCatalog.create());
-    catalogOpExecutor_ =
-        new CatalogOpExecutor(catalog_.getSrcCatalog(),
-            new NoopAuthorizationFactory().getAuthorizationConfig(),
-            new NoopAuthorizationManager());
+    CatalogServiceTestCatalog testSrcCatalog = CatalogServiceTestCatalog.create();
+    catalog_ = new ImpaladTestCatalog(testSrcCatalog);
+    catalogOpExecutor_ = testSrcCatalog.getCatalogOpExecutor();
   }
 
   /**
@@ -120,6 +119,7 @@ public class AlterDatabaseTest {
    */
   private static TDdlExecRequest dropDbRequest() {
     TDdlExecRequest request = new TDdlExecRequest();
+    request.setQuery_options(new TDdlQueryOptions());
     request.setDdl_type(TDdlType.DROP_DATABASE);
     TDropDbParams dropDbParams = new TDropDbParams();
     dropDbParams.setDb(TEST_ALTER_DB);
@@ -134,6 +134,7 @@ public class AlterDatabaseTest {
    */
   private static TDdlExecRequest createDbRequest() {
     TDdlExecRequest request = new TDdlExecRequest();
+    request.setQuery_options(new TDdlQueryOptions());
     request.setDdl_type(TDdlType.CREATE_DATABASE);
     TCreateDbParams createDbParams = new TCreateDbParams();
     createDbParams.setDb(TEST_ALTER_DB);
@@ -219,6 +220,7 @@ public class AlterDatabaseTest {
     alterDbParams.setAlter_type(TAlterDbType.SET_OWNER);
     alterDbParams.setSet_owner_params(alterDbSetOwnerParams);
     TDdlExecRequest request = new TDdlExecRequest();
+    request.setQuery_options(new TDdlQueryOptions());
     request.setDdl_type(TDdlType.ALTER_DATABASE);
     request.setAlter_db_params(alterDbParams);
     return request;

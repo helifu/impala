@@ -37,5 +37,5 @@ message RowBatchHeaderPB {
   optional int64 uncompressed_size = 3;
 
   // The compression codec (if any) used for compressing the row batch.
-  optional CompressionType compression_type = 4;
+  optional CompressionTypePB compression_type = 4;
 }

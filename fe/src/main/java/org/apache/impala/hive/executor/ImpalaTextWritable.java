@@ -21,25 +21,17 @@ import org.apache.hadoop.io.Text;
 
 /**
  * Impala writable type that implements the Text interface. The data marshalling is
- * handled by the underlying {@link ImpalaStringWritable} object.
+ * handled by {@link JavaUdfDataType#loadStringValueFromNativeHeap(long)}.
  */
-public class ImpalaTextWritable extends Text {
-  private final ImpalaStringWritable string_;
+public class ImpalaTextWritable extends Text implements Reloadable {
+  private final long ptr_;
 
-  public ImpalaTextWritable(long ptr) {
-    string_ = new ImpalaStringWritable(ptr);
-  }
+  public ImpalaTextWritable(long ptr) { this.ptr_ = ptr; }
 
   @Override
-  public String toString() { return new String(getBytes()); }
-  @Override
-  public byte[] getBytes() { return string_.getBytes(); }
-  @Override
-  public int getLength() { return string_.getLength(); }
-
-  @Override
-  public void set(byte[] v, int offset, int len) {
-    string_.set(v, offset, len);
+  public void reload() {
+    byte[] bytes = JavaUdfDataType.loadStringValueFromNativeHeap(ptr_);
+    super.set(bytes);
   }
 
 }

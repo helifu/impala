@@ -41,11 +41,13 @@ DECLARE_string(keytab_file);
 DECLARE_string(ssl_client_ca_certificate);
 DECLARE_string(ssl_cipher_list);
 DECLARE_string(ssl_minimum_version);
+DECLARE_string(tls_ciphersuites);
 
 DECLARE_int32(state_store_port);
 
-DECLARE_int32(be_port);
 DECLARE_int32(beeswax_port);
+
+DECLARE_int32(thrift_rpc_max_message_size);
 
 static string IMPALA_HOME(getenv("IMPALA_HOME"));
 static const string& SERVER_CERT =
@@ -69,6 +71,9 @@ static string principal_kt_path;
 static const string TLS1_0_COMPATIBLE_CIPHER = "AES128-SHA";
 static const string TLS1_0_COMPATIBLE_CIPHER_2 = "AES256-SHA";
 
+static const string TLS1_3_CIPHERSUITE = "TLS_AES_256_GCM_SHA384";
+static const string TLS1_3_CIPHERSUITE_2 = "TLS_CHACHA20_POLY1305_SHA256";
+
 /// Dummy server class (chosen because it has the smallest interface to implement) that
 /// tests can use to start Thrift servers.
 class DummyStatestoreService : public StatestoreServiceIf {
@@ -78,9 +83,9 @@ class DummyStatestoreService : public StatestoreServiceIf {
   }
 };
 
-boost::shared_ptr<TProcessor> MakeProcessor() {
-  boost::shared_ptr<DummyStatestoreService> service(new DummyStatestoreService());
-  return boost::shared_ptr<TProcessor>(new StatestoreServiceProcessor(service));
+std::shared_ptr<TProcessor> MakeProcessor() {
+  std::shared_ptr<DummyStatestoreService> service(new DummyStatestoreService());
+  return std::shared_ptr<TProcessor>(new StatestoreServiceProcessor(service));
 }
 
 int GetServerPort() {
@@ -141,6 +146,37 @@ TEST(ThriftTestBase, Connectivity) {
 
   // Test that client recovers from failure to connect.
   ASSERT_OK(wrong_port_client.Open());
+}
+
+void TestMaxMessageSize(std::string subscriber_id, bool expect_throw) {
+  int port = GetServerPort();
+  ThriftServer* server;
+  EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port).Build(&server));
+  ASSERT_OK(server->Start());
+
+  ThriftClient<StatestoreServiceClientWrapper> client(
+      "localhost", port, "", nullptr, false);
+  ASSERT_OK(client.Open());
+  TRegisterSubscriberRequest req;
+  TRegisterSubscriberResponse resp;
+  bool send_done = false;
+
+  req.subscriber_id = subscriber_id;
+  if (expect_throw) {
+    EXPECT_THROW(
+        client.iface()->RegisterSubscriber(resp, req, &send_done), TTransportException);
+  } else {
+    EXPECT_NO_THROW(client.iface()->RegisterSubscriber(resp, req, &send_done));
+  }
+}
+
+TEST(ThriftTestBase, MaxMessageSizeFit) {
+  TestMaxMessageSize("dummy_id", false);
+}
+
+TEST(ThriftTestBase, MaxMessageSizeExceeded) {
+  std::string long_id(256 * 1024, 'a');
+  TestMaxMessageSize(long_id, true);
 }
 
 TEST_P(ThriftKerberizedParamsTest, SslConnectivity) {
@@ -279,20 +315,21 @@ TEST(SslTest, BadCiphers) {
     EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port)
                   .ssl(SERVER_CERT, PRIVATE_KEY)
                   .cipher_list("this_is_not_a_cipher")
+                  .tls_ciphersuites("")
                   .Build(&server));
     EXPECT_FALSE(server->Start().ok());
   }
-
   {
     ThriftServer* server;
     EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port)
                   .ssl(SERVER_CERT, PRIVATE_KEY)
                   .Build(&server));
     EXPECT_OK(server->Start());
-
     auto s1 =
         ScopedFlagSetter<string>::Make(&FLAGS_ssl_cipher_list, "this_is_not_a_cipher");
     auto s2 =
+        ScopedFlagSetter<string>::Make(&FLAGS_tls_ciphersuites, "");
+    auto s3 =
         ScopedFlagSetter<string>::Make(&FLAGS_ssl_client_ca_certificate, SERVER_CERT);
 
     ThriftClient<StatestoreServiceClientWrapper> ssl_client(
@@ -310,17 +347,19 @@ TEST(SslTest, MismatchedCiphers) {
                 .ssl(SERVER_CERT, PASSWORD_PROTECTED_PRIVATE_KEY)
                 .pem_password_cmd("echo password")
                 .cipher_list(TLS1_0_COMPATIBLE_CIPHER)
+                .tls_ciphersuites("")
                 .Build(&server));
   EXPECT_OK(server->Start());
-  auto s =
+  auto s1 =
       ScopedFlagSetter<string>::Make(&FLAGS_ssl_cipher_list, TLS1_0_COMPATIBLE_CIPHER_2);
+  auto s2 =
+      ScopedFlagSetter<string>::Make(&FLAGS_tls_ciphersuites, "");
   ThriftClient<StatestoreServiceClientWrapper> ssl_client(
       "localhost", port, "", nullptr, true);
 
   // Failure to negotiate a cipher will show up when data is sent, not when socket is
   // opened.
   EXPECT_OK(ssl_client.Open());
-
   bool send_done = false;
   TRegisterSubscriberResponse resp;
   EXPECT_THROW(ssl_client.iface()->RegisterSubscriber(
@@ -413,12 +452,15 @@ TEST(SslTest, MatchedCiphers) {
                 .ssl(SERVER_CERT, PASSWORD_PROTECTED_PRIVATE_KEY)
                 .pem_password_cmd("echo password")
                 .cipher_list(TLS1_0_COMPATIBLE_CIPHER)
+                .tls_ciphersuites("")
                 .Build(&server));
   EXPECT_OK(server->Start());
 
   FLAGS_ssl_client_ca_certificate = SERVER_CERT;
-  auto s =
+  auto s1 =
       ScopedFlagSetter<string>::Make(&FLAGS_ssl_cipher_list, TLS1_0_COMPATIBLE_CIPHER);
+  auto s2 =
+      ScopedFlagSetter<string>::Make(&FLAGS_tls_ciphersuites, "");
   ThriftClient<StatestoreServiceClientWrapper> ssl_client(
       "localhost", port, "", nullptr, true);
 
@@ -441,12 +483,14 @@ TEST(SslTest, OverlappingMatchedCiphers) {
       .ssl(SERVER_CERT, PASSWORD_PROTECTED_PRIVATE_KEY)
       .pem_password_cmd("echo password")
       .cipher_list(CIPHER_LIST)
+      .tls_ciphersuites("")
       .Build(&server));
   EXPECT_OK(server->Start());
 
   FLAGS_ssl_client_ca_certificate = SERVER_CERT;
-  auto s = ScopedFlagSetter<string>::Make(&FLAGS_ssl_cipher_list,
+  auto s1 = ScopedFlagSetter<string>::Make(&FLAGS_ssl_cipher_list,
       Substitute("$0,not-a-cipher", TLS1_0_COMPATIBLE_CIPHER));
+  auto s2 = ScopedFlagSetter<string>::Make(&FLAGS_tls_ciphersuites, "");
   ThriftClient<StatestoreServiceClientWrapper> ssl_client(
       "localhost", port, "", nullptr, true);
 
@@ -459,6 +503,175 @@ TEST(SslTest, OverlappingMatchedCiphers) {
             resp, TRegisterSubscriberRequest(), &send_done);
       });
 }
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+TEST(SslTest, BadTlsCipherSuites) {
+  int port = GetServerPort();
+  {
+    ThriftServer* server;
+    EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port)
+                  .ssl(SERVER_CERT, PRIVATE_KEY)
+                  .disable_tls12(true)
+                  .tls_ciphersuites("this_is_not_a_ciphersuite")
+                  .Build(&server));
+    EXPECT_FALSE(server->Start().ok());
+  }
+  {
+    ThriftServer* server;
+    EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port)
+                  .ssl(SERVER_CERT, PRIVATE_KEY)
+                  .Build(&server));
+    EXPECT_OK(server->Start());
+    auto s1 = ScopedFlagSetter<string>::Make(&FLAGS_tls_ciphersuites,
+        "this_is_not_a_ciphersuite");
+    auto s2 =
+        ScopedFlagSetter<string>::Make(&FLAGS_ssl_client_ca_certificate, SERVER_CERT);
+
+    ThriftClient<StatestoreServiceClientWrapper> ssl_client(
+        "localhost", port, "", nullptr, true, true /* disable_tls12 */);
+    EXPECT_FALSE(ssl_client.Open().ok());
+  }
+}
+
+TEST(SslTest, MismatchedTlsCiphersuites) {
+  int port = GetServerPort();
+  FLAGS_ssl_client_ca_certificate = SERVER_CERT;
+
+  ThriftServer* server;
+  EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port)
+                .ssl(SERVER_CERT, PASSWORD_PROTECTED_PRIVATE_KEY)
+                .pem_password_cmd("echo password")
+                .disable_tls12(true)
+                .tls_ciphersuites(TLS1_3_CIPHERSUITE)
+                .Build(&server));
+  EXPECT_OK(server->Start());
+  auto s =
+      ScopedFlagSetter<string>::Make(&FLAGS_tls_ciphersuites, TLS1_3_CIPHERSUITE_2);
+  ThriftClient<StatestoreServiceClientWrapper> ssl_client(
+      "localhost", port, "", nullptr, true, true /* disable_tls12 */);
+
+  // Failure to negotiate a cipher will show up when data is sent, not when socket is
+  // opened.
+  EXPECT_OK(ssl_client.Open());
+  bool send_done = false;
+  TRegisterSubscriberResponse resp;
+  EXPECT_THROW(ssl_client.iface()->RegisterSubscriber(
+                   resp, TRegisterSubscriberRequest(), &send_done),
+      TTransportException);
+}
+
+TEST(SslTest, MismatchTls12ServerTls13Client) {
+  int port = GetServerPort();
+  FLAGS_ssl_client_ca_certificate = SERVER_CERT;
+
+  // Disable TLS 1.3 on server by setting tls_ciphersuites="", allow TLS 1.2
+  ThriftServer* server;
+  EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port)
+                .ssl(SERVER_CERT, PASSWORD_PROTECTED_PRIVATE_KEY)
+                .pem_password_cmd("echo password")
+                .tls_ciphersuites("")
+                .Build(&server));
+  EXPECT_OK(server->Start());
+
+  // Disable TLS 1.2 on client, allow TLS 1.3
+  ThriftClient<StatestoreServiceClientWrapper> ssl_client(
+      "localhost", port, "", nullptr, true, true /* disable_tls12 */);
+
+  // Failure to negotiate a cipher will show up when data is sent, not when socket is
+  // opened.
+  EXPECT_OK(ssl_client.Open());
+  bool send_done = false;
+  TRegisterSubscriberResponse resp;
+  EXPECT_THROW(ssl_client.iface()->RegisterSubscriber(
+                   resp, TRegisterSubscriberRequest(), &send_done),
+      TTransportException);
+}
+
+TEST(SslTest, MismatchTls13ServerTls12Client) {
+  int port = GetServerPort();
+  FLAGS_ssl_client_ca_certificate = SERVER_CERT;
+
+  // Disable TLS 1.2 on server, allow TLS 1.3
+  ThriftServer* server;
+  EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port)
+                .ssl(SERVER_CERT, PASSWORD_PROTECTED_PRIVATE_KEY)
+                .pem_password_cmd("echo password")
+                .disable_tls12(true)
+                .Build(&server));
+  EXPECT_OK(server->Start());
+
+  // Disable TLS 1.3 on client by setting tls_ciphersuites="", allow TLS 1.2
+  auto s1 =
+      ScopedFlagSetter<string>::Make(&FLAGS_tls_ciphersuites, "");
+  ThriftClient<StatestoreServiceClientWrapper> ssl_client(
+      "localhost", port, "", nullptr, true);
+
+  // Failure to negotiate a cipher will show up when data is sent, not when socket is
+  // opened.
+  EXPECT_OK(ssl_client.Open());
+  bool send_done = false;
+  TRegisterSubscriberResponse resp;
+  EXPECT_THROW(ssl_client.iface()->RegisterSubscriber(
+                   resp, TRegisterSubscriberRequest(), &send_done),
+      TTransportException);
+}
+
+TEST(SslTest, MatchedTlsCiphersuites) {
+  int port = GetServerPort();
+  ThriftServer* server;
+  EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port)
+                .ssl(SERVER_CERT, PASSWORD_PROTECTED_PRIVATE_KEY)
+                .pem_password_cmd("echo password")
+                .disable_tls12(true)
+                .tls_ciphersuites(TLS1_3_CIPHERSUITE)
+                .Build(&server));
+  EXPECT_OK(server->Start());
+
+  FLAGS_ssl_client_ca_certificate = SERVER_CERT;
+  auto s =
+      ScopedFlagSetter<string>::Make(&FLAGS_tls_ciphersuites, TLS1_3_CIPHERSUITE);
+  ThriftClient<StatestoreServiceClientWrapper> ssl_client(
+      "localhost", port, "", nullptr, true, true /* disable_tls12 */);
+
+  EXPECT_OK(ssl_client.Open());
+
+  bool send_done = false;
+  TRegisterSubscriberResponse resp;
+  EXPECT_NO_THROW({
+    ssl_client.iface()->RegisterSubscriber(
+        resp, TRegisterSubscriberRequest(), &send_done);
+  });
+}
+
+TEST(SslTest, OverlappingMatchedTlsCiphersuites) {
+  int port = GetServerPort();
+  const string TLS_CIPHERSUITE_LIST = Substitute("$0:$1", TLS1_3_CIPHERSUITE,
+      TLS1_3_CIPHERSUITE_2);
+  ThriftServer* server;
+  EXPECT_OK(ThriftServerBuilder("DummyStatestore", MakeProcessor(), port)
+      .ssl(SERVER_CERT, PASSWORD_PROTECTED_PRIVATE_KEY)
+      .pem_password_cmd("echo password")
+      .disable_tls12(true)
+      .tls_ciphersuites(TLS_CIPHERSUITE_LIST)
+      .Build(&server));
+  EXPECT_OK(server->Start());
+
+  FLAGS_ssl_client_ca_certificate = SERVER_CERT;
+  auto s = ScopedFlagSetter<string>::Make(&FLAGS_tls_ciphersuites, TLS1_3_CIPHERSUITE);
+  ThriftClient<StatestoreServiceClientWrapper> ssl_client(
+      "localhost", port, "", nullptr, true, true /* disable_tls12 */);
+
+  EXPECT_OK(ssl_client.Open());
+
+  bool send_done = false;
+  TRegisterSubscriberResponse resp;
+  EXPECT_NO_THROW({
+        ssl_client.iface()->RegisterSubscriber(
+            resp, TRegisterSubscriberRequest(), &send_done);
+      });
+}
+
+#endif
 
 TEST(ConcurrencyTest, MaxConcurrentConnections) {
   // Tests if max concurrent connections is being enforced by the ThriftServer
@@ -507,31 +720,6 @@ TEST(ConcurrencyTest, MaxConcurrentConnections) {
   EXPECT_TRUE(did_reach_max);
 }
 
-/// Test disabled because requires a high ulimit -n on build machines. Since the test does
-/// not always fail, we don't lose much coverage by disabling it until we fix the build
-/// infra issue.
-TEST(ConcurrencyTest, DISABLED_ManyConcurrentConnections) {
-  // Test that a large number of concurrent connections will all succeed and not time out
-  // waiting to be accepted. (IMPALA-4135)
-  // Note that without the fix for IMPALA-4135, this test won't always fail, depending on
-  // the hardware that it is run on.
-  int port = GetServerPort();
-  ThriftServer* server;
-  EXPECT_OK(ThriftServerBuilder("DummyServer", MakeProcessor(), port).Build(&server));
-  ASSERT_OK(server->Start());
-
-  ThreadPool<int64_t> pool(
-      "group", "test", 256, 10000, [port](int tid, const int64_t& item) {
-        using Client = ThriftClient<ImpalaInternalServiceClient>;
-        Client* client = new Client("127.0.0.1", port, "", nullptr, false);
-        Status status = client->Open();
-        ASSERT_OK(status);
-      });
-  ASSERT_OK(pool.Init());
-  for (int i = 0; i < 1024 * 16; ++i) pool.Offer(i);
-  pool.DrainAndShutdown();
-}
-
 TEST(NoPasswordPemFile, BadServerCertificate) {
   int port = GetServerPort();
   ThriftServer* server;
@@ -560,6 +748,7 @@ TEST(NoPasswordPemFile, BadServerCertificate) {
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   impala::InitCommonRuntime(argc, argv, false, impala::TestInfo::BE_TEST);
+  FLAGS_thrift_rpc_max_message_size = 128 * 1024;
 
   int port = impala::FindUnusedEphemeralPort();
   std::unique_ptr<impala::MiniKdcWrapper> kdc;

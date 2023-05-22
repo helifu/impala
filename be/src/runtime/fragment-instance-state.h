@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_RUNTIME_FRAGMENT_INSTANCE_STATE_H
-#define IMPALA_RUNTIME_FRAGMENT_INSTANCE_STATE_H
-
+#include <mutex>
 #include <string>
 #include <boost/scoped_ptr.hpp>
-#include <boost/thread/mutex.hpp>
 
 #include "common/atomic.h"
 #include "common/status.h"
@@ -29,6 +27,7 @@
 #include "util/promise.h"
 
 #include "gen-cpp/control_service.pb.h"
+#include "gen-cpp/data_stream_service.pb.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
 #include "gutil/threading/thread_collision_warner.h" // for DFAKE_*
 #include "runtime/row-batch.h"
@@ -36,9 +35,16 @@
 #include "util/promise.h"
 #include "util/runtime-profile.h"
 
+namespace kudu {
+namespace rpc {
+class RpcContext;
+} // namespace rpc
+} // namespace kudu
+
 namespace impala {
 
-class TPlanFragmentCtx;
+class FragmentState;
+class TPlanFragment;
 class TPlanFragmentInstanceCtx;
 class TBloomFilter;
 class TUniqueId;
@@ -51,7 +57,9 @@ class PlanNode;
 class PlanRootSink;
 class Thread;
 class DataSink;
+class DataSinkConfig;
 class RuntimeState;
+class JoinBuilder;
 
 /// FragmentInstanceState handles all aspects of the execution of a single plan fragment
 /// instance, including setup and finalization, both in the success and error case.
@@ -72,8 +80,9 @@ class RuntimeState;
 /// - absorb RuntimeState?
 class FragmentInstanceState {
  public:
-  FragmentInstanceState(QueryState* query_state, const TPlanFragmentCtx& fragment_ctx,
-      const TPlanFragmentInstanceCtx& instance_ctx);
+  FragmentInstanceState(QueryState* query_state, FragmentState* fragment_state,
+      const TPlanFragmentInstanceCtx& instance_ctx,
+      const PlanFragmentInstanceCtxPB& instance_ctx_pb);
 
   /// Main loop of fragment instance execution. Blocks until execution finishes and
   /// automatically releases resources. Returns execution status.
@@ -89,13 +98,15 @@ class FragmentInstanceState {
   Status WaitForOpen();
 
   /// Publishes filter with ID 'filter_id' to this fragment instance's filter bank.
-  void PublishFilter(const TPublishFilterParams& params);
+  void PublishFilter(const PublishFilterParamsPB& params, kudu::rpc::RpcContext* context);
 
   /// Called periodically by query state thread to get the current status of this fragment
   /// instance. The fragment instance's status is stored in 'instance_status' and its
-  /// Thrift runtime profile is stored in 'thrift_profile'.
+  /// Thrift runtime profile is stored in either 'unagg_profile' or 'agg_profile',
+  /// depending on whether aggregated profiles are enabled.
   void GetStatusReport(FragmentInstanceExecStatusPB* instance_status,
-      TRuntimeProfileTree* thrift_profile);
+      TRuntimeProfileTree* unagg_profile, AggregatedRuntimeProfile* agg_profile,
+      const Status& overall_status);
 
   /// After each call to GetStatusReport(), the query state thread should call one of the
   /// following to indicate if the report rpc was successful. Note that in the case of
@@ -104,9 +115,13 @@ class FragmentInstanceState {
   void ReportSuccessful(const FragmentInstanceExecStatusPB& instance_status);
   void ReportFailed(const FragmentInstanceExecStatusPB& instance_status);
 
-  /// Returns fragment instance's sink if this is the root fragment instance. Valid after
-  /// the Prepare phase. May be nullptr.
+  /// Accessor functions for this fragment instance's sink. Valid after the Prepare
+  /// phase. Returns nullptr if this fragment has a different sink type.
   PlanRootSink* GetRootSink() const;
+  JoinBuilder* GetJoinBuildSink() const;
+
+  /// Return true if this finstance's sink is a join builder.
+  bool HasJoinBuildSink() const;
 
   /// Returns a string description of 'state'.
   static const string& ExecStateToString(FInstanceExecStatePB state);
@@ -119,15 +134,26 @@ class FragmentInstanceState {
   RuntimeState* runtime_state() { return runtime_state_; }
   RuntimeProfile* profile() const;
   const TQueryCtx& query_ctx() const;
-  const TPlanFragmentCtx& fragment_ctx() const { return fragment_ctx_; }
+  const TPlanFragment& fragment() const { return fragment_; }
   const TPlanFragmentInstanceCtx& instance_ctx() const { return instance_ctx_; }
+  const PlanFragmentCtxPB& fragment_ctx() const { return fragment_ctx_; }
+  const PlanFragmentInstanceCtxPB& instance_ctx_pb() const { return instance_ctx_pb_; }
   const TUniqueId& query_id() const { return query_ctx().query_id; }
   const TUniqueId& instance_id() const { return instance_ctx_.fragment_instance_id; }
   FInstanceExecStatePB current_state() const { return current_state_.Load(); }
   bool final_report_sent() const { return final_report_sent_; }
-  const TNetworkAddress& coord_address() const { return query_ctx().coord_address; }
   bool IsDone() const { return current_state_.Load() == FInstanceExecStatePB::FINISHED; }
+  bool ExecFailed() const { return exec_failed_.Load(); }
   ObjectPool* obj_pool();
+  int64_t scan_ranges_complete() const { return scan_ranges_complete_; }
+  int64_t peak_mem_consumption() const { return peak_mem_consumption_; }
+  int64_t cpu_user_ns() const { return cpu_user_ns_; }
+  int64_t cpu_sys_ns() const { return cpu_sys_ns_; }
+  int64_t bytes_read() const { return bytes_read_; }
+  int64_t total_bytes_sent() const { return total_bytes_sent_; }
+  const std::map<int32_t, int64_t>& per_join_rows_produced() const {
+    return per_join_rows_produced_;
+  }
 
   /// Returns true if the current thread is a thread executing the whole or part of
   /// a fragment instance.
@@ -145,15 +171,16 @@ class FragmentInstanceState {
 
  private:
   QueryState* query_state_;
-  const TPlanFragmentCtx& fragment_ctx_;
+  FragmentState* fragment_state_;
+  const TPlanFragment& fragment_;
   const TPlanFragmentInstanceCtx& instance_ctx_;
+  const PlanFragmentCtxPB& fragment_ctx_;
+  const PlanFragmentInstanceCtxPB& instance_ctx_pb_;
 
   /// All following member variables that are initialized to nullptr are set
   /// in Prepare().
   ExecNode* exec_tree_ = nullptr; // lives in obj_pool()
   RuntimeState* runtime_state_ = nullptr;  // lives in obj_pool()
-  /// Lives in obj_pool(). Not mutated after being initialized.
-  const PlanNode* plan_tree_ = nullptr;
 
   /// A 'fake mutex' to detect any race condition in accessing 'report_seq_no_' below.
   /// There should be only one thread doing status report at the same time.
@@ -174,6 +201,26 @@ class FragmentInstanceState {
   /// True if a report has been generated where 'done' is true, after which the sequence
   /// number should not be bumped for future reports.
   bool final_report_generated_ = false;
+
+  /// Total scan ranges complete across all scan nodes. Set in GetStatusReport().
+  int64_t scan_ranges_complete_ = 0;
+
+  /// Last peak memory consumption value. Set in GetStatusReport().
+  int64_t peak_mem_consumption_ = 0;
+
+  /// Last CPU user and system totals in ns. Set in GetStatusReport().
+  int64_t cpu_user_ns_ = 0;
+  int64_t cpu_sys_ns_ = 0;
+
+  /// Sum of BytesRead counters on this backend. Set in GetStatusReport().
+  int64_t bytes_read_ = 0;
+
+  /// Total bytes sent on exchanges in this backend. Set in GetStatusReport().
+  int64_t total_bytes_sent_ = 0;
+
+  /// For each join node, sum of RowsReturned counters on this backend.
+  /// Set in GetStatusReport().
+  std::map<int32_t, int64_t> per_join_rows_produced_;
 
   /// Profile for timings for each stage of the plan fragment instance's lifecycle.
   /// Lives in obj_pool().
@@ -210,15 +257,17 @@ class FragmentInstanceState {
   /// fragment instance thread in UpdateState() and read by the profile reporting threads.
   AtomicEnum<FInstanceExecStatePB> current_state_{FInstanceExecStatePB::WAITING_FOR_EXEC};
 
+  /// Set to true when hitting an error during execution for the fragment instance.
+  /// It's used to work around the race when updating the fragment instance state and
+  /// updating the 'Query State'.
+  AtomicBool exec_failed_{false};
+
   /// Output sink for rows sent to this fragment. Created in Prepare(), lives in
   /// obj_pool().
   DataSink* sink_ = nullptr;
 
   /// should live in obj_pool(), but managed separately so we can delete it in Close()
   boost::scoped_ptr<RowBatch> row_batch_;
-
-  /// Set when Prepare() returns.
-  Promise<Status> prepared_promise_;
 
   /// Set when OpenInternal() returns.
   Promise<Status> opened_promise_;
@@ -236,8 +285,7 @@ class FragmentInstanceState {
   /// on a single host will have the same value for this counter.
   RuntimeProfile::Counter* per_host_mem_usage_ = nullptr;
 
-  /// Number of rows returned by this fragment
-  /// TODO: by this instance?
+  /// Number of rows returned by this fragment instance.
   RuntimeProfile::Counter* rows_produced_counter_ = nullptr;
 
   /// Average number of thread tokens for the duration of the fragment instance execution.
@@ -247,7 +295,6 @@ class FragmentInstanceState {
   /// additional tokens.
   /// This is a measure of how much CPU resources this instance used during the course
   /// of the execution.
-  /// TODO-MT: remove
   RuntimeProfile::Counter* avg_thread_tokens_ = nullptr;
 
   /// Sampled memory usage at even time intervals.
@@ -293,5 +340,3 @@ class FragmentInstanceState {
 };
 
 }
-
-#endif

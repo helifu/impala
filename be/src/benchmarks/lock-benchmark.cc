@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <iostream>
-#include <vector>
 #include <sstream>
-#include <boost/thread.hpp>
-#include <boost/thread/mutex.hpp>
+#include <mutex>
+#include <sstream>
+#include <vector>
+#include <boost/thread/thread.hpp>
 #include "util/benchmark.h"
 #include "util/cpu-info.h"
 #include "util/spinlock.h"
@@ -80,7 +81,7 @@ struct TestData {
 mutex lock_;
 SpinLock spinlock_;
 
-typedef function<void (int64_t, int64_t*)> Fn;
+typedef std::function<void (int64_t, int64_t*)> Fn;
 
 void UnlockedConsumeThread(int64_t n, int64_t* value) {
   // volatile to prevent compile from collapsing this loop to *value -= n

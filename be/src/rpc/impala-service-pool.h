@@ -29,10 +29,10 @@
 #include "kudu/util/status.h"
 #include "util/histogram-metric.h"
 #include "util/spinlock.h"
-#include "util/thread.h"
 
 namespace impala {
 class MemTracker;
+class Thread;
 
 /// A pool of threads that handle new incoming RPC calls.
 /// Also includes a queue that calls get pushed onto for handling by the pool.
@@ -49,12 +49,16 @@ class ImpalaServicePool : public kudu::rpc::RpcService {
   /// 'address' is the ip address and port that 'service' runs on.
   ImpalaServicePool(const scoped_refptr<kudu::MetricEntity>& entity,
       int service_queue_length, kudu::rpc::GeneratedServiceIf* service,
-      MemTracker* service_mem_tracker, const TNetworkAddress& address);
+      MemTracker* service_mem_tracker, const NetworkAddressPB& address,
+      MetricGroup* rpc_metrics);
 
   virtual ~ImpalaServicePool();
 
   /// Start up the thread pool.
   Status Init(int num_threads);
+
+  /// Wait until all working threads complete execution.
+  void Join();
 
   /// Shut down the queue and the thread pool.
   void Shutdown();
@@ -62,8 +66,8 @@ class ImpalaServicePool : public kudu::rpc::RpcService {
   virtual kudu::rpc::RpcMethodInfo* LookupMethod(const kudu::rpc::RemoteMethod& method)
     override;
 
-  virtual kudu::Status
-      QueueInboundCall(gscoped_ptr<kudu::rpc::InboundCall> call) OVERRIDE;
+  virtual kudu::Status QueueInboundCall(
+      std::unique_ptr<kudu::rpc::InboundCall> call) OVERRIDE;
 
   const std::string service_name() const;
 
@@ -110,8 +114,15 @@ class ImpalaServicePool : public kudu::rpc::RpcService {
   /// Protects against concurrent Shutdown() operations.
   /// TODO: This seems implausible given our current usage pattern.
   /// Consider removing lock.
-  boost::mutex shutdown_lock_;
+  std::mutex shutdown_lock_;
   bool closing_ = false;
+
+  /// Protects is_closed_.
+  std::mutex close_lock_;
+
+  /// Set as true when all working threads complete execution.
+  /// Protected by 'close_lock_'.
+  bool is_joined_ = false;
 
   /// The address this service is running on.
   const std::string hostname_;

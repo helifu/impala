@@ -17,6 +17,7 @@
 #
 # The base class that should be used for almost all Impala tests
 
+from __future__ import absolute_import, division, print_function
 import logging
 import pytest
 import os
@@ -24,6 +25,7 @@ import time
 from subprocess import check_call
 from tests.util.filesystem_utils import get_fs_path
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
+from tests.common.skip import SkipIf, SkipIfFS
 
 LOG = logging.getLogger('test_coordinators')
 LOG.setLevel(level=logging.DEBUG)
@@ -47,7 +49,7 @@ class TestCoordinators(CustomClusterTestSuite):
     beeswax_client = None
     try:
       beeswax_client = worker.service.create_beeswax_client()
-    except Exception, e:
+    except Exception as e:
       LOG.info("Caught exception {0}".format(e))
     finally:
       assert beeswax_client is None
@@ -55,7 +57,7 @@ class TestCoordinators(CustomClusterTestSuite):
     hs2_client = None
     try:
       hs2_client = worker.service.create_hs2_client()
-    except Exception, e:
+    except Exception as e:
       LOG.info("Caught exception {0}".format(e))
     finally:
       assert hs2_client is None
@@ -143,7 +145,7 @@ class TestCoordinators(CustomClusterTestSuite):
     old_src_path = os.path.join(
         os.environ['IMPALA_HOME'], 'testdata/udfs/impala-hive-udfs.jar')
     new_src_path = os.path.join(
-        os.environ['IMPALA_HOME'], 'tests/test-hive-udfs/target/test-hive-udfs-1.0.jar')
+        os.environ['IMPALA_HOME'], 'testdata/udfs/impala-hive-udfs-modified.jar')
     tgt_dir = get_fs_path('/test-warehouse/{0}.db'.format(db_name))
     tgt_path = tgt_dir + "/tmp.jar"
 
@@ -273,6 +275,7 @@ class TestCoordinators(CustomClusterTestSuite):
       self.client = client
 
       client.execute("SET EXPLAIN_LEVEL=2")
+      client.execute("SET TEST_REPLAN=0")
 
       # Ensure that the plan generated always uses only the executor nodes for scanning
       # Multi-partition table
@@ -280,24 +283,30 @@ class TestCoordinators(CustomClusterTestSuite):
               "where id NOT IN (0,1,2) and string_col IN ('aaaa', 'bbbb', 'cccc', NULL) "
               "and mod(int_col,50) IN (0,1) and id IN (int_col);").data
       assert 'F00:PLAN FRAGMENT [RANDOM] hosts=2 instances=2' in result
-      # Single partition table
-      result = client.execute("explain select * from tpch.lineitem "
-              "union all select * from tpch.lineitem").data
+      # Single partition table with 3 blocks
+      result = client.execute("explain select * from tpch_parquet.lineitem "
+              "union all select * from tpch_parquet.lineitem").data
       assert 'F02:PLAN FRAGMENT [RANDOM] hosts=2 instances=2' in result
     finally:
       assert client is not None
       self._stop_impala_cluster()
 
   @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args(cluster_size=1, num_exclusive_coordinators=1)
+  @CustomClusterTestSuite.with_args(impalad_args="--queue_wait_timeout_ms=2000",
+                                    cluster_size=1, num_exclusive_coordinators=1)
   def test_dedicated_coordinator_without_executors(self):
     """This test verifies that a query gets queued and times out when no executors are
-    present."""
-    result = self.execute_query_expect_failure(self.client, "select 2")
-    expected_error = "Query aborted:Admission for query exceeded timeout 60000ms in " \
+    present but a coordinator only query gets executed."""
+    # Pick a non-trivial query that needs to be scheduled on executors.
+    query = "select count(*) from functional.alltypes where month + random() < 3"
+    result = self.execute_query_expect_failure(self.client, query)
+    expected_error = "Query aborted:Admission for query exceeded timeout 2000ms in " \
                      "pool default-pool. Queued reason: Waiting for executors to " \
-                     "start. Only DDL queries can currently run."
+                     "start."
     assert expected_error in str(result)
+    # Now pick a coordinator only query.
+    query = "select 1"
+    self.execute_query_expect_success(self.client, query)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(cluster_size=1, num_exclusive_coordinators=1,
@@ -310,3 +319,15 @@ class TestCoordinators(CustomClusterTestSuite):
                          "functional.alltypes b on a.id = b.id;")
     num_hosts = "hosts=10 instances=10"
     assert num_hosts in str(ret)
+
+  @SkipIfFS.hbase
+  @SkipIf.skip_hbase
+  @pytest.mark.execute_serially
+  def test_executor_only_hbase(self):
+    """Verifies HBase tables can be scanned by executor only impalads."""
+    self._start_impala_cluster([], cluster_size=3, num_coordinators=1,
+                         use_exclusive_coordinators=True)
+    client = self.cluster.impalads[0].service.create_beeswax_client()
+    query = "select count(*) from functional_hbase.alltypes"
+    result = self.execute_query_expect_success(client, query)
+    assert result.data == ['7300']

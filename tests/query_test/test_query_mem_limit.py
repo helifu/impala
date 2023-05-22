@@ -17,6 +17,7 @@
 #
 # Targeted tests to validate per-query memory limit.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 import re
 import sys
@@ -45,9 +46,9 @@ class TestQueryMemLimit(ImpalaTestSuite):
   # dynamically, even if it is a rough approximation.
   # A mem_limit is expressed in bytes, with values <= 0 signifying no cap.
   # These values are either really small, unlimited, or have a really large cap.
-  MAXINT_BYTES = str(sys.maxint)
-  MAXINT_MB = str(sys.maxint/(1024*1024))
-  MAXINT_GB = str(sys.maxint/(1024*1024*1024))
+  MAXINT_BYTES = str(sys.maxsize)
+  MAXINT_MB = str(sys.maxsize // (1024 * 1024))
+  MAXINT_GB = str(sys.maxsize // (1024 * 1024 * 1024))
   # We expect the tests with MAXINT_* using valid units [bmg] to succeed.
   PASS_REGEX = re.compile("(%s|%s|%s)[bmg]?$" % (MAXINT_BYTES, MAXINT_MB, MAXINT_GB),
                           re.I)
@@ -88,7 +89,6 @@ class TestQueryMemLimit(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('exec_option')['batch_size'] == 0)
 
-  @SkipIfEC.oom
   @pytest.mark.execute_serially
   def test_mem_limit(self, vector):
     mem_limit = copy(vector.get_value('mem_limit'))
@@ -96,6 +96,10 @@ class TestQueryMemLimit(ImpalaTestSuite):
     exec_options['mem_limit'] = mem_limit
     # Send to the no-limits pool so that no memory limits apply.
     exec_options['request_pool'] = "root.no-limits"
+    # IMPALA-9856: For the group_concat query, this test expect a resulting row up to
+    # 17.17 MB in size.Therefore, we explicitly set 18 MB MAX_ROW_SIZE here so that it
+    # can fit in BufferedPlanRootSink.
+    exec_options['max_row_size'] = '18M'
     query = vector.get_value('query')
     table_format = vector.get_value('table_format')
     if mem_limit in["0", "-1"] or self.PASS_REGEX.match(mem_limit):
@@ -109,7 +113,7 @@ class TestQueryMemLimit(ImpalaTestSuite):
     try:
       self.execute_query(query, exec_options, table_format=table_format)
       assert should_succeed, "Query was expected to fail"
-    except ImpalaBeeswaxException, e:
+    except ImpalaBeeswaxException as e:
       assert not should_succeed, "Query should not have failed: %s" % e
 
 

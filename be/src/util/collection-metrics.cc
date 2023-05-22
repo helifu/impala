@@ -17,6 +17,14 @@
 
 #include "util/collection-metrics.h"
 
+#include <ostream>
+
+#include <boost/accumulators/statistics/count.hpp>
+#include <boost/accumulators/statistics/max.hpp>
+#include <boost/accumulators/statistics/mean.hpp>
+#include <boost/accumulators/statistics/min.hpp>
+#include <boost/accumulators/statistics/variance.hpp>
+
 #include "util/json-util.h"
 #include "util/pretty-printer.h"
 
@@ -120,7 +128,7 @@ void StatsMetric<T, StatsSelection>::ToJson(
   lock_guard<mutex> l(lock_);
   rapidjson::Value container(rapidjson::kObjectType);
   AddStandardFields(document, &container);
-  rapidjson::Value units(PrintThriftEnum(unit_).c_str(), document->GetAllocator());
+  rapidjson::Value units(PrintValue(unit_).c_str(), document->GetAllocator());
   container.AddMember("units", units, document->GetAllocator());
 
   if (StatsSelection & StatsType::COUNT) {

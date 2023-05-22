@@ -15,11 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_vector import ImpalaTestDimension
-from tests.common.skip import SkipIfBuildType
+from tests.common.skip import SkipIfFS
 from tests.common.test_dimensions import create_exec_option_dimension
 
 class TestLocalTzConversion(CustomClusterTestSuite):
@@ -47,10 +47,13 @@ class TestLocalTzConversion(CustomClusterTestSuite):
   def get_workload(self):
     return 'functional-query'
 
+  @SkipIfFS.hbase
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("--use_local_tz_for_unix_timestamp_conversions=true")
   def test_timestamp_functions(self, vector):
     """Tests timestamp functions with --use_local_tz_for_unix_timestamp_conversions=true
+       TODO: this test can be probably removed as a query option is created for
+             use_local_tz_for_unix_timestamp_conversions in IMPALA-10171
     """
     vector.get_value('exec_option')['enable_expr_rewrites'] = \
         vector.get_value('enable_expr_rewrites')
@@ -64,3 +67,7 @@ class TestLocalTzConversion(CustomClusterTestSuite):
     # Tests for local timestamp functions, i.e. functions that depend on the
     # behavior of the flag --use_local_tz_for_unix_timestamp_conversions.
     self.run_test_case('QueryTest/local-timestamp-functions', vector)
+
+    # Test that scanning of different file formats is not affected by flag
+    # use_local_tz_for_unix_timestamp_conversions.
+    self.run_test_case('QueryTest/file-formats-with-local-tz-conversion', vector)

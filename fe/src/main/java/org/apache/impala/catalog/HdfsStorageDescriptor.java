@@ -25,6 +25,7 @@ import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.impala.thrift.THdfsPartition;
+import org.apache.impala.thrift.THdfsStorageDescriptor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,7 +72,9 @@ public class HdfsStorageDescriptor {
       "parquet.hive.serde.ParquetHiveSerDe", // (parquet - legacy)
       // TODO: Verify the following Parquet SerDe works with Impala and add
       // support for the new input/output format classes. See IMPALA-4214.
-      "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"); // (parquet)
+      "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe", // (parquet)
+      "org.apache.iceberg.mr.hive.HiveIcebergSerDe", // (iceberg)
+      "org.apache.hadoop.hive.serde2.JsonSerDe");// (json)
 
   private final static Logger LOG = LoggerFactory.getLogger(HdfsStorageDescriptor.class);
 
@@ -176,7 +179,6 @@ public class HdfsStorageDescriptor {
     if (escapeChar == fieldDelim ||
         escapeChar == lineDelim ||
         escapeChar == collectionDelim) {
-      // TODO: we should output the table name here but it's hard to get to now.
       this.escapeChar_ = DEFAULT_ESCAPE_CHAR;
       LOG.warn("Escape character for table, " + tblName + " is set to "
           + "the same character as one of the delimiters.  Ignoring escape character.");
@@ -226,7 +228,8 @@ public class HdfsStorageDescriptor {
 
     try {
       return INTERNER.intern(new HdfsStorageDescriptor(tblName,
-          HdfsFileFormat.fromJavaClassName(sd.getInputFormat()),
+          HdfsFileFormat.fromJavaClassName(
+              sd.getInputFormat(), sd.getSerdeInfo().getSerializationLib()),
           delimMap.get(serdeConstants.LINE_DELIM),
           delimMap.get(serdeConstants.FIELD_DELIM),
           delimMap.get(serdeConstants.COLLECTION_DELIM),
@@ -240,15 +243,17 @@ public class HdfsStorageDescriptor {
     }
   }
 
-  public static HdfsStorageDescriptor fromThriftPartition(THdfsPartition thriftPartition,
+  public static HdfsStorageDescriptor fromThrift(THdfsStorageDescriptor tDesc,
       String tableName) {
     return INTERNER.intern(new HdfsStorageDescriptor(tableName,
-        HdfsFileFormat.fromThrift(thriftPartition.getFileFormat()),
-        thriftPartition.lineDelim, thriftPartition.fieldDelim,
-        thriftPartition.collectionDelim, thriftPartition.mapKeyDelim,
-        thriftPartition.escapeChar,
-        (byte) '"', // TODO: We should probably add quoteChar to THdfsPartition.
-        thriftPartition.blockSize));
+        HdfsFileFormat.fromThrift(tDesc.getFileFormat()), tDesc.lineDelim,
+        tDesc.fieldDelim, tDesc.collectionDelim, tDesc.mapKeyDelim, tDesc.escapeChar,
+        tDesc.quoteChar, tDesc.blockSize));
+  }
+
+  public THdfsStorageDescriptor toThrift() {
+    return new THdfsStorageDescriptor(lineDelim_, fieldDelim_, collectionDelim_,
+        mapKeyDelim_, escapeChar_, quoteChar_, fileFormat_.toThrift(), blockSize_);
   }
 
   public HdfsStorageDescriptor cloneWithChangedFileFormat(HdfsFileFormat newFormat) {

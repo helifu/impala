@@ -23,9 +23,11 @@
 
 '''
 
+from __future__ import absolute_import, division, print_function
+from base import range
 import base64
 import pickle
-import StringIO
+from io import BytesIO
 
 from tests.comparison.db_types import Decimal
 from tests.comparison.random_val_generator import RandomValGenerator
@@ -54,15 +56,15 @@ class TextTableDataGenerator(object):
     col_val_generators = [self._create_val_generator(c.exact_type) for c in cols]
     val_buffer_size = 1024
     col_val_buffers = [[None] * val_buffer_size for c in cols]
-    for row_idx in xrange(self.row_count):
+    for row_idx in range(self.row_count):
       val_buffer_idx = row_idx % val_buffer_size
       if val_buffer_idx == 0:
         for col_idx, col in enumerate(cols):
           val_buffer = col_val_buffers[col_idx]
           val_generator = col_val_generators[col_idx]
-          for idx in xrange(val_buffer_size):
+          for idx in range(val_buffer_size):
             val = next(val_generator)
-            val_buffer[idx] = "\N" if val is None else val
+            val_buffer[idx] = r"\N" if val is None else val
       for col_idx, col in enumerate(cols):
         if col_idx > 0:
           # Postgres doesn't seem to have an option to specify that the last column value
@@ -92,7 +94,7 @@ def estimate_bytes_per_row(table_data_generator, row_count):
   original_row_count = table_data_generator.row_count
   original_output_file = table_data_generator.output_file
   table_data_generator.row_count = row_count
-  table_data_generator.output_file = StringIO.StringIO()
+  table_data_generator.output_file = BytesIO()
   table_data_generator.populate_output_file()
   table_data_generator.output_file.flush()
   bytes_per_row = len(table_data_generator.output_file.getvalue()) / float(row_count)
@@ -107,7 +109,7 @@ def estimate_rows_per_reducer(table_data_generator, mb_per_reducer):
   bytes_per_row = estimate_bytes_per_row(table_data_generator, 1)
   if bytes_per_row >= bytes_per_reducer:
     return 1
-  rows_per_reducer = bytes_per_reducer / bytes_per_row
+  rows_per_reducer = bytes_per_reducer // bytes_per_row
   bytes_per_row = estimate_bytes_per_row(table_data_generator,
       max(int(rows_per_reducer * 0.001), 1))
-  return max(bytes_per_reducer / bytes_per_row, 1)
+  return max(bytes_per_reducer // bytes_per_row, 1)

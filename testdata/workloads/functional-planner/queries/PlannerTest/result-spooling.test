@@ -39,7 +39,7 @@ Per-Host Resources: mem-estimate=16.00MB mem-reservation=32.00KB thread-reservat
 Max Per-Host Resource Reservation: Memory=4.06MB Threads=3
 Per-Host Resource Estimates: Memory=36MB
 F01:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=4.02MB mem-reservation=4.00MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=4.02MB mem-reservation=4.00MB thread-reservation=1
 PLAN-ROOT SINK
 |  output exprs: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
@@ -52,7 +52,7 @@ PLAN-ROOT SINK
 |  in pipelines: 01(GETNEXT)
 |
 F00:PLAN FRAGMENT [RANDOM] hosts=3 instances=6
-Per-Host Resources: mem-estimate=32.00MB mem-reservation=64.00KB thread-reservation=2
+Per-Instance Resources: mem-estimate=16.00MB mem-reservation=32.00KB thread-reservation=1
 01:TOP-N [LIMIT=10]
 |  order by: id ASC
 |  mem-estimate=890B mem-reservation=0B thread-reservation=0
@@ -75,7 +75,7 @@ Per-Host Resources: mem-estimate=32.00MB mem-reservation=64.00KB thread-reservat
 select * from tpch.lineitem order by l_orderkey
 ---- DISTRIBUTEDPLAN
 Max Per-Host Resource Reservation: Memory=24.00MB Threads=3
-Per-Host Resource Estimates: Memory=257MB
+Per-Host Resource Estimates: Memory=659MB
 F01:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=130.69MB mem-reservation=4.00MB thread-reservation=1
 PLAN-ROOT SINK
@@ -89,10 +89,10 @@ PLAN-ROOT SINK
 |  in pipelines: 01(GETNEXT)
 |
 F00:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
-Per-Host Resources: mem-estimate=126.00MB mem-reservation=20.00MB thread-reservation=2
+Per-Host Resources: mem-estimate=528.26MB mem-reservation=20.00MB thread-reservation=2
 01:SORT
 |  order by: l_orderkey ASC
-|  mem-estimate=38.00MB mem-reservation=12.00MB spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=440.26MB mem-reservation=12.00MB spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=231B cardinality=6.00M
 |  in pipelines: 01(GETNEXT), 00(OPEN)
 |
@@ -107,9 +107,9 @@ Per-Host Resources: mem-estimate=126.00MB mem-reservation=20.00MB thread-reserva
    in pipelines: 00(GETNEXT)
 ---- PARALLELPLANS
 Max Per-Host Resource Reservation: Memory=44.00MB Threads=3
-Per-Host Resource Estimates: Memory=413MB
+Per-Host Resource Estimates: Memory=778MB
 F01:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=161.38MB mem-reservation=4.00MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=161.38MB mem-reservation=4.00MB thread-reservation=1
 PLAN-ROOT SINK
 |  output exprs: l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment
 |  mem-estimate=100.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
@@ -121,10 +121,10 @@ PLAN-ROOT SINK
 |  in pipelines: 01(GETNEXT)
 |
 F00:PLAN FRAGMENT [RANDOM] hosts=3 instances=6
-Per-Host Resources: mem-estimate=252.00MB mem-reservation=40.00MB thread-reservation=2
+Per-Instance Resources: mem-estimate=308.13MB mem-reservation=20.00MB thread-reservation=1
 01:SORT
 |  order by: l_orderkey ASC
-|  mem-estimate=38.00MB mem-reservation=12.00MB spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=220.13MB mem-reservation=12.00MB spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=231B cardinality=6.00M
 |  in pipelines: 01(GETNEXT), 00(OPEN)
 |
@@ -136,5 +136,109 @@ Per-Host Resources: mem-estimate=252.00MB mem-reservation=40.00MB thread-reserva
    extrapolated-rows=disabled max-scan-range-rows=1.07M
    mem-estimate=88.00MB mem-reservation=8.00MB thread-reservation=0
    tuple-ids=0 row-size=231B cardinality=6.00M
+   in pipelines: 00(GETNEXT)
+====
+# Select stmt returning one constant row does not need to spool query results.
+select 1, uuid()
+---- DISTRIBUTEDPLAN
+Max Per-Host Resource Reservation: Memory=0B Threads=1
+Per-Host Resource Estimates: Memory=10MB
+F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=0B mem-reservation=0B thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: 1, uuid()
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|
+00:UNION
+   constant-operands=1
+   mem-estimate=0B mem-reservation=0B thread-reservation=0
+   tuple-ids=0 row-size=13B cardinality=1
+   in pipelines: <none>
+====
+# Select from an inline view that returns one row does not need to spool query results
+select a, b from (select 1 a, uuid() b) t
+---- DISTRIBUTEDPLAN
+Max Per-Host Resource Reservation: Memory=0B Threads=1
+Per-Host Resource Estimates: Memory=10MB
+F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=0B mem-reservation=0B thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: a, b
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|
+00:UNION
+   constant-operands=1
+   mem-estimate=0B mem-reservation=0B thread-reservation=0
+   tuple-ids=0 row-size=13B cardinality=1
+   in pipelines: <none>
+====
+# Select stmt with a 'limit 1' clause does not need to spool query results
+select id from functional.dimtbl limit 1
+---- DISTRIBUTEDPLAN
+Max Per-Host Resource Reservation: Memory=8.00KB Threads=3
+Per-Host Resource Estimates: Memory=16MB
+F01:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=16.00KB mem-reservation=0B thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: id
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|
+01:EXCHANGE [UNPARTITIONED]
+|  limit: 1
+|  mem-estimate=16.00KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=0 row-size=8B cardinality=1
+|  in pipelines: 00(GETNEXT)
+|
+F00:PLAN FRAGMENT [RANDOM] hosts=1 instances=1
+Per-Host Resources: mem-estimate=16.05MB mem-reservation=8.00KB thread-reservation=2
+00:SCAN HDFS [functional.dimtbl, RANDOM]
+   HDFS partitions=1/1 files=1 size=171B
+   stored statistics:
+     table: rows=10 size=171B
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=10
+   limit: 1
+   mem-estimate=16.00MB mem-reservation=8.00KB thread-reservation=1
+   tuple-ids=0 row-size=8B cardinality=1
+   in pipelines: 00(GETNEXT)
+====
+# Select stmt with an aggregate function and no group by does not need to spool query results
+select count(*) from functional.dimtbl
+---- DISTRIBUTEDPLAN
+Max Per-Host Resource Reservation: Memory=8.00KB Threads=3
+Per-Host Resource Estimates: Memory=16MB
+F01:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+PLAN-ROOT SINK
+|  output exprs: count(*)
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|
+03:AGGREGATE [FINALIZE]
+|  output: count:merge(*)
+|  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=1 row-size=8B cardinality=1
+|  in pipelines: 03(GETNEXT), 01(OPEN)
+|
+02:EXCHANGE [UNPARTITIONED]
+|  mem-estimate=16.00KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=1 row-size=8B cardinality=1
+|  in pipelines: 01(GETNEXT)
+|
+F00:PLAN FRAGMENT [RANDOM] hosts=1 instances=1
+Per-Host Resources: mem-estimate=16.02MB mem-reservation=8.00KB thread-reservation=2
+01:AGGREGATE
+|  output: count(*)
+|  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  tuple-ids=1 row-size=8B cardinality=1
+|  in pipelines: 01(GETNEXT), 00(OPEN)
+|
+00:SCAN HDFS [functional.dimtbl, RANDOM]
+   HDFS partitions=1/1 files=1 size=171B
+   stored statistics:
+     table: rows=10 size=171B
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=10
+   mem-estimate=16.00MB mem-reservation=8.00KB thread-reservation=1
+   tuple-ids=0 row-size=0B cardinality=10
    in pipelines: 00(GETNEXT)
 ====

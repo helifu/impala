@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import logging
 import os
 import pytest
@@ -35,7 +37,7 @@ from TCLIService import TCLIService
 from beeswaxd.BeeswaxService import QueryState
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfNotHdfsMinicluster
+from tests.common.skip import SkipIfNotHdfsMinicluster, SkipIfFS
 from tests.hs2.hs2_test_suite import HS2TestSuite, needs_session
 
 LOG = logging.getLogger(__name__)
@@ -58,13 +60,13 @@ class TestRestart(CustomClusterTestSuite):
     # existing metrics yet so we wait for some time here.
     wait_time_s = build_flavor_timeout(60, slow_build_timeout=100)
     sleep(wait_time_s)
-    for retry in xrange(wait_time_s):
+    for retry in range(wait_time_s):
       try:
         cursor.execute("describe database functional")
         return
-      except HiveServer2Error, e:
-        assert "AnalysisException: Database does not exist: functional" in e.message,\
-               "Unexpected exception: " + e.message
+      except HiveServer2Error as e:
+        assert "AnalysisException: Database does not exist: functional" in str(e),\
+               "Unexpected exception: " + str(e)
         sleep(1)
     assert False, "Coordinator never received non-empty metadata from the restarted " \
            "statestore after {0} seconds".format(wait_time_s)
@@ -81,7 +83,7 @@ class TestRestart(CustomClusterTestSuite):
       client = self.cluster.impalads[0].service.create_beeswax_client()
       assert client is not None
 
-      for i in xrange(5):
+      for i in range(5):
         self.execute_query_expect_success(client, "select * from functional.alltypes")
         node_to_restart = 1 + (i % 2)
         self.cluster.impalads[node_to_restart].restart()
@@ -91,6 +93,29 @@ class TestRestart(CustomClusterTestSuite):
         sleep(3)
 
       client.close()
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      # Debug action to delay statestore updates to give the restarted impalad time to
+      # register itself before a membership topic update is generated.
+      statestored_args="--debug_actions=DO_SUBSCRIBER_UPDATE:JITTER@10000")
+  def test_statestore_update_after_impalad_restart(self):
+      """Test that checks that coordinators are informed that an impalad went down even if
+      the statestore doesn't send a membership update until after a new impalad has been
+      restarted at the same location."""
+      if self.exploration_strategy() != 'exhaustive':
+        pytest.skip()
+
+      assert len(self.cluster.impalads) == 3
+      client = self.cluster.impalads[0].service.create_beeswax_client()
+      assert client is not None
+
+      handle = client.execute_async(
+          "select count(*) from functional.alltypes where id = sleep(100000)")
+      node_to_restart = self.cluster.impalads[2]
+      node_to_restart.restart()
+      # Verify that the query is cancelled due to the failed impalad quickly.
+      self.wait_for_state(handle, QueryState.EXCEPTION, 20, client=client)
 
   @pytest.mark.execute_serially
   def test_catalog_connection_retries(self):
@@ -139,6 +164,110 @@ class TestRestart(CustomClusterTestSuite):
     self.cluster.catalogd.start()
     thread.join()
     self.wait_for_state(query_handle[0], QueryState.FINISHED, 30000)
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    statestored_args="--statestore_update_frequency_ms=5000")
+  def test_restart_catalogd(self):
+    self.execute_query_expect_success(self.client, "drop table if exists join_aa")
+    self.execute_query_expect_success(self.client, "create table join_aa(id int)")
+    # Make the catalog object version grow large enough
+    self.execute_query_expect_success(self.client, "invalidate metadata")
+
+    # No need to care whether the dll is executed successfully, it is just to make
+    # the local catalog catche of impalad out of sync
+    for i in range(0, 10):
+      try:
+        query = "alter table join_aa add columns (age" + str(i) + " int)"
+        self.execute_query_async(query)
+      except Exception as e:
+        LOG.info(str(e))
+      if i == 5:
+        self.cluster.catalogd.restart()
+
+    self.execute_query_expect_success(self.client,
+        "alter table join_aa add columns (name string)")
+    self.execute_query_expect_success(self.client, "select name from join_aa")
+    self.execute_query_expect_success(self.client, "drop table join_aa")
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    statestored_args="--statestore_update_frequency_ms=5000")
+  def test_restart_catalogd_sync_ddl(self):
+    self.execute_query_expect_success(self.client, "drop table if exists join_aa")
+    self.execute_query_expect_success(self.client, "create table join_aa(id int)")
+    # Make the catalog object version grow large enough
+    self.execute_query_expect_success(self.client, "invalidate metadata")
+    query_options = {"sync_ddl": "true"}
+
+    # No need to care whether the dll is executed successfully, it is just to make
+    # the local catalog catche of impalad out of sync
+    for i in range(0, 10):
+      try:
+        query = "alter table join_aa add columns (age" + str(i) + " int)"
+        self.execute_query_async(query, query_options)
+      except Exception as e:
+        LOG.info(str(e))
+      if i == 5:
+        self.cluster.catalogd.restart()
+
+    self.execute_query_expect_success(self.client,
+        "alter table join_aa add columns (name string)", query_options)
+    self.execute_query_expect_success(self.client, "select name from join_aa")
+    self.execute_query_expect_success(self.client, "drop table join_aa")
+
+  UPDATE_FREQUENCY_S = 10
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    statestored_args="--statestore_update_frequency_ms={frequency_ms}"
+    .format(frequency_ms=(UPDATE_FREQUENCY_S * 1000)))
+  def test_restart_catalogd_twice(self):
+    self.execute_query_expect_success(self.client, "drop table if exists join_aa")
+    self.cluster.catalogd.restart()
+    query = "create table join_aa(id int)"
+    query_handle = []
+
+    def execute_query_async():
+      query_handle.append(self.execute_query(query))
+
+    thread = threading.Thread(target=execute_query_async)
+    thread.start()
+    sleep(self.UPDATE_FREQUENCY_S - 5)
+    self.cluster.catalogd.restart()
+    thread.join()
+    self.execute_query_expect_success(self.client,
+        "alter table join_aa add columns (name string)")
+    self.execute_query_expect_success(self.client, "select name from join_aa")
+    self.execute_query_expect_success(self.client, "drop table join_aa")
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--use_local_catalog=true",
+      catalogd_args="--catalog_topic_mode=minimal",
+      statestored_args="--statestore_update_frequency_ms=5000")
+  def test_restart_catalogd_with_local_catalog(self):
+    self.execute_query_expect_success(self.client, "drop table if exists join_aa")
+    self.execute_query_expect_success(self.client, "create table join_aa(id int)")
+    # Make the catalog object version grow large enough
+    self.execute_query_expect_success(self.client, "invalidate metadata")
+
+    # No need to care whether the dll is executed successfully, it is just to make
+    # the local catalog catche of impalad out of sync
+    for i in range(0, 10):
+      try:
+        query = "alter table join_aa add columns (age" + str(i) + " int)"
+        self.execute_query_async(query)
+      except Exception as e:
+        LOG.info(str(e))
+      if i == 5:
+        self.cluster.catalogd.restart()
+
+    self.execute_query_expect_success(self.client,
+        "alter table join_aa add columns (name string)")
+    self.execute_query_expect_success(self.client, "select name from join_aa")
+    self.execute_query_expect_success(self.client, "select age0 from join_aa")
+    self.execute_query_expect_success(self.client, "drop table join_aa")
 
   SUBSCRIBER_TIMEOUT_S = 2
   CANCELLATION_GRACE_PERIOD_S = 5
@@ -233,9 +362,11 @@ class TestGracefulShutdown(CustomClusterTestSuite, HS2TestSuite):
   def get_workload(cls):
     return 'functional-query'
 
+  @SkipIfFS.shutdown_idle_fails
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
       impalad_args="--shutdown_grace_period_s={grace_period} \
+          --rpc_use_unix_domain_socket=false \
           --hostname={hostname}".format(grace_period=IDLE_SHUTDOWN_GRACE_PERIOD_S,
             hostname=socket.gethostname()))
   def test_shutdown_idle(self):
@@ -250,16 +381,80 @@ class TestGracefulShutdown(CustomClusterTestSuite, HS2TestSuite):
         ":shutdown('e6c00ca5cd67b567eb96c6ecfb26f05')")
     assert "Could not find IPv4 address for:" in str(ex)
     ex = self.execute_query_expect_failure(self.client, ":shutdown('localhost:100000')")
-    assert "Invalid port:" in str(ex)
+    assert "invalid port:" in str(ex)
     assert ("This may be because the port specified is wrong.") not in str(ex)
 
     # Test that pointing to the wrong thrift service (the HS2 port) fails gracefully-ish.
-    thrift_ports = [21051, 22001]  # HS2 port, old backend port.
-    for port in thrift_ports:
-      ex = self.execute_query_expect_failure(self.client,
-          ":shutdown('localhost:{0}')".format(port))
-      assert ("failed with error 'RemoteShutdown() RPC failed") in str(ex)
-      assert ("This may be because the port specified is wrong.") in str(ex)
+    thrift_port = 21051  # HS2 port.
+    ex = self.execute_query_expect_failure(self.client,
+        ":shutdown('localhost:{0}')".format(thrift_port))
+    assert ("failed with error 'RemoteShutdown() RPC failed") in str(ex)
+    assert ("This may be because the port specified is wrong.") in str(ex)
+
+    # Test RPC error handling with debug action.
+    ex = self.execute_query_expect_failure(self.client, ":shutdown('localhost:27001')",
+        query_options={'debug_action': 'CRS_SHUTDOWN_RPC:FAIL'})
+    assert 'Rpc to 127.0.0.1:27001 failed with error \'Debug Action: ' \
+        'CRS_SHUTDOWN_RPC:FAIL' in str(ex)
+
+    # Test remote shutdown.
+    LOG.info("Start remote shutdown {0}".format(time.time()))
+    self.execute_query_expect_success(self.client, ":shutdown('localhost:27001')",
+        query_options={})
+
+    # Remote shutdown does not require statestore.
+    self.cluster.statestored.kill()
+    self.cluster.statestored.wait_for_exit()
+    self.execute_query_expect_success(self.client, ":shutdown('localhost:27002')",
+        query_options={})
+
+    # Test local shutdown, which should succeed even with injected RPC error.
+    LOG.info("Start local shutdown {0}".format(time.time()))
+    self.execute_query_expect_success(self.client,
+        ":shutdown('{0}:27000')".format(socket.gethostname()),
+        query_options={'debug_action': 'CRS_SHUTDOWN_RPC:FAIL'})
+
+    # Make sure that the impala daemons exit after the shutdown grace period plus a 10
+    # second margin of error.
+    start_time = time.time()
+    LOG.info("Waiting for impalads to exit {0}".format(start_time))
+    impalad1.wait()
+    LOG.info("First impalad exited {0}".format(time.time()))
+    impalad2.wait()
+    LOG.info("Second impalad exited {0}".format(time.time()))
+    impalad3.wait()
+    LOG.info("Third impalad exited {0}".format(time.time()))
+    shutdown_duration = time.time() - start_time
+    assert shutdown_duration <= self.IDLE_SHUTDOWN_GRACE_PERIOD_S + 10
+
+  @SkipIfFS.shutdown_idle_fails
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--shutdown_grace_period_s={grace_period} \
+          --rpc_use_unix_domain_socket=true \
+          --hostname={hostname}".format(grace_period=IDLE_SHUTDOWN_GRACE_PERIOD_S,
+            hostname=socket.gethostname()))
+  def test_shutdown_idle_rpc_use_uds(self):
+    """Test that idle impalads shut down in a timely manner after the shutdown grace
+    period elapses."""
+    impalad1 = psutil.Process(self.cluster.impalads[0].get_pid())
+    impalad2 = psutil.Process(self.cluster.impalads[1].get_pid())
+    impalad3 = psutil.Process(self.cluster.impalads[2].get_pid())
+
+    # Test that a failed shut down from a bogus host or port fails gracefully.
+    ex = self.execute_query_expect_failure(self.client,
+        ":shutdown('e6c00ca5cd67b567eb96c6ecfb26f05')")
+    assert "Could not find IPv4 address for:" in str(ex)
+    ex = self.execute_query_expect_failure(self.client, ":shutdown('localhost:100000')")
+    # IMPALA-11129: RPC return different error message for socket over Unix domain socket.
+    assert "Connection refused" in str(ex)
+
+    # Test that pointing to the wrong thrift service (the HS2 port) fails gracefully-ish.
+    thrift_port = 21051  # HS2 port.
+    ex = self.execute_query_expect_failure(self.client,
+        ":shutdown('localhost:{0}')".format(thrift_port))
+    assert ("failed with error 'RemoteShutdown() RPC failed") in str(ex)
+    assert ("This may be because the port specified is wrong.") in str(ex)
 
     # Test RPC error handling with debug action.
     ex = self.execute_query_expect_failure(self.client, ":shutdown('localhost:27001')",
@@ -322,7 +517,7 @@ class TestGracefulShutdown(CustomClusterTestSuite, HS2TestSuite):
   def test_shutdown_executor_with_delay(self):
     """Regression test for IMPALA-7931 that adds delays to status reporting and
     to fetching of results to trigger races that previously resulted in query failures."""
-    print self.exploration_strategy
+    print(self.exploration_strategy)
     if self.exploration_strategy() != 'exhaustive':
       pytest.skip()
     self.do_test_shutdown_executor(fetch_delay_s=5)
@@ -351,7 +546,7 @@ class TestGracefulShutdown(CustomClusterTestSuite, HS2TestSuite):
     # the shutdown grace period expires. This demonstrates that queries don't get
     # cancelled if the cluster membership changes while they're waiting for admission.
     before_shutdown_admission_handle = self.execute_query_async(QUERY,
-        {'debug_action': 'CRS_BEFORE_ADMISSION:SLEEP@30000'})
+        {'debug_action': 'AC_BEFORE_ADMISSION:SLEEP@30000'})
 
     # Shut down and wait for the shutdown state to propagate through statestore.
     result = self.execute_query_expect_success(self.client, SHUTDOWN_EXEC2)
@@ -418,7 +613,7 @@ class TestGracefulShutdown(CustomClusterTestSuite, HS2TestSuite):
         self.client, SHUTDOWN_EXEC3.format(HIGH_DEADLINE))
     grace, deadline, _, _ = parse_shutdown_result(result)
     assert grace == "{0}s000ms".format(self.EXEC_SHUTDOWN_GRACE_PERIOD_S)
-    assert deadline == "{0}m{1}s".format(HIGH_DEADLINE / 60, HIGH_DEADLINE % 60)
+    assert deadline == "{0}m{1}s".format(HIGH_DEADLINE // 60, HIGH_DEADLINE % 60)
 
     result = self.execute_query_expect_success(
         self.client, SHUTDOWN_EXEC3.format(VERY_HIGH_DEADLINE))
@@ -466,14 +661,14 @@ class TestGracefulShutdown(CustomClusterTestSuite, HS2TestSuite):
     result = self.execute_query_expect_success(self.client, SHUTDOWN)
     grace, deadline, registered, _ = parse_shutdown_result(result)
     assert grace == "{0}s000ms".format(self.COORD_SHUTDOWN_GRACE_PERIOD_S)
-    assert deadline == "{0}m".format(self.COORD_SHUTDOWN_DEADLINE_S / 60), "4"
+    assert deadline == "{0}m".format(self.COORD_SHUTDOWN_DEADLINE_S // 60), "4"
     assert registered == "3"
 
     # Expect that the beeswax shutdown error occurs when calling fn()
     def expect_beeswax_shutdown_error(fn):
       try:
         fn()
-      except ImpalaBeeswaxException, e:
+      except ImpalaBeeswaxException as e:
         assert SHUTDOWN_ERROR_PREFIX in str(e)
     expect_beeswax_shutdown_error(lambda: self.client.execute("select 1"))
     expect_beeswax_shutdown_error(lambda: self.client.execute_async("select 1"))
@@ -548,14 +743,16 @@ class TestGracefulShutdown(CustomClusterTestSuite, HS2TestSuite):
     try:
       self.client.fetch(query, handle)
       assert False, "Expected query to fail"
-    except Exception, e:
+    except Exception as e:
       assert 'Failed due to unreachable impalad(s)' in str(e)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
       impalad_args="--shutdown_grace_period_s={grace_period} \
+          --shutdown_deadline_s={deadline} \
           --hostname={hostname}".format(grace_period=IDLE_SHUTDOWN_GRACE_PERIOD_S,
-            hostname=socket.gethostname()), cluster_size=1)
+            deadline=EXEC_SHUTDOWN_DEADLINE_S, hostname=socket.gethostname()),
+      cluster_size=1)
   def test_shutdown_signal(self):
     """Test that an idle impalad shuts down in a timely manner after the shutdown grace
     period elapses."""
@@ -574,7 +771,8 @@ class TestGracefulShutdown(CustomClusterTestSuite, HS2TestSuite):
     # Make sure signal was received and the grace period and deadline are as expected.
     self.assert_impalad_log_contains('INFO',
       "Shutdown signal received. Current Shutdown Status: shutdown grace period left: "
-      "{0}s000ms, deadline left: 8760h".format(self.IDLE_SHUTDOWN_GRACE_PERIOD_S))
+      "{0}s000ms, deadline left: {1}s000ms".format(self.IDLE_SHUTDOWN_GRACE_PERIOD_S,
+        self.EXEC_SHUTDOWN_DEADLINE_S))
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(cluster_size=1)

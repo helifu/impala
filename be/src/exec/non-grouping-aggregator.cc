@@ -21,9 +21,11 @@
 
 #include "codegen/llvm-codegen.h"
 #include "exec/exec-node.h"
+#include "exec/exec-node.inline.h"
 #include "exprs/agg-fn-evaluator.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/descriptors.h"
+#include "runtime/fragment-state.h"
 #include "runtime/mem-pool.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
@@ -35,23 +37,28 @@
 
 namespace impala {
 
+NonGroupingAggregatorConfig::NonGroupingAggregatorConfig(
+    const TAggregator& taggregator, FragmentState* state, PlanNode* pnode, int agg_idx)
+  : AggregatorConfig(taggregator, state, pnode, agg_idx) {}
+
+void NonGroupingAggregatorConfig::Codegen(FragmentState* state) {
+  LlvmCodeGen* codegen = state->codegen();
+  DCHECK(codegen != nullptr);
+  TPrefetchMode::type prefetch_mode = state->query_options().prefetch_mode;
+  Status status = CodegenAddBatchImpl(codegen, prefetch_mode);
+  codegen_status_msg_ = FragmentState::GenerateCodegenMsg(status.ok(), status);
+}
+
 NonGroupingAggregator::NonGroupingAggregator(
-    ExecNode* exec_node, ObjectPool* pool, const AggregatorConfig& config, int agg_idx)
-  : Aggregator(exec_node, pool, config, Substitute("NonGroupingAggregator $0", agg_idx),
-        agg_idx) {}
+    ExecNode* exec_node, ObjectPool* pool, const NonGroupingAggregatorConfig& config)
+  : Aggregator(
+        exec_node, pool, config, Substitute("NonGroupingAggregator $0", config.agg_idx_)),
+    add_batch_impl_fn_(config.add_batch_impl_fn_) {}
 
 Status NonGroupingAggregator::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(Aggregator::Prepare(state));
   singleton_tuple_pool_.reset(new MemPool(mem_tracker_.get()));
   return Status::OK();
-}
-
-void NonGroupingAggregator::Codegen(RuntimeState* state) {
-  LlvmCodeGen* codegen = state->codegen();
-  DCHECK(codegen != nullptr);
-  TPrefetchMode::type prefetch_mode = state->query_options().prefetch_mode;
-  Status codegen_status = CodegenAddBatchImpl(codegen, prefetch_mode);
-  runtime_profile()->AddCodegenMsg(codegen_status.ok(), codegen_status);
 }
 
 Status NonGroupingAggregator::Open(RuntimeState* state) {
@@ -118,8 +125,10 @@ Status NonGroupingAggregator::AddBatch(RuntimeState* state, RowBatch* batch) {
   SCOPED_TIMER(build_timer_);
   RETURN_IF_ERROR(QueryMaintenance(state));
 
-  if (add_batch_impl_fn_ != nullptr) {
-    RETURN_IF_ERROR(add_batch_impl_fn_(this, batch));
+  NonGroupingAggregatorConfig::AddBatchImplFn add_batch_impl_fn
+      = add_batch_impl_fn_.load();
+  if (add_batch_impl_fn != nullptr) {
+    RETURN_IF_ERROR(add_batch_impl_fn(this, batch));
   } else {
     RETURN_IF_ERROR(AddBatchImpl(batch));
   }
@@ -155,7 +164,7 @@ void NonGroupingAggregator::DebugString(int indentation_level, stringstream* out
   *out << ")";
 }
 
-Status NonGroupingAggregator::CodegenAddBatchImpl(
+Status NonGroupingAggregatorConfig::CodegenAddBatchImpl(
     LlvmCodeGen* codegen, TPrefetchMode::type prefetch_mode) {
   llvm::Function* update_tuple_fn;
   RETURN_IF_ERROR(CodegenUpdateTuple(codegen, &update_tuple_fn));
@@ -174,8 +183,7 @@ Status NonGroupingAggregator::CodegenAddBatchImpl(
                   "AddBatchImpl() function failed verification, see log");
   }
 
-  void** codegened_fn_ptr = reinterpret_cast<void**>(&add_batch_impl_fn_);
-  codegen->AddFunctionToJit(add_batch_impl_fn, codegened_fn_ptr);
+  codegen->AddFunctionToJit(add_batch_impl_fn, &add_batch_impl_fn_);
   return Status::OK();
 }
 } // namespace impala

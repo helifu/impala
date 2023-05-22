@@ -17,22 +17,40 @@
 
 # Common test dimensions and associated utility functions.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import copy
 import os
 from itertools import product
 
 from tests.common.test_vector import ImpalaTestDimension, ImpalaTestVector
+from tests.util.filesystem_utils import (
+    IS_HDFS)
 
 WORKLOAD_DIR = os.environ['IMPALA_WORKLOAD_DIR']
+
+# Map from the test dimension file_format string to the SQL "STORED AS" or "STORED BY"
+# argument.
+FILE_FORMAT_TO_STORED_AS_MAP = {
+  'text': 'TEXTFILE',
+  'seq': 'SEQUENCEFILE',
+  'rc': 'RCFILE',
+  'orc': 'ORC',
+  'parquet': 'PARQUET',
+  'hudiparquet': 'HUDIPARQUET',
+  'avro': 'AVRO',
+  'hbase': "'org.apache.hadoop.hive.hbase.HBaseStorageHandler'",
+  'kudu': "KUDU",
+  'iceberg': "ICEBERG"
+}
 
 # Describes the configuration used to execute a single tests. Contains both the details
 # of what specific table format to target along with the exec options (num_nodes, etc)
 # to use when running the query.
 class TableFormatInfo(object):
-  KNOWN_FILE_FORMATS = ['text', 'seq', 'rc', 'parquet', 'orc', 'avro', 'hbase']
-  if os.environ['KUDU_IS_SUPPORTED'] == 'true':
-    KNOWN_FILE_FORMATS.append('kudu')
-  KNOWN_COMPRESSION_CODECS = ['none', 'snap', 'gzip', 'bzip', 'def', 'lzo', 'zstd', 'lz4']
+  KNOWN_FILE_FORMATS = ['text', 'seq', 'rc', 'parquet', 'orc', 'avro', 'hbase',
+                        'kudu', 'iceberg']
+  KNOWN_COMPRESSION_CODECS = ['none', 'snap', 'gzip', 'bzip', 'def', 'zstd', 'lz4']
   KNOWN_COMPRESSION_TYPES = ['none', 'block', 'record']
 
   def __init__(self, **kwargs):
@@ -44,14 +62,14 @@ class TableFormatInfo(object):
 
   def __validate(self):
     if self.file_format not in TableFormatInfo.KNOWN_FILE_FORMATS:
-      raise ValueError, 'Unknown file format: %s' % self.file_format
+      raise ValueError('Unknown file format: %s' % self.file_format)
     if self.compression_codec not in TableFormatInfo.KNOWN_COMPRESSION_CODECS:
-      raise ValueError, 'Unknown compression codec: %s' % self.compression_codec
+      raise ValueError('Unknown compression codec: %s' % self.compression_codec)
     if self.compression_type not in TableFormatInfo.KNOWN_COMPRESSION_TYPES:
-      raise ValueError, 'Unknown compression type: %s' % self.compression_type
+      raise ValueError('Unknown compression type: %s' % self.compression_type)
     if (self.compression_codec == 'none' or self.compression_type == 'none') and\
         self.compression_codec != self.compression_type:
-      raise ValueError, 'Invalid combination of compression codec/type: %s' % str(self)
+      raise ValueError('Invalid combination of compression codec/type: %s' % str(self))
 
   @staticmethod
   def create_from_string(dataset, table_format_string):
@@ -63,11 +81,11 @@ class TableFormatInfo(object):
     or 'none' if the table is uncompressed.
     """
     if table_format_string is None:
-      raise ValueError, 'Table format string cannot be None'
+      raise ValueError('Table format string cannot be None')
 
     format_parts = table_format_string.strip().split('/')
-    if len(format_parts) not in range(2, 4):
-      raise ValueError, 'Invalid table format %s' % table_format_string
+    if len(format_parts) not in list(range(2, 4)):
+      raise ValueError('Invalid table format %s' % table_format_string)
 
     file_format, compression_codec = format_parts[:2]
     if len(format_parts) == 3:
@@ -109,10 +127,21 @@ def create_parquet_dimension(workload):
       TableFormatInfo.create_from_string(dataset, 'parquet/none'))
 
 
+def create_orc_dimension(workload):
+  dataset = get_dataset_from_workload(workload)
+  return ImpalaTestDimension('table_format',
+      TableFormatInfo.create_from_string(dataset, 'orc/def'))
+
 def create_avro_snappy_dimension(workload):
   dataset = get_dataset_from_workload(workload)
   return ImpalaTestDimension('table_format',
       TableFormatInfo.create_from_string(dataset, 'avro/snap/block'))
+
+
+def create_kudu_dimension(workload):
+  dataset = get_dataset_from_workload(workload)
+  return ImpalaTestDimension('table_format',
+      TableFormatInfo.create_from_string(dataset, 'kudu/none'))
 
 
 def create_client_protocol_dimension():
@@ -123,6 +152,23 @@ def create_client_protocol_dimension():
   if not hasattr(ssl, "create_default_context"):
     return ImpalaTestDimension('protocol', 'beeswax', 'hs2')
   return ImpalaTestDimension('protocol', 'beeswax', 'hs2', 'hs2-http')
+
+
+def create_client_protocol_http_transport():
+  return ImpalaTestDimension('protocol', 'hs2-http')
+
+
+def create_client_protocol_strict_dimension():
+  # only support strict dimensions if the file system is HDFS, since that is
+  # where the hive cluster is run.
+  if IS_HDFS:
+    return ImpalaTestDimension('strict_hs2_protocol', False, True)
+  else:
+    return create_client_protocol_no_strict_dimension()
+
+
+def create_client_protocol_no_strict_dimension():
+  return ImpalaTestDimension('strict_hs2_protocol', False)
 
 
 def hs2_parquet_constraint(v):
@@ -139,6 +185,13 @@ def hs2_text_constraint(v):
   return (v.get_value('protocol') == 'beeswax' or
           v.get_value('table_format').file_format == 'text' and
           v.get_value('table_format').compression_codec == 'none')
+
+
+def orc_schema_resolution_constraint(v):
+  """ Constraint to use multiple orc_schema_resolution only in case of orc files"""
+  file_format = v.get_value('table_format').file_format
+  orc_schema_resolution = v.get_value('orc_schema_resolution')
+  return file_format == 'orc' or orc_schema_resolution == 0
 
 # Common sets of values for the exec option vectors
 ALL_BATCH_SIZES = [0]
@@ -173,7 +226,8 @@ def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
       'batch_size': batch_sizes,
       'disable_codegen': disable_codegen_options,
       'disable_codegen_rows_threshold': disable_codegen_rows_threshold_options,
-      'num_nodes': cluster_sizes}
+      'num_nodes': cluster_sizes,
+      'test_replan': [1]}
 
   if sync_ddl is not None:
     exec_option_dimensions['sync_ddl'] = sync_ddl
@@ -236,7 +290,7 @@ def load_table_info_dimension(workload_name, exploration_strategy, file_formats=
       WORKLOAD_DIR, workload_name, '%s_%s.csv' % (workload_name, exploration_strategy))
 
   if not os.path.isfile(test_vector_file):
-    raise RuntimeError, 'Vector file not found: ' + test_vector_file
+    raise RuntimeError('Vector file not found: ' + test_vector_file)
 
   vector_values = []
 
@@ -248,10 +302,6 @@ def load_table_info_dimension(workload_name, exploration_strategy, file_formats=
       # Extract each test vector and add them to a dictionary
       vals = dict((key.strip(), value.strip()) for key, value in\
           (item.split(':') for item in line.split(',')))
-
-      # Skip Kudu if Kudu is not supported (IMPALA-4287).
-      if os.environ['KUDU_IS_SUPPORTED'] != 'true' and vals['file_format'] == 'kudu':
-        continue
 
       # If only loading specific file formats skip anything that doesn't match
       if file_formats is not None and vals['file_format'] not in file_formats:

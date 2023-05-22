@@ -17,6 +17,8 @@
 
 # py.test configuration module
 #
+from __future__ import absolute_import, division, print_function
+from builtins import map, range
 from impala.dbapi import connect as impala_connect
 from kudu import connect as kudu_connect
 from random import choice, sample
@@ -26,14 +28,15 @@ import contextlib
 import logging
 import os
 import pytest
+import sys
 
 import tests.common
 from impala_py_lib.helpers import find_all_files, is_core_dump
 from tests.common.environ import build_flavor_timeout
-from common.test_result_verifier import QueryTestResult
+from tests.common.test_result_verifier import QueryTestResult
 from tests.common.patterns import is_valid_impala_identifier
 from tests.comparison.db_connection import ImpalaConnection
-from tests.util.filesystem_utils import FILESYSTEM, ISILON_WEBHDFS_PORT
+from tests.util.filesystem_utils import FILESYSTEM, ISILON_WEBHDFS_PORT, WAREHOUSE
 
 LOG = logging.getLogger('test_configuration')
 LOG_FORMAT = "-- %(asctime)s %(levelname)-8s %(threadName)s: %(message)s"
@@ -44,6 +47,8 @@ DEFAULT_HDFS_XML_CONF = os.path.join(os.environ['HADOOP_CONF_DIR'], "hdfs-site.x
 DEFAULT_HIVE_SERVER2 = 'localhost:11050'
 DEFAULT_IMPALAD_HS2_PORT = '21050'
 DEFAULT_IMPALAD_HS2_HTTP_PORT = '28000'
+DEFAULT_STRICT_HS2_PORT = '11050'
+DEFAULT_STRICT_HS2_HTTP_PORT = '10001'
 DEFAULT_IMPALADS = "localhost:21000,localhost:21001,localhost:21002"
 DEFAULT_KUDU_MASTER_HOSTS = os.getenv('KUDU_MASTER_HOSTS', '127.0.0.1')
 DEFAULT_KUDU_MASTER_PORT = os.getenv('KUDU_MASTER_PORT', '7051')
@@ -67,7 +72,16 @@ def configure_logging():
   # Use a "--" since most of our tests output SQL commands, and it's nice to
   # be able to copy-paste directly from the test output back into a shell to
   # try to reproduce a failure.
+  #
+  # This call only takes effect if it is the first call to logging.basicConfig().
+  # For example, if some other library calls logging.basicConfig() at the global
+  # level, then importing that library can render this call ineffective.
   logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+
+  # Verify that the logging level is set to the correct value.
+  rootLoggerLevel = logging.getLogger().getEffectiveLevel()
+  print("rootLoggerLevel = {0}".format(logging.getLevelName(rootLoggerLevel)))
+  assert(rootLoggerLevel == logging.INFO)
 
 
 def pytest_addoption(parser):
@@ -90,6 +104,12 @@ def pytest_addoption(parser):
 
   parser.addoption("--impalad_hs2_http_port", default=DEFAULT_IMPALAD_HS2_HTTP_PORT,
                    help="The impalad HiveServer2 HTTP port.")
+
+  parser.addoption("--strict_hs2_port", default=DEFAULT_STRICT_HS2_PORT,
+                   help="The strict HiveServer2 port (directly to hs2).")
+
+  parser.addoption("--strict_hs2_http_port", default=DEFAULT_STRICT_HS2_HTTP_PORT,
+                   help="The strict HiveServer2 HTTP port (directly to hs2).")
 
   parser.addoption("--metastore_server", default=DEFAULT_METASTORE_SERVER,
                    help="The Hive Metastore server host:port to connect to.")
@@ -147,6 +167,14 @@ def pytest_addoption(parser):
                    help="If set to N/M (e.g., 3/5), will split the tests into "
                    "M partitions and run the Nth partition. 1-indexed.")
 
+  parser.addoption("--shell_executable", default=None,
+                   help="Full path to the impala-shell executable. Useful for running"
+                   "shell/ e2e tests against a version of the impala-shell that has been "
+                   "installed as a python package in a separate virtualenv. The python "
+                   "version in the target virtualenv does not need to the match the "
+                   "version used to execute the tests. "
+                   "(See $IMPALA_HOME/bin/set-pythonpath.sh.)")
+
 
 def pytest_assertrepr_compare(op, left, right):
   """
@@ -202,9 +230,9 @@ def pytest_generate_tests(metafunc):
 
     if len(vectors) == 0:
       LOG.warning("No test vectors generated for test '%s'. Check constraints and "
-          "input vectors" % metafunc.function.func_name)
+          "input vectors" % metafunc.function.__name__)
 
-    vector_names = map(str, vectors)
+    vector_names = list(map(str, vectors))
     # In the case this is a test result update or sanity run, select a single test vector
     # to run. This is okay for update_results because results are expected to be the same
     # for all test vectors.
@@ -332,22 +360,31 @@ def unique_database(request, testid_checksum):
                        ' test function name or any prefixes for long length or invalid '
                        'characters.'.format(db_name))
 
+  def cleanup_database(db_name, must_exist):
+    request.instance.execute_query_expect_success(request.instance.client,
+        'DROP DATABASE {0} `{1}` CASCADE'.format(
+            "" if must_exist else "IF EXISTS", db_name),
+        {'sync_ddl': sync_ddl})
+    # The database directory may not be removed if there are external tables in the
+    # database when it is dropped. The external locations are not removed by cascade.
+    # These preexisting files/directories can cause errors when tests run repeatedly or
+    # use a data snapshot (see IMPALA-9702), so this forces cleanup of the database
+    # directory.
+    db_location = "{0}/{1}.db".format(WAREHOUSE, db_name).lstrip('/')
+    request.instance.filesystem_client.delete_file_dir(db_location, recursive=True)
+
   def cleanup():
     # Make sure we don't try to drop the current session database
     request.instance.execute_query_expect_success(request.instance.client, "use default")
     for db_name in db_names:
-      request.instance.execute_query_expect_success(
-          request.instance.client, 'DROP DATABASE `{0}` CASCADE'.format(db_name),
-          {'sync_ddl': sync_ddl})
+      cleanup_database(db_name, True)
       LOG.info('Dropped database "{0}" for test ID "{1}"'.format(
           db_name, str(request.node.nodeid)))
 
   request.addfinalizer(cleanup)
 
   for db_name in db_names:
-    request.instance.execute_query_expect_success(
-        request.instance.client, 'DROP DATABASE IF EXISTS `{0}` CASCADE'.format(db_name),
-        {'sync_ddl': sync_ddl})
+    cleanup_database(db_name, False)
     request.instance.execute_query_expect_success(
         request.instance.client, 'CREATE DATABASE `{0}`'.format(db_name),
         {'sync_ddl': sync_ddl})
@@ -609,6 +646,15 @@ def cluster_properties():
   yield cluster_properties
 
 
+@pytest.fixture(autouse=True, scope='session')
+def validate_python_version():
+  """Check the Python runtime version before running any tests. Since Impala switched
+     to the toolchain Python, which is at least v2.7, the tests will not run on a version
+     below that.
+  """
+  assert sys.version_info > (2, 7), "Tests only support Python 2.7+"
+
+
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(items, config, session):
   """Hook to handle --shard_tests command line option.
@@ -620,7 +666,7 @@ def pytest_collection_modifyitems(items, config, session):
     return
 
   num_items = len(items)
-  this_shard, num_shards = map(int, config.option.shard_tests.split("/"))
+  this_shard, num_shards = list(map(int, config.option.shard_tests.split("/")))
   assert 0 <= this_shard <= num_shards
   if this_shard == num_shards:
     this_shard = 0

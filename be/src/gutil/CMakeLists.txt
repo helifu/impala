@@ -18,7 +18,6 @@
 INCLUDE_DIRECTORIES(${GLOG_INCLUDE_DIR})
 
 set(GUTIL_SRCS
-  atomicops-internals-x86.cc
   bits.cc
   callback_internal.cc
   cpu.cc
@@ -54,6 +53,12 @@ set(GUTIL_SRCS
   utf/rune.c
   walltime.cc)
 
+if (NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+set(GUTIL_SRCS
+  atomicops-internals-x86.cc
+  ${GUTIL_SRCS})
+endif()
+
 set(GUTIL_LIBS
   glog
   protobuf)
@@ -75,5 +80,5 @@ add_kudu_test(strings/string_util-test)
 add_library(GUtilTests STATIC
   sysinfo-test.cc
 )
-add_dependencies(GUtilTests gen-deps gen_ir_descriptions)
+add_dependencies(GUtilTests gen-deps)
 ADD_UNIFIED_BE_LSAN_TEST(sysinfo-test "SysInfoTest.*")

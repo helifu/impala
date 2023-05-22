@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 
+#include "exec/hdfs-table-writer.h"
 #include "exec/parquet/parquet-common.h"
 #include "runtime/date-value.h"
 #include "runtime/decimal-value.h"
@@ -111,6 +112,11 @@ class ColumnStatsBase {
 
   /// Encodes the current values into a Statistics thrift message.
   virtual void EncodeToThrift(parquet::Statistics* out) const = 0;
+
+  /// Writes the current values into IcebergColumnStats struct.
+  /// Min and max stats are Single-value serialized.
+  virtual void GetIcebergStats(int64_t column_size, int64_t value_count,
+                               IcebergColumnStats* out) const = 0;
 
   /// Resets the state of this object.
   void Reset();
@@ -203,6 +209,9 @@ class ColumnStats : public ColumnStatsBase {
   virtual int64_t BytesNeeded() const override;
   virtual void EncodeToThrift(parquet::Statistics* out) const override;
 
+  virtual void GetIcebergStats(int64_t column_size, int64_t value_count,
+      IcebergColumnStats* out) const override;
+
   /// Decodes the plain encoded stats value from 'buffer' and writes the result into the
   /// buffer pointed to by 'slot'. Returns true if decoding was successful, false
   /// otherwise. For timestamps and dates an additional validation will be performed.
@@ -210,10 +219,17 @@ class ColumnStats : public ColumnStatsBase {
       parquet::Type::type parquet_type);
 
  protected:
+  /// For BE tests.
+  FRIEND_TEST(SerializeSingleValueTest, Decimal);
+
   /// Encodes a single value using parquet's plain encoding and stores it into the binary
   /// string 'out'. String values are stored without additional encoding. 'bytes_needed'
   /// must be positive.
   static void EncodePlainValue(const T& v, int64_t bytes_needed, std::string* out);
+
+  /// Single-value serialize value 'v'.
+  /// https://iceberg.apache.org/spec/#appendix-d-single-value-serialization
+  static void SerializeIcebergSingleValue(const T& v, std::string* out);
 
   /// Returns the number of bytes needed to encode value 'v'.
   int64_t BytesNeeded(const T& v) const;
@@ -252,8 +268,9 @@ public:
   /// the minimum or maximum value.
   enum class StatsField { MIN, MAX };
 
-  ColumnStatsReader(const parquet::ColumnChunk& col_chunk,  const ColumnType& col_type,
-      const parquet::ColumnOrder* col_order, const parquet::SchemaElement& element)
+  ColumnStatsReader(const parquet::ColumnChunk& col_chunk,
+      const ColumnType& col_type, const parquet::ColumnOrder* col_order,
+      const parquet::SchemaElement& element)
   : col_chunk_(col_chunk),
     col_type_(col_type),
     col_order_(col_order),
@@ -270,14 +287,62 @@ public:
   /// was successful, false otherwise.
   bool ReadFromThrift(StatsField stats_field, void* slot) const;
 
+  /// Call the above ReadFromThrift() for both the MIN and MAX stats. Return true if
+  /// both stats are read successfully, false otherwise.
+  bool ReadMinMaxFromThrift(void* min_slot, void* max_slot) const;
+
   /// Read plain encoded value from a string 'encoded_value' into 'slot'.
+  /// Set paired_stats_value as nullptr if there is no corresponding paired stats,
+  /// or paired stats value is not set.
   bool ReadFromString(StatsField stats_field, const std::string& encoded_value,
+      const std::string* paired_stats_value,
       void* slot) const;
+
+  /// Batch read encoded values from a range ['start_idx', 'end_idx'] in
+  /// vector<string> 'encoded_value' into 'slots'.
+  ///
+  /// Return 'true' when all values in the range are decoded successfully, 'false'
+  /// otherwise.
+  bool ReadFromStringsBatch(StatsField stats_field,
+      const vector<std::string>& encoded_values, int64_t start_index,
+      int64_t end_idx, int fixed_len_size, void* slots) const;
+
+  /// Batch decode routine that reads from a vector of std::string 'source' and decodes
+  /// each value in the vector into a value of Impala type 'InternalType'.
+  ///
+  /// Return the number of decoded values from 'source' or -1 if there was an error
+  /// decoding (e.g. invalid data) or invalid specification of the range.
+  ///
+  /// This routine breaks 'source' into batches of 8 elements and unrolls each batch.
+  ///
+  /// For each string value, this routine calls
+  /// ColumnStats<InternalType>::DecodePlainValue() which in turn calls
+  /// ParquetPlainEncoder::DecodeByParquetType() that switches on Parquet type.
+  template <typename InternalType>
+  int64_t DecodeBatchOneBoundsCheck(const vector<std::string>& source, int64_t start_idx,
+      int64_t end_idx, int fixed_len_size, InternalType* v,
+      parquet::Type::type PARQUET_TYPE) const;
+
+  /// A fast track version of the above batch decode routine DecodeBatchOneBoundsCheck().
+  ///
+  /// For each string value, this routine calls ParquetPlainEncoder::DecodeNoBoundsCheck()
+  /// that simply memcpy out the value. This version is used when the Impala internal type
+  /// and the Parquet type are identical.
+  template <typename InternalType>
+  int64_t DecodeBatchOneBoundsCheckFastTrack(const vector<std::string>& source,
+      int64_t start_idx, int64_t end_idx, int fixed_len_size, InternalType* v) const;
 
   // Gets the null_count statistics from the column chunk's metadata and returns
   // it via an output parameter.
   // Returns true if the null_count stats were read successfully, false otherwise.
   bool ReadNullCountStat(int64_t* null_count) const;
+
+  /// Gets the null_count and num_values statistics from the column chunk's metadata
+  /// and decide whether all values are nulls.
+  /// Returns true if the stats were read successfully and 'all_nulls' is set to
+  /// null_count being equal to num_values. Return false if stats can not be read. In
+  /// the latter case, 'all_nulls' is not altered.
+  bool AllNulls(bool* all_nulls) const;
 
   /// Returns the required stats field for the given function. 'fn_name' can be 'le',
   /// 'lt', 'ge', and 'gt' (i.e. binary operators <=, <, >=, >). If we want to check that
@@ -298,6 +363,10 @@ private:
   /// 'max' in parquet::Statistics to be correct for the type 'col_type_' and the column
   /// order 'col_order_'. Otherwise, returns false.
   bool CanUseDeprecatedStats() const;
+
+  /// Decodes decimal value into slot. Does conversion if needed.
+  template <typename DecimalType>
+  bool DecodeDecimal(const std::string& stat_value, DecimalType* slot) const;
 
   /// Decodes 'stat_value' and does INT64->TimestampValue and timezone conversions if
   /// necessary. Returns true if the decoding and conversions were successful.

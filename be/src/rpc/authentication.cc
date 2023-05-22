@@ -29,7 +29,9 @@
 #include <gutil/strings/split.h>
 #include <gutil/strings/strip.h>
 #include <gutil/strings/substitute.h>
-#include <random>
+#include <algorithm>
+#include <map>
+#include <vector>
 #include <string>
 #include <vector>
 #include <thrift/Thrift.h>
@@ -39,19 +41,24 @@
 
 #include <ldap.h>
 
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/security/gssapi.h"
 #include "kudu/security/init.h"
+#include "kudu/util/openssl_util.h"
 #include "rpc/auth-provider.h"
-#include "rpc/cookie-util.h"
+#include "rpc/authentication-util.h"
 #include "rpc/thrift-server.h"
+#include "runtime/exec-env.h"
+#include "service/frontend.h"
 #include "transport/THttpServer.h"
 #include "transport/TSaslClientTransport.h"
 #include "util/auth-util.h"
 #include "util/coding-util.h"
 #include "util/debug-util.h"
 #include "util/error-util.h"
+#include "util/jwt-util.h"
+#include "util/ldap-util.h"
 #include "util/network-util.h"
 #include "util/os-util.h"
 #include "util/promise.h"
@@ -64,7 +71,6 @@
 #include "common/names.h"
 
 using boost::algorithm::is_any_of;
-using boost::algorithm::replace_all;
 using boost::algorithm::split;
 using boost::algorithm::trim;
 using boost::mt19937;
@@ -74,46 +80,133 @@ using namespace apache::thrift::transport;
 using namespace boost::filesystem;   // for is_regular(), is_absolute()
 using namespace strings;
 
+DECLARE_bool(skip_external_kerberos_auth);
+DECLARE_bool(skip_internal_kerberos_auth);
 DECLARE_string(keytab_file);
 DECLARE_string(principal);
 DECLARE_string(be_principal);
 DECLARE_string(krb5_ccname);
 DECLARE_string(krb5_conf);
 DECLARE_string(krb5_debug_file);
+DECLARE_int32(external_fe_port);
 
 // Defined in kudu/security/init.cc
 DECLARE_bool(use_system_auth_to_local);
 
 DECLARE_int64(max_cookie_lifetime_s);
 
+DECLARE_int32(hs2_http_port);
+
 DEFINE_string(sasl_path, "", "Colon separated list of paths to look for SASL "
     "security library plugins.");
 DEFINE_bool(enable_ldap_auth, false,
     "If true, use LDAP authentication for client connections");
-
-DEFINE_string(ldap_uri, "", "The URI of the LDAP server to authenticate users against");
-DEFINE_bool(ldap_tls, false, "If true, use the secure TLS protocol to connect to the LDAP"
-    " server");
 DEFINE_string(ldap_ca_certificate, "", "The full path to the certificate file used to"
     " authenticate the LDAP server's certificate for SSL / TLS connections.");
-DEFINE_bool(ldap_passwords_in_clear_ok, false, "If set, will allow LDAP passwords "
-    "to be sent in the clear (without TLS/SSL) over the network.  This option should not "
-    "be used in production environments" );
-DEFINE_bool(ldap_allow_anonymous_binds, false, "(Advanced) If true, LDAP authentication "
-    "with a blank password (an 'anonymous bind') is allowed by Impala.");
-DEFINE_bool(ldap_manual_config, false, "Obsolete; Ignored");
-DEFINE_string(ldap_domain, "", "If set, Impala will try to bind to LDAP with a name of "
-    "the form <userid>@<ldap_domain>");
-DEFINE_string(ldap_baseDN, "", "If set, Impala will try to bind to LDAP with a name of "
-    "the form uid=<userid>,<ldap_baseDN>");
-DEFINE_string(ldap_bind_pattern, "", "If set, Impala will try to bind to LDAP with a name"
-     " of <ldap_bind_pattern>, but where the string #UID is replaced by the user ID. Use"
-     " to control the bind name precisely; do not set --ldap_domain or --ldap_baseDN with"
-     " this option");
+DEFINE_string(ldap_user_filter, "", "Used as filter for both simple and search "
+    "bind mechanisms. For simple bind it is a comma separated list of user names. If "
+    "specified, users must be on this list for authentication to succeed. For search "
+    "bind it is an LDAP filter that will be used during LDAP search, it can contain "
+    "'{0}' pattern which will be replaced with the user name.");
+DEFINE_string(ldap_group_filter, "", "Used as filter for both simple and search "
+    "bind mechanisms. For simple bind it is a comma separated list of groups. If "
+    "specified, users must belong to one of these groups for authentication to succeed. "
+    "For search bind it is an LDAP filter that will be used during LDAP group search, it "
+    "can contain '{0}' pattern which will be replaced with the user name and/or '{1}' "
+    "which will be replace with the user dn.");
+
 DEFINE_string(internal_principals_whitelist, "hdfs", "(Advanced) Comma-separated list of "
     " additional usernames authorized to access Impala's internal APIs. Defaults to "
     "'hdfs' which is the system user that in certain deployments must access "
     "catalog server APIs.");
+
+DEFINE_string(trusted_domain, "",
+    "If set, Impala will skip authentication for connections originating from this "
+    "domain. Currently, only connections over HTTP support this. Note: It still requires "
+    "the client to specify a username via the Basic Authorization header in the format "
+    "<username>:<password> where the password is not used and can be left blank.");
+
+DEFINE_bool(trusted_domain_use_xff_header, false,
+    "If set to true, this uses the 'X-Forwarded-For' HTML header to check for origin "
+    "while attempting to verify if the connection request originated from a trusted "
+    "domain. Only used if '--trusted_domain' is specified. Warning: Only use this if you "
+    "trust the incoming connection to have this set correctly.");
+
+DEFINE_bool(trusted_domain_strict_localhost, true,
+    "If set to true and trusted_domain='localhost', this will not use reverse DNS to "
+    "determine if something is from localhost. It will only match 127.0.0.1. This is "
+    "important for security, because reverse DNS can resolve other non-local addresses "
+    "to localhost.");
+
+// This flag must be used with caution to avoid security risks.
+DEFINE_string(trusted_auth_header, "",
+    "If set as non empty string, Impala will look for this header in the HTTP headers. "
+    "If the header is present, Impala will skip authentication and extract the username "
+    "directly from the authorization header. Currently, only connections over HTTP "
+    "support this. Note: It still requires the client to specify a username via the "
+    "Basic Authorization header in the format <username>:<password> where the password "
+    "is not used and can be left blank. Warning: Only use this flag if the connections "
+    "are authenticated before the requests land on Impala so that Impala can avoid the "
+    "authentication again. The system must remove the trusted HTTP headers from any "
+    "requests that come from outside the system.");
+
+DEFINE_bool_hidden(saml2_allow_without_tls_debug_only, false,
+    "When this configuration is set to true, Impala allows SAML2 authentication "
+    "on unsecure channel. This should be only enabled for development / testing.");
+
+DECLARE_string(saml2_sp_callback_url);
+
+// If set, Impala support for trusting an authentication based on JWT token in the HTTP
+// header.
+DEFINE_bool(jwt_token_auth, false,
+    "When true, read the JWT token out of the HTTP Header and extract user name from "
+    "the token payload.");
+// The last segment of a JWT is the signature, which is used to verify that the token was
+// signed by the sender and not altered in any way. By default, it's required to validate
+// the signature of the JWT tokens. Otherwise it may expose security issue.
+DEFINE_bool(jwt_validate_signature, true,
+    "When true, validate the signature of JWT token with pre-installed JWKS.");
+// JWKS consists the public keys used by the signing party to the clients that need to
+// validate signatures. It represents cryptographic keys in JSON data structure.
+DEFINE_string(jwks_file_path, "",
+    "File path of the pre-installed JSON Web Key Set (JWKS) for JWT verification");
+// This specifies the URL for JWKS to be downloaded.
+DEFINE_string(jwks_url, "", "URL of the JSON Web Key Set (JWKS) for JWT verification");
+// Enables retrieving the JWKS URL without verifying the presented TLS certificate
+// from the server.
+DEFINE_bool(jwks_verify_server_certificate, true,
+    "Specifies if the TLS certificate of the JWKS server is verified when retrieving "
+    "the JWKS from the specified JWKS URL.  A certificate is considered valid if a "
+    "trust chain can be established for it, and if the certificate has a common name or "
+    "SAN that matches the server's hostname. This should only be set to false for "
+    "development / testing.");
+// Enables defining a custom pem bundle file containing root certificates to trust.
+DEFINE_string(jwks_ca_certificate, "", "File path of a pem bundle of root ca "
+    "certificates that will be trusted when retrieving the JWKS from the "
+    "specified JWKS URL.");
+DEFINE_int32(jwks_update_frequency_s, 60,
+    "(Advanced) The time in seconds to wait between downloading JWKS from the specified "
+    "URL.");
+DEFINE_int32(jwks_pulling_timeout_s, 10,
+    "(Advanced) The time in seconds for connection timed out when pulling JWKS from the "
+    "specified URL.");
+// This specifies the custom claim in the JWT that contains the "username" for the
+// session.
+DEFINE_string(jwt_custom_claim_username, "username", "Custom claim 'username'");
+// If set, Impala allows JWT authentication on unsecure channel.
+// JWT is only secure when used with TLS. But in some deployment scenarios, TLS is handled
+// by proxy so that it does not show up as TLS to Impala.
+DEFINE_bool_hidden(jwt_allow_without_tls, false,
+    "When this configuration is set to true, Impala allows JWT authentication on "
+    "unsecure channel. This should be only enabled for testing, or development for which "
+    "TLS is handled by proxy.");
+DEFINE_bool(enable_group_filter_check_for_authenticated_kerberos_user, false,
+    "If this configuration is set to true, Impala checks the provided "
+    "LDAP group filter, if any, with the authenticated Kerberos user. "
+    "This should be only enabled if both Kerberos and LDAP authentication are enabled "
+    "and the users in KDC and LDAP are synchronized (e.g. when the KDC and the LDAP "
+    "is the same Active Directory server). "
+    "The default value is false, which provides backwards-compatible behavior.");
 
 namespace impala {
 
@@ -141,10 +234,6 @@ static string APP_NAME;
 // Constants for the two Sasl mechanisms we support
 static const string KERBEROS_MECHANISM = "GSSAPI";
 static const string PLAIN_MECHANISM = "PLAIN";
-
-// Required prefixes for ldap URIs:
-static const string LDAP_URI_PREFIX = "ldap://";
-static const string LDAPS_URI_PREFIX = "ldaps://";
 
 // We implement an "auxprop" plugin for the Sasl layer in order to have a hook in which
 // to log messages about the start of authentication. This is that plugin's name.
@@ -192,91 +281,38 @@ static int SaslLogCallback(void* context, int level, const char* message) {
   return SASL_OK;
 }
 
-// This callback is only called when we're providing LDAP authentication. This "check
-// pass" callback is our hook to ask the real LDAP server if we're allowed to log in or
-// not. We can be thought of as a proxy for LDAP logins - the user gives their password
-// to us, and we pass it to the real LDAP server.
-//
-// Note that this method uses ldap_sasl_bind_s(), which does *not* provide any security
-// to the connection between Impala and the LDAP server. You must either set --ldap_tls,
-// or have a URI which has "ldaps://" as the scheme in order to get a secure connection.
-// Use --ldap_ca_certificate to specify the location of the certificate used to confirm
-// the authenticity of the LDAP server certificate.
-//
-// user: The username to authenticate
-// pass: The password to use
-// passlen: The length of pass
-// Return: true on success, false otherwise
-static bool LdapCheckPass(const char* user, const char* pass, unsigned passlen) {
-  if (passlen == 0 && !FLAGS_ldap_allow_anonymous_binds) {
-    // Disable anonymous binds.
-    return false;
+// Calls into the LDAP utils to check the provided group filters
+bool DoLdapCheckFilters(const char* user) {
+  ImpalaLdap* ldap = AuthManager::GetInstance()->GetLdap();
+  ImpalaServer* server = ExecEnv::GetInstance()->impala_server();
+  if (server == nullptr) {
+    LOG(FATAL) << "Invalid config: SASL LDAP is only supported for client connections "
+               << "to an impalad.";
   }
-
-  LDAP* ld;
-  int rc = ldap_initialize(&ld, FLAGS_ldap_uri.c_str());
-  if (rc != LDAP_SUCCESS) {
-    LOG(WARNING) << "Could not initialize connection with LDAP server ("
-                 << FLAGS_ldap_uri << "). Error: " << ldap_err2string(rc);
-    return false;
+  // If the user is an authorized proxy user, we do not yet know the effective user as
+  // it may be set by 'impala.doas.user', in which case we defer checking LDAP filters
+  // until OpenSession(). Otherwise, we prefer to check the filters as easly as
+  // possible, so check them here.
+  if (server->IsAuthorizedProxyUser(user)) {
+    return true;
   }
-
-  // Force the LDAP version to 3 to make sure TLS is supported.
-  int ldap_ver = 3;
-  ldap_set_option(ld, LDAP_OPT_PROTOCOL_VERSION, &ldap_ver);
-
-  // If -ldap_tls is turned on, and the URI is ldap://, issue a STARTTLS operation.
-  // Note that we'll ignore -ldap_tls when using ldaps:// because we've already
-  // got a secure connection (and the LDAP server will reject the STARTTLS).
-  if (FLAGS_ldap_tls && (FLAGS_ldap_uri.find(LDAP_URI_PREFIX) == 0)) {
-    int tls_rc = ldap_start_tls_s(ld, NULL, NULL);
-    if (tls_rc != LDAP_SUCCESS) {
-      LOG(WARNING) << "Could not start TLS secure connection to LDAP server ("
-                   << FLAGS_ldap_uri << "). Error: " << ldap_err2string(tls_rc);
-      ldap_unbind_ext(ld, NULL, NULL);
-      return false;
-    }
-    VLOG(2) << "Started TLS connection with LDAP server: " << FLAGS_ldap_uri;
-  }
-
-  // Map the user string into an acceptable LDAP "DN" (distinguished name)
-  string user_str = user;
-  if (!FLAGS_ldap_domain.empty()) {
-    // Append @domain if there isn't already an @ in the user string.
-    if (user_str.find("@") == string::npos) {
-      user_str = Substitute("$0@$1", user_str, FLAGS_ldap_domain);
-    }
-  } else if (!FLAGS_ldap_baseDN.empty()) {
-    user_str = Substitute("uid=$0,$1", user_str, FLAGS_ldap_baseDN);
-  } else if (!FLAGS_ldap_bind_pattern.empty()) {
-    user_str = FLAGS_ldap_bind_pattern;
-    replace_all(user_str, "#UID", user);
-  }
-
-  // Map the password into a credentials structure
-  struct berval cred;
-  cred.bv_val = const_cast<char*>(pass);
-  cred.bv_len = passlen;
-
-  VLOG_QUERY << "Trying simple LDAP bind for: " << user_str;
-
-  rc = ldap_sasl_bind_s(ld, user_str.c_str(), LDAP_SASL_SIMPLE, &cred,
-      NULL, NULL, NULL);
-  // Free ld
-  ldap_unbind_ext(ld, NULL, NULL);
-  if (rc != LDAP_SUCCESS) {
-    LOG(WARNING) << "LDAP authentication failure for " << user_str
-                 << " : " << ldap_err2string(rc);
-    return false;
-  }
-
-  VLOG_QUERY << "LDAP bind successful";
-
-  return true;
+  return ldap->LdapCheckFilters(user);
 }
 
-// Wrapper around the function we use to check passwords with LDAP which converts the
-// return value to something appropriate for SASL.
+// Calls into the LDAP utils to check the provided user/pass,
+// and the provided group filters.
+bool DoLdapCheck(const char* user, const char* pass, unsigned passlen) {
+  ImpalaLdap* ldap = AuthManager::GetInstance()->GetLdap();
+  bool success = ldap->LdapCheckPass(user, pass, passlen);
+  if (!success) {
+    return false;
+  }
+
+  return DoLdapCheckFilters(user);
+}
+
+// Wrapper around the function we use to check passwords with LDAP which has the function
+// signature required to work with SASL.
 //
 // conn: The Sasl connection struct, which we ignore
 // context: Ignored; always NULL
@@ -287,7 +323,7 @@ static bool LdapCheckPass(const char* user, const char* pass, unsigned passlen) 
 // Return: SASL_OK on success, SASL_FAIL otherwise
 int SaslLdapCheckPass(sasl_conn_t* conn, void* context, const char* user,
     const char* pass, unsigned passlen, struct propctx* propctx) {
-  return LdapCheckPass(user, pass, passlen) ? SASL_OK : SASL_FAIL;
+  return DoLdapCheck(user, pass, passlen) ? SASL_OK : SASL_FAIL;
 }
 
 // Sasl wants a way to ask us about some options, this function provides
@@ -464,8 +500,66 @@ int SaslAuthorizeInternal(sasl_conn_t* conn, void* context,
   return SASL_BADAUTH;
 }
 
+// Takes a Kerberos principal (either user/hostname@realm or user@realm)
+// and returns the username part.
+string GetShortUsernameFromKerberosPrincipal(const string& principal) {
+  size_t end_idx = min(principal.find("/"), principal.find("@"));
+  string short_user(
+      end_idx == string::npos || end_idx == 0 ?
+      principal : principal.substr(0, end_idx));
+  return short_user;
+}
+
+// If Kerberos and LDAP authentications are enabled and
+// enable_group_filter_check_for_authenticated_kerberos_user flag is set,
+// then this callback checks if the authenticated user passes LDAP group
+// filters.
+//
+// conn: Sasl connection - Ignored
+// context: Ignored, always NULL
+// requested_user: The identity/username to authorize
+// rlen: Length of above
+// auth_identity: "The identity associated with the secret"
+// alen: Length of above
+// def_realm: Default user realm
+// urlen: Length of above
+// propctx: Auxiliary properties - Ignored
+// Return: SASL_OK
+static int SaslKerberosAuthorizeExternal(sasl_conn_t* conn, void* context,
+    const char* requested_user, unsigned rlen,
+    const char* auth_identity, unsigned alen,
+    const char* def_realm, unsigned urlen,
+    struct propctx* propctx) {
+  if (FLAGS_enable_ldap_auth &&
+      FLAGS_enable_group_filter_check_for_authenticated_kerberos_user) {
+    DCHECK(IsKerberosEnabled());
+
+    string username = string(requested_user, rlen);
+    string short_user =
+        GetShortUsernameFromKerberosPrincipal(username);
+
+    LOG(INFO) << "Checking LDAP group filters for "
+              << "username \"" << short_user << "\" "
+              << "parsed from user principal \""
+              << username << "\".";
+
+    bool success = DoLdapCheckFilters(short_user.c_str());
+    if (!success) {
+      LOG(WARNING) << "Got authenticated principal but the "
+                   << "user \"" << short_user << "\" "
+                   << "didn't pass the group filters.";
+      return SASL_BADAUTH;
+    }
+  }
+
+  LOG(INFO) << "Successfully authenticated client user \""
+            << string(requested_user, rlen) << "\"";
+  return SASL_OK;
+}
+
 // This callback could be used to authorize or restrict access to certain
-// users.  Currently it is used to log a message that we successfully
+// users when authenticating with LDAP.
+// Currently it is used to log a message that we successfully
 // authenticated with a user on an external connection.
 //
 // conn: Sasl connection - Ignored
@@ -478,7 +572,7 @@ int SaslAuthorizeInternal(sasl_conn_t* conn, void* context,
 // urlen: Length of above
 // propctx: Auxiliary properties - Ignored
 // Return: SASL_OK
-static int SaslAuthorizeExternal(sasl_conn_t* conn, void* context,
+static int SaslLdapAuthorizeExternal(sasl_conn_t* conn, void* context,
     const char* requested_user, unsigned rlen,
     const char* auth_identity, unsigned alen,
     const char* def_realm, unsigned urlen,
@@ -520,29 +614,60 @@ bool CookieAuth(ThriftServer::ConnectionContext* connection_context,
   return false;
 }
 
+bool GetUsernameFromBasicAuthHeader(
+    ThriftServer::ConnectionContext* connection_context, string& auth_header) {
+  string stripped_basic_auth_token;
+  StripWhiteSpace(&auth_header);
+  bool got_basic_auth =
+      TryStripPrefixString(auth_header, "Basic ", &stripped_basic_auth_token);
+  string basic_auth_token = got_basic_auth ? move(stripped_basic_auth_token) : "";
+  string username, password;
+  Status status = BasicAuthExtractCredentials(basic_auth_token, username, password);
+  if (!status.ok()) {
+    LOG(ERROR) << "Error parsing basic authentication token from: "
+               << TNetworkAddressToString(connection_context->network_address)
+               << " Error: " << status;
+    return false;
+  }
+  connection_context->username = username;
+  return true;
+}
+
+bool TrustedDomainCheck(ThriftServer::ConnectionContext* connection_context,
+    const AuthenticationHash& hash, const std::string& origin, string auth_header) {
+  if (!IsTrustedDomain(origin, FLAGS_trusted_domain,
+          FLAGS_trusted_domain_strict_localhost)) {
+    return false;
+  }
+
+  if (!GetUsernameFromBasicAuthHeader(connection_context, auth_header)) return false;
+  // Create a cookie to return.
+  connection_context->return_headers.push_back(
+      Substitute("Set-Cookie: $0", GenerateCookie(connection_context->username, hash)));
+  return true;
+}
+
+bool HandleTrustedAuthHeader(ThriftServer::ConnectionContext* connection_context,
+    const AuthenticationHash& hash, string auth_header) {
+  if (!GetUsernameFromBasicAuthHeader(connection_context, auth_header)) return false;
+  // Create a cookie to return.
+  connection_context->return_headers.push_back(
+      Substitute("Set-Cookie: $0", GenerateCookie(connection_context->username, hash)));
+  return true;
+}
+
 bool BasicAuth(ThriftServer::ConnectionContext* connection_context,
-    const AuthenticationHash& hash, const std::string& base64) {
-  if (base64.empty()) {
+    const AuthenticationHash& hash, const string& base64) {
+  string username, password;
+  Status status = BasicAuthExtractCredentials(base64, username, password);
+  if (!status.ok()) {
+    LOG(ERROR) << "Error parsing basic authentication token from: "
+               << TNetworkAddressToString(connection_context->network_address)
+               << " Error: " << status;
     connection_context->return_headers.push_back("WWW-Authenticate: Basic");
     return false;
   }
-  string decoded;
-  if (!Base64Unescape(base64, &decoded)) {
-    LOG(ERROR) << "Failed to decode base64 auth string from: "
-               << TNetworkAddressToString(connection_context->network_address);
-    connection_context->return_headers.push_back("WWW-Authenticate: Basic");
-    return false;
-  }
-  std::size_t colon = decoded.find(':');
-  if (colon == std::string::npos) {
-    LOG(ERROR) << "Auth string must be in the form '<username>:<password>' from: "
-               << TNetworkAddressToString(connection_context->network_address);
-    connection_context->return_headers.push_back("WWW-Authenticate: Basic");
-    return false;
-  }
-  string username = decoded.substr(0, colon);
-  string password = decoded.substr(colon + 1);
-  bool ret = LdapCheckPass(username.c_str(), password.c_str(), password.length());
+  bool ret = DoLdapCheck(username.c_str(), password.c_str(), password.length());
   if (ret) {
     // Authenication was successful, so set the username on the connection.
     connection_context->username = username;
@@ -553,6 +678,41 @@ bool BasicAuth(ThriftServer::ConnectionContext* connection_context,
   }
   connection_context->return_headers.push_back("WWW-Authenticate: Basic");
   return false;
+}
+
+bool JWTTokenAuth(ThriftServer::ConnectionContext* connection_context,
+    const AuthenticationHash& hash, const string& token) {
+  JWTHelper::UniqueJWTDecodedToken decoded_token;
+  Status status = JWTHelper::Decode(token, decoded_token);
+  if (!status.ok()) {
+    LOG(ERROR) << "Error decoding JWT token received from: "
+               << TNetworkAddressToString(connection_context->network_address)
+               << " Error: " << status;
+    return false;
+  }
+  if (FLAGS_jwt_validate_signature) {
+    status = JWTHelper::GetInstance()->Verify(decoded_token.get());
+    if (!status.ok()) {
+      LOG(ERROR) << "Error verifying JWT token received from: "
+                 << TNetworkAddressToString(connection_context->network_address)
+                 << " Error: " << status;
+      return false;
+    }
+  }
+
+  DCHECK(!FLAGS_jwt_custom_claim_username.empty());
+  string username;
+  status = JWTHelper::GetCustomClaimUsername(
+      decoded_token.get(), FLAGS_jwt_custom_claim_username, username);
+  if (!status.ok()) {
+    LOG(ERROR) << "Error extracting username from JWT token received from: "
+               << TNetworkAddressToString(connection_context->network_address)
+               << " Error: " << status;
+    return false;
+  }
+  connection_context->username = username;
+  // TODO: cookies are not added, but are not needed right now
+  return true;
 }
 
 // Performs a step of SPNEGO auth for the HTTP transport and sets the username on
@@ -591,6 +751,27 @@ bool NegotiateAuth(ThriftServer::ConnectionContext* connection_context,
                     << TNetworkAddressToString(connection_context->network_address)
                     << ": " << spnego_status.ToString();
       } else {
+        if (FLAGS_enable_ldap_auth &&
+            FLAGS_enable_group_filter_check_for_authenticated_kerberos_user) {
+
+          string short_user = GetShortUsernameFromKerberosPrincipal(username);
+
+          LOG(INFO) << "Checking LDAP group filters for "
+                    << "username \"" << short_user << "\" "
+                    << "parsed from user principal \""
+                    << username << "\".";
+
+          bool success = DoLdapCheckFilters(short_user.c_str());
+          if (!success) {
+            LOG(WARNING) << "Got authenticated principal for SPNEGO-authenticated "
+                        << "connection from "
+                        << TNetworkAddressToString(connection_context->network_address)
+                        << " but the authenticated user \"" << short_user << "\" "
+                        << "didn't pass the group filters.";
+            return false;
+          }
+        }
+
         // Authentication was successful, so set the username on the connection.
         connection_context->username = username;
         // Create a cookie to return.
@@ -610,29 +791,145 @@ vector<string> ReturnHeaders(ThriftServer::ConnectionContext* connection_context
   return std::move(connection_context->return_headers);
 }
 
-// Takes the path component of an HTTP request and parses it. For now, we only care about
-// the 'doAs' parameter.
-bool HttpPathFn(ThriftServer::ConnectionContext* connection_context, const string& path,
-    string* err_msg) {
-  // 'path' should be of the form '/.*[?<key=value>[&<key=value>...]]'
-  vector<string> split = Split(path, delimiter::Limit("?", 1));
-  if (split.size() == 2) {
-    for (auto pair : Split(split[1], "&")) {
-      vector<string> key_value = Split(pair, delimiter::Limit("=", 1));
-      if (key_value.size() == 2 && key_value[0] == "doAs") {
-        string decoded;
-        if (!UrlDecode(key_value[1], &decoded)) {
-          *err_msg = Substitute(
-              "Could not decode 'doAs' parameter from HTTP request with path: $0", path);
-          return false;
-        } else {
-          connection_context->do_as_user = decoded;
-        }
-        break;
+// Parses a param string.
+//  params_to_check: map from the name of params that should be parsed to pointers where
+//                   the value should be written
+//  original: the full http path (used only in error message)
+//  params_string: & delimited param string to parse
+//  err_msg: write detailed message here in case of error
+bool ParseParams(std::map<string, string*>& params_to_check,
+   const string& original, const string& params_string, string* err_msg) {
+  for (auto pair : Split(params_string, "&")) {
+    vector<string> key_value = Split(pair, delimiter::Limit("=", 1));
+    if (key_value.size() == 2) {
+      auto it = params_to_check.find(key_value[0]);
+      if (it == params_to_check.end()) continue;
+      string decoded;
+      if (!UrlDecode(key_value[1], &decoded)) {
+        *err_msg = Substitute(
+            "Could not decode '$0' parameter from HTTP request with path: $1",
+                key_value[0], original);
+        return false;
+      } else {
+        *it->second = decoded;
       }
     }
   }
   return true;
+}
+
+// Takes the path component of an HTTP request and parses it.
+// The followings are inspected in the path:
+// - the 'doAs' parameter if it exists
+// - if SAML auth is enabled then the path is checked whether it matches
+//   the SP callback URL, if yes, then the whole body has to be read for,
+//   authentication purposes, not just the headers
+bool HttpPathFn(ThriftServer::ConnectionContext* connection_context,
+     const string& saml_path, const string& path, string* err_msg,
+     bool* read_whole_body) {
+  TWrappedHttpRequest* request = connection_context->request.get();
+  // 'path' should be of the form '/.*[?<key=value>[&<key=value>...]]'
+  vector<string> split = Split(path, delimiter::Limit("?", 1));
+  bool is_saml_response = !saml_path.empty() && split[0] == saml_path;
+  *read_whole_body = is_saml_response;
+
+  if (request) request->path = split[0];
+
+  if (split.size() != 2) return true;
+
+  std::map<string, string*> params_to_check;
+  params_to_check["doAs"] = &connection_context->do_as_user;
+
+  return ParseParams(params_to_check, path, split[1], err_msg);
+}
+
+TWrappedHttpResponse* GetSaml2Redirect(
+    ThriftServer::ConnectionContext* connection_context) {
+  TWrappedHttpRequest* request = connection_context->request.get();
+  TWrappedHttpResponse* response = connection_context->response.get();
+  DCHECK(request != nullptr);
+  DCHECK(response == nullptr);
+  response = new TWrappedHttpResponse();
+  connection_context->response.reset(response);
+  Status status =
+      ExecEnv::GetInstance()->frontend()->GetSaml2Redirect(*request, response);
+  if (!status.ok()) return nullptr;
+
+  return response;
+}
+
+TWrappedHttpResponse* ValidateSaml2AuthnResponse(
+    ThriftServer::ConnectionContext* connection_context,
+    const AuthenticationHash& hash) {
+  TWrappedHttpRequest* request = connection_context->request.get();
+  TWrappedHttpResponse* response = connection_context->response.get();
+  DCHECK(request != nullptr);
+  DCHECK(response == nullptr);
+  response = new TWrappedHttpResponse();
+  connection_context->response.reset(response);
+  // Parse the body.
+  std::map<string, string*> params_to_check;
+  string saml_relay_state;
+  params_to_check["RelayState"] =  &saml_relay_state;
+  string error_msg;
+  const string& content = request->content;
+  if(!ParseParams(params_to_check, content, content, &error_msg)) {
+    LOG(ERROR) << "failed to parse SAML response params: " << error_msg;
+    return nullptr;
+  }
+  StripWhiteSpace(&saml_relay_state);
+  request->params["RelayState"] = saml_relay_state;
+  // We return some html in case of auth error. TODO: Should handle other
+  // errors where no response is generated.
+  Status status =
+      ExecEnv::GetInstance()->frontend()->ValidateSaml2Response(*request, response);
+  return response;
+}
+
+bool ValidateSaml2Bearer(ThriftServer::ConnectionContext* connection_context,
+    const AuthenticationHash& hash) {
+  TWrappedHttpRequest* request = connection_context->request.get();
+  string username;
+  Status status =
+      ExecEnv::GetInstance()->frontend()->ValidateSaml2Bearer(*request, &username);
+
+  if (!status.ok()) return false;
+
+  connection_context->username = username;
+  // Create a cookie to return.
+  connection_context->return_headers.push_back(
+      Substitute("Set-Cookie: $0", GenerateCookie(username, hash)));
+  return true;
+}
+
+TWrappedHttpRequest* InitWrappedHttpRequest(
+      ThriftServer::ConnectionContext* connection_context) {
+  TWrappedHttpRequest* request = new TWrappedHttpRequest();
+  request->remote_ip = connection_context->network_address.hostname;
+  request->server_name = connection_context->server_name;
+  // Intentionally lying to the pac4j lib  in the frontend to ensure that non-secure
+  // test setups work similarly to secure production systems. SAML must use TLS if
+  // FLAGS_saml2_allow_without_tls_debug_only is not true.
+  request->secure = true;
+  connection_context->request.reset(request);
+  return request;
+}
+
+// Parses and validates FLAGS_saml2_sp_callback_url.
+// Sets saml_sp_path to the path part if successful.
+Status ParseSamlSpUrl(string* saml_sp_path) {
+  vector<string> split =
+      Split(FLAGS_saml2_sp_callback_url, delimiter::Limit("/", 3));
+  if (split.size() != 4 || (split[0] != "http:" && split[0] != "https:")) {
+    return Status(
+        Substitute("Bad saml2_sp_callback_url: $0", FLAGS_saml2_sp_callback_url));
+  }
+  // The port in the url should be the same as FLAGS_hs2_http_port in general,
+  // but this is not enforced to allow the use case when the port is mapped,
+  // e.g. external_port->http_port. FLAGS_saml2_sp_callback_url has to contain the
+  // external_port in this case.
+  if (saml_sp_path != nullptr) *saml_sp_path = "/" + split[3];
+  return Status::OK();
 }
 
 namespace {
@@ -698,7 +995,7 @@ Status InitAuth(const string& appname) {
 
   // Other than the general callbacks, we only setup other SASL things as required.
   if (FLAGS_enable_ldap_auth || IsKerberosEnabled()) {
-    if (!FLAGS_principal.empty()) {
+    if (IsKerberosEnabled()) {
       // Callbacks for when we're a Kerberos Sasl internal connection.  Just do logging.
       KERB_INT_CALLBACKS.resize(3);
 
@@ -720,7 +1017,7 @@ Status InitAuth(const string& appname) {
       KERB_EXT_CALLBACKS[0].context = ((void *)"Kerberos (external)");
 
       KERB_EXT_CALLBACKS[1].id = SASL_CB_PROXY_POLICY;
-      KERB_EXT_CALLBACKS[1].proc = (int (*)())&SaslAuthorizeExternal;
+      KERB_EXT_CALLBACKS[1].proc = (int (*)())&SaslKerberosAuthorizeExternal;
       KERB_EXT_CALLBACKS[1].context = NULL;
 
       KERB_EXT_CALLBACKS[2].id = SASL_CB_LIST_END;
@@ -735,7 +1032,7 @@ Status InitAuth(const string& appname) {
       LDAP_EXT_CALLBACKS[0].context = ((void *)"LDAP");
 
       LDAP_EXT_CALLBACKS[1].id = SASL_CB_PROXY_POLICY;
-      LDAP_EXT_CALLBACKS[1].proc = (int (*)())&SaslAuthorizeExternal;
+      LDAP_EXT_CALLBACKS[1].proc = (int (*)())&SaslLdapAuthorizeExternal;
       LDAP_EXT_CALLBACKS[1].context = NULL;
 
       // This last callback is where we take the password and turn around and
@@ -793,6 +1090,7 @@ Status InitAuth(const string& appname) {
 // to debug.  We do this using direct stat() calls because boost doesn't support the
 // detail we need.
 Status CheckReplayCacheDirPermissions() {
+  DCHECK(IsKerberosEnabled());
   struct stat st;
 
   if (stat("/var/tmp", &st) < 0) {
@@ -812,13 +1110,8 @@ Status CheckReplayCacheDirPermissions() {
   return Status::OK();
 }
 
-Status SecureAuthProvider::InitKerberos(
-    const string& principal, const string& keytab_file) {
+Status SecureAuthProvider::InitKerberos(const string& principal) {
   principal_ = principal;
-  keytab_file_ = keytab_file;
-  // The logic here is that needs_kinit_ is false unless we are the internal
-  // auth provider and we support kerberos.
-  needs_kinit_ = is_internal_;
 
   RETURN_IF_ERROR(ParseKerberosPrincipal(
       principal_, &service_name_, &hostname_, &realm_));
@@ -864,33 +1157,43 @@ static Status EnvAppend(const string& attr, const string& thing, const string& t
 }
 
 Status AuthManager::InitKerberosEnv() {
-  DCHECK(!FLAGS_principal.empty());
-
-  RETURN_IF_ERROR(CheckReplayCacheDirPermissions());
-
-  if (!is_regular(FLAGS_keytab_file)) {
-    return Status(Substitute("Bad --keytab_file value: The file $0 is not a "
-        "regular file", FLAGS_keytab_file));
+  if (IsKerberosEnabled()) {
+    RETURN_IF_ERROR(CheckReplayCacheDirPermissions());
+    if (FLAGS_keytab_file.empty()) {
+      return Status("--keytab_file must be configured if kerberos is enabled");
+    }
+    if (FLAGS_krb5_ccname.empty()) {
+      return Status("--krb5_ccname must be configured if kerberos is enabled");
+    }
   }
 
-  // Set the keytab name in the environment so that Sasl Kerberos and kinit can
-  // find and use it.
-  if (setenv("KRB5_KTNAME", FLAGS_keytab_file.c_str(), 1)) {
-    return Status(Substitute("Kerberos could not set KRB5_KTNAME: $0",
-        GetStrErrMsg()));
+  if (!FLAGS_keytab_file.empty()) {
+    if (!is_regular(FLAGS_keytab_file)) {
+      return Status(Substitute("Bad --keytab_file value: The file $0 is not a "
+          "regular file", FLAGS_keytab_file));
+    }
+
+    // Set the keytab name in the environment so that Sasl Kerberos and kinit can
+    // find and use it.
+    if (setenv("KRB5_KTNAME", FLAGS_keytab_file.c_str(), 1)) {
+      return Status(Substitute("Kerberos could not set KRB5_KTNAME: $0",
+          GetStrErrMsg()));
+    }
   }
 
-  // We want to set a custom location for the impala credential cache.
-  // Usually, it's /tmp/krb5cc_xxx where xxx is the UID of the process.  This
-  // is normally fine, but if you're not running impala daemons as user
-  // 'impala', the kinit we perform is going to blow away credentials for the
-  // current user.  Not setting this isn't technically fatal, so ignore errors.
-  const path krb5_ccname_path(FLAGS_krb5_ccname);
-  if (!krb5_ccname_path.is_absolute()) {
-    return Status(Substitute("Bad --krb5_ccname value: $0 is not an absolute file path",
-        FLAGS_krb5_ccname));
+  if (!FLAGS_krb5_ccname.empty()) {
+    // We want to set a custom location for the impala credential cache.
+    // Usually, it's /tmp/krb5cc_xxx where xxx is the UID of the process.  This
+    // is normally fine, but if you're not running impala daemons as user
+    // 'impala', the kinit we perform is going to blow away credentials for the
+    // current user.  Not setting this isn't technically fatal, so ignore errors.
+    const path krb5_ccname_path(FLAGS_krb5_ccname);
+    if (!krb5_ccname_path.is_absolute()) {
+      return Status(Substitute("Bad --krb5_ccname value: $0 is not an absolute file path",
+          FLAGS_krb5_ccname));
+    }
+    discard_result(setenv("KRB5CCNAME", FLAGS_krb5_ccname.c_str(), 1));
   }
-  discard_result(setenv("KRB5CCNAME", FLAGS_krb5_ccname.c_str(), 1));
 
   // If an alternate krb5_conf location is supplied, set both KRB5_CONFIG and
   // JAVA_TOOL_OPTIONS in the environment.
@@ -918,13 +1221,13 @@ Status AuthManager::InitKerberosEnv() {
   if (!FLAGS_krb5_debug_file.empty()) {
     bool krb5_debug_fail = false;
     if (setenv("KRB5_TRACE", FLAGS_krb5_debug_file.c_str(), 1) < 0) {
-      LOG(WARNING) << "Failed to set KRB5_TRACE; --krb5_debuf_file not enabled for "
-          "back-end code";
+      LOG(WARNING) << "Failed to set KRB5_TRACE; --krb5_debug_file not enabled for "
+                      "back-end code";
       krb5_debug_fail = true;
     }
     if (!EnvAppend("JAVA_TOOL_OPTIONS", "sun.security.krb5.debug", "true").ok()) {
-      LOG(WARNING) << "Failed to set JAVA_TOOL_OPTIONS; --krb5_debuf_file not enabled "
-          "for front-end code";
+      LOG(WARNING) << "Failed to set JAVA_TOOL_OPTIONS; --krb5_debug_file not enabled "
+                      "for front-end code";
       krb5_debug_fail = true;
     }
     if (!krb5_debug_fail) {
@@ -936,19 +1239,6 @@ Status AuthManager::InitKerberosEnv() {
 }
 
 Status SecureAuthProvider::Start() {
-  // True for kerberos internal use
-  if (needs_kinit_) {
-    DCHECK(is_internal_);
-    DCHECK(!principal_.empty());
-    // IMPALA-8154: Disable any Kerberos auth_to_local mappings.
-    FLAGS_use_system_auth_to_local = false;
-    // Starts a thread that periodically does a 'kinit'. The thread lives as long as the
-    // process does.
-    KUDU_RETURN_IF_ERROR(kudu::security::InitKerberosForServer(principal_, keytab_file_,
-        FLAGS_krb5_ccname, false), "Could not init kerberos");
-    LOG(INFO) << "Kerberos ticket granted to " << principal_;
-  }
-
   if (has_ldap_) {
     DCHECK(!is_internal_);
     if (!FLAGS_ldap_ca_certificate.empty()) {
@@ -980,18 +1270,24 @@ Status SecureAuthProvider::Start() {
 
 Status SecureAuthProvider::GetServerTransportFactory(
     ThriftServer::TransportType underlying_transport_type, const std::string& server_name,
-    MetricGroup* metrics, boost::shared_ptr<TTransportFactory>* factory) {
-  DCHECK(!principal_.empty() || has_ldap_);
+    MetricGroup* metrics, std::shared_ptr<TTransportFactory>* factory) {
+  DCHECK(!principal_.empty() || has_ldap_ || has_saml_ || has_jwt_);
 
   if (underlying_transport_type == ThriftServer::HTTP) {
     bool has_kerberos = !principal_.empty();
     bool use_cookies = FLAGS_max_cookie_lifetime_s > 0;
-    factory->reset(new THttpServerTransportFactory(
-        server_name, metrics, has_ldap_, has_kerberos, use_cookies));
+    bool check_trusted_domain = !FLAGS_trusted_domain.empty();
+    bool check_trusted_auth_header = !FLAGS_trusted_auth_header.empty();
+    factory->reset(new THttpServerTransportFactory(server_name, metrics, has_ldap_,
+        has_kerberos, use_cookies, check_trusted_domain, check_trusted_auth_header,
+        has_saml_, has_jwt_));
     return Status::OK();
   }
 
   DCHECK(underlying_transport_type == ThriftServer::BINARY);
+
+  DCHECK(!principal_.empty() || has_ldap_);
+
   // This is the heart of the link between this file and thrift.  Here we
   // associate a Sasl mechanism with our callbacks.
   try {
@@ -1027,9 +1323,9 @@ Status SecureAuthProvider::GetServerTransportFactory(
 }
 
 Status SecureAuthProvider::WrapClientTransport(const string& hostname,
-    boost::shared_ptr<TTransport> raw_transport, const string& service_name,
-    boost::shared_ptr<TTransport>* wrapped_transport) {
-  boost::shared_ptr<sasl::TSasl> sasl_client;
+    std::shared_ptr<TTransport> raw_transport, const string& service_name,
+    std::shared_ptr<TTransport>* wrapped_transport) {
+  std::shared_ptr<sasl::TSasl> sasl_client;
   const map<string, string> props; // Empty; unused by thrift
   const string auth_id; // Empty; unused by thrift
 
@@ -1046,6 +1342,7 @@ Status SecureAuthProvider::WrapClientTransport(const string& hostname,
     return Status(e.what());
   }
   wrapped_transport->reset(new TSaslClientTransport(sasl_client, raw_transport));
+  SetMaxMessageSize(wrapped_transport->get());
 
   // This function is called immediately prior to sasl_client_start(), and so
   // can be used to log an "I'm beginning authentication for this principal"
@@ -1057,9 +1354,9 @@ Status SecureAuthProvider::WrapClientTransport(const string& hostname,
 }
 
 void SecureAuthProvider::SetupConnectionContext(
-    const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
-    ThriftServer::TransportType underlying_transport_type, TTransport* input_transport,
-    TTransport* output_transport) {
+    const shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+    ThriftServer::TransportType underlying_transport_type,
+    TTransport* input_transport, TTransport* output_transport) {
   TSocket* socket = nullptr;
   switch (underlying_transport_type) {
     case ThriftServer::BINARY: {
@@ -1076,11 +1373,20 @@ void SecureAuthProvider::SetupConnectionContext(
       THttpServer* http_input_transport = down_cast<THttpServer*>(input_transport);
       THttpServer* http_output_transport = down_cast<THttpServer*>(output_transport);
       THttpServer::HttpCallbacks callbacks;
+
+      string saml_path;
+      if (has_saml_) {
+        Status parse_status = ParseSamlSpUrl(&saml_path);
+        DCHECK(parse_status.ok());
+      }
       callbacks.path_fn = std::bind(
-          HttpPathFn, connection_ptr.get(), std::placeholders::_1, std::placeholders::_2);
+          HttpPathFn, connection_ptr.get(), saml_path, std::placeholders::_1,
+          std::placeholders::_2, std::placeholders::_3);
       callbacks.return_headers_fn = std::bind(ReturnHeaders, connection_ptr.get());
       callbacks.cookie_auth_fn =
           std::bind(CookieAuth, connection_ptr.get(), hash_, std::placeholders::_1);
+      callbacks.trusted_domain_check_fn = std::bind(TrustedDomainCheck,
+          connection_ptr.get(), hash_, std::placeholders::_1, std::placeholders::_2);
       if (has_ldap_) {
         callbacks.basic_auth_fn =
             std::bind(BasicAuth, connection_ptr.get(), hash_, std::placeholders::_1);
@@ -1088,6 +1394,24 @@ void SecureAuthProvider::SetupConnectionContext(
       if (!principal_.empty()) {
         callbacks.negotiate_auth_fn = std::bind(NegotiateAuth, connection_ptr.get(),
             hash_, std::placeholders::_1, std::placeholders::_2);
+      }
+      if (has_saml_) {
+        callbacks.init_wrapped_http_request_fn = std::bind(
+            InitWrappedHttpRequest, connection_ptr.get());
+        callbacks.get_saml_redirect_fn =
+            std::bind(GetSaml2Redirect, connection_ptr.get());
+        callbacks.validate_saml2_authn_response_fn =
+            std::bind(ValidateSaml2AuthnResponse, connection_ptr.get(), hash_);
+        callbacks.validate_saml2_bearer_fn =
+            std::bind(ValidateSaml2Bearer, connection_ptr.get(), hash_);
+      }
+      if (has_jwt_) {
+        callbacks.jwt_token_auth_fn =
+            std::bind(JWTTokenAuth, connection_ptr.get(), hash_, std::placeholders::_1);
+      }
+      if (!FLAGS_trusted_auth_header.empty()) {
+        callbacks.trusted_auth_header_handle_fn = std::bind(
+            HandleTrustedAuthHeader, connection_ptr.get(), hash_, std::placeholders::_1);
       }
       http_input_transport->setCallbacks(callbacks);
       http_output_transport->setCallbacks(callbacks);
@@ -1103,7 +1427,7 @@ void SecureAuthProvider::SetupConnectionContext(
 
 Status NoAuthProvider::GetServerTransportFactory(
     ThriftServer::TransportType underlying_transport_type, const std::string& server_name,
-    MetricGroup* metrics, boost::shared_ptr<TTransportFactory>* factory) {
+    MetricGroup* metrics, std::shared_ptr<TTransportFactory>* factory) {
   // No Sasl - yawn.  Here, have a regular old buffered transport.
   switch (underlying_transport_type) {
     case ThriftServer::BINARY:
@@ -1119,18 +1443,19 @@ Status NoAuthProvider::GetServerTransportFactory(
 }
 
 Status NoAuthProvider::WrapClientTransport(const string& hostname,
-    boost::shared_ptr<TTransport> raw_transport, const string& dummy_service,
-    boost::shared_ptr<TTransport>* wrapped_transport) {
+    std::shared_ptr<TTransport> raw_transport, const string& dummy_service,
+    std::shared_ptr<TTransport>* wrapped_transport) {
   // No Sasl - yawn.  Don't do any transport wrapping for clients.
   *wrapped_transport = raw_transport;
   return Status::OK();
 }
 
 void NoAuthProvider::SetupConnectionContext(
-    const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
-    ThriftServer::TransportType underlying_transport_type, TTransport* input_transport,
-    TTransport* output_transport) {
+    const std::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+    ThriftServer::TransportType underlying_transport_type,
+    TTransport* input_transport, TTransport* output_transport) {
   connection_ptr->username = "";
+  connection_ptr->do_as_user = "";
   TSocket* socket = nullptr;
   switch (underlying_transport_type) {
     case ThriftServer::BINARY: {
@@ -1146,7 +1471,8 @@ void NoAuthProvider::SetupConnectionContext(
       // Even though there's no security, we set up some callbacks, eg. to allow
       // impersonation over unsecured connections for testing purposes.
       callbacks.path_fn = std::bind(
-          HttpPathFn, connection_ptr.get(), std::placeholders::_1, std::placeholders::_2);
+          HttpPathFn, connection_ptr.get(), "", std::placeholders::_1,
+          std::placeholders::_2, std::placeholders::_3);
       callbacks.return_headers_fn = std::bind(ReturnHeaders, connection_ptr.get());
       http_input_transport->setCallbacks(callbacks);
       http_output_transport->setCallbacks(callbacks);
@@ -1160,60 +1486,46 @@ void NoAuthProvider::SetupConnectionContext(
       MakeNetworkAddress(socket->getPeerAddress(), socket->getPeerPort());
 }
 
-Status AuthManager::Init() {
-  ssl_socket_factory_.reset(new TSSLSocketFactory(TLSv1_0));
+AuthManager::AuthManager() {}
 
-  bool use_ldap = false;
-  const string excl_msg = "--$0 and --$1 are mutually exclusive "
-      "and should not be set together";
+AuthManager::~AuthManager() {}
+
+Status AuthManager::Init() {
+  // Tell Thrift not to initialize SSL for us, as we use Kudu's SSL initializtion.
+  TSSLSocketFactory::setManualOpenSSLInitialization(true);
+  kudu::security::InitializeOpenSSL();
+  LOG(INFO) << "Initialized " << OPENSSL_VERSION_TEXT;
+
+  // Could use any other requiered flag for SAML
+  bool use_saml = !FLAGS_saml2_sp_callback_url.empty();
+  if (use_saml) {
+    RETURN_IF_ERROR(ParseSamlSpUrl(nullptr));
+    if (!IsExternalTlsConfigured()) {
+      if (!FLAGS_saml2_allow_without_tls_debug_only) {
+        return Status("SAML SSO authentication should be only used with TLS enabled.");
+      }
+      LOG(WARNING) << "SAML SSO authentication is used without TLS.";
+    }
+  }
+
+  bool use_jwt = FLAGS_jwt_token_auth;
+  if (use_jwt) {
+    if (!IsExternalTlsConfigured()) {
+      if (!FLAGS_jwt_allow_without_tls) {
+        return Status("JWT authentication should be only used with TLS enabled.");
+      }
+      LOG(WARNING) << "JWT authentication is used without TLS.";
+    }
+    if (FLAGS_jwt_custom_claim_username.empty()) {
+      return Status(
+          "JWT authentication requires jwt_custom_claim_username to be specified.");
+    }
+  }
 
   // Get all of the flag validation out of the way
   if (FLAGS_enable_ldap_auth) {
-    use_ldap = true;
-
-    if (!FLAGS_ldap_domain.empty()) {
-      if (!FLAGS_ldap_baseDN.empty()) {
-        return Status(Substitute(excl_msg, "ldap_domain", "ldap_baseDN"));
-      }
-      if (!FLAGS_ldap_bind_pattern.empty()) {
-        return Status(Substitute(excl_msg, "ldap_domain", "ldap_bind_pattern"));
-      }
-    } else if (!FLAGS_ldap_baseDN.empty()) {
-      if (!FLAGS_ldap_bind_pattern.empty()) {
-        return Status(Substitute(excl_msg, "ldap_baseDN", "ldap_bind_pattern"));
-      }
-    }
-
-    if (FLAGS_ldap_uri.empty()) {
-      return Status("--ldap_uri must be supplied when --ldap_enable_auth is set");
-    }
-
-    if ((FLAGS_ldap_uri.find(LDAP_URI_PREFIX) != 0) &&
-        (FLAGS_ldap_uri.find(LDAPS_URI_PREFIX) != 0)) {
-      return Status(Substitute("--ldap_uri must start with either $0 or $1",
-              LDAP_URI_PREFIX, LDAPS_URI_PREFIX ));
-    }
-
-    LOG(INFO) << "Using LDAP authentication with server " << FLAGS_ldap_uri;
-
-    if (!FLAGS_ldap_tls && (FLAGS_ldap_uri.find(LDAPS_URI_PREFIX) != 0)) {
-      if (FLAGS_ldap_passwords_in_clear_ok) {
-        LOG(WARNING) << "LDAP authentication is being used, but without TLS. "
-                     << "ALL PASSWORDS WILL GO OVER THE NETWORK IN THE CLEAR.";
-      } else {
-        return Status("LDAP authentication specified, but without TLS. "
-                      "Passwords would go over the network in the clear. "
-                      "Enable TLS with --ldap_tls or use an ldaps:// URI. "
-                      "To override this is non-production environments, "
-                      "specify --ldap_passwords_in_clear_ok");
-      }
-    } else if (FLAGS_ldap_ca_certificate.empty()) {
-      LOG(WARNING) << "LDAP authentication is being used with TLS, but without "
-                   << "an --ldap_ca_certificate file, the identity of the LDAP "
-                   << "server cannot be verified.  Network communication (and "
-                   << "hence passwords) could be intercepted by a "
-                   << "man-in-the-middle attack";
-    }
+    RETURN_IF_ERROR(
+        ImpalaLdap::CreateLdap(&ldap_, FLAGS_ldap_user_filter, FLAGS_ldap_group_filter));
   }
 
   if (FLAGS_principal.empty() && !FLAGS_be_principal.empty()) {
@@ -1225,20 +1537,7 @@ Status AuthManager::Init() {
         "is used in internal (back-end) communication.");
   }
 
-  // When acting as a client, or as a server on internal connections:
-  string kerberos_internal_principal;
-  // When acting as a server on external connections:
-  string kerberos_external_principal;
-
-  bool use_kerberos = IsKerberosEnabled();
-  if (use_kerberos) {
-    RETURN_IF_ERROR(GetInternalKerberosPrincipal(&kerberos_internal_principal));
-    RETURN_IF_ERROR(GetExternalKerberosPrincipal(&kerberos_external_principal));
-    DCHECK(!kerberos_internal_principal.empty());
-    DCHECK(!kerberos_external_principal.empty());
-
-    RETURN_IF_ERROR(InitKerberosEnv());
-  }
+  RETURN_IF_ERROR(InitKerberosEnv());
 
   // This is written from the perspective of the daemons - thus "internal"
   // means "I am used for communication with other daemons, both as a client
@@ -1246,49 +1545,113 @@ Status AuthManager::Init() {
   // for clients that are external - that is, they aren't daemons - like the
   // impala shell, odbc, jdbc, etc.
   //
+  // Note that Kerberos and LDAP are enabled when --principal and --enable_ldap_auth are
+  // set, respectively.
+  //
   // Flags     | Internal | External
   // --------- | -------- | --------
   // None      | NoAuth   | NoAuth
   // LDAP only | NoAuth   | Sasl(ldap)
   // Kerb only | Sasl(be) | Sasl(fe)
   // Both      | Sasl(be) | Sasl(fe+ldap)
-
+  //
+  // --skip_internal_kerberos_auth and --skip_external_kerberos_auth disable Kerberos
+  // auth for the Internal and External columns respectively.
+  //
   // Set up the internal auth provider as per above.  Since there's no LDAP on
   // the client side, this is just a check for the "back end" kerberos
   // principal.
-  if (use_kerberos) {
-    SecureAuthProvider* sap = NULL;
+  // When acting as a client, or as a server on internal connections:
+  string kerberos_internal_principal;
+  // When acting as a server on external connections:
+  string kerberos_external_principal;
+  if (IsKerberosEnabled()) {
+    RETURN_IF_ERROR(GetInternalKerberosPrincipal(&kerberos_internal_principal));
+    RETURN_IF_ERROR(GetExternalKerberosPrincipal(&kerberos_external_principal));
+    DCHECK(!kerberos_internal_principal.empty());
+    DCHECK(!kerberos_external_principal.empty());
+  }
+
+  if (IsInternalKerberosEnabled()) {
+    // Initialize the auth provider first, in case validation of the principal fails.
+    SecureAuthProvider* sap = nullptr;
     internal_auth_provider_.reset(sap = new SecureAuthProvider(true));
-    RETURN_IF_ERROR(sap->InitKerberos(kerberos_internal_principal,
-        FLAGS_keytab_file));
+    RETURN_IF_ERROR(sap->InitKerberos(kerberos_internal_principal));
     LOG(INFO) << "Internal communication is authenticated with Kerberos";
   } else {
     internal_auth_provider_.reset(new NoAuthProvider());
     LOG(INFO) << "Internal communication is not authenticated";
   }
-  RETURN_IF_ERROR(internal_auth_provider_->Start());
 
+  bool external_kerberos_enabled = IsExternalKerberosEnabled();
   // Set up the external auth provider as per above.  Either a "front end"
   // principal or ldap tells us to use a SecureAuthProvider, and we fill in
   // details from there.
-  if (use_ldap || use_kerberos) {
-    SecureAuthProvider* sap = NULL;
+  if (FLAGS_enable_ldap_auth || external_kerberos_enabled) {
+    SecureAuthProvider* sap = nullptr;
     external_auth_provider_.reset(sap = new SecureAuthProvider(false));
-    if (use_kerberos) {
-      RETURN_IF_ERROR(sap->InitKerberos(kerberos_external_principal,
-          FLAGS_keytab_file));
+    if (external_kerberos_enabled) {
+      RETURN_IF_ERROR(sap->InitKerberos(kerberos_external_principal));
       LOG(INFO) << "External communication is authenticated with Kerberos";
     }
-    if (use_ldap) {
+    if (FLAGS_enable_ldap_auth) {
       sap->InitLdap();
       LOG(INFO) << "External communication is authenticated with LDAP";
     }
+    if (use_saml) {
+      LOG(INFO) << "External communication can be also authenticated with SAML2 SSO";
+      sap->InitSaml();
+    }
+    if (use_jwt) {
+      LOG(INFO) << "External communication can be also authenticated with JWT";
+      sap->InitJwt();
+    }
   } else {
     external_auth_provider_.reset(new NoAuthProvider());
-    LOG(INFO) << "External communication is not authenticated";
+    LOG(INFO) << "External communication is not authenticated for binary protocols";
+    if (use_saml) {
+      SecureAuthProvider* sap = nullptr;
+      external_http_auth_provider_.reset(sap = new SecureAuthProvider(false));
+      sap->InitSaml();
+      LOG(INFO) << "External communication is authenticated for hs2-http protocol with "
+                   "SAML2 SSO";
+    } else if (use_jwt) {
+      SecureAuthProvider* sap = nullptr;
+      external_http_auth_provider_.reset(sap = new SecureAuthProvider(false));
+      sap->InitJwt();
+      LOG(INFO)
+          << "External communication is authenticated for hs2-http protocol with JWT";
+    } else {
+      LOG(INFO) << "External communication is not authenticated for hs2-http protocol";
+    }
   }
-  RETURN_IF_ERROR(external_auth_provider_->Start());
 
+  // Acquire a kerberos ticket and start the background renewal thread before starting
+  // the auth providers. Do this after the InitKerberos() calls above which validate the
+  // principal format so that we don't try to do anything before the flags have been
+  // validated.
+  if (IsKerberosEnabled()) {
+    // IMPALA-8154: Disable any Kerberos auth_to_local mappings.
+    FLAGS_use_system_auth_to_local = false;
+    // Starts a thread that periodically does a 'kinit'. The thread lives as long as the
+    // process does. We only need to kinit as the internal principal, because that is the
+    // identity we will use for authentication with both other Impala services (impalad,
+    // statestore, catalogd) and other services lower in the stack (HMS, HDFS, Kudu, etc).
+    // We do not need a TGT for the external principal because we do not create any
+    // connections using that principal.
+    KUDU_RETURN_IF_ERROR(kudu::security::InitKerberosForServer(
+        kerberos_internal_principal, FLAGS_keytab_file,
+        FLAGS_krb5_ccname, false), "Could not init kerberos");
+    LOG(INFO) << "Kerberos ticket granted to " << kerberos_internal_principal;
+  }
+  RETURN_IF_ERROR(internal_auth_provider_->Start());
+  RETURN_IF_ERROR(external_auth_provider_->Start());
+  if (FLAGS_external_fe_port > 0 ||
+      (TestInfo::is_test() && FLAGS_external_fe_port == 0)) {
+    external_fe_auth_provider_.reset(new NoAuthProvider());
+    LOG(INFO) << "External Frontend communication is not authenticated";
+    RETURN_IF_ERROR(external_fe_auth_provider_->Start());
+  }
   return Status::OK();
 }
 
@@ -1297,9 +1660,19 @@ AuthProvider* AuthManager::GetExternalAuthProvider() {
   return external_auth_provider_.get();
 }
 
+AuthProvider* AuthManager::GetExternalFrontendAuthProvider() {
+  DCHECK(external_fe_auth_provider_.get() != NULL);
+  return external_fe_auth_provider_.get();
+}
+
 AuthProvider* AuthManager::GetInternalAuthProvider() {
   DCHECK(internal_auth_provider_.get() != NULL);
   return internal_auth_provider_.get();
+}
+
+AuthProvider* AuthManager::GetExternalHttpAuthProvider() {
+  return external_http_auth_provider_.get() != nullptr ?
+      external_http_auth_provider_.get() : GetExternalAuthProvider();
 }
 
 }

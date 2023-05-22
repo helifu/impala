@@ -46,6 +46,7 @@
 #include "exprs/udf-builtins.h"
 #include "exprs/utility-functions.h"
 #include "exprs/valid-tuple-id.h"
+#include "runtime/fragment-state.h"
 #include "runtime/runtime-state.h"
 #include "runtime/tuple-row.h"
 #include "runtime/tuple.h"
@@ -64,19 +65,20 @@ namespace impala {
 
 const char* ScalarExpr::LLVM_CLASS_NAME = "class.impala::ScalarExpr";
 
-ScalarExpr::ScalarExpr(const ColumnType& type, bool is_constant)
+ScalarExpr::ScalarExpr(const ColumnType& type, bool is_constant, bool is_codegen_disabled)
   : Expr(type),
-    is_constant_(is_constant) {
-}
+    is_constant_(is_constant),
+    is_codegen_disabled_(is_codegen_disabled) {}
 
 ScalarExpr::ScalarExpr(const TExprNode& node)
   : Expr(node),
-    is_constant_(node.is_constant) {
+    is_constant_(node.is_constant),
+    is_codegen_disabled_(node.is_codegen_disabled) {
   if (node.__isset.fn) fn_ = node.fn;
 }
 
 Status ScalarExpr::Create(const TExpr& texpr, const RowDescriptor& row_desc,
-    RuntimeState* state, ObjectPool* pool, ScalarExpr** scalar_expr) {
+    FragmentState* state, ObjectPool* pool, ScalarExpr** scalar_expr) {
   *scalar_expr = nullptr;
   ScalarExpr* root;
   RETURN_IF_ERROR(CreateNode(texpr.nodes[0], pool, &root));
@@ -98,7 +100,7 @@ Status ScalarExpr::Create(const TExpr& texpr, const RowDescriptor& row_desc,
 }
 
 Status ScalarExpr::Create(const vector<TExpr>& texprs, const RowDescriptor& row_desc,
-    RuntimeState* state, ObjectPool* pool, vector<ScalarExpr*>* exprs) {
+    FragmentState* state, ObjectPool* pool, vector<ScalarExpr*>* exprs) {
   exprs->clear();
   for (const TExpr& texpr: texprs) {
     ScalarExpr* expr;
@@ -110,12 +112,12 @@ Status ScalarExpr::Create(const vector<TExpr>& texprs, const RowDescriptor& row_
 }
 
 Status ScalarExpr::Create(const TExpr& texpr, const RowDescriptor& row_desc,
-    RuntimeState* state, ScalarExpr** scalar_expr) {
+    FragmentState* state, ScalarExpr** scalar_expr) {
   return ScalarExpr::Create(texpr, row_desc, state, state->obj_pool(), scalar_expr);
 }
 
 Status ScalarExpr::Create(const vector<TExpr>& texprs, const RowDescriptor& row_desc,
-    RuntimeState* state, vector<ScalarExpr*>* exprs) {
+    FragmentState* state, vector<ScalarExpr*>* exprs) {
   return ScalarExpr::Create(texprs, row_desc, state, state->obj_pool(), exprs);
 }
 
@@ -140,13 +142,13 @@ Status ScalarExpr::CreateNode(
     case TExprNodeType::TIMESTAMP_LITERAL:
     case TExprNodeType::DATE_LITERAL:
       *expr = pool->Add(new Literal(texpr_node));
-      return Status::OK();
+      break;
     case TExprNodeType::CASE_EXPR:
       if (!texpr_node.__isset.case_expr) {
         return Status("Case expression not set in thrift node");
       }
       *expr = pool->Add(new CaseExpr(texpr_node));
-      return Status::OK();
+      break;
     case TExprNodeType::COMPOUND_PRED:
       if (texpr_node.fn.name.function_name == "and") {
         *expr = pool->Add(new AndPredicate(texpr_node));
@@ -156,19 +158,19 @@ Status ScalarExpr::CreateNode(
         DCHECK_EQ(texpr_node.fn.name.function_name, "not");
         *expr = pool->Add(new ScalarFnCall(texpr_node));
       }
-      return Status::OK();
+      break;
     case TExprNodeType::NULL_LITERAL:
       *expr = pool->Add(new NullLiteral(texpr_node));
-      return Status::OK();
+      break;
     case TExprNodeType::SLOT_REF:
       if (!texpr_node.__isset.slot_ref) {
         return Status("Slot reference not set in thrift node");
       }
       *expr = pool->Add(new SlotRef(texpr_node));
-      return Status::OK();
+      break;
     case TExprNodeType::TUPLE_IS_NULL_PRED:
       *expr = pool->Add(new TupleIsNullPredicate(texpr_node));
-      return Status::OK();
+      break;
     case TExprNodeType::FUNCTION_CALL:
       if (!texpr_node.__isset.fn) {
         return Status("Function not set in thrift node");
@@ -191,28 +193,35 @@ Status ScalarExpr::CreateNode(
       } else {
         *expr = pool->Add(new ScalarFnCall(texpr_node));
       }
-      return Status::OK();
+      break;
     case TExprNodeType::IS_NOT_EMPTY_PRED:
       *expr = pool->Add(new IsNotEmptyPredicate(texpr_node));
-      return Status::OK();
+      break;
     case TExprNodeType::KUDU_PARTITION_EXPR:
       *expr = pool->Add(new KuduPartitionExpr(texpr_node));
-      return Status::OK();
+      break;
     case TExprNodeType::VALID_TUPLE_ID_EXPR:
       *expr = pool->Add(new ValidTupleIdExpr(texpr_node));
-      return Status::OK();
+      break;
     default:
       *expr = nullptr;
       stringstream os;
       os << "Unknown expr node type: " << texpr_node.node_type;
       return Status(os.str());
   }
+  DCHECK(*expr != nullptr);
+  return Status::OK();
 }
 
 Status ScalarExpr::OpenEvaluator(FunctionContext::FunctionStateScope scope,
     RuntimeState* state, ScalarExprEvaluator* eval) const {
   for (int i = 0; i < children_.size(); ++i) {
-    RETURN_IF_ERROR(children_[i]->OpenEvaluator(scope, state, eval));
+    ScalarExprEvaluator* child_eval = eval;
+    if (type_.IsStructType()) {
+      DCHECK_EQ(children_.size(), eval->GetChildEvaluators().size());
+      child_eval = eval->GetChildEvaluators()[i];
+    }
+    RETURN_IF_ERROR(children_[i]->OpenEvaluator(scope, state, child_eval));
   }
   return Status::OK();
 }
@@ -245,13 +254,13 @@ struct MemLayoutData {
   }
 };
 
-int ScalarExpr::ComputeResultsLayout(const vector<ScalarExpr*>& exprs,
-    vector<int>* offsets, int* var_result_begin) {
+ScalarExprsResultsRowLayout::ScalarExprsResultsRowLayout(
+    const vector<ScalarExpr*>& exprs) {
   if (exprs.size() == 0) {
-    *var_result_begin = -1;
-    return 0;
+    var_results_begin_offset = -1;
+    expr_values_bytes_per_row = 0;
+    return;
   }
-
 
   vector<MemLayoutData> data;
   data.resize(exprs.size());
@@ -263,40 +272,34 @@ int ScalarExpr::ComputeResultsLayout(const vector<ScalarExpr*>& exprs,
     data[i].byte_size = exprs[i]->type().GetSlotSize();
     DCHECK_GT(data[i].byte_size, 0);
     data[i].variable_length = exprs[i]->type().IsVarLenStringType();
-
   }
 
   sort(data.begin(), data.end());
 
-  int byte_offset = 0;
-  offsets->resize(exprs.size());
-  *var_result_begin = -1;
+  expr_values_bytes_per_row = 0;
+  expr_values_offsets.resize(exprs.size());
+  var_results_begin_offset = -1;
 
   for (int i = 0; i < data.size(); ++i) {
-
-    (*offsets)[data[i].expr_idx] = byte_offset;
-    if (data[i].variable_length && *var_result_begin == -1) {
-      *var_result_begin = byte_offset;
+    expr_values_offsets[data[i].expr_idx] = expr_values_bytes_per_row;
+    if (data[i].variable_length && var_results_begin_offset == -1) {
+      var_results_begin_offset = expr_values_bytes_per_row;
     }
-    DCHECK(!(i == 0 && byte_offset > 0)) << "first value should be at start of layout";
-    byte_offset += data[i].byte_size;
+    DCHECK(!(i == 0 && expr_values_bytes_per_row > 0))
+        << "first value should be at start of layout";
+    expr_values_bytes_per_row += data[i].byte_size;
   }
-
-  return byte_offset;
 }
 
 Status ScalarExpr::Init(
-    const RowDescriptor& row_desc, bool is_entry_point, RuntimeState* state) {
+    const RowDescriptor& row_desc, bool is_entry_point, FragmentState* state) {
   DCHECK(type_.type != INVALID_TYPE);
   for (int i = 0; i < children_.size(); ++i) {
     RETURN_IF_ERROR(children_[i]->Init(row_desc, false, state));
   }
   // Add the expression to the list of expressions to codegen in the codegen phase.
   if (ShouldCodegen(state)) {
-    // If the expression is not interpretable, we need an entry point to evaluate
-    // the expression from interpreted code, e.g. GetConstValue().
-    bool is_codegen_entry_point = is_entry_point || !IsInterpretable();
-    state->AddScalarExprToCodegen(this, is_codegen_entry_point);
+    state->AddScalarExprToCodegen(this, is_entry_point, IsInterpretable());
   }
   return Status::OK();
 }
@@ -321,15 +324,17 @@ string ScalarExpr::DebugString(const vector<ScalarExpr*>& exprs) {
   return out.str();
 }
 
-bool ScalarExpr::ShouldCodegen(const RuntimeState* state) const {
+bool ScalarExpr::ShouldCodegen(const FragmentState* state) const {
   // Use the interpreted path and call the builtin without codegen if any of the
   // followings is true:
   // 1. The expression does not have an associated RuntimeState, e.g. is a partition
   //    key expression in a descriptor table.
   // 2. codegen is disabled by query option.
   // 3. there is an optimization hint to disable codegen and the expr can be interpreted.
+  // 4. Optimizer decided to disable codegen. Example: const expressions in VALUES()
+  //    which are evaluated only once.
   return state != nullptr && !state->CodegenDisabledByQueryOption()
-      && !(state->CodegenHasDisableHint() && IsInterpretable());
+      && !((state->CodegenHasDisableHint() || is_codegen_disabled_) && IsInterpretable());
 }
 
 int ScalarExpr::GetSlotIds(vector<SlotId>* slot_ids) const {
@@ -338,39 +343,6 @@ int ScalarExpr::GetSlotIds(vector<SlotId>* slot_ids) const {
     n += children_[i]->GetSlotIds(slot_ids);
   }
   return n;
-}
-
-llvm::Function* ScalarExpr::GetStaticGetValWrapper(
-    ColumnType type, LlvmCodeGen* codegen) {
-  switch (type.type) {
-    case TYPE_BOOLEAN:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_BOOLEAN_VAL, false);
-    case TYPE_TINYINT:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_TINYINT_VAL, false);
-    case TYPE_SMALLINT:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_SMALLINT_VAL, false);
-    case TYPE_INT:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_INT_VAL, false);
-    case TYPE_BIGINT:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_BIGINT_VAL, false);
-    case TYPE_FLOAT:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_FLOAT_VAL, false);
-    case TYPE_DOUBLE:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_DOUBLE_VAL, false);
-    case TYPE_STRING:
-    case TYPE_CHAR:
-    case TYPE_VARCHAR:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_STRING_VAL, false);
-    case TYPE_TIMESTAMP:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_TIMESTAMP_VAL, false);
-    case TYPE_DECIMAL:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_DECIMAL_VAL, false);
-    case TYPE_DATE:
-      return codegen->GetFunction(IRFunction::SCALAR_EXPR_GET_DATE_VAL, false);
-    default:
-      DCHECK(false) << "Invalid type: " << type.DebugString();
-      return NULL;
-  }
 }
 
 llvm::Function* ScalarExpr::CreateIrFunctionPrototype(
@@ -404,36 +376,6 @@ Status ScalarExpr::GetCodegendComputeFn(
   return Status::OK();
 }
 
-Status ScalarExpr::GetCodegendComputeFnWrapper(
-    LlvmCodeGen* codegen, llvm::Function** fn) {
-  for (ScalarExpr* expr : children_) {
-    llvm::Function* dummy;
-    // The codegen'd function will call expr->Get*Val(). Ensure that the child expr
-    // is a codegen entry point we expr->GetVal() uses the fast codegen'd path.
-    RETURN_IF_ERROR(expr->GetCodegendComputeFn(codegen, true, &dummy));
-  }
-
-  llvm::Function* static_getval_fn = GetStaticGetValWrapper(type(), codegen);
-
-  // Call it passing this as the additional first argument.
-  llvm::Value* args[2];
-  *fn = CreateIrFunctionPrototype("CodegenComputeFnWrapper", codegen, &args);
-  llvm::BasicBlock* entry_block =
-      llvm::BasicBlock::Create(codegen->context(), "entry", *fn);
-  LlvmBuilder builder(entry_block);
-  llvm::Value* this_ptr =
-      codegen->CastPtrToLlvmPtr(codegen->GetStructPtrType<ScalarExpr>(), this);
-  llvm::Value* compute_fn_args[] = {this_ptr, args[0], args[1]};
-  llvm::Value* ret = CodegenAnyVal::CreateCall(
-      codegen, &builder, static_getval_fn, compute_fn_args, "ret");
-  builder.CreateRet(ret);
-  *fn = codegen->FinalizeFunction(*fn);
-  if (UNLIKELY(*fn == nullptr)) {
-    return Status(TErrorCode::IR_VERIFY_FAILED, "CodegendComputeFnWrapper");
-  }
-  return Status::OK();
-}
-
 #define SCALAR_EXPR_GET_VAL_INTERPRETED(type)                 \
   type ScalarExpr::Get##type##Interpreted(                    \
       ScalarExprEvaluator* eval, const TupleRow* row) const { \
@@ -454,6 +396,7 @@ SCALAR_EXPR_GET_VAL_INTERPRETED(TimestampVal);
 SCALAR_EXPR_GET_VAL_INTERPRETED(DecimalVal);
 SCALAR_EXPR_GET_VAL_INTERPRETED(DateVal);
 SCALAR_EXPR_GET_VAL_INTERPRETED(CollectionVal);
+SCALAR_EXPR_GET_VAL_INTERPRETED(StructVal);
 
 string ScalarExpr::DebugString(const string& expr_name) const {
   stringstream out;

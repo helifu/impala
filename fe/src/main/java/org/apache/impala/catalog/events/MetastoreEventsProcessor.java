@@ -17,8 +17,8 @@
 
 package org.apache.impala.catalog.events;
 
-
 import com.codahale.metrics.Gauge;
+import com.codahale.metrics.Snapshot;
 import com.codahale.metrics.Timer;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -26,27 +26,38 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import javax.annotation.Nullable;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+import org.apache.hadoop.hive.metastore.IMetaStoreClient.NotificationFilter;
 import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
 import org.apache.hadoop.hive.metastore.api.NotificationEvent;
+import org.apache.hadoop.hive.metastore.api.NotificationEventRequest;
 import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
 import org.apache.hadoop.hive.metastore.messaging.MessageDeserializer;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
+import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.IncompleteTable;
 import org.apache.impala.catalog.events.ConfigValidator.ValidationResult;
+import org.apache.impala.catalog.events.MetastoreEvents.DropDatabaseEvent;
 import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEvent;
 import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventFactory;
 import org.apache.impala.common.Metrics;
+import org.apache.impala.common.PrintUtils;
 import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.thrift.TEventProcessorMetrics;
 import org.apache.impala.thrift.TEventProcessorMetricsSummaryResponse;
 import org.apache.impala.util.MetaStoreUtil;
+import org.apache.impala.util.ThreadNameAnnotator;
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -97,38 +108,47 @@ import org.slf4j.LoggerFactory;
  * corresponding object of the event could either be stale, exactly-same or at a version
  * which is higher than one provided by event. Catalog state should only be updated when
  * it is stale with respect to the event. In order to determine if the catalog object is
- * stale, we rely on a combination of creationTime and object version. A object in catalog
- * is stale if and only if its creationTime is < creationTime of the object from event OR
- * its version < version from event if createTime matches
+ * stale, we rely on a combination of create EventId and object version.
+ * In case of create/drop events on database/table/partitions we use the
+ * <code>createEventId</code> field of the corresponding object in the catalogd
+ * to determine if the event needs to be processed or ignored. E.g. if Impala creates
+ * a table, {@link CatalogOpExecutor} will create the table and assign the createEventId
+ * of the table by fetching the CREATE_TABLE event from HMS. Later on when the event
+ * is fetched by events processor, it uses the createEventId of the Catalogd's table to
+ * ignore the event. Similar approach is used for databases and partition create events.
  *
- * If the object has the same createTime and version when compared to event or if the
- * createTime > createTime from the event, the event can be safely ignored.
+ * In case of Drop events for database/table/partition events processor looks at the
+ * {@link DeleteEventLog} in the CatalogOpExecutor to determine if the table has been
+ * dropped already from catalogd.
  *
- * Following table shows the actions to be taken when the catalog state is stale.
+ * In case of ALTER/INSERT events events processor relies on the object version in the
+ * properties of the table to determine if this is a self-event or not.
+ *
+ * Following table shows the actions to be taken when the given event type is received.
  *
  * <pre>
- *               +----------------------------------------+
- *               |    Catalog object state                |
- * +----------------------------+------------+------------+
- * | Event type  | Loaded       | Incomplete | Not present|
- * |             |              |            |            |
- * +------------------------------------------------------+
- * |             |              |            |            |
- * | CREATE EVENT| removeAndAdd | Ignore     | Add        |
- * |             |              |            |            |
- * |             |              |            |            |
- * | ALTER EVENT | Invalidate   | Ignore     | Ignore     |
- * |             |              |            |            |
- * |             |              |            |            |
- * | DROP EVENT  | Remove       | Remove     | Ignore     |
- * |             |              |            |            |
- * |             |              |            |            |
- * | INSERT EVENT| Refresh      | Ignore     | Ignore     |
- * |             |              |            |            |
- * +-------------+--------------+------------+------------+
+ *               +------------------------------------------------+ --------------------+
+ *               |    Catalog object state                                              |
+ * +--------------------------------------+-----------------------+---------------------+
+ * | Event type  | Loaded                 | Incomplete            | Not present         |
+ * |             |                        |                       |                     |
+ * +--------------------------------------------------------------+---------------------+
+ * |             |                        |                       |                     |
+ * | CREATE EVENT| Ignore                 | Ignore                | addIfNotRemovedLater|
+ * |             |                        |                       |                     |
+ * |             |                        |                       |                     |
+ * | ALTER EVENT | Refresh                | Ignore                | Ignore              |
+ * |             |                        |                       |                     |
+ * |             |                        |                       |                     |
+ * | DROP EVENT  | removeIfNotAddedLater  | removeIfNotAddedLater | Ignore              |
+ * |             |                        |                       |                     |
+ * |             |                        |                       |                     |
+ * | INSERT EVENT| Refresh                | Ignore                | Ignore              |
+ * |             |                        |                       |                     |
+ * +-------------+------------------------+-----------------------+---------------------+
  * </pre>
  *
- * Currently event handlers rely on creation time on Database, Table and Partition to
+ * Currently event handlers rely on createEventId on Database, Table and Partition to
  * uniquely determine if the object from event is same as object in the catalog. This
  * information is used to make sure that we are deleting the right incarnation of the
  * object when compared to Metastore.
@@ -141,27 +161,29 @@ import org.slf4j.LoggerFactory;
  * clears this version when the corresponding version number identified by serviceId is
  * received in the event. This is needed since it is possible that a external
  * non-Impala system which generates the event presents the same serviceId and version
- * number later on. The algorithm to detect a self-event is as below.
+ * number later on. The algorithm to detect such self-event is as below.
  *
- * 1. Add the service id and expected catalog version to table/partition parameters
- * when executing the DDL operation. When the HMS operation is successful, add the
- * version number to the list of version for in-flight events at table level.
+ * 1. Add the service id and expected catalog version to database/table/partition
+ * parameters when executing the DDL operation. When the HMS operation is successful, add
+ * the version number to the list of version for in-flight events at
+ * table/database/partition level.
  * 2. When the event is received, the first time you see the combination of serviceId
  * and version number, event processor clears the version number from table's list and
- * determines the event as self-generated (and hence ignored)
+ * determines the event as self-generated (and hence ignored).
  * 3. If the event data presents a unknown serviceId or if the version number is not
  * present in the list of in-flight versions, event is not a self-event and needs to be
  * processed.
  *
- * In order to limit the total memory footprint, only 10 version numbers are stored at
- * the table. Since the event processor is expected to poll every few seconds this
- * should be a reasonable bound which satisfies most use-cases. Otherwise, event
+ * In order to limit the total memory footprint, only 100 version numbers are stored at
+ * the catalog object. Since the event processor is expected to poll every few seconds
+ * this should be a reasonable bound which satisfies most use-cases. Otherwise, event
  * processor may wrongly process a self-event to invalidate the table. In such a case,
  * its a performance penalty not a correctness issue.
  *
  * All the operations which change the state of catalog cache while processing a certain
- * event type must be atomic in nature. We rely on taking a write lock on version object
- * in CatalogServiceCatalog to make sure that readers are blocked while the metadata
+ * event type must be atomic in nature. We rely on taking a DDL lock in CatalogOpExecutor
+ * in case of create/drop events and object (Db or table) level writeLock in case of alter
+ * events to make sure that readers are blocked while the metadata
  * update operation is being performed. Since the events are generated post-metastore
  * operations, such catalog updates do not need to update the state in Hive Metastore.
  *
@@ -170,6 +192,12 @@ import org.slf4j.LoggerFactory;
  * and no subsequent events are polled. In such a case a invalidate metadata command
  * restarts the event polling which updates the lastSyncedEventId to the latest from
  * metastore.
+ *
+ * TODO:
+ * 1. a global invalidate metadata command to get the events processor out of error state
+ * is too heavy weight. We should make it easier to recover from the error state.
+ * 2. The createEventId logic can be extended to track the last eventId which the table
+ * has synced to and we can then get rid of self-event logic for alter events too.
  */
 public class MetastoreEventsProcessor implements ExternalEventsProcessor {
 
@@ -196,16 +224,256 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   public static final String EVENTS_PROCESS_DURATION_METRIC = "events-apply-duration";
   // rate of events received per unit time
   public static final String EVENTS_RECEIVED_METRIC = "events-received";
-  // total number of events which are skipped because of the flag setting
+  // total number of events which are skipped because of the flag setting or
+  // in case of [CREATE|DROP] events on [DATABASE|TABLE|PARTITION] which were ignored
+  // because the [DATABASE|TABLE|PARTITION] was already [PRESENT|ABSENT] in the catalogd.
   public static final String EVENTS_SKIPPED_METRIC = "events-skipped";
   // name of the event processor status metric
   public static final String STATUS_METRIC = "status";
   // last synced event id
   public static final String LAST_SYNCED_ID_METRIC = "last-synced-event-id";
-  // metric name which counts the number of self-events which are skipped
-  public static final String NUMBER_OF_SELF_EVENTS = "self-events-skipped";
-  // metric name for number of tables which are invalidated by event processor so far
-  public static final String NUMBER_OF_TABLE_INVALIDATES = "tables-invalidated";
+  // metric name for number of tables which are refreshed by event processor so far
+  public static final String NUMBER_OF_TABLE_REFRESHES = "tables-refreshed";
+  // number of times events processor refreshed a partition
+  public static final String NUMBER_OF_PARTITION_REFRESHES = "partitions-refreshed";
+  // number of tables which were added to the catalogd based on events.
+  public static final String NUMBER_OF_TABLES_ADDED = "tables-added";
+  // number of tables which were removed to the catalogd based on events.
+  public static final String NUMBER_OF_TABLES_REMOVED = "tables-removed";
+  // number of databases which were added to the catalogd based on events.
+  public static final String NUMBER_OF_DATABASES_ADDED = "databases-added";
+  // number of database which were removed to the catalogd based on events.
+  public static final String NUMBER_OF_DATABASES_REMOVED = "databases-removed";
+  // number of partitions which were added to the catalogd based on events.
+  public static final String NUMBER_OF_PARTITIONS_ADDED = "partitions-added";
+  // number of partitions which were removed to the catalogd based on events.
+  public static final String NUMBER_OF_PARTITIONS_REMOVED = "partitions-removed";
+  // number of entries in the delete event log
+  public static final String DELETE_EVENT_LOG_SIZE = "delete-event-log-size";
+  // number of batch events generated
+  public static final String NUMBER_OF_BATCH_EVENTS = "batch-events-created";
+
+  private static final long SECOND_IN_NANOS = 1000 * 1000 * 1000L;
+
+  /**
+   * Wrapper around {@link
+   * MetastoreEventsProcessor#getNextMetastoreEventsInBatches(CatalogServiceCatalog,
+   * long, NotificationFilter, int)} which passes the default batch size.
+   */
+  public static List<NotificationEvent> getNextMetastoreEventsInBatches(
+      CatalogServiceCatalog catalog, long eventId, NotificationFilter filter)
+      throws MetastoreNotificationFetchException {
+    return getNextMetastoreEventsInBatches(catalog, eventId, filter,
+        EVENTS_BATCH_SIZE_PER_RPC);
+  }
+
+  /**
+   * Gets the next list of {@link NotificationEvent} from Hive Metastore which are
+   * greater than the given eventId and filtered according to the provided filter.
+   * @param catalog The CatalogServiceCatalog used to get the metastore client
+   * @param eventId The eventId after which the events are needed.
+   * @param filter The {@link NotificationFilter} used to filter the list of fetched
+   *               events. Note that this is a client side filter not a server side
+   *               filter. Unfortunately, HMS doesn't provide a similar mechanism to
+   *               do server side filtering.
+   * @param eventsBatchSize the batch size for fetching the events from metastore.
+   * @return List of {@link NotificationEvent} which are all greater than eventId and
+   * satisfy the given filter.
+   * @throws MetastoreNotificationFetchException in case of RPC errors to metastore.
+   */
+  @VisibleForTesting
+  public static List<NotificationEvent> getNextMetastoreEventsInBatches(
+      CatalogServiceCatalog catalog, long eventId, NotificationFilter filter,
+      int eventsBatchSize) throws MetastoreNotificationFetchException {
+    Preconditions.checkArgument(eventsBatchSize > 0);
+    List<NotificationEvent> result = new ArrayList<>();
+    try (MetaStoreClient msc = catalog.getMetaStoreClient()) {
+      long toEventId = msc.getHiveClient().getCurrentNotificationEventId()
+          .getEventId();
+      if (toEventId <= eventId) return result;
+      long currentEventId = eventId;
+      while (currentEventId < toEventId) {
+        int batchSize = Math
+            .min(eventsBatchSize, (int)(toEventId - currentEventId));
+        // we don't call the HiveMetaStoreClient's getNextNotification()
+        // call here because it can throw a IllegalStateException if the eventId
+        // which we pass in is very old and metastore has already cleaned up
+        // the events since that eventId.
+        NotificationEventRequest eventRequest = new NotificationEventRequest();
+        eventRequest.setMaxEvents(batchSize);
+        eventRequest.setLastEvent(currentEventId);
+        NotificationEventResponse notificationEventResponse = MetastoreShim
+            .getNextNotification(msc.getHiveClient(), eventRequest);
+        for (NotificationEvent event : notificationEventResponse.getEvents()) {
+          // if no filter is provided we add all the events
+          if (filter == null || filter.accept(event)) result.add(event);
+          currentEventId = event.getEventId();
+        }
+      }
+      return result;
+    } catch (TException e) {
+      throw new MetastoreNotificationFetchException(String.format(
+          CatalogOpExecutor.HMS_RPC_ERROR_FORMAT_STR, "getNextNotification"), e);
+    }
+  }
+
+  /**
+   * Sync table to latest event id starting from last synced
+   * event id.
+   * @param catalog
+   * @param tbl: Catalog table to be synced
+   * @param eventFactory
+   * @throws CatalogException
+   * @throws MetastoreNotificationException
+   */
+  public static void syncToLatestEventId(CatalogServiceCatalog catalog,
+      org.apache.impala.catalog.Table tbl, EventFactory eventFactory, Metrics metrics)
+      throws CatalogException, MetastoreNotificationException {
+    Preconditions.checkArgument(tbl != null, "tbl is null");
+    Preconditions.checkState(!(tbl instanceof IncompleteTable) &&
+        tbl.isLoaded(), "table %s is either incomplete or not loaded",
+        tbl.getFullName());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread(),
+        String.format("Write lock is not held on table %s by current thread",
+            tbl.getFullName()));
+    long lastEventId = tbl.getLastSyncedEventId();
+    Preconditions.checkArgument(lastEventId > 0, "lastEvent " +
+        " Id %s for table %s should be greater than 0", lastEventId, tbl.getFullName());
+
+    String annotation = String.format("sync table %s to latest HMS event id",
+        tbl.getFullName());
+    try(ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation)) {
+      List<NotificationEvent> events = getNextMetastoreEventsInBatches(catalog,
+          lastEventId, getTableNotificationEventFilter(tbl));
+
+      if (events.isEmpty()) {
+        LOG.debug("table {} synced till event id {}. No new HMS events to process from "
+                + "event id: {}", tbl.getFullName(), lastEventId, lastEventId + 1);
+        return;
+      }
+      MetastoreEvents.MetastoreEvent currentEvent = null;
+      for (NotificationEvent event : events) {
+        currentEvent = eventFactory.get(event, metrics);
+        LOG.trace("for table {}, processing event {}", tbl.getFullName(), currentEvent);
+        currentEvent.processIfEnabled();
+        if (currentEvent.isDropEvent()) {
+          // currentEvent can only be DropPartition or DropTable
+          Preconditions.checkNotNull(currentEvent.getDbName());
+          Preconditions.checkNotNull(currentEvent.getTableName());
+          String key = DeleteEventLog.getTblKey(currentEvent.getDbName(),
+              currentEvent.getTableName());
+          catalog.getMetastoreEventProcessor().getDeleteEventLog()
+              .addRemovedObject(currentEvent.getEventId(), key);
+        }
+        if (currentEvent instanceof MetastoreEvents.DropTableEvent) {
+          // return after processing table drop event
+          return;
+        }
+      }
+      // setting HMS Event ID after all the events
+      // are successfully processed only if table was
+      // not dropped
+      // Certain events like alter_table, do an incremental reload which sets the event
+      // id to the current hms event id at that time. Therefore, check table's last
+      // synced event id again before setting currentEvent id
+      if (currentEvent.getEventId() > tbl.getLastSyncedEventId()) {
+        tbl.setLastSyncedEventId(currentEvent.getEventId());
+      }
+      LOG.info("Synced table {} till HMS event:  {}", tbl.getFullName(),
+          tbl.getLastSyncedEventId());
+    }
+  }
+
+  /**
+   * Sync database to latest event id starting from the last synced
+   * event id
+   * @param catalog
+   * @param db
+   * @param eventFactory
+   * @throws CatalogException
+   * @throws MetastoreNotificationException
+   */
+  public static void syncToLatestEventId(CatalogServiceCatalog catalog,
+      org.apache.impala.catalog.Db db, EventFactory eventFactory, Metrics metrics)
+      throws CatalogException, MetastoreNotificationException {
+    Preconditions.checkArgument(db != null, "db is null");
+    long lastEventId = db.getLastSyncedEventId();
+    Preconditions.checkArgument(lastEventId > 0, "Invalid " +
+        "last synced event ID %s for db %s ", lastEventId, db.getName());
+    Preconditions.checkState(db.isLockHeldByCurrentThread(),
+        "Current thread does not hold lock on db: %s", db.getName());
+
+    String annotation = String.format("sync db %s to latest HMS event id", db.getName());
+    try(ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation)) {
+      List<NotificationEvent> events = getNextMetastoreEventsInBatches(catalog,
+          lastEventId, getDbNotificationEventFilter(db));
+
+      if (events.isEmpty()) {
+        LOG.debug("db {} already synced till event id: {}, no new hms events from "
+            + "event id: {}", db.getName(), lastEventId, lastEventId+1);
+        return;
+      }
+
+      MetastoreEvents.MetastoreEvent currentEvent = null;
+      for (NotificationEvent event : events) {
+        currentEvent = eventFactory.get(event, metrics);
+        LOG.trace("for db {}, processing event: {}", db.getName(), currentEvent);
+        currentEvent.processIfEnabled();
+        if (currentEvent.isDropEvent()) {
+          Preconditions.checkState(currentEvent instanceof DropDatabaseEvent,
+              "invalid drop event {} ", currentEvent);
+          Preconditions.checkNotNull(currentEvent.getDbName());
+          String key = DeleteEventLog.getDbKey(currentEvent.getDbName());
+          catalog.getMetastoreEventProcessor().getDeleteEventLog()
+              .addRemovedObject(currentEvent.getEventId(), key);
+          // return after processing drop db event
+          return;
+        }
+      }
+      // setting HMS Event Id after all the events
+      // are successfully processed only if db was not dropped
+      db.setLastSyncedEventId(currentEvent.getEventId());
+      LOG.info("Synced db {} till HMS event {}", db.getName(),
+          currentEvent);
+    }
+  }
+
+  /*
+  This filter is used when syncing events for a table to the latest HMS event id.
+  It filters all events except db related ones.
+   */
+  private static NotificationFilter getTableNotificationEventFilter(Table tbl) {
+    NotificationFilter filter = new NotificationFilter() {
+      @Override
+      public boolean accept(NotificationEvent event) {
+        if (event.getDbName() != null && event.getTableName() != null) {
+          return tbl.getDb().getName().equalsIgnoreCase(event.getDbName()) &&
+              tbl.getName().equalsIgnoreCase(event.getTableName());
+        }
+        // filter all except db events
+        return event.getDbName() == null;
+      }
+    };
+    return filter;
+  }
+
+  /*
+  This filter is used when syncing db to the latest HMS event id. The
+  filter accepts all events except table related ones
+   */
+  private static NotificationFilter getDbNotificationEventFilter(Db db) {
+    NotificationFilter filter = new NotificationFilter() {
+      @Override
+      public boolean accept(NotificationEvent event) {
+        if (event.getDbName() != null && event.getTableName() == null) {
+          return db.getName().equalsIgnoreCase(event.getDbName());
+        }
+        // filter all events except table events
+        return event.getTableName() == null;
+      }
+    };
+    return filter;
+  }
 
   // possible status of event processor
   public enum EventProcessorStatus {
@@ -226,12 +494,21 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
 
   // keeps track of the last event id which we have synced to
   private final AtomicLong lastSyncedEventId_ = new AtomicLong(-1);
+  private final AtomicLong lastSyncedEventTimeMs_ = new AtomicLong(0);
+
+  // The event id and eventTime of the latest event in HMS. Only used in metrics to show
+  // how far we are lagging behind.
+  private final AtomicLong latestEventId_ = new AtomicLong(0);
+  private final AtomicLong latestEventTimeMs_ = new AtomicLong(0);
+
+  // The duration in nanoseconds of the processing of the last event batch.
+  private final AtomicLong lastEventProcessDurationNs_ = new AtomicLong(0);
 
   // polling interval in seconds. Note this is a time we wait AFTER each fetch call
   private final long pollingFrequencyInSec_;
 
   // catalog service instance to be used while processing events
-  private final CatalogServiceCatalog catalog_;
+  protected final CatalogServiceCatalog catalog_;
 
   // scheduler daemon thread executor for processing events at given frequency
   private final ScheduledExecutorService scheduler_ = Executors
@@ -243,16 +520,21 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   // have to pass it around as a argument in constructor in MetastoreEvents
   private final Metrics metrics_ = new Metrics();
 
+  // When events processing is ACTIVE this delete event log is used to keep track of
+  // DROP events for databases, tables and partitions so that the MetastoreEventsProcessor
+  // can ignore the drop events when they are received later.
+  private final DeleteEventLog deleteEventLog_ = new DeleteEventLog();
+
   @VisibleForTesting
-  MetastoreEventsProcessor(CatalogServiceCatalog catalog, long startSyncFromId,
+  MetastoreEventsProcessor(CatalogOpExecutor catalogOpExecutor, long startSyncFromId,
       long pollingFrequencyInSec) throws CatalogException {
     Preconditions.checkState(pollingFrequencyInSec > 0);
-    this.catalog_ = Preconditions.checkNotNull(catalog);
+    this.catalog_ = Preconditions.checkNotNull(catalogOpExecutor.getCatalog());
     validateConfigs();
     lastSyncedEventId_.set(startSyncFromId);
-    metastoreEventFactory_ = new MetastoreEventFactory(catalog_, metrics_);
-    pollingFrequencyInSec_ = pollingFrequencyInSec;
     initMetrics();
+    metastoreEventFactory_ = new MetastoreEventFactory(catalogOpExecutor);
+    pollingFrequencyInSec_ = pollingFrequencyInSec;
   }
 
   /**
@@ -277,28 +559,28 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
         LOG.error(msg, e);
         throw new CatalogException(msg);
       }
-      if (!validationErrors.isEmpty()) {
-        LOG.error("Found {} incorrect metastore configuration(s).",
-            validationErrors.size());
-        for (ValidationResult invalidConfig: validationErrors) {
-          LOG.error(invalidConfig.getReason());
-        }
-        throw new CatalogException(String.format("Found %d incorrect metastore "
-            + "configuration(s). Events processor cannot start. See ERROR log for more "
-            + "details.", validationErrors.size()));
+    }
+    if (!validationErrors.isEmpty()) {
+      LOG.error("Found {} incorrect metastore configuration(s).",
+          validationErrors.size());
+      for (ValidationResult invalidConfig: validationErrors) {
+        LOG.error(invalidConfig.getReason());
       }
+      throw new CatalogException(String.format("Found %d incorrect metastore "
+          + "configuration(s). Events processor cannot start. See ERROR log for more "
+          + "details.", validationErrors.size()));
     }
   }
+
+  public DeleteEventLog getDeleteEventLog() { return deleteEventLog_; }
 
   /**
    * Returns the list of Metastore configurations to validate depending on the hive
    * version
    */
   public static List<MetastoreEventProcessorConfig> getEventProcessorConfigsToValidate() {
-    if (MetastoreShim.getMajorVersion() >= 2) {
-      return Arrays.asList(MetastoreEventProcessorConfig.FIRE_EVENTS_FOR_DML);
-    }
-    return Arrays.asList(MetastoreEventProcessorConfig.values());
+    return Arrays.asList(MetastoreEventProcessorConfig.FIRE_EVENTS_FOR_DML,
+        MetastoreEventProcessorConfig.METASTORE_DEFAULT_CATALOG_NAME);
   }
 
   private void initMetrics() {
@@ -310,8 +592,17 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
         (Gauge<String>) () -> getStatus().toString());
     metrics_.addGauge(LAST_SYNCED_ID_METRIC,
         (Gauge<Long>) () -> lastSyncedEventId_.get());
-    metrics_.addCounter(NUMBER_OF_SELF_EVENTS);
-    metrics_.addCounter(NUMBER_OF_TABLE_INVALIDATES);
+    metrics_.addCounter(NUMBER_OF_TABLE_REFRESHES);
+    metrics_.addCounter(NUMBER_OF_PARTITION_REFRESHES);
+    metrics_.addCounter(NUMBER_OF_TABLES_ADDED);
+    metrics_.addCounter(NUMBER_OF_TABLES_REMOVED);
+    metrics_.addCounter(NUMBER_OF_DATABASES_ADDED);
+    metrics_.addCounter(NUMBER_OF_DATABASES_REMOVED);
+    metrics_.addCounter(NUMBER_OF_PARTITIONS_ADDED);
+    metrics_.addCounter(NUMBER_OF_PARTITIONS_REMOVED);
+    metrics_
+        .addGauge(DELETE_EVENT_LOG_SIZE, (Gauge<Integer>) deleteEventLog_::size);
+    metrics_.addCounter(NUMBER_OF_BATCH_EVENTS);
   }
 
   /**
@@ -334,8 +625,7 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   /**
    * Gets the current event processor status
    */
-  @VisibleForTesting
-  EventProcessorStatus getStatus() {
+  public EventProcessorStatus getStatus() {
     return eventProcessorStatus_;
   }
 
@@ -352,6 +642,7 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
       return MetaStoreUtil.getMetastoreConfigValue(iMetaStoreClient, config, defaultVal);
     }
   }
+
   /**
    * returns the current value of LastSyncedEventId. This method is not thread-safe and
    * only to be used for testing purposes
@@ -368,6 +659,10 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
         pollingFrequencyInSec_));
     scheduler_.scheduleWithFixedDelay(this::processEvents, pollingFrequencyInSec_,
         pollingFrequencyInSec_, TimeUnit.SECONDS);
+    // Update latestEventId in another thread in case that the processEvents() thread is
+    // blocked by slow metadata reloading or waiting for table locks.
+    scheduler_.scheduleWithFixedDelay(this::updateLatestEventId, pollingFrequencyInSec_,
+        pollingFrequencyInSec_, TimeUnit.SECONDS);
   }
 
   /**
@@ -378,7 +673,11 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
    */
   @Override
   public synchronized void pause() {
-    Preconditions.checkState(eventProcessorStatus_ != EventProcessorStatus.PAUSED);
+    // when concurrent invalidate metadata are running, it is possible the we receive
+    // a pause method call on a already paused events processor.
+    if (eventProcessorStatus_ == EventProcessorStatus.PAUSED) {
+      return;
+    }
     updateStatus(EventProcessorStatus.PAUSED);
     LOG.info(String.format("Event processing is paused. Last synced event id is %d",
         lastSyncedEventId_.get()));
@@ -403,9 +702,17 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   @Override
   public synchronized void start(long fromEventId) {
     Preconditions.checkArgument(fromEventId >= 0);
-    Preconditions.checkState(eventProcessorStatus_ != EventProcessorStatus.ACTIVE,
-        "Event processing start called when it is already active");
+    EventProcessorStatus currentStatus = eventProcessorStatus_;
     long prevLastSyncedEventId = lastSyncedEventId_.get();
+    if (currentStatus == EventProcessorStatus.ACTIVE) {
+      // if events processor is already active, we should make sure that the
+      // start event id provided is not behind the lastSyncedEventId. This could happen
+      // when there are concurrent invalidate metadata calls. if we detect such a case
+      // we should return here.
+      if (prevLastSyncedEventId >= fromEventId) {
+        return;
+      }
+    }
     lastSyncedEventId_.set(fromEventId);
     updateStatus(EventProcessorStatus.ACTIVE);
     LOG.info(String.format(
@@ -453,14 +760,26 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   }
 
   /**
-   * Fetch the next batch of NotificationEvents from metastore. The default batch size if
-   * <code>EVENTS_BATCH_SIZE_PER_RPC</code>
+   * Gets metastore notification events from the given eventId. The returned list of
+   * NotificationEvents are filtered using the NotificationFilter provided if it is not
+   * null.
+   * @param eventId The returned events are all after this given event id.
+   * @param getAllEvents If this is true all the events since eventId are returned.
+   *                     Note that Hive MetaStore can limit the response to a specific
+   *                     maximum number of limit based on the value of configuration
+   *                     {@code hive.metastore.max.event.response}.
+   *                     If it is false, only EVENTS_BATCH_SIZE_PER_RPC events are
+   *                     returned, caller is expected to issue more calls to this method
+   *                     to fetch the remaining events.
+   * @param filter This is a nullable argument. If not null, the events are filtered
+   *               and then returned using this. Otherwise, all the events are returned.
+   * @return List of NotificationEvents from metastore since eventId.
+   * @throws MetastoreNotificationFetchException In case of exceptions from HMS.
    */
-  @VisibleForTesting
-  protected List<NotificationEvent> getNextMetastoreEvents()
+  public List<NotificationEvent> getNextMetastoreEvents(final long eventId,
+      final boolean getAllEvents, @Nullable final NotificationFilter filter)
       throws MetastoreNotificationFetchException {
     final Timer.Context context = metrics_.getTimer(EVENTS_FETCH_DURATION_METRIC).time();
-    long lastSyncedEventId = lastSyncedEventId_.get();
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
       // fetch the current notification event id. We assume that the polling interval
       // is small enough that most of these polling operations result in zero new
@@ -471,22 +790,43 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
       long currentEventId = currentNotificationEventId.getEventId();
 
       // no new events since we last polled
-      if (currentEventId <= lastSyncedEventId) {
+      if (currentEventId <= eventId) {
         return Collections.emptyList();
       }
-
-      NotificationEventResponse response = msClient.getHiveClient()
-          .getNextNotification(lastSyncedEventId, EVENTS_BATCH_SIZE_PER_RPC, null);
+      int batchSize = getAllEvents ? -1 : EVENTS_BATCH_SIZE_PER_RPC;
+      // we use the thrift API directly instead of
+      // HiveMetastoreClient#getNextNotification because the HMS client can throw an
+      // exception when there is a gap between the eventIds returned.
+      NotificationEventRequest eventRequest = new NotificationEventRequest();
+      eventRequest.setLastEvent(eventId);
+      eventRequest.setMaxEvents(batchSize);
+      NotificationEventResponse response = MetastoreShim
+          .getNextNotification(msClient.getHiveClient(), eventRequest);
       LOG.info(String.format("Received %d events. Start event id : %d",
-          response.getEvents().size(), lastSyncedEventId));
-      return response.getEvents();
+          response.getEvents().size(), eventId));
+      if (filter == null) return response.getEvents();
+      List<NotificationEvent> filteredEvents = new ArrayList<>();
+      for (NotificationEvent event : response.getEvents()) {
+        if (filter.accept(event)) filteredEvents.add(event);
+      }
+      return filteredEvents;
     } catch (TException e) {
       throw new MetastoreNotificationFetchException(
           "Unable to fetch notifications from metastore. Last synced event id is "
-              + lastSyncedEventId, e);
+              + eventId, e);
     } finally {
       context.stop();
     }
+  }
+
+  /**
+   * Fetch the next batch of NotificationEvents from metastore. The default batch size is
+   * <code>EVENTS_BATCH_SIZE_PER_RPC</code>
+   */
+  @VisibleForTesting
+  protected List<NotificationEvent> getNextMetastoreEvents()
+      throws MetastoreNotificationFetchException {
+    return getNextMetastoreEvents(lastSyncedEventId_.get(), false, null);
   }
 
   /**
@@ -528,6 +868,43 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   }
 
   /**
+   * Update the latest event id regularly so we know how far we are lagging behind.
+   */
+  private void updateLatestEventId() {
+    EventProcessorStatus currentStatus = eventProcessorStatus_;
+    if (currentStatus != EventProcessorStatus.ACTIVE) {
+      return;
+    }
+    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      CurrentNotificationEventId currentNotificationEventId =
+          msClient.getHiveClient().getCurrentNotificationEventId();
+      long currentEventId = currentNotificationEventId.getEventId();
+      // no new events since we last polled
+      if (currentEventId <= latestEventId_.get()) {
+        return;
+      }
+      // Fetch the last event to get its eventTime.
+      NotificationEventRequest eventRequest = new NotificationEventRequest();
+      eventRequest.setLastEvent(currentEventId - 1);
+      eventRequest.setMaxEvents(1);
+      NotificationEventResponse response = MetastoreShim
+          .getNextNotification(msClient.getHiveClient(), eventRequest);
+      Iterator<NotificationEvent> eventIter = response.getEventsIterator();
+      // Events could be empty if they are just cleaned up.
+      if (!eventIter.hasNext()) return;
+      NotificationEvent event = eventIter.next();
+      Preconditions.checkState(event.getEventId() == currentEventId);
+      LOG.info("Latest event in HMS: id={}, time={}", currentEventId,
+          event.getEventTime());
+      latestEventId_.set(currentEventId);
+      latestEventTimeMs_.set(event.getEventTime());
+    } catch (Exception e) {
+      LOG.error("Unable to update current notification event id. Last value: {}",
+          latestEventId_, e);
+    }
+  }
+
+  /**
    * Gets the current event processor metrics along with its status. If the status is
    * not active the metrics are skipped. Only the status is sent
    */
@@ -538,25 +915,48 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     eventProcessorMetrics.setStatus(currentStatus.toString());
     eventProcessorMetrics.setLast_synced_event_id(getLastSyncedEventId());
     if (currentStatus != EventProcessorStatus.ACTIVE) return eventProcessorMetrics;
+    // The following counters are only updated when event-processor is active.
+    eventProcessorMetrics.setLast_synced_event_time(lastSyncedEventTimeMs_.get());
+    eventProcessorMetrics.setLatest_event_id(latestEventId_.get());
+    eventProcessorMetrics.setLatest_event_time(latestEventTimeMs_.get());
 
     long eventsReceived = metrics_.getMeter(EVENTS_RECEIVED_METRIC).getCount();
     long eventsSkipped = metrics_.getCounter(EVENTS_SKIPPED_METRIC).getCount();
-    double avgFetchDuration =
-        metrics_.getTimer(EVENTS_FETCH_DURATION_METRIC).getMeanRate();
-    double avgProcessDuration =
-        metrics_.getTimer(EVENTS_PROCESS_DURATION_METRIC).getMeanRate();
+    eventProcessorMetrics.setEvents_received(eventsReceived);
+    eventProcessorMetrics.setEvents_skipped(eventsSkipped);
+
+    Snapshot fetchDuration =
+        metrics_.getTimer(EVENTS_FETCH_DURATION_METRIC).getSnapshot();
+    double avgFetchDuration = fetchDuration.getMean() / SECOND_IN_NANOS;
+    double p75FetchDuration = fetchDuration.get75thPercentile() / SECOND_IN_NANOS;
+    double p95FetchDuration = fetchDuration.get95thPercentile() / SECOND_IN_NANOS;
+    double p99FetchDuration = fetchDuration.get99thPercentile() / SECOND_IN_NANOS;
+    eventProcessorMetrics.setEvents_fetch_duration_mean(avgFetchDuration);
+    eventProcessorMetrics.setEvents_fetch_duration_p75(p75FetchDuration);
+    eventProcessorMetrics.setEvents_fetch_duration_p95(p95FetchDuration);
+    eventProcessorMetrics.setEvents_fetch_duration_p99(p99FetchDuration);
+
+    Snapshot processDuration =
+        metrics_.getTimer(EVENTS_PROCESS_DURATION_METRIC).getSnapshot();
+    double avgProcessDuration = processDuration.getMean() / SECOND_IN_NANOS;
+    double p75ProcessDuration = processDuration.get75thPercentile() / SECOND_IN_NANOS;
+    double p95ProcessDuration = processDuration.get95thPercentile() / SECOND_IN_NANOS;
+    double p99ProcessDuration = processDuration.get99thPercentile() / SECOND_IN_NANOS;
+    eventProcessorMetrics.setEvents_process_duration_mean(avgProcessDuration);
+    eventProcessorMetrics.setEvents_process_duration_p75(p75ProcessDuration);
+    eventProcessorMetrics.setEvents_process_duration_p95(p95ProcessDuration);
+    eventProcessorMetrics.setEvents_process_duration_p99(p99ProcessDuration);
+
+    double lastProcessDuration = lastEventProcessDurationNs_.get() /
+        (double) SECOND_IN_NANOS;
+    eventProcessorMetrics.setLast_events_process_duration(lastProcessDuration);
+
     double avgNumberOfEventsReceived1Min =
         metrics_.getMeter(EVENTS_RECEIVED_METRIC).getOneMinuteRate();
     double avgNumberOfEventsReceived5Min =
         metrics_.getMeter(EVENTS_RECEIVED_METRIC).getFiveMinuteRate();
     double avgNumberOfEventsReceived15Min =
         metrics_.getMeter(EVENTS_RECEIVED_METRIC).getFifteenMinuteRate();
-
-
-    eventProcessorMetrics.setEvents_received(eventsReceived);
-    eventProcessorMetrics.setEvents_skipped(eventsSkipped);
-    eventProcessorMetrics.setEvents_fetch_duration_mean(avgFetchDuration);
-    eventProcessorMetrics.setEvents_process_duration_mean(avgProcessDuration);
     eventProcessorMetrics.setEvents_received_1min_rate(avgNumberOfEventsReceived1Min);
     eventProcessorMetrics.setEvents_received_5min_rate(avgNumberOfEventsReceived5Min);
     eventProcessorMetrics.setEvents_received_15min_rate(avgNumberOfEventsReceived15Min);
@@ -596,7 +996,7 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
         metrics_.getTimer(EVENTS_PROCESS_DURATION_METRIC).time();
     try {
       List<MetastoreEvent> filteredEvents =
-          metastoreEventFactory_.getFilteredEvents(events);
+          metastoreEventFactory_.getFilteredEvents(events, metrics_);
       if (filteredEvents.isEmpty()) {
         lastSyncedEventId_.set(events.get(events.size() - 1).getEventId());
         return;
@@ -611,7 +1011,9 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
           }
           lastProcessedEvent = event.metastoreNotificationEvent_;
           event.processIfEnabled();
-          lastSyncedEventId_.set(event.eventId_);
+          deleteEventLog_.garbageCollect(event.getEventId());
+          lastSyncedEventId_.set(event.getEventId());
+          lastSyncedEventTimeMs_.set(event.getEventTime());
         }
       }
     } catch (CatalogException e) {
@@ -619,7 +1021,10 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
           "Unable to process event %d of type %s. Event processing will be stopped.",
           lastProcessedEvent.getEventId(), lastProcessedEvent.getEventType()), e);
     } finally {
-      context.stop();
+      long elapsed_ns = context.stop();
+      lastEventProcessDurationNs_.set(elapsed_ns);
+      LOG.info("Time elapsed in processing event batch: {}",
+          PrintUtils.printTimeNs(elapsed_ns));
     }
   }
 
@@ -652,8 +1057,8 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
    * a singleton and should only be created during catalogD initialization time, so that
    * the start syncId matches with the catalogD startup time.
    *
-   * @param catalog the CatalogServiceCatalog instance to which this event processing
-   *     belongs
+   * @param catalogOpExecutor the CatalogOpExecutor instance to which this event
+   *     processor belongs.
    * @param startSyncFromId Start event id. Events will be polled starting from this
    *     event id
    * @param eventPollingInterval HMS polling interval in seconds
@@ -661,19 +1066,17 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
    *     instantiated
    */
   public static synchronized ExternalEventsProcessor getInstance(
-      CatalogServiceCatalog catalog, long startSyncFromId, long eventPollingInterval)
-      throws CatalogException {
-    if (instance != null) {
-      return instance;
-    }
-
+      CatalogOpExecutor catalogOpExecutor, long startSyncFromId,
+      long eventPollingInterval) throws CatalogException {
+    if (instance != null) return instance;
     instance =
-        new MetastoreEventsProcessor(catalog, startSyncFromId, eventPollingInterval);
+        new MetastoreEventsProcessor(catalogOpExecutor, startSyncFromId,
+            eventPollingInterval);
     return instance;
   }
 
-  @VisibleForTesting
-  public MetastoreEventFactory getMetastoreEventFactory() {
+  @Override
+  public MetastoreEventFactory getEventsFactory() {
     return metastoreEventFactory_;
   }
 

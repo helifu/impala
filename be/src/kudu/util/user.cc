@@ -20,26 +20,35 @@
 #include <pwd.h>
 #include <unistd.h>
 
-#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
 #include <utility>
 
 #include <glog/logging.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/util/debug/leakcheck_disabler.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/status.h"
 
 using std::string;
+using std::unique_ptr;
 
 namespace kudu {
 namespace {
 
 Status DoGetLoggedInUser(string* user_name) {
+  const char* override_username = getenv("KUDU_USER_NAME");
+  if (override_username && strlen(override_username)) {
+    VLOG(1) << "Overriding logged-in user name to " << override_username;
+    *user_name = override_username;
+    return Status::OK();
+  }
+
   DCHECK(user_name != nullptr);
 
   struct passwd pwd;
@@ -50,11 +59,7 @@ Status DoGetLoggedInUser(string* user_name) {
   int64_t retval = sysconf(_SC_GETPW_R_SIZE_MAX);
   size_t bufsize = retval > 0 ? retval : 16384;
 
-  gscoped_ptr<char[], FreeDeleter> buf(static_cast<char *>(malloc(bufsize)));
-  if (buf.get() == nullptr) {
-    return Status::RuntimeError("malloc failed", ErrnoToString(errno), errno);
-  }
-
+  unique_ptr<char[]> buf(new char[bufsize]);
   int ret = getpwuid_r(getuid(), &pwd, buf.get(), bufsize, &result);
   if (result == nullptr) {
     if (ret == 0) {

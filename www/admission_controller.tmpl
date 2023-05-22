@@ -36,6 +36,8 @@ Example of json received from the impala server
             "max_query_mem_limit": 0,
             "min_query_mem_limit": 0,
             "clamp_mem_limit_query_option": true,
+            "max_query_cpu_core_per_node_limit": 8,
+            "max_query_cpu_core_coordinator_limit": 8,
             "wait_time_ms_EMA": 0.0,
             "histogram": [
                 [
@@ -97,12 +99,44 @@ Example of json received from the impala server
 <strong>{{statestore_update_staleness_detail}}</strong>
 </div>
 {{/statestore_update_staleness_detail}}
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.7.3/Chart.min.js" type="text/javascript"></script>
+<script src='{{ __common__.host-url }}/www/Chart-2.9.4.min.js'></script>
 <script type="text/javascript">
 window.onload = function() {
   renderGraph();
   formatMemoryColumns();
 };
+
+// Workaround for https://github.com/chartjs/Chart.js/issues/6154, where the last X-axis
+// label is always omitted. This function bakes in a lot of assumptions for our chart.
+function afterFit(axis) {
+  const ticks = axis.getTicks();
+  const widest = axis._labelSizes.widest.width;
+  const chartWidth = axis.width;
+
+  // Apply a rough heuristic for rotation.
+  const maxFit = Math.trunc(3 * chartWidth / (2 * widest));
+  // Limit to 20 labels.
+  const willFit = Math.min(maxFit, 20);
+
+  // Ensure first and last are always shown.
+  const validLabelIndices = new Set();
+  validLabelIndices.add(0);
+  validLabelIndices.add(ticks.length - 1);
+
+  const numLabels = ticks.length % 2 === 0 ? willFit : willFit - 1;
+
+  const interval = ticks.length / (numLabels - 1);
+  for (let i = 1; i < willFit - 1; i += 1) {
+    validLabelIndices.add(Math.floor(interval * i));
+  }
+
+  ticks.forEach((tick, index) => {
+    Object.assign(
+      tick,
+      { label: validLabelIndices.has(index) ? tick.label : null },
+    );
+  });
+}
 
 // Picks up all the canvas elements associated with each resource pool and renders its
 // peak memory usage histogram.
@@ -145,6 +179,14 @@ function renderGraph() {
               title: {
                   display: true,
                   text: 'Peak Memory per Host'
+              },
+              scales: {
+                xAxes: [{
+                  afterFit: afterFit,
+                  ticks: {
+                    autoSkip: false
+                  }
+                }]
               }
           }
       });
@@ -262,16 +304,12 @@ Time since last statestore update containing admission control topic state (ms):
       <td>{{clamp_mem_limit_query_option}}</td>
     </tr>
     <tr>
-      <td>Max Running Queries Multiple</td>
-      <td>{{max_running_queries_multiple}}</td>
+      <td>Query CPU core per node</td>
+      <td>{{max_query_cpu_core_per_node_limit}}</td>
     </tr>
     <tr>
-      <td>Max Queued Queries Multiple</td>
-      <td>{{max_queued_queries_multiple}}</td>
-    </tr>
-    <tr>
-      <td>Max Memory Multiple</td>
-      <td class='memory'>{{max_memory_multiple}}</td>
+      <td>Query CPU core on coordinator</td>
+      <td>{{max_query_cpu_core_coordinator_limit}}</td>
     </tr>
   </table>
 
@@ -349,22 +387,22 @@ Time since last statestore update containing admission control topic state (ms):
     <tr>
       <td>Queries currently running</td>
       <td>{{agg_num_running}}</td>
-      <td>{{max_running_queries_derived}}</td>
+      <td>{{pool_max_requests}}</td>
     </tr>
     <tr>
       <td>Queries currently queued</td>
       <td>{{agg_num_queued}}</td>
-      <td>{{max_queued_queries_derived}}</td>
+      <td>{{pool_max_queued}}</td>
     </tr>
     <tr>
       <td>Total memory reserved across cluster</td>
       <td class='memory'>{{agg_mem_reserved}}</td>
-      <td class='memory'>{{max_memory_derived}}</td>
+      <td class='memory'>{{pool_max_mem_resources}}</td>
     </tr>
     <tr>
       <td>Memory admitted on this coordinator</td>
       <td class='memory'>{{local_mem_admitted}}</td>
-      <td class='memory'>{{max_memory_derived}}</td>
+      <td class='memory'>{{pool_max_mem_resources}}</td>
     </tr>
     <tr>
       <td>Queued reason of query at the head of the queue</td>

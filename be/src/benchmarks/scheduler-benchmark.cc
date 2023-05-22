@@ -26,7 +26,10 @@
 #include "util/debug-util.h"
 #include "util/thread.h"
 
+#include "codegen/llvm-codegen.h"
+#include "common/init.h"
 #include "common/names.h"
+#include "service/fe-support.h"
 
 using namespace impala;
 using namespace impala::test;
@@ -130,7 +133,7 @@ void BenchmarkFunction(int num_iterations, void* data) {
 /// blocks. Scheduling will be done according to the parameter 'replica_preference'.
 void RunClusterSizeBenchmark(TReplicaPreference::type replica_preference) {
   string suite_name = strings::Substitute(
-      "Cluster Size, $0", PrintThriftEnum(replica_preference));
+      "Cluster Size, $0", PrintValue(replica_preference));
   Benchmark suite(suite_name, false /* micro_heuristics */);
   vector<TestCtx> test_ctx(CLUSTER_SIZES.size());
 
@@ -160,9 +163,9 @@ void RunNumBlocksBenchmark(TReplicaPreference::type replica_preference) {
 }
 
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
-  CpuInfo::Init();
-  impala::InitThreading();
+  impala::InitCommonRuntime(argc, argv, true, impala::TestInfo::BE_TEST);
+  impala::InitFeSupport();
+  ABORT_IF_ERROR(LlvmCodeGen::InitializeLlvm());
 
   cout << Benchmark::GetMachineInfo() << endl;
   RunClusterSizeBenchmark(TReplicaPreference::DISK_LOCAL);

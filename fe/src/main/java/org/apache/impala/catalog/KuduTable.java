@@ -32,7 +32,9 @@ import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.impala.analysis.ColumnDef;
 import org.apache.impala.analysis.KuduPartitionParam;
 import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TKuduPartitionByHashParam;
 import org.apache.impala.thrift.TKuduPartitionByRangeParam;
 import org.apache.impala.thrift.TKuduPartitionParam;
@@ -42,6 +44,7 @@ import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableType;
 import org.apache.impala.util.KuduUtil;
 import org.apache.kudu.ColumnSchema;
+import org.apache.kudu.Schema;
 import org.apache.kudu.client.HiveMetastoreConfig;
 import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduException;
@@ -57,6 +60,10 @@ import com.google.common.collect.Lists;
  * Representation of a Kudu table in the catalog cache.
  */
 public class KuduTable extends Table implements FeKuduTable {
+
+  // Boolean config to enable the check which compares Kudu's and Impala's HMS instances.
+  private static boolean ENABLE_KUDU_IMPALA_HMS_CHECK =
+      BackendConfig.INSTANCE.getBackendCfg().enable_kudu_impala_hms_check;
 
   // Alias to the string key that identifies the storage handler for Kudu tables.
   public static final String KEY_STORAGE_HANDLER =
@@ -102,6 +109,12 @@ public class KuduTable extends Table implements FeKuduTable {
 
   // Comma separated list of Kudu master hosts with optional ports.
   private String kuduMasters_;
+
+  // Set to true if primary key is unique.
+  private boolean isPrimaryKeyUnique_ = true;
+
+  // Set to true if the table has auto-incrementing column.
+  private boolean hasAutoIncrementingColumn_ = false;
 
   // Primary key column names, the column names are all in lower case.
   private final List<String> primaryKeyColumnNames_ = new ArrayList<>();
@@ -183,6 +196,12 @@ public class KuduTable extends Table implements FeKuduTable {
   public org.apache.kudu.Schema getKuduSchema() { return kuduSchema_; }
 
   @Override
+  public boolean isPrimaryKeyUnique() { return isPrimaryKeyUnique_; }
+
+  @Override
+  public boolean hasAutoIncrementingColumn() { return hasAutoIncrementingColumn_; }
+
+  @Override
   public List<String> getPrimaryKeyColumnNames() {
     return ImmutableList.copyOf(primaryKeyColumnNames_);
   }
@@ -228,8 +247,9 @@ public class KuduTable extends Table implements FeKuduTable {
    */
   public static boolean isHMSIntegrationEnabledAndValidate(String kuduMasters,
       String hmsUris) throws ImpalaRuntimeException {
-    Preconditions.checkNotNull(hmsUris);
-    Preconditions.checkArgument(!hmsUris.isEmpty());
+    if (hmsUris == null || hmsUris.isEmpty()) {
+      return false;
+    }
     HiveMetastoreConfig hmsConfig = getHiveMetastoreConfig(kuduMasters);
     if (hmsConfig == null) {
       return false;
@@ -247,7 +267,8 @@ public class KuduTable extends Table implements FeKuduTable {
       throw new ImpalaRuntimeException(
           String.format("Error parsing URI: %s", e.getMessage()));
     }
-    if (hmsHosts != null && kuduHmsHosts != null && hmsHosts.equals(kuduHmsHosts)) {
+    if (hmsHosts != null && kuduHmsHosts != null &&
+        (hmsHosts.equals(kuduHmsHosts) || !ENABLE_KUDU_IMPALA_HMS_CHECK)) {
       return true;
     }
     throw new ImpalaRuntimeException(
@@ -373,6 +394,9 @@ public class KuduTable extends Table implements FeKuduTable {
 
     int pos = 0;
     kuduSchema_ = kuduTable.getSchema();
+    isPrimaryKeyUnique_ = kuduSchema_.isPrimaryKeyUnique();
+    hasAutoIncrementingColumn_ = kuduSchema_.hasAutoIncrementingColumn();
+    Preconditions.checkState(!isPrimaryKeyUnique_ || !hasAutoIncrementingColumn_);
     for (ColumnSchema colSchema: kuduSchema_.getColumns()) {
       KuduColumn kuduCol = KuduColumn.fromColumnSchema(colSchema, pos);
       Preconditions.checkNotNull(kuduCol);
@@ -396,14 +420,29 @@ public class KuduTable extends Table implements FeKuduTable {
    */
   public static KuduTable createCtasTarget(Db db,
       org.apache.hadoop.hive.metastore.api.Table msTbl, List<ColumnDef> columnDefs,
-      List<ColumnDef> primaryKeyColumnDefs, List<KuduPartitionParam> partitionParams) {
+      boolean isPrimaryKeyUnique, List<ColumnDef> primaryKeyColumnDefs,
+      List<KuduPartitionParam> partitionParams)
+      throws ImpalaRuntimeException {
     KuduTable tmpTable = new KuduTable(msTbl, db, msTbl.getTableName(), msTbl.getOwner());
+    tmpTable.isPrimaryKeyUnique_ = isPrimaryKeyUnique;
     int pos = 0;
     for (ColumnDef colDef: columnDefs) {
-      tmpTable.addColumn(new Column(colDef.getColName(), colDef.getType(), pos++));
+      tmpTable.addColumn(KuduColumn.fromThrift(colDef.toThrift(), pos++));
+      // Simulate Kudu engine to add auto-incrementing column as the key column in the
+      // temporary KuduTable if the primary key is not unique so that the temporary
+      // KuduTable has same layout as the table created by Kudu engine. This makes
+      // analysis module could find the right position for each column.
+      if (!isPrimaryKeyUnique && pos == primaryKeyColumnDefs.size()) {
+        tmpTable.addColumn(KuduColumn.createAutoIncrementingColumn(pos++));
+        tmpTable.hasAutoIncrementingColumn_ = true;
+      }
     }
     for (ColumnDef pkColDef: primaryKeyColumnDefs) {
       tmpTable.primaryKeyColumnNames_.add(pkColDef.getColName());
+    }
+    if (!isPrimaryKeyUnique) {
+      // Add auto-incrementing column's name to the list of key column's name
+      tmpTable.primaryKeyColumnNames_.add(Schema.getAutoIncrementingColumnName());
     }
     tmpTable.partitionBy_ = ImmutableList.copyOf(partitionParams);
     return tmpTable;
@@ -425,6 +464,8 @@ public class KuduTable extends Table implements FeKuduTable {
     kuduMasters_ = Joiner.on(',').join(tkudu.getMaster_addresses());
     primaryKeyColumnNames_.clear();
     primaryKeyColumnNames_.addAll(tkudu.getKey_columns());
+    isPrimaryKeyUnique_ = tkudu.isIs_primary_key_unique();
+    hasAutoIncrementingColumn_ = tkudu.isHas_auto_incrementing();
     partitionBy_ = loadPartitionByParamsFromThrift(tkudu.getPartition_by());
   }
 
@@ -458,6 +499,8 @@ public class KuduTable extends Table implements FeKuduTable {
   private TKuduTable getTKuduTable() {
     TKuduTable tbl = new TKuduTable();
     tbl.setKey_columns(Preconditions.checkNotNull(primaryKeyColumnNames_));
+    tbl.setIs_primary_key_unique(isPrimaryKeyUnique_);
+    tbl.setHas_auto_incrementing(hasAutoIncrementingColumn_);
     tbl.setMaster_addresses(Lists.newArrayList(kuduMasters_.split(",")));
     tbl.setTable_name(kuduTableName_);
     Preconditions.checkNotNull(partitionBy_);

@@ -17,17 +17,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import os
 import sys
 
-kerberize = os.environ.get('IMPALA_KERBERIZE') == '1'
+kerberize = os.environ.get('IMPALA_KERBERIZE') == 'true'
 target_filesystem = os.environ.get('TARGET_FILESYSTEM')
 
 compression_codecs = [
   'org.apache.hadoop.io.compress.GzipCodec',
   'org.apache.hadoop.io.compress.DefaultCodec',
-  'com.hadoop.compression.lzo.LzoCodec',
-  'com.hadoop.compression.lzo.LzopCodec',
   'org.apache.hadoop.io.compress.BZip2Codec'
 ]
 
@@ -44,7 +43,6 @@ CONFIG = {
 
   # Compression codecs
   'io.compression.codecs': ",".join(compression_codecs),
-  'io.compression.deoc.lzo.class': 'com.hadoop.compression.lzo.LzoCodec',
 
   # Set up proxyuser
   'hadoop.proxyuser.${USER}.hosts': '*',
@@ -89,6 +87,45 @@ CONFIG = {
   # This property can be used in tests to ascertain that this core-site.xml from
   # the classpath has been loaded. (Ex: TestRequestPoolService)
   'impala.core-site.overridden': 'true',
+
+  # Hadoop changed behaviors for S3AFilesystem to check permissions for the bucket
+  # on initialization (see HADOOP-16711). Some frontend tests access non-existent
+  # buckets and rely on the old behavior. This also means that the tests do not
+  # require AWS credentials.
+  'fs.s3a.bucket.probe': '1',
+
+  # GCS IAM permissions don't map to POSIX permissions required by Hadoop FileSystem,
+  # so the GCS connector presents fake POSIX file permissions. The default 700 may end up
+  # being too restrictive for some processes performing file-based checks, e.g.
+  # HiveServer2 requires permission of /tmp/hive to be at lest 733.
+  'fs.gs.reported.permissions': '777',
+
+  # COS configuration
+  # Note: This is needed even when not running on COS, because some frontend tests
+  # include COS paths that require initializing an COS filesystem.
+  # See ExplainTest.testScanNodeFsScheme().
+  'fs.cosn.userinfo.secretId': '${COS_SECRET_ID}',
+  'fs.cosn.userinfo.secretKey': '${COS_SECRET_KEY}',
+  'fs.cosn.bucket.region': '${COS_REGION}',
+  'fs.cosn.impl': 'org.apache.hadoop.fs.CosFileSystem',
+  'fs.AbstractFileSystem.cosn.impl': 'org.apache.hadoop.fs.CosN',
+
+   # OSS configuration
+   # Note: This is needed even when not running on OSS, because some frontend tests
+   # include OSS paths that require initializing an OSS filesystem.
+   # See ExplainTest.testScanNodeFsScheme().
+   'fs.oss.accessKeyId': '${OSS_ACCESS_KEY_ID}',
+   'fs.oss.accessKeySecret': '${OSS_SECRET_ACCESS_KEY}',
+   'fs.oss.endpoint': '${OSS_ACCESS_ENDPOINT}',
+   'fs.oss.impl': 'org.apache.hadoop.fs.aliyun.oss.AliyunOSSFileSystem',
+   'fs.AbstractFileSystem.oss.impl': 'org.apache.hadoop.fs.aliyun.oss.OSS',
+
+   # Manifest caching configuration for Iceberg.
+   'iceberg.io-impl': 'org.apache.iceberg.hadoop.HadoopFileIO',
+   'iceberg.io.manifest.cache-enabled': 'true',
+   'iceberg.io.manifest.cache.expiration-interval-ms': '60000',
+   'iceberg.io.manifest.cache.max-total-bytes': '104857600',
+   'iceberg.io.manifest.cache.max-content-length': '8388608',
 }
 
 if target_filesystem == 's3':
@@ -101,6 +138,18 @@ if target_filesystem == 's3':
       'fs.s3a.s3guard.ddb.table': '${S3GUARD_DYNAMODB_TABLE}',
       'fs.s3a.s3guard.ddb.region': '${S3GUARD_DYNAMODB_REGION}',
     })
+
+if target_filesystem == 'obs':
+  CONFIG.update({
+    'fs.obs.impl': 'org.apache.hadoop.fs.obs.OBSFileSystem',
+    'fs.AbstractFileSystem.obs.impl': 'org.apache.hadoop.fs.obs.OBS',
+    'fs.obs.access.key': '${OBS_ACCESS_KEY}',
+    'fs.obs.secret.key': '${OBS_SECRET_KEY}',
+    'fs.obs.endpoint': '${OBS_ENDPOINT}',
+    })
+
+if target_filesystem == 'ozone':
+  CONFIG.update({'fs.ofs.impl': 'org.apache.hadoop.fs.ozone.RootedOzoneFileSystem'})
 
 if kerberize:
   CONFIG.update({

@@ -19,6 +19,8 @@
 
 # This tool walks the build directory (release by default) and will print the text, data,
 # and bss section sizes of the archives.
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import fnmatch
 import os
 import re
@@ -28,8 +30,9 @@ from prettytable import PrettyTable
 def get_bin_size_data(file):
   data = ""
   try:
-    data = subprocess.check_output(["size", "-B", "-t", file], stderr=subprocess.STDOUT)
-  except Exception, e:
+    data = subprocess.check_output(["size", "-B", "-t", file],
+        stderr=subprocess.STDOUT, universal_newlines=True)
+  except Exception as e:
     data = e.output
 
   res = re.split(r'\s+', data.split("\n")[-2])

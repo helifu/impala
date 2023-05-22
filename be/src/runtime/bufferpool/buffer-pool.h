@@ -20,21 +20,15 @@
 
 #include <stdint.h>
 #include <string>
-#include <vector>
 #include <boost/scoped_ptr.hpp>
-#include <boost/thread/locks.hpp>
 
-#include "common/atomic.h"
 #include "common/compiler-util.h"
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "gutil/macros.h"
 #include "runtime/mem-tracker-types.h"
-#include "runtime/tmp-file-mgr.h"
 #include "util/aligned-new.h"
-#include "util/internal-queue.h"
 #include "util/mem-range.h"
-#include "util/spinlock.h"
 
 namespace impala {
 
@@ -42,6 +36,7 @@ class MetricGroup;
 class ReservationTracker;
 class RuntimeProfile;
 class SystemAllocator;
+class TmpFileGroup;
 
 /// A buffer pool that manages memory buffers for all queries in an Impala daemon.
 /// The buffer pool enforces buffer reservations, limits, and implements policies
@@ -178,7 +173,7 @@ class BufferPool : public CacheLineAligned {
   /// 'reservation_limit' and associated with MemTracker 'mem_tracker'. The initial
   /// reservation is 0 bytes. 'mem_limit_mode' determines whether reservation
   /// increases are checked against the soft or hard limit of 'mem_tracker'.
-  Status RegisterClient(const std::string& name, TmpFileMgr::FileGroup* file_group,
+  Status RegisterClient(const std::string& name, TmpFileGroup* file_group,
       ReservationTracker* parent_reservation, MemTracker* mem_tracker,
       int64_t reservation_limit, RuntimeProfile* profile, ClientHandle* client,
       MemLimit mem_limit_mode = MemLimit::SOFT) WARN_UNUSED_RESULT;
@@ -307,6 +302,7 @@ class BufferPool : public CacheLineAligned {
   /// power-of-two buffer sizes.
   static constexpr int LOG_MAX_BUFFER_BYTES = 48;
   static constexpr int64_t MAX_BUFFER_BYTES = 1L << LOG_MAX_BUFFER_BYTES;
+  static constexpr int MAX_PAGE_ITER_DEBUG = 100;
 
  protected:
   friend class BufferPoolTest;
@@ -367,7 +363,13 @@ class BufferPool::ClientHandle {
 
   /// Move some of src's reservation to this client. 'bytes' of unused reservation must be
   /// available in 'src'.
+  ///
+  /// This is safe to call concurrently from multiple threads, as long as those threads
+  /// coordinate to ensure there is sufficient unused reservation.
   void RestoreReservation(SubReservation* src, int64_t bytes);
+
+  /// Same as above but move all of src's unused reservation to this client.
+  void RestoreAllReservation(SubReservation* src);
 
   /// Accessors for this client's reservation corresponding to the identically-named
   /// methods in ReservationTracker.
@@ -381,12 +383,21 @@ class BufferPool::ClientHandle {
   bool TransferReservationFrom(ReservationTracker* src, int64_t bytes);
 
   /// Transfer 'bytes' of reservation from this client to 'dst' using
-  /// ReservationTracker::TransferReservationTo().
-  bool TransferReservationTo(ReservationTracker* dst, int64_t bytes);
+  /// ReservationTracker::TransferReservationTo(). The client must have at least 'bytes'
+  /// of unused reservation. May fail if transferring the reservation requires flushing
+  /// unpinned pages to disk and a write to disk fails, in which case it returns an error
+  /// status. May also fail if a reservation limit on 'dst' would be exceeded as a result
+  /// of the transfer, in which case *transferred is false but Status::OK is returned.
+  ///
+  /// This is safe to call concurrently from multiple threads, as long as those threads
+  /// coordinate to ensure there is sufficient unused reservation.
+  Status TransferReservationTo(ReservationTracker* dst, int64_t bytes, bool* transferred);
+  Status TransferReservationTo(ClientHandle* dst, int64_t bytes, bool* transferred);
 
   /// Call SetDebugDenyIncreaseReservation() on this client's ReservationTracker.
   void SetDebugDenyIncreaseReservation(double probability);
 
+  int64_t min_buffer_len() const;
   bool is_registered() const { return impl_ != NULL; }
 
   /// Return true if there are any unpinned pages for this client.
@@ -436,9 +447,10 @@ class BufferPool::SubReservation {
   boost::scoped_ptr<ReservationTracker> tracker_;
 };
 
-/// A handle to a buffer allocated from the buffer pool. Each BufferHandle should only
-/// be used by a single thread at a time: concurrently calling BufferHandle methods or
-/// BufferPool methods with the BufferHandle as an argument is not supported.
+/// A handle to a buffer allocated from the buffer pool. Only const methods on
+/// BufferHandle are thread-safe. It is not safe to call non-constant BufferHandle
+/// methods or BufferPool methods with the BufferHandle as an argument concurrently
+/// with any other operations on the BufferHandle.
 class BufferPool::BufferHandle {
  public:
   BufferHandle() { Reset(); }
@@ -502,9 +514,10 @@ class BufferPool::BufferHandle {
   int home_core_;
 };
 
-/// The handle for a page used by clients of the BufferPool. Each PageHandle should
-/// only be used by a single thread at a time: concurrently calling PageHandle methods
-/// or BufferPool methods with the PageHandle as an argument is not supported.
+/// The handle for a page used by clients of the BufferPool. Only const methods on
+/// PageHandle are thread-safe. It is not safe to call non-constant PageHandle
+/// methods or BufferPool methods with the PageHandle as an argument concurrently
+/// with any other operations on the PageHandle.
 class BufferPool::PageHandle {
  public:
   PageHandle();
@@ -529,6 +542,9 @@ class BufferPool::PageHandle {
   /// since the last call to GetBuffer(). Only const accessors of the returned handle can
   /// be used: it is invalid to call FreeBuffer() or TransferBuffer() on it or to
   /// otherwise modify the handle.
+  ///
+  /// This is safe to call from multiple threads at the same time as long as the
+  /// page is pinned.
   Status GetBuffer(const BufferHandle** buffer_handle) const WARN_UNUSED_RESULT;
 
   std::string DebugString() const;

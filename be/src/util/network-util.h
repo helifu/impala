@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
+
+#include <string>
+#include <vector>
+
 #include "common/status.h"
 #include "gen-cpp/common.pb.h"
-#include "gen-cpp/StatestoreService_types.h"
 #include "gen-cpp/Types_types.h"
-#include <vector>
 
 namespace kudu {
 class Sockaddr;
@@ -35,6 +38,7 @@ typedef std::string IpAddr;
 
 /// Returns true if 'addr' is a fully resolved IP address, rather than a fqdn + port.
 bool IsResolvedAddress(const TNetworkAddress& addr);
+bool IsResolvedAddress(const NetworkAddressPB& addr);
 
 /// Looks up all IP addresses associated with a given hostname and returns one of them via
 /// 'address'. If the IP addresses of a host don't change, then subsequent calls will
@@ -50,8 +54,19 @@ bool FindFirstNonLocalhost(const std::vector<std::string>& addresses, std::strin
 /// Returns OK if a hostname can be found, false otherwise.
 Status GetHostname(std::string* hostname) WARN_UNUSED_RESULT;
 
-/// Utility method because Thrift does not supply useful constructors
+/// Generate UDS address.
+string GetUDSAddress(const std::string& hostname, int port, const UniqueIdPB& backend_id,
+    const UdsAddressUniqueIdPB& uds_addr_unique_id);
+
+/// Utility methods because Thrift/protobuf do not supply useful constructors
 TNetworkAddress MakeNetworkAddress(const std::string& hostname, int port);
+NetworkAddressPB MakeNetworkAddressPB(const std::string& hostname, int port);
+NetworkAddressPB MakeNetworkAddressPB(const std::string& hostname, int port,
+    const UniqueIdPB& backend_id, const UdsAddressUniqueIdPB& uds_addr_unique_id);
+/// This function generate unique ID if needed.
+/// It's only used if backend ID is not available, like unit-test or Admissiond.
+NetworkAddressPB MakeNetworkAddressPB(const std::string& hostname, int port,
+    const UdsAddressUniqueIdPB& uds_addr_unique_id);
 
 /// Utility method to parse the given string into a network address.
 /// Accepted format: "host:port" or "host". For the latter format the port is set to zero.
@@ -68,13 +83,21 @@ std::string TNetworkAddressToString(const TNetworkAddress& address);
 /// Utility method to print a NetworkAddressPB as address:port.
 std::string NetworkAddressPBToString(const NetworkAddressPB& address);
 
+inline ostream& operator<<(ostream& os, const NetworkAddressPB& address) {
+  return os << NetworkAddressPBToString(address);
+}
+
 /// Utility method to convert a NetworkAddressPB to a TNetworkAddress.
 TNetworkAddress FromNetworkAddressPB(const NetworkAddressPB& address);
 
-/// Utility method to convert TNetworkAddress to Kudu sock addr.
+/// Utility method to convert a TNetworkAddress to a NetworkAddressPB.
+NetworkAddressPB FromTNetworkAddress(const TNetworkAddress& address);
+
+/// Utility method to convert NetworkAddressPB to Kudu Sockaddr.
+/// If use_uds is true, set Kudu Sockaddr as UDS address.
 /// Note that 'address' has to contain a resolved IP address.
-Status TNetworkAddressToSockaddr(const TNetworkAddress& address,
-    kudu::Sockaddr* sockaddr);
+Status NetworkAddressPBToSockaddr(
+    const NetworkAddressPB& address, bool use_uds, kudu::Sockaddr* sockaddr);
 
 /// Returns a ephemeral port that is currently unused. Returns -1 on an error or if
 /// a free ephemeral port can't be found after 100 tries.

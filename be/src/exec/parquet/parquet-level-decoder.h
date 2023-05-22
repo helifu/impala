@@ -49,11 +49,19 @@ class ParquetLevelDecoder {
     : decoding_error_code_(is_def_level_decoder ? TErrorCode::PARQUET_DEF_LEVEL_ERROR :
                                                   TErrorCode::PARQUET_REP_LEVEL_ERROR) {}
 
-  /// Initialize the LevelDecoder. Reads and advances the provided data buffer if the
-  /// encoding requires reading metadata from the page header. 'cache_size' will be
-  /// rounded up to a multiple of 32 internally.
-  Status Init(const string& filename, const parquet::Encoding::type* encoding,
-      MemPool* cache_pool, int cache_size, int max_level, uint8_t** data, int* data_size);
+  /// Initialize the LevelDecoder. Assumes that data is RLE encoded.
+  /// 'cache_size' will be rounded up to a multiple of 32 internally.
+  Status Init(const std::string& filename, MemPool* cache_pool, int cache_size,
+      int max_level, uint8_t* data, int32_t num_bytes);
+
+  /// Parses the number of bytes used for level encoding from the buffer and moves
+  /// 'data' forward.
+  static Status ParseRleByteSize(const string& filename,
+      uint8_t** data, int* total_data_size, int32_t* num_bytes);
+
+  // Validates that encoding is RLE.
+  static Status ValidateEncoding(const string& filename,
+      const parquet::Encoding::type encoding);
 
   /// Returns the next level or INVALID_LEVEL if there was an error. Not as efficient
   /// as batched methods.
@@ -81,6 +89,13 @@ class ParquetLevelDecoder {
   /// input did not have the expected number of values. Only valid to call when
   /// the cache has been exhausted, i.e. CacheHasNext() is false.
   Status CacheNextBatch(int vals_remaining);
+
+  /// No-op if there are remaining values in the cache. Invokes 'CacheNextBatch()' if the
+  /// cache is empty.
+  Status CacheNextBatchIfEmpty(int vals_to_cache) {
+    if (LIKELY(CacheHasNext())) return Status::OK();
+    return CacheNextBatch(vals_to_cache);
+  }
 
   /// Functions for working with the level cache.
   bool CacheHasNext() const { return cached_level_idx_ < num_cached_levels_; }
@@ -140,7 +155,7 @@ class ParquetLevelDecoder {
   int cache_size_ = 0;
 
   /// Name of the parquet file. Used for reporting level decoding errors.
-  string filename_;
+  std::string filename_;
 
   /// Error code to use when reporting level decoding errors.
   TErrorCode::type decoding_error_code_;

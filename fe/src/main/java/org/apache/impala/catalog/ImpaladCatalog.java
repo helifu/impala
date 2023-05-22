@@ -19,7 +19,11 @@ package org.apache.impala.catalog;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -29,6 +33,7 @@ import org.apache.impala.authorization.AuthorizationChecker;
 import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TAuthzCacheInvalidation;
 import org.apache.impala.thrift.TCatalogObject;
@@ -37,15 +42,20 @@ import org.apache.impala.thrift.TDataSource;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TGetPartitionStatsResponse;
+import org.apache.impala.thrift.THdfsPartition;
+import org.apache.impala.thrift.THdfsTable;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
 import org.apache.impala.thrift.TUpdateCatalogCacheResponse;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.impala.util.TByteBuffer;
-import org.apache.log4j.Logger;
+import org.apache.impala.util.TUniqueIdUtil;
+import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 
@@ -75,7 +85,7 @@ import com.google.common.base.Preconditions;
  * service has been started, in which case a full topic update is required.
  */
 public class ImpaladCatalog extends Catalog implements FeCatalog {
-  private static final Logger LOG = Logger.getLogger(ImpaladCatalog.class);
+  private static final Logger LOG = LoggerFactory.getLogger(ImpaladCatalog.class);
   // The last known Catalog Service ID. If the ID changes, it indicates the CatalogServer
   // has restarted.
   private TUniqueId catalogServiceId_ = Catalog.INITIAL_CATALOG_SERVICE_ID;
@@ -194,33 +204,58 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
     // For updates from catalog op results, the service ID is set in the request.
     if (req.isSetCatalog_service_id()) setCatalogServiceId(req.catalog_service_id);
     ObjectUpdateSequencer sequencer = new ObjectUpdateSequencer();
+    // Maps that group incremental partition updates by table names so we can apply them
+    // when updating the table.
+    Map<TableName, List<THdfsPartition>> newPartitionsByTable = new HashMap<>();
+    Map<TableName, PartitionMetaSummary> partUpdates = new HashMap<>();
     long newCatalogVersion = lastSyncedCatalogVersion_.get();
     Pair<Boolean, ByteBuffer> update;
+    int maxMessageSize = BackendConfig.INSTANCE.getThriftRpcMaxMessageSize();
+    final TConfiguration config = new TConfiguration(maxMessageSize,
+        TConfiguration.DEFAULT_MAX_FRAME_SIZE, TConfiguration.DEFAULT_RECURSION_DEPTH);
     while ((update = FeSupport.NativeGetNextCatalogObjectUpdate(req.native_iterator_ptr))
         != null) {
+      boolean isDelete = update.first;
       TCatalogObject obj = new TCatalogObject();
-      obj.read(new TBinaryProtocol(new TByteBuffer(update.second)));
+      obj.read(new TBinaryProtocol(new TByteBuffer(config, update.second)));
       String key = Catalog.toCatalogObjectKey(obj);
       int len = update.second.capacity();
       if (len > 100 * 1024 * 1024 /* 100MB */) {
         LOG.info("Received large catalog object(>100mb): " + key + " is " + len +
             "bytes");
       }
-      LOG.info((update.first ? "Deleting: " : "Adding: ") + key + " version: "
-          + obj.catalog_version + " size: " + len);
+      if (!key.contains("HDFS_PARTITION")) {
+        LOG.info((isDelete ? "Deleting: " : "Adding: ") + key + " version: "
+            + obj.catalog_version + " size: " + len);
+      }
       // For statestore updates, the service ID and updated version is wrapped in a
       // CATALOG catalog object.
       if (obj.type == TCatalogObjectType.CATALOG) {
         setCatalogServiceId(obj.catalog.catalog_service_id);
         newCatalogVersion = obj.catalog_version;
+      } else if (obj.type == TCatalogObjectType.HDFS_PARTITION) {
+        TableName tblName = new TableName(obj.getHdfs_partition().db_name,
+            obj.getHdfs_partition().tbl_name);
+        partUpdates.computeIfAbsent(tblName,
+            (s) -> new PartitionMetaSummary(tblName.toString(), /*inCatalogd*/false,
+                /*hasV1Updates*/true, /*hasV2Updates*/false))
+            .update(/*isV1Key*/true, isDelete, obj.hdfs_partition.partition_name,
+                obj.catalog_version, len, /*unused*/-1);
+        if (!isDelete) {
+          newPartitionsByTable.computeIfAbsent(tblName, (s) -> new ArrayList<>())
+              .add(obj.getHdfs_partition());
+        }
       } else {
-        sequencer.add(obj, update.first);
+        sequencer.add(obj, isDelete);
       }
+    }
+    for (PartitionMetaSummary summary : partUpdates.values()) {
+      if (summary.hasUpdates()) LOG.info(summary.toString());
     }
 
     for (TCatalogObject catalogObject: sequencer.getUpdatedObjects()) {
       try {
-        addCatalogObject(catalogObject);
+        addCatalogObject(catalogObject, newPartitionsByTable);
       } catch (Exception e) {
         LOG.error("Error adding catalog object: " + e.getMessage(), e);
       }
@@ -272,8 +307,8 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
    *  2) The catalogDeltaLog_ contains an entry for this object with a version
    *     > than the given TCatalogObject's version.
    */
-  private void addCatalogObject(TCatalogObject catalogObject)
-      throws TableLoadingException {
+  private void addCatalogObject(TCatalogObject catalogObject,
+      Map<TableName, List<THdfsPartition>> newPartitions) throws TableLoadingException {
     // This item is out of date and should not be applied to the catalog.
     if (catalogDeltaLog_.wasObjectRemovedAfter(catalogObject)) {
       if (LOG.isTraceEnabled()) {
@@ -289,7 +324,11 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
         break;
       case TABLE:
       case VIEW:
-        addTable(catalogObject.getTable(), catalogObject.getCatalog_version());
+        TTable table = catalogObject.getTable();
+        TableName tblName = new TableName(table.getDb_name(), table.getTbl_name());
+        addTable(table,
+            newPartitions.getOrDefault(tblName, Collections.emptyList()),
+            catalogObject.getCatalog_version());
         break;
       case FUNCTION:
         // Remove the function first, in case there is an existing function with the same
@@ -373,6 +412,10 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
         removeAuthzCacheInvalidation(catalogObject.getAuthz_cache_invalidation(),
             dropCatalogVersion);
         break;
+      case HDFS_PARTITION:
+        // Ignore partition deletions in catalog-v1 mode since they are handled during
+        // table updates to atomically update the table.
+        break;
       default:
         throw new IllegalStateException(
             "Unexpected TCatalogObjectType: " + catalogObject.getType());
@@ -415,8 +458,8 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
     }
   }
 
-  private void addTable(TTable thriftTable, long catalogVersion)
-      throws TableLoadingException {
+  private void addTable(TTable thriftTable, List<THdfsPartition> newPartitions,
+      long catalogVersion) throws TableLoadingException {
     Db db = getDb(thriftTable.db_name);
     if (db == null) {
       if (LOG.isTraceEnabled()) {
@@ -426,8 +469,80 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
       return;
     }
 
+    Preconditions.checkNotNull(newPartitions);
+    Table existingTable = db.getTable(thriftTable.tbl_name);
     Table newTable = Table.fromThrift(db, thriftTable);
     newTable.setCatalogVersion(catalogVersion);
+    if (existingTable != null && existingTable.getCatalogVersion() >= catalogVersion) {
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Ignore stale update on table {}: currentVersion={}, updateVersion={}",
+            existingTable.getFullName(), existingTable.getCatalogVersion(),
+            catalogVersion);
+      }
+      return;
+    }
+    // Apply partition updates if this is a partial THdfsTable object with minimal
+    // partitions. Currently, catalogd returns full table objects in DDL responses and
+    // sends partial table objects in catalog topic updates. When sending partial table
+    // objects, partition updates are sent in the same topic update so we can apply them
+    // here.
+    if (newTable instanceof HdfsTable
+        && !thriftTable.getHdfs_table().has_full_partitions) {
+      THdfsTable tHdfsTable = thriftTable.getHdfs_table();
+      int numExistingParts = 0;
+      int numNewParts = 0;
+      int numDeletedParts = 0;
+      HdfsTable newHdfsTable = (HdfsTable) newTable;
+      // HdfsPartitions are immutable so we can reuse them in the old table instance.
+      // Copy existing partitions before we apply incremental updates.
+      if (existingTable instanceof HdfsTable) {
+        for (PrunablePartition part : ((HdfsTable) existingTable).getPartitions()) {
+          numExistingParts++;
+          if (tHdfsTable.partitions.containsKey(part.getId())) {
+            // Create a new partition instance under the new table object and copy all
+            // the fields of the existing partition.
+            HdfsPartition newPart = new HdfsPartition.Builder(newHdfsTable, part.getId())
+                .copyFromPartition((HdfsPartition) part)
+                .build();
+            Preconditions.checkState(newHdfsTable.addPartitionNoThrow(newPart));
+          } else {
+            numDeletedParts++;
+          }
+        }
+      }
+      // Apply incremental updates.
+      for (THdfsPartition tPart : newPartitions) {
+        // TODO: remove this after IMPALA-9937. It's only illegal in statestore updates,
+        //  which indicates a leak of partitions in the catalog topic - a stale partition
+        //  should already have a corresponding deletion so won't get here.
+        Preconditions.checkState(tHdfsTable.partitions.containsKey(tPart.id),
+            "Received stale partition in a statestore update: " + tPart);
+        // The existing table could have a newer version than the last sent table version
+        // in catalogd, so some partition instances may already exist here. This happens
+        // when we have executed DDL/DMLs on this table on this coordinator since the last
+        // catalog update. (IMPALA-10283)
+        if (newHdfsTable.getPartitionMap().containsKey(tPart.id)) {
+          LOG.info("Skip adding existing partition (id:{}, name:{}) to table {}",
+              tPart.id, tPart.partition_name, newHdfsTable.getFullName());
+          continue;
+        }
+        HdfsPartition part = new HdfsPartition.Builder(newHdfsTable, tPart.id)
+            .fromThrift(tPart)
+            .build();
+        Preconditions.checkState(newHdfsTable.addPartitionNoThrow(part),
+            "Failed adding new partition (id:{}, name:{}) to table {}",
+            tPart.id, tPart.partition_name, newHdfsTable.getFullName());
+        LOG.trace("Added partition (id:{}, name:{}) to table {}",
+            tPart.id, tPart.partition_name, newHdfsTable.getFullName());
+        numNewParts++;
+      }
+      // Validate that all partitions are set.
+      ((HdfsTable) newTable).validatePartitions(tHdfsTable.partitions.keySet());
+      LOG.info("Applied incremental table updates on {} existing partitions of " +
+          "table {}.{}: added {} new partitions, deleted {} stale partitions.",
+          numExistingParts, thriftTable.db_name, thriftTable.tbl_name,
+          numNewParts, numDeletedParts);
+    }
     db.addTable(newTable);
   }
 
@@ -545,6 +660,12 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
     if (!FeSupport.NativeLibCacheRemoveEntry(hdfsLibFile)) {
       LOG.error("LibCacheRemoveEntry(" + hdfsLibFile + ") failed.");
     }
+  }
+
+  @Override
+  public String getAcidUserId() {
+    return String.format("Impala Catalog %s",
+        TUniqueIdUtil.PrintId(getCatalogServiceId()));
   }
 
   @Override

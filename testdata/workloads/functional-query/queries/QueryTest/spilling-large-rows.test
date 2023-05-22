@@ -21,6 +21,7 @@ Row of size 9.54 MB could not be materialized by AGGREGATION_NODE
 ====
 ---- QUERY
 # Agg should be able to process the large strings if we increase the row size.
+set mem_limit="1gb";
 set max_row_size=10m;
 select id, count(distinct bigstr)
 from bigstrs
@@ -63,7 +64,7 @@ from functional.alltypes atp
   join bigstrs bs on repeat(atp.string_col, 10000) = substring(bs.bigstr, 5000000, 10000) and atp.id = bs.id
 where atp.id < 100
 ---- CATCH
-Row of size 9.54 MB could not be materialized by HASH_JOIN_NODE (id=2). Increase the max_row_size query option (currently 512.00 KB) to process larger rows.
+Row of size 9.54 MB could not be materialized by Hash Join Builder (join_node_id=2). Increase the max_row_size query option (currently 512.00 KB) to process larger rows.
 ====
 ---- QUERY
 # Row is too big to process in right side of hash join.
@@ -152,7 +153,7 @@ Row of size 9.54 MB could not be materialized by SORT_NODE (id=1). Increase the 
 ---- QUERY
 # Sort and analytic should be able to process the large strings if we increase the row
 # size.
-set mem_limit="1gb";
+set mem_limit="1.4gb";
 set max_row_size=10m;
 SELECT id, int_col, substring(bigstr, 1, 10), substring(bigstr, 9999999, 1), rank
 FROM (
@@ -190,4 +191,66 @@ int,int,string,string,bigint
 22,2,'2222222222','2',7
 23,3,'3333333333','3',10
 24,4,'4444444444','4',13
+====
+---- QUERY
+# IMPALA-9955,IMPALA-9957: Test aggregation on a table with both large rows and normal
+# rows. TODO: use UNION ALL to generate the table after IMPALA-10040 is fixed.
+set mem_limit="1gb";
+create table bigstrs2 stored as parquet as
+select *, repeat(string_col, 100000) as bigstr
+from functional.alltypes
+order by id
+limit 10;
+insert into bigstrs2
+select *, repeat(string_col, 10000000) as bigstr
+from functional.alltypes
+order by id
+limit 10;
+====
+---- QUERY
+set mem_limit="1gb";
+set max_row_size=10m;
+select group_concat(string_col), length(bigstr) from bigstrs2
+group by bigstr;
+---- TYPES
+string,int
+---- RESULTS
+'0',100000
+'1',100000
+'2',100000
+'3',100000
+'4',100000
+'5',100000
+'6',100000
+'7',100000
+'8',100000
+'9',100000
+'0',10000000
+'1',10000000
+'2',10000000
+'3',10000000
+'4',10000000
+'5',10000000
+'6',10000000
+'7',10000000
+'8',10000000
+'9',10000000
+====
+---- QUERY
+# IMPALA-9955,IMPALA-9957: Test aggregation on a table with random length of large rows.
+# Can't check the results since it's a random table. The following queries will fail or
+# crash the impalads when there are bugs in reservation.
+set mem_limit="2gb";
+create table bigstrs3 stored as parquet as
+select *, repeat(uuid(), cast(random() * 200000 as int)) as bigstr
+from functional.alltypes
+limit 100;
+# Length of uuid() is 36. So the max row size is 7,200,000.
+set MAX_ROW_SIZE=8m;
+create table my_str_group stored as parquet as
+  select group_concat(string_col) as ss, bigstr
+  from bigstrs3 group by bigstr;
+create table my_cnt stored as parquet as
+  select count(*) as cnt, bigstr
+  from bigstrs3 group by bigstr;
 ====

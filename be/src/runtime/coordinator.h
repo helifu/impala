@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_RUNTIME_COORDINATOR_H
-#define IMPALA_RUNTIME_COORDINATOR_H
+#pragma once
 
 #include <memory>
 #include <string>
 #include <vector>
-#include <boost/thread/shared_mutex.hpp>
 #include <boost/unordered_map.hpp>
 #include <rapidjson/document.h>
 
@@ -31,21 +29,33 @@
 #include "common/status.h"
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/Types_types.h"
+#include "gen-cpp/data_stream_service.pb.h"
 #include "runtime/dml-exec-state.h"
+#include "runtime/query-exec-params.h"
 #include "util/counting-barrier.h"
 #include "util/progress-updater.h"
+#include "util/promise.h"
 #include "util/runtime-profile-counters.h"
 #include "util/spinlock.h"
+#include "util/container-util.h"
+
+namespace kudu {
+namespace rpc {
+class RpcContext;
+} // namespace rpc
+} // namespace kudu
 
 namespace impala {
 
+class AuxErrorInfoPB;
 class ClientRequestState;
+class FragmentExecParamsPB;
 class FragmentInstanceState;
 class MemTracker;
 class ObjectPool;
 class PlanRootSink;
+class QueryDriver;
 class QueryResultSet;
-class QuerySchedule;
 class QueryState;
 class ReportExecStatusRequestPB;
 class RuntimeProfile;
@@ -85,23 +95,29 @@ class TUpdateCatalogRequest;
 ///    executing (without an error status).
 /// 3. The query has returned all rows. The overall query status is OK (and remains
 ///    OK). Client cancellation is no longer possible and subsequent backend errors are
-///    ignored. (TODO: IMPALA-6984 initiate backend cancellation in this case).
+///    ignored. The coordinator initiates cancellation for all backends and waits for the
+///    final exec status reports.
 ///
 /// Lifecycle: this object must not be destroyed until after one of the three states
 /// above is reached (error, cancelled, or EOS) to ensure resources are released.
+/// There is work that needs to be done as part of the transition into each of the
+/// above states. That work is done by the thread that triggered the state transition
+/// *after* the atomic state transition by calling HandleExecStateTransition(). If
+/// another thread depends on that work being complete, they can wait on the 'finalized_'
+/// promise.
 ///
 /// Lock ordering: (lower-numbered acquired before higher-numbered)
 /// 1. wait_lock_
-/// 2. filter_lock_
-/// 3. exec_state_lock_, backend_states_init_lock_, filter_update_lock_, ExecSummary::lock
+/// 2. Coordinator::FilterRoutingTable::lock
+/// 3. exec_state_lock_, backend_states_init_lock_, FilterState::lock_, ExecSummary::lock
 /// 4. Coordinator::BackendState::lock_ (leafs)
 ///
 /// TODO: move into separate subdirectory and move nested classes into separate files
 /// and unnest them
 class Coordinator { // NOLINT: The member variables could be re-ordered to save space
  public:
-  Coordinator(ClientRequestState* parent, const QuerySchedule& schedule,
-      RuntimeProfile::EventSequence* events);
+  Coordinator(ClientRequestState* parent, const TExecRequest& exec_request,
+      const QuerySchedulePB& query_schedule, RuntimeProfile::EventSequence* events);
   ~Coordinator();
 
   /// Initiate asynchronous execution of a query with the given schedule. When it
@@ -113,7 +129,8 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// Blocks until result rows are ready to be retrieved via GetNext(), or, if the
   /// query doesn't return rows, until the query finishes or is cancelled. A call to
   /// Wait() must precede all calls to GetNext().  Multiple calls to Wait() are
-  /// idempotent and it is okay to issue multiple Wait() calls concurrently.
+  /// idempotent and it is okay to issue multiple Wait() calls concurrently. Only valid to
+  /// call after Exec() returns successfully.
   Status Wait() WARN_UNUSED_RESULT;
 
   /// Fills 'results' with up to 'max_rows' rows. May return fewer than 'max_rows'
@@ -131,8 +148,12 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
       int64_t block_on_wait_time_us) WARN_UNUSED_RESULT;
 
   /// Cancel execution of query and sets the overall query status to CANCELLED if the
-  /// query is still executing. Idempotent.
-  void Cancel();
+  /// query is still executing. Idempotent. If 'wait_until_finalized' is true and another
+  /// thread is cancelling 'coord_', block until the query profile is completed, e.g.
+  /// if ComputeQuerySummary() is running concurrently. This is only used by the thread
+  /// unregistering the query - other threads should return immediately if the query
+  /// is in the process of being cancelled.
+  void Cancel(bool wait_until_finalized=false);
 
   /// Called by the report status RPC handler to update execution status of a particular
   /// backend as well as dml_exec_state_ and the profile. This may block if exec RPCs are
@@ -143,9 +164,10 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
 
   /// Returns the time in ms since the latest report was received for the backend which
   /// has gone the longest without a report being received, and sets 'address' to the host
-  /// for that backend. May return 0, for example if the backends are not initialized yet
-  /// or if all of them have already completed, in which case 'address' will not be set.
-  int64_t GetMaxBackendStateLagMs(TNetworkAddress* address);
+  /// for that backend. Only valid to call if Exec() has returned successfully. May return
+  /// 0, for example if all of the backends have already completed, in which case
+  /// 'address' will not be set.
+  int64_t GetMaxBackendStateLagMs(NetworkAddressPB* address);
 
   /// Get cumulative profile aggregated over all fragments of the query.
   /// This is a snapshot of the current state of execution and will change in
@@ -171,7 +193,7 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// with others for the same filter ID into a global filter. If all updates for that
   /// filter ID have been received (may be 1 or more per filter), broadcast the global
   /// filter to fragment instances.
-  void UpdateFilter(const TUpdateFilterParams& params);
+  void UpdateFilter(const UpdateFilterParamsPB& params, kudu::rpc::RpcContext* context);
 
   /// Adds to 'document' a serialized array of all backends in a member named
   /// 'backend_states'.
@@ -205,6 +227,9 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
     /// Total system cpu consumed.
     int64_t cpu_sys_ns = 0;
 
+    /// Total num rows produced by each join node. The key is join node id.
+    std::map<int32_t, int64_t> per_join_rows_produced;
+
     /// Merge utilization from 'other' into this.
     void Merge(const ResourceUtilization& other) {
       peak_per_host_mem_consumption =
@@ -214,6 +239,17 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
       scan_bytes_sent += other.scan_bytes_sent;
       cpu_user_ns += other.cpu_user_ns;
       cpu_sys_ns += other.cpu_sys_ns;
+      MergeMapValues(other.per_join_rows_produced, &per_join_rows_produced);
+    }
+
+    /// Max join rows produced across join nodes
+    const std::pair<int32_t, int64_t> MaxJoinNodeRowsProduced() const {
+      std::pair<int32_t, int64_t> entryWithMaxValue = std::make_pair(0, 0);
+      for (const auto& entry : per_join_rows_produced) {
+        if (entry.second > entryWithMaxValue.second)
+          entryWithMaxValue = std::make_pair(entry.first, entry.second);
+      }
+      return entryWithMaxValue;
     }
   };
 
@@ -223,8 +259,8 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
 
   /// Return the backends in 'candidates' that still have at least one fragment instance
   /// executing on them. The returned backends may not be in the same order as the input.
-  std::vector<TNetworkAddress> GetActiveBackends(
-      const std::vector<TNetworkAddress>& candidates);
+  std::vector<NetworkAddressPB> GetActiveBackends(
+      const std::vector<NetworkAddressPB>& candidates);
 
  private:
   class BackendState;
@@ -234,12 +270,17 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   class FilterState;
   class FragmentStats;
 
+  /// The parent QueryDriver object for this coordinator. The reference is set in the
+  /// constructor. It always outlives the coordinator.
+  QueryDriver* parent_query_driver_;
+
   /// The parent ClientRequestState object for this coordinator. The reference is set in
-  /// the constructor. It always outlives the this coordinator.
+  /// the constructor. It always outlives the coordinator.
   ClientRequestState* parent_request_state_;
 
-  /// owned by the ClientRequestState that owns this coordinator
-  const QuerySchedule& schedule_;
+  /// Contains references to Thrift and Protobuf structs constituting the execution
+  /// parameters. These structs are owned by the QueryDriver and ClientRequestState.
+  QueryExecParams exec_params_;
 
   /// Copied from TQueryExecRequest, governs when finalization occurs. Set in Exec().
   TStmtType::type stmt_type_;
@@ -248,12 +289,12 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// are non-nullptr and owned by obj_pool(). Populated by Exec()/InitBackendStates().
   std::vector<BackendState*> backend_states_;
 
-  /// A map from the TNetworkAddress of a backend to the BackendState running on the
-  /// TNetworkAddress. All values are non-nullptr and owned by obj_pool(). The address
+  /// A map from the NetworkAddressPB of a backend to the BackendState running on the
+  /// NetworkAddressPB. All values are non-nullptr and owned by obj_pool(). The address
   /// is the kRPC address (Coordinator::BackendState::krpc_impalad_address) of the
-  /// Backend. This map is distinct from QuerySchedule::per_backend_exec_params(),
+  /// Backend. This map is distinct from QuerySchedulePB::per_backend_exec_params(),
   /// which uses the Thrift address as the key rather than the kRPC address.
-  boost::unordered_map<TNetworkAddress, BackendState*> addr_to_backend_state_;
+  boost::unordered_map<NetworkAddressPB, BackendState*> addr_to_backend_state_;
 
   /// Protects the population of backend_states_ vector (not the BackendState objects).
   /// Used when accessing backend_states_ if it's not guaranteed that
@@ -281,7 +322,9 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// ensures single-threaded execution of Wait(). See lock ordering class comment.
   SpinLock wait_lock_;
 
-  bool has_called_wait_ = false;  // if true, Wait() was called; protected by wait_lock_
+  /// If true, Wait() was called. When read / written in Wait() the wait_lock_ should
+  /// still be acquired to ensure Wait() is only executed once.
+  AtomicBool has_called_wait_;
 
   BackendResourceState* backend_resource_state_ = nullptr;
 
@@ -337,7 +380,7 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
     /// A mapping of fragment data sink ids to index into thrift_exec_summary.nodes
     boost::unordered_map<TPlanNodeId, int> data_sink_id_to_idx_map;
 
-    void Init(const QuerySchedule& query_schedule);
+    void Init(const QueryExecParams& exec_params);
   };
 
   // Initialized by Exec().
@@ -356,8 +399,12 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// sequentially, without synchronization.
   std::vector<FragmentStats*> fragment_stats_;
 
-  /// Barrier that is released when all calls to BackendState::Exec() have returned.
-  CountingBarrier exec_rpcs_complete_barrier_;
+  /// Barrier that is released when all backend Exec() rpcs have completed successfully,
+  /// or when one fails, in which case the returned value is the error from that rpc.
+  TypedCountingBarrier<Status> exec_rpcs_status_barrier_;
+
+  /// True if all Exec() rpcs have completed.
+  AtomicBool exec_rpcs_complete_{false};
 
   /// Barrier that is released when all backends have indicated execution completion,
   /// or when all backends are cancelled due to an execution error or client requested
@@ -388,6 +435,10 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// - CANCELLED: CANCELLED
   /// - ERROR: error status
   Status exec_status_;
+
+  /// Set when all of the work to transition into a terminal state is complete,
+  /// including ComputeQuerySummary().
+  Promise<bool> finalized_;
 
   /// Contains all the state about filters being handled by this coordinator.
   std::unique_ptr<FilterRoutingTable> filter_routing_table_;
@@ -447,7 +498,6 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   void HandleExecStateTransition(const ExecState old_state, const ExecState new_state);
 
   /// Return true if 'exec_state_' is RETURNED_RESULTS.
-  /// TODO: remove with IMPALA-6984.
   bool ReturnedAllResults() WARN_UNUSED_RESULT {
     return exec_state_.Load() == ExecState::RETURNED_RESULTS;
   }
@@ -461,14 +511,18 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   }
 
   /// Helper for HandleExecStateTransition(). Sends cancellation request to all
-  /// executing backends but does not wait for acknowledgement from the backends. The
-  /// ExecState state-machine ensures this is called at most once.
-  void CancelBackends();
+  /// executing backends. If 'fire_and_forget' is true, does not wait for the
+  /// final exec status reports from the backends. The ExecState state-machine
+  /// ensures this is called at most once.
+  void CancelBackends(bool fire_and_forget);
 
   /// Returns only when either all execution backends have reported success or a request
   /// to cancel the backends has already been sent. It is safe to call this concurrently,
   /// but any calls must be made only after Exec().
   void WaitForBackends();
+
+  /// Returns when all Exec() rpcs have completed. Thread-safe.
+  void WaitOnExecRpcs();
 
   /// Initializes fragment_stats_ and query_profile_. Must be called before
   /// InitBackendStates().
@@ -490,6 +544,12 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// finishing the INSERT in flight.
   Status FinalizeHdfsDml() WARN_UNUSED_RESULT;
 
+  /// Perform any post-query cleanup required for Result Sink writing. Called by Wait()
+  /// only after all fragment instances have returned. It is the responsibility of an
+  /// external frontend to clean up the Result Sink location on success or error of the
+  /// running query.
+  Status FinalizeResultSink() WARN_UNUSED_RESULT;
+
   /// Helper for Exec(). Populates backend_states_, starts query execution at all
   /// backends in parallel, and blocks until startup completes.
   Status StartBackendExec();
@@ -501,9 +561,17 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// possible at this point if no fragment instances were assigned to it).
   Status FinishBackendStartup() WARN_UNUSED_RESULT;
 
-  /// Build the filter routing table by iterating over all plan nodes and collecting the
-  /// filters that they either produce or consume.
+  /// Build the filter routing table by iterating over all plan nodes and data sinks and
+  /// collecting the filters that they either produce or consume.
   void InitFilterRoutingTable();
+
+  /// Helper for InitFilterRoutingTable() that adds a source join node or join build sink
+  /// for 'filter' to the routing table. 'src_fragment_params' is the parameters for the
+  /// fragment containing the join node (if build is integrated) or build sink (if the
+  /// build is separate). 'num_instances' and 'num_backends' are the number of instances
+  /// and backends that the fragment runs on.
+  void AddFilterSource(const FragmentExecParamsPB& src_fragment_params, int num_instances,
+      int num_backends, const TRuntimeFilterDesc& filter, int join_node_id);
 
   /// Helper for HandleExecStateTransition(). Releases all resources associated with
   /// query execution. The ExecState state-machine ensures this is called exactly once.
@@ -548,15 +616,36 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// Checks the exec_state_ of the query and returns true if the query is executing.
   bool IsExecuting();
 
-  /// Helper function for UpdateBackendExecStatus that iterates through the
-  /// FragmentInstanceExecStatusPB for each fragment and uses AuxErrorInfoPB to check if
-  /// any nodes should be blacklisted. AuxErrorInfoPB contains additional error
-  /// information about why the fragment failed, beyond what is available in the
+  /// Helper function for UpdateBackendExecStatus that iterates through the given vector
+  /// of AuxErrorInfoPB objects and uses each one to check if any nodes should be
+  /// blacklisted. AuxErrorInfoPB contains additional error information about why the
+  /// fragment failed, beyond what is available in the
   /// ReportExecStatusRequestPB::overall_status field. This method uses information in
   /// AuxErrorInfoPB to classify specific nodes as "faulty" and then blacklists them. A
   /// node might be considered "faulty" if, for example, a RPC to that node failed, or a
   /// fragment on that node failed due to a disk IO error.
-  void UpdateBlacklistWithAuxErrorInfo(const ReportExecStatusRequestPB& request);
+  /// 'status' is the Status of the given BackendState. 'backend_state' is the
+  /// BackendState that reported an error.
+  /// Returns the Status object used when blacklisting a backend, or Status::OK if no
+  /// backends were blacklisted.
+  Status UpdateBlacklistWithAuxErrorInfo(std::vector<AuxErrorInfoPB>* aux_error_info,
+      const Status& status, BackendState* backend_state) WARN_UNUSED_RESULT;
+
+  /// Helper function for UpdateBackendExecStatus that check if the backend node should
+  /// be blacklisted based on the reported backend error.
+  /// 'status' is the Status of the given BackendState. 'backend_state' is the
+  /// BackendState that reported an error.
+  /// Returns the Status object used when blacklisting a backend, or Status::OK if no
+  /// backends were blacklisted.
+  Status UpdateBlacklistWithBackendState(
+      const Status& status, BackendState* backend_state) WARN_UNUSED_RESULT;
+
+  /// Called if the Exec RPC to the given vector of BackendStates failed. Currently, just
+  /// triggers a retry of the query.
+  void HandleFailedExecRpcs(std::vector<BackendState*> failed_backend_states);
+
+  /// Deletes the query-level staging directory.
+  Status DeleteQueryLevelStagingDir();
 
   /// BackendState and BackendResourceState are private to the Coordinator class, so mark
   /// all tests in CoordinatorBackendStateTest as friends.
@@ -568,5 +657,3 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
 };
 
 }
-
-#endif

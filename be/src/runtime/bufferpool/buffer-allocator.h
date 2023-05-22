@@ -20,9 +20,11 @@
 
 #include <boost/scoped_ptr.hpp>
 
+#include "common/atomic.h"
 #include "runtime/bufferpool/buffer-pool-internal.h"
 #include "runtime/bufferpool/free-list.h"
 #include "util/aligned-new.h"
+#include "util/spinlock.h"
 
 namespace impala {
 
@@ -102,7 +104,7 @@ class BufferPool::BufferAllocator {
   /// client's lock via 'client_lock' so that moving the page between the client list and
   /// the free page list is atomic. Caller must not hold 'FreeBufferArena::lock_' or any
   /// Page::lock.
-  void AddCleanPage(const boost::unique_lock<boost::mutex>& client_lock, Page* page);
+  void AddCleanPage(const std::unique_lock<std::mutex>& client_lock, Page* page);
 
   /// Removes a clean page 'page' from a clean page list and returns true, if present in
   /// one of the lists. Returns true if it was present. If 'claim_buffer' is true, the
@@ -112,7 +114,7 @@ class BufferPool::BufferAllocator {
   /// client list and the free page list is atomic. Caller must not hold
   /// 'FreeBufferArena::lock_' or any Page::lock.
   bool RemoveCleanPage(
-      const boost::unique_lock<boost::mutex>& client_lock, bool claim_buffer, Page* page);
+      const std::unique_lock<std::mutex>& client_lock, bool claim_buffer, Page* page);
 
   /// Periodically called to release free buffers back to the SystemAllocator. Releases
   /// buffers based on recent allocation patterns, trying to minimise the number of

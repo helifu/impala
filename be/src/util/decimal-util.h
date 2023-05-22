@@ -15,33 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_UTIL_DECIMAL_UTIL_H
-#define IMPALA_UTIL_DECIMAL_UTIL_H
+#include <endian.h>
 
+#include <cstdint>
 #include <functional>
-#include <ostream>
-#include <string>
-#include <boost/cstdint.hpp>
 
+#include "common/compiler-util.h"
+#include "common/logging.h"
 #include "runtime/multi-precision.h"
 #include "runtime/types.h"
+#include "util/arithmetic-util.h"
 #include "util/bit-util.h"
+#include "util/decimal-constants.h"
 
 namespace impala {
 
 class DecimalUtil {
  public:
-  /// Maximum absolute value of a valid Decimal4Value. This is 9 digits of 9's.
-  static const int32_t MAX_UNSCALED_DECIMAL4 = 999999999;
-
-  /// Maximum absolute value of a valid Decimal8Value. This is 18 digits of 9's.
-  static const int64_t MAX_UNSCALED_DECIMAL8 = 999999999999999999;
-
-  /// Maximum absolute value a valid Decimal16Value. This is 38 digits of 9's.
-  static const int128_t MAX_UNSCALED_DECIMAL16 = 99 + 100 *
-      (MAX_UNSCALED_DECIMAL8 + (1 + MAX_UNSCALED_DECIMAL8) *
-       static_cast<int128_t>(MAX_UNSCALED_DECIMAL8));
+  // The scale's exclusive upper bound for GetScaleMultiplier<int32_t>()
+  static constexpr int INT32_SCALE_UPPER_BOUND = ColumnType::MAX_DECIMAL4_PRECISION + 1;
+  // The scale's exclusive upper bound for GetScaleMultiplier<int64_t>()
+  static constexpr int INT64_SCALE_UPPER_BOUND = ColumnType::MAX_DECIMAL8_PRECISION + 1;
+  // The scale's exclusive upper bound for GetScaleMultiplier<int128_t>()
+  static constexpr int INT128_SCALE_UPPER_BOUND = ColumnType::MAX_PRECISION + 1;
+  // The scale's exclusive upper bound for GetScaleMultiplier<int256_t>()
+  static constexpr int INT256_SCALE_UPPER_BOUND = 77;
 
   // Helper function that checks for multiplication overflow. We only check for overflow
   // if may_overflow is false.
@@ -95,7 +95,7 @@ class DecimalUtil {
         // here that it is a multiple of two.
         if (abs(remainder) >= (divisor >> 1)) {
           // Bias at zero must be corrected by sign of dividend.
-          result += BitUtil::Sign(value);
+          result += Sign(value);
         }
       }
       return result;
@@ -132,25 +132,32 @@ class DecimalUtil {
 #endif
   }
 
-  template<typename T>
+  template <typename T>
   static inline void DecodeFromFixedLenByteArray(
-      const uint8_t* buffer, int fixed_len_size, T* v) {
+      const uint8_t* RESTRICT buffer, int fixed_len_size, T* RESTRICT v) {
     DCHECK_GT(fixed_len_size, 0);
-    DCHECK_LE(fixed_len_size, sizeof(T));
-    *v = 0;
-    // We need to sign extend val. For example, if the original value was
-    // -1, the original bytes were -1,-1,-1,-1. If we only wrote out 1 byte, after
-    // the encode step above, val would contain (-1, 0, 0, 0). We need to sign
-    // extend the remaining 3 bytes to get the original value.
-    // We do this by filling in the most significant bytes and (arithmetic) bit
-    // shifting down.
-    int bytes_to_fill = sizeof(T) - fixed_len_size;
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-    BitUtil::ByteSwap(reinterpret_cast<int8_t*>(v) + bytes_to_fill, buffer, fixed_len_size);
-#else
-    memcpy(v, buffer, fixed_len_size);
+#if __BYTE_ORDER != __LITTLE_ENDIAN
+    static_assert(false, "Byte order must be little-endian");
 #endif
-    v->value() >>= (bytes_to_fill * 8);
+    if (LIKELY(sizeof(T) >= fixed_len_size)) {
+      // We need to sign extend val. For example, if the original value was
+      // -1, the original bytes were -1,-1,-1,-1. If we only wrote out 1 byte, ByteSwap()
+      // only fills in the first byte of 'v' - the least significant byte. We initialize
+      // the value to either 0 or -1 to ensure that the result is correctly sign-extended.
+
+      // GCC can optimize this code to an instruction pair of movsbq and sarq with no
+      // branches.
+      int8_t most_significant_byte = reinterpret_cast<const int8_t*>(buffer)[0];
+      v->set_value(most_significant_byte >= 0 ? 0 : -1);
+      BitUtil::ByteSwap(reinterpret_cast<int8_t*>(v), buffer, fixed_len_size);
+    } else {
+      // If the destination 'v' is smaller than the input, discard the upper bytes.
+      // These bytes should only contain the sign-extended value if they were encoded
+      // correctly, so are not required.
+      int bytes_to_discard = fixed_len_size - sizeof(T);
+      BitUtil::ByteSwap(reinterpret_cast<int8_t*>(v),
+          buffer + bytes_to_discard, sizeof(T));
+    }
   }
 
   // Used to skip checking overflow in multiply of decimal values.
@@ -168,7 +175,7 @@ class DecimalUtil {
 template <>
 inline int32_t DecimalUtil::GetScaleMultiplier<int32_t>(int scale) {
   DCHECK_GE(scale, 0);
-  static const int32_t values[] = {
+  static constexpr int32_t values[INT32_SCALE_UPPER_BOUND] = {
       1,
       10,
       100,
@@ -179,15 +186,14 @@ inline int32_t DecimalUtil::GetScaleMultiplier<int32_t>(int scale) {
       10000000,
       100000000,
       1000000000};
-  DCHECK_GE(sizeof(values) / sizeof(int32_t), ColumnType::MAX_DECIMAL4_PRECISION);
-  if (LIKELY(scale < 10)) return values[scale];
+  if (LIKELY(scale < INT32_SCALE_UPPER_BOUND)) return values[scale];
   return -1;  // Overflow
 }
 
 template <>
 inline int64_t DecimalUtil::GetScaleMultiplier<int64_t>(int scale) {
   DCHECK_GE(scale, 0);
-  static const int64_t values[] = {
+  static constexpr int64_t values[INT64_SCALE_UPPER_BOUND] = {
       1ll,
       10ll,
       100ll,
@@ -207,15 +213,15 @@ inline int64_t DecimalUtil::GetScaleMultiplier<int64_t>(int scale) {
       10000000000000000ll,
       100000000000000000ll,
       1000000000000000000ll};
-  DCHECK_GE(sizeof(values) / sizeof(int64_t), ColumnType::MAX_DECIMAL8_PRECISION);
-  if (LIKELY(scale < 19)) return values[scale];
+  if (LIKELY(scale < INT64_SCALE_UPPER_BOUND)) return values[scale];
   return -1;  // Overflow
 }
 
 template <>
 inline int128_t DecimalUtil::GetScaleMultiplier<int128_t>(int scale) {
   DCHECK_GE(scale, 0);
-  static const int128_t values[] = {
+  static constexpr int128_t i10e18{1000000000000000000ll};
+  static constexpr int128_t values[INT128_SCALE_UPPER_BOUND] = {
       static_cast<int128_t>(1ll),
       static_cast<int128_t>(10ll),
       static_cast<int128_t>(100ll),
@@ -234,31 +240,114 @@ inline int128_t DecimalUtil::GetScaleMultiplier<int128_t>(int scale) {
       static_cast<int128_t>(1000000000000000ll),
       static_cast<int128_t>(10000000000000000ll),
       static_cast<int128_t>(100000000000000000ll),
-      static_cast<int128_t>(1000000000000000000ll),
-      static_cast<int128_t>(1000000000000000000ll) * 10ll,
-      static_cast<int128_t>(1000000000000000000ll) * 100ll,
-      static_cast<int128_t>(1000000000000000000ll) * 1000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 10000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 100000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 1000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 10000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 100000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 1000000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 10000000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 100000000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 1000000000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 10000000000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 100000000000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 1000000000000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 10000000000000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 100000000000000000ll,
-      static_cast<int128_t>(1000000000000000000ll) * 100000000000000000ll * 10ll,
-      static_cast<int128_t>(1000000000000000000ll) * 100000000000000000ll * 100ll,
-      static_cast<int128_t>(1000000000000000000ll) * 100000000000000000ll * 1000ll};
-  DCHECK_GE(sizeof(values) / sizeof(int128_t), ColumnType::MAX_PRECISION);
-  if (LIKELY(scale < 39)) return values[scale];
+      i10e18,
+      i10e18 * 10ll,
+      i10e18 * 100ll,
+      i10e18 * 1000ll,
+      i10e18 * 10000ll,
+      i10e18 * 100000ll,
+      i10e18 * 1000000ll,
+      i10e18 * 10000000ll,
+      i10e18 * 100000000ll,
+      i10e18 * 1000000000ll,
+      i10e18 * 10000000000ll,
+      i10e18 * 100000000000ll,
+      i10e18 * 1000000000000ll,
+      i10e18 * 10000000000000ll,
+      i10e18 * 100000000000000ll,
+      i10e18 * 1000000000000000ll,
+      i10e18 * 10000000000000000ll,
+      i10e18 * 100000000000000000ll,
+      i10e18 * i10e18,
+      i10e18 * i10e18 * 10ll,
+      i10e18 * i10e18 * 100ll};
+  if (LIKELY(scale < INT128_SCALE_UPPER_BOUND)) return values[scale];
+  return -1;  // Overflow
+}
+
+template <>
+inline int256_t DecimalUtil::GetScaleMultiplier<int256_t>(int scale) {
+  DCHECK_GE(scale, 0);
+  static constexpr int256_t i10e18{1000000000000000000ll};
+  static constexpr int256_t values[INT256_SCALE_UPPER_BOUND] = {
+      static_cast<int256_t>(1ll),
+      static_cast<int256_t>(10ll),
+      static_cast<int256_t>(100ll),
+      static_cast<int256_t>(1000ll),
+      static_cast<int256_t>(10000ll),
+      static_cast<int256_t>(100000ll),
+      static_cast<int256_t>(1000000ll),
+      static_cast<int256_t>(10000000ll),
+      static_cast<int256_t>(100000000ll),
+      static_cast<int256_t>(1000000000ll),
+      static_cast<int256_t>(10000000000ll),
+      static_cast<int256_t>(100000000000ll),
+      static_cast<int256_t>(1000000000000ll),
+      static_cast<int256_t>(10000000000000ll),
+      static_cast<int256_t>(100000000000000ll),
+      static_cast<int256_t>(1000000000000000ll),
+      static_cast<int256_t>(10000000000000000ll),
+      static_cast<int256_t>(100000000000000000ll),
+      i10e18,
+      i10e18 * 10ll,
+      i10e18 * 100ll,
+      i10e18 * 1000ll,
+      i10e18 * 10000ll,
+      i10e18 * 100000ll,
+      i10e18 * 1000000ll,
+      i10e18 * 10000000ll,
+      i10e18 * 100000000ll,
+      i10e18 * 1000000000ll,
+      i10e18 * 10000000000ll,
+      i10e18 * 100000000000ll,
+      i10e18 * 1000000000000ll,
+      i10e18 * 10000000000000ll,
+      i10e18 * 100000000000000ll,
+      i10e18 * 1000000000000000ll,
+      i10e18 * 10000000000000000ll,
+      i10e18 * 100000000000000000ll,
+      i10e18 * i10e18,
+      i10e18 * i10e18 * 10ll,
+      i10e18 * i10e18 * 100ll,
+      i10e18 * i10e18 * 1000ll,
+      i10e18 * i10e18 * 10000ll,
+      i10e18 * i10e18 * 100000ll,
+      i10e18 * i10e18 * 1000000ll,
+      i10e18 * i10e18 * 10000000ll,
+      i10e18 * i10e18 * 100000000ll,
+      i10e18 * i10e18 * 1000000000ll,
+      i10e18 * i10e18 * 10000000000ll,
+      i10e18 * i10e18 * 100000000000ll,
+      i10e18 * i10e18 * 1000000000000ll,
+      i10e18 * i10e18 * 10000000000000ll,
+      i10e18 * i10e18 * 100000000000000ll,
+      i10e18 * i10e18 * 1000000000000000ll,
+      i10e18 * i10e18 * 10000000000000000ll,
+      i10e18 * i10e18 * 100000000000000000ll,
+      i10e18 * i10e18 * i10e18,
+      i10e18 * i10e18 * i10e18 * 10ll,
+      i10e18 * i10e18 * i10e18 * 100ll,
+      i10e18 * i10e18 * i10e18 * 1000ll,
+      i10e18 * i10e18 * i10e18 * 10000ll,
+      i10e18 * i10e18 * i10e18 * 100000ll,
+      i10e18 * i10e18 * i10e18 * 1000000ll,
+      i10e18 * i10e18 * i10e18 * 10000000ll,
+      i10e18 * i10e18 * i10e18 * 100000000ll,
+      i10e18 * i10e18 * i10e18 * 1000000000ll,
+      i10e18 * i10e18 * i10e18 * 10000000000ll,
+      i10e18 * i10e18 * i10e18 * 100000000000ll,
+      i10e18 * i10e18 * i10e18 * 1000000000000ll,
+      i10e18 * i10e18 * i10e18 * 10000000000000ll,
+      i10e18 * i10e18 * i10e18 * 100000000000000ll,
+      i10e18 * i10e18 * i10e18 * 1000000000000000ll,
+      i10e18 * i10e18 * i10e18 * 10000000000000000ll,
+      i10e18 * i10e18 * i10e18 * 100000000000000000ll,
+      i10e18 * i10e18 * i10e18 * i10e18,
+      i10e18 * i10e18 * i10e18 * i10e18 * 10ll,
+      i10e18 * i10e18 * i10e18 * i10e18 * 100ll,
+      i10e18 * i10e18 * i10e18 * i10e18 * 1000ll,
+      i10e18 * i10e18 * i10e18 * i10e18 * 10000ll};
+  if (LIKELY(scale < INT256_SCALE_UPPER_BOUND)) return values[scale];
   return -1;  // Overflow
 }
 }
-
-#endif

@@ -22,7 +22,6 @@
 #include <memory>
 #include <string>
 #include <boost/scoped_ptr.hpp>
-#include <boost/thread.hpp>
 
 #include "exec/blocking-join-node.h"
 #include "exec/exec-node.h"
@@ -34,14 +33,17 @@ namespace impala {
 
 class BloomFilter;
 class MemPool;
+class PartitionedHashJoinNode;
 class RowBatch;
 class RuntimeFilter;
 class TupleRow;
 
 class PartitionedHashJoinPlanNode : public BlockingJoinPlanNode {
  public:
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status Init(const TPlanNode& tnode, FragmentState* state) override;
+  virtual void Close() override;
   virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+  virtual void Codegen(FragmentState* state) override;
 
   ~PartitionedHashJoinPlanNode(){}
 
@@ -50,8 +52,43 @@ class PartitionedHashJoinPlanNode : public BlockingJoinPlanNode {
   std::vector<ScalarExpr*> build_exprs_;
   std::vector<ScalarExpr*> probe_exprs_;
 
+  /// is_not_distinct_from_[i] is true if and only if the ith equi-join predicate is IS
+  /// NOT DISTINCT FROM, rather than equality.
+  std::vector<bool> is_not_distinct_from_;
+
   /// Non-equi-join conjuncts from the ON clause.
   std::vector<ScalarExpr*> other_join_conjuncts_;
+
+  /// Data sink config object for creating a phj builder that will be eventually used by
+  /// the exec node.
+  PhjBuilderConfig* phj_builder_config_;
+
+  /// Seed used for hashing rows.
+  uint32_t hash_seed_;
+
+  /// Used for codegening hash table specific methods and to create the corresponding
+  /// instance of HashTableCtx.
+  const HashTableConfig* hash_table_config_;
+
+  /// For the below codegen'd functions, xxx_fn_level0_ uses CRC hashing when available
+  /// and is used when the partition level is 0, otherwise xxx_fn_ uses murmur hash and is
+  /// used for subsequent levels.
+  typedef int (*ProcessProbeBatchFn)(
+      PartitionedHashJoinNode*, TPrefetchMode::type, RowBatch*, HashTableCtx*, Status*);
+  /// Jitted PartitionedHashJoinNode::ProcessProbeBatch function pointers.  NULL if
+  /// codegen is disabled.
+  CodegenFnPtr<ProcessProbeBatchFn> process_probe_batch_fn_;
+  CodegenFnPtr<ProcessProbeBatchFn> process_probe_batch_fn_level0_;
+
+ private:
+  /// Codegen function to create output row. Assumes that the probe row is non-NULL.
+  Status CodegenCreateOutputRow(LlvmCodeGen* codegen, llvm::Function** fn);
+
+  /// Codegen processing probe batches.  Identical signature to
+  /// PartitionedHashJoinNode::ProcessProbeBatch(). Returns non-OK if codegen was not
+  /// possible.
+  Status CodegenProcessProbeBatch(
+      LlvmCodeGen* codegen, TPrefetchMode::type prefetch_mode);
 };
 
 /// Operator to perform partitioned hash join, spilling to disk as necessary. This
@@ -79,12 +116,12 @@ class PartitionedHashJoinPlanNode : public BlockingJoinPlanNode {
 ///
 /// The above algorithm is implemented as a state machine with the following phases:
 ///
-///   1. [PARTITIONING_BUILD or REPARTITIONING_BUILD] Read build rows from child(1) OR
-///      from the spilled build rows of a partition and partition them into the builder's
-///      hash partitions. If there is sufficient memory, all build partitions are kept
-///      in memory. Otherwise, build partitions are spilled as needed to free up memory.
-///      Finally, build a hash table for each in-memory partition and create a probe
-///      partition with a write buffer for each spilled partition.
+///   1. [PARTITIONING_BUILD or REPARTITIONING_BUILD] Read build rows from the right
+///      input plan tree OR from the spilled build rows of a partition and partition them
+///      into the builder's hash partitions. If there is sufficient memory, all build
+///      partitions are kept in memory. Otherwise, build partitions are spilled as needed
+///      to free up memory. Finally, build a hash table for each in-memory partition and
+///      create a probe partition with a write buffer for each spilled partition.
 ///
 ///      After the phase, the algorithm advances from PARTITIONING_BUILD to
 ///      PARTITIONING_PROBE or from REPARTITIONING_BUILD to REPARTITIONING_PROBE.
@@ -115,11 +152,11 @@ class PartitionedHashJoinPlanNode : public BlockingJoinPlanNode {
 ///      progress.
 ///
 ///
-/// TODO: when IMPALA-9156 is implemented, HashJoinState of the builder will drive the
-/// hash join algorithm across all the PartitionedHashJoinNode implementations sharing
-/// the builder. Each PartitionedHashJoinNode implementation will independently execute
-/// its ProbeState state machine, synchronizing via the builder for transitions of the
-/// HashJoinState state machine.
+/// When the PhjBuilder is shared by multiple PartitionedHashJoinNodes, HashJoinState of
+/// the builder will drive the hash join algorithm across all the PartitionedHashJoinNode
+/// implementations sharing the builder. Each PartitionedHashJoinNode implementation will
+/// independently execute its ProbeState state machine, synchronizing via the builder for
+/// transitions of the HashJoinState state machine.
 ///
 /// Null aware anti-join (NAAJ) extends the above algorithm by accumulating rows with
 /// NULLs into several different streams, which are processed in a separate step to
@@ -128,12 +165,11 @@ class PartitionedHashJoinPlanNode : public BlockingJoinPlanNode {
 
 class PartitionedHashJoinNode : public BlockingJoinNode {
  public:
-  PartitionedHashJoinNode(ObjectPool* pool, const PartitionedHashJoinPlanNode& pnode,
+  PartitionedHashJoinNode(RuntimeState* state, const PartitionedHashJoinPlanNode& pnode,
       const DescriptorTbl& descs);
   virtual ~PartitionedHashJoinNode();
 
   virtual Status Prepare(RuntimeState* state) override;
-  virtual void Codegen(RuntimeState* state) override;
   virtual Status Open(RuntimeState* state) override;
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) override;
   virtual Status Reset(RuntimeState* state, RowBatch* row_batch) override;
@@ -410,11 +446,11 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   /// Initializes 'null_probe_rows_' and prepares that stream for writing.
   Status InitNullProbeRows() WARN_UNUSED_RESULT;
 
-  /// Initializes null_aware_partition_ and nulls_build_batch_ to output rows.
+  /// Prepare to output rows from the null-aware partition.
   /// *has_null_aware_rows is set to true if the null-aware partition has rows that need
   /// to be processed by calling OutputNullAwareProbeRows(), false otherwise. In both
   /// cases, null probe rows need to be processed with OutputNullAwareNullProbe().
-  Status PrepareNullAwarePartition(bool* has_null_aware_rows) WARN_UNUSED_RESULT;
+  Status BeginNullAwareProbe(bool* has_null_aware_rows) WARN_UNUSED_RESULT;
 
   /// Output rows from builder_->null_aware_partition(). Called when 'probe_state_'
   /// is OUTPUTTING_NULL_AWARE - after all input is processed, including spilled
@@ -423,9 +459,10 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   Status OutputNullAwareProbeRows(
       RuntimeState* state, RowBatch* out_batch, bool* done) WARN_UNUSED_RESULT;
 
-  /// Evaluates all other_join_conjuncts against null_probe_rows_ with all the
-  /// rows in build. This updates matched_null_probe_, short-circuiting if one of the
-  /// conjuncts pass (i.e. there is a match).
+  /// Evaluates 'other_join_conjuncts' for all pairs of 'null_probe_rows_' and the build
+  /// rows provided by the caller until a match is found for that null probe row. This
+  /// updates matched_null_probe_, short-circuiting if one of the conjuncts pass (i.e.
+  /// there is a match). 'build' must be pinned.
   /// This is used for NAAJ, when there are NULL probe rows.
   Status EvaluateNullProbe(
       RuntimeState* state, BufferedTupleStream* build) WARN_UNUSED_RESULT;
@@ -492,10 +529,6 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   /// rows from 'input_partition_'.
   Status BeginSpilledProbe() WARN_UNUSED_RESULT;
 
-  /// Construct an error status for the null-aware anti-join when it could not fit 'rows'
-  /// from the build side in memory.
-  Status NullAwareAntiJoinError(BufferedTupleStream* rows);
-
   /// Calls Close() on every probe partition, destroys the partitions and cleans up any
   /// references to the partitions. Also closes and destroys 'null_probe_rows_'. If
   /// 'row_batch' is not NULL, transfers ownership of all row-backing resources to it.
@@ -505,27 +538,27 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   /// with rows and entering 'probe_state_' PROBING_IN_BATCH.
   void ResetForProbe();
 
-  /// Codegen function to create output row. Assumes that the probe row is non-NULL.
-  Status CodegenCreateOutputRow(
-      LlvmCodeGen* codegen, llvm::Function** fn) WARN_UNUSED_RESULT;
-
-  /// Codegen processing probe batches.  Identical signature to ProcessProbeBatch.
-  /// Returns non-OK if codegen was not possible.
-  Status CodegenProcessProbeBatch(
-      LlvmCodeGen* codegen, TPrefetchMode::type prefetch_mode) WARN_UNUSED_RESULT;
+  uint32_t hash_seed() const {
+    return static_cast<const PartitionedHashJoinPlanNode&>(plan_node_).hash_seed_;
+  }
 
   std::string NodeDebugString() const;
 
   RuntimeState* runtime_state_;
 
   /// Our equi-join predicates "<lhs> = <rhs>" are separated into
-  /// build_exprs_ (over child(1)) and probe_exprs_ (over child(0))
-  std::vector<ScalarExpr*> build_exprs_;
-  std::vector<ScalarExpr*> probe_exprs_;
+  /// build_exprs_ (over the build input row) and probe_exprs_ (over child(0))
+  const std::vector<ScalarExpr*>& build_exprs_;
+  const std::vector<ScalarExpr*>& probe_exprs_;
 
   /// Non-equi-join conjuncts from the ON clause.
-  std::vector<ScalarExpr*> other_join_conjuncts_;
+  const std::vector<ScalarExpr*>& other_join_conjuncts_;
   std::vector<ScalarExprEvaluator*> other_join_conjunct_evals_;
+
+  /// Reference to the hash table config which is a part of the
+  /// PartitionedHashJoinPlanNode that was used to create this object. Its used to create
+  /// an instance of the HashTableCtx in Prepare(). Not Owned.
+  const HashTableConfig& hash_table_config_;
 
   /// Used for hash-related functionality, such as evaluating rows and calculating hashes.
   /// This owns the evaluators for the build and probe expressions used during insertion
@@ -552,8 +585,15 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   /// State of the probing algorithm. Used to drive the state machine in GetNext().
   ProbeState probe_state_ = ProbeState::PROBE_COMPLETE;
 
-  /// The build-side of the join. Initialized in Prepare().
-  boost::scoped_ptr<PhjBuilder> builder_;
+  /// Additional state for flushing build-side data. Needed for
+  /// separate build.
+  /// TODO: IMPALA-9411: this could be removed if we attached the buffers.
+  bool flushed_unattachable_build_buffers_ = false;
+
+  /// The build-side rows of the join. Initialized in Prepare() if the build is embedded
+  /// in the join, otherwise looked up in Open() if it's a separate build. Owned by an
+  /// object pool with query lifetime in either case.
+  PhjBuilder* builder_ = nullptr;
 
   /// Last set of hash partitions obtained from builder_. Only valid when the
   /// builder's state is PARTITIONING_PROBE or REPARTITIONING_PROBE.
@@ -575,6 +615,8 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
 
   /// Probe partitions that have been spilled and still need more processing. Each of
   /// these has a corresponding build partition in 'builder_' with the same PartitionId.
+  /// For shared broadcast join builds, the set of keys in this map will be the same
+  /// across all of the instances of the join builder.
   /// This list is populated at DoneProbing().
   std::unordered_map<PhjBuilder::PartitionId, std::unique_ptr<ProbePartition>>
       spilled_partitions_;
@@ -586,7 +628,7 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   /// In the case of right-outer and full-outer joins, this is the list of the partitions
   /// for which we need to output their unmatched build rows. This list is populated at
   /// DoneProbing(). If this is non-empty, probe_state_ must be OUTPUTTING_UNMATCHED.
-  std::deque<std::unique_ptr<PhjBuilder::Partition>> output_build_partitions_;
+  std::deque<std::unique_ptr<PhjBuilderPartition>> output_build_partitions_;
 
   /// Partition used if 'null_aware_' is set. During probing, rows from the probe
   /// side that did not have a match in the hash table are appended to this partition.
@@ -638,7 +680,7 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
    public:
     /// Create a new probe partition for the same hash partition as 'build_partition'.
     ProbePartition(RuntimeState* state, PartitionedHashJoinNode* parent,
-        PhjBuilder::Partition* build_partition);
+        PhjBuilderPartition* build_partition);
     ~ProbePartition();
 
     /// Prepare to write the probe rows. Allocates the first write block. This stream
@@ -657,13 +699,13 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
     void Close(RowBatch* batch);
 
     BufferedTupleStream* ALWAYS_INLINE probe_rows() { return probe_rows_.get(); }
-    PhjBuilder::Partition* build_partition() { return build_partition_; }
+    PhjBuilderPartition* build_partition() { return build_partition_; }
 
     inline bool IsClosed() const { return probe_rows_ == NULL; }
 
    private:
     /// The corresponding build partition. Not NULL. Owned by PhjBuilder.
-    PhjBuilder::Partition* build_partition_;
+    PhjBuilderPartition* build_partition_;
 
     /// Stream of probe tuples in this partition. Initially owned by this object but
     /// transferred to the parent exec node (via the row batch) when the partition
@@ -671,15 +713,11 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
     std::unique_ptr<BufferedTupleStream> probe_rows_;
   };
 
-  /// For the below codegen'd functions, xxx_fn_level0_ uses CRC hashing when available
-  /// and is used when the partition level is 0, otherwise xxx_fn_ uses murmur hash and is
-  /// used for subsequent levels.
-
-  typedef int (*ProcessProbeBatchFn)(PartitionedHashJoinNode*,
-      TPrefetchMode::type, RowBatch*, HashTableCtx*, Status*);
-  /// Jitted ProcessProbeBatch function pointers.  NULL if codegen is disabled.
-  ProcessProbeBatchFn process_probe_batch_fn_ = nullptr;
-  ProcessProbeBatchFn process_probe_batch_fn_level0_ = nullptr;
+  /// See PartitionedHashJoinPlanNode::ProcessProbeBatchFn for more details.
+  const CodegenFnPtr<PartitionedHashJoinPlanNode::ProcessProbeBatchFn>&
+      process_probe_batch_fn_;
+  const CodegenFnPtr<PartitionedHashJoinPlanNode::ProcessProbeBatchFn>&
+      process_probe_batch_fn_level0_;
 };
 
 }

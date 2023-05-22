@@ -18,6 +18,7 @@
 package org.apache.impala.analysis;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.concurrent.TimeUnit;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -25,12 +26,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.impala.authorization.TableMask;
+import org.apache.impala.authorization.User;
+import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeCatalog;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeIncompleteTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.MaterializedViewHdfsTable;
 import org.apache.impala.catalog.Table;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.service.Frontend;
@@ -40,6 +46,7 @@ import org.apache.impala.util.TUniqueIdUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
 /**
@@ -57,6 +64,7 @@ public class StmtMetadataLoader {
   private final Frontend fe_;
   private final String sessionDb_;
   private final EventSequence timeline_;
+  private final User user_;
 
   // Results of the loading process. See StmtTableCache.
   private final Set<String> dbs_ = new HashSet<>();
@@ -98,12 +106,24 @@ public class StmtMetadataLoader {
 
   /**
    * The 'fe' and 'sessionDb' arguments must be non-null. A null 'timeline' may be passed
-   * if no events should be marked.
+   * if no events should be marked. A null 'user' may be passed if don't need to resolve
+   * column-masking/row-filtering policies.
    */
-  public StmtMetadataLoader(Frontend fe, String sessionDb, EventSequence timeline) {
+  public StmtMetadataLoader(Frontend fe, String sessionDb, EventSequence timeline,
+      User user) {
     fe_ = Preconditions.checkNotNull(fe);
     sessionDb_ = Preconditions.checkNotNull(sessionDb);
     timeline_ = timeline;
+    user_ = user;
+  }
+
+  /**
+   * Constructor used by callers that don't need to resolve column-masking/row-filtering
+   * policies (which may introduce new tables), e.g. MetadataOp to get columns, primary
+   * keys, cross reference of a table.
+   */
+  public StmtMetadataLoader(Frontend fe, String sessionDb, EventSequence timeline) {
+    this(fe, sessionDb, timeline, null);
   }
 
   // Getters for testing
@@ -257,7 +277,7 @@ public class StmtMetadataLoader {
           if (AcidUtils.isTransactionalTable(iTbl.getMetaStoreTable().getParameters())) {
             validIdsBuf.append("\n");
             validIdsBuf.append("           ");
-            validIdsBuf.append(iTbl.getValidWriteIds());
+            validIdsBuf.append(iTbl.getValidWriteIds().writeToString());
             hasAcidTbls = true;
           }
         }
@@ -296,6 +316,21 @@ public class StmtMetadataLoader {
       loadedOrFailedTbls_.put(tblName, tbl);
       if (tbl instanceof FeView) {
         viewTbls.addAll(collectTableCandidates(((FeView) tbl).getQueryStmt()));
+      } else if (tbl instanceof MaterializedViewHdfsTable) {
+        Set<TableName> mvSrcTableNames = collectTableCandidates(
+            ((MaterializedViewHdfsTable) tbl).getQueryStmt());
+        ((MaterializedViewHdfsTable) tbl).addSrcTables(mvSrcTableNames);
+        viewTbls.addAll(mvSrcTableNames);
+      }
+      // Adds tables/views introduced by column-masking/row-filtering policies.
+      if (!(tbl instanceof FeIncompleteTable)
+          && fe_.getAuthzFactory().getAuthorizationConfig().isEnabled()
+          && fe_.getAuthzFactory().supportsTableMasking() && user_ != null) {
+        try {
+          viewTbls.addAll(collectPolicyTables(tbl));
+        } catch (Exception e) {
+          LOG.error("Failed to collect policy tables for {}", tblName, e);
+        }
       }
     }
     // Recursively collect loaded/missing tables from loaded views.
@@ -312,10 +347,45 @@ public class StmtMetadataLoader {
   private Set<TableName> collectTableCandidates(StatementBase stmt) {
     Preconditions.checkNotNull(stmt);
     List<TableRef> tblRefs = new ArrayList<>();
-    stmt.collectTableRefs(tblRefs);
+    // The information about whether table masking is supported is not available to
+    // ResetMetadataStmt so we collect the TableRef for ResetMetadataStmt whenever
+    // applicable.
+    if (stmt instanceof ResetMetadataStmt
+        && fe_.getAuthzFactory().getAuthorizationConfig().isEnabled()
+        && fe_.getAuthzFactory().supportsTableMasking()) {
+      TableName tableName = ((ResetMetadataStmt) stmt).getTableName();
+      if (tableName != null) tblRefs.add(new TableRef(tableName.toPath(), null));
+    } else {
+      stmt.collectTableRefs(tblRefs);
+    }
     Set<TableName> tableNames = new HashSet<>();
     for (TableRef ref: tblRefs) {
       tableNames.addAll(Path.getCandidateTables(ref.getPath(), sessionDb_));
+    }
+    return tableNames;
+  }
+
+  @VisibleForTesting
+  Set<TableName> collectPolicyTables(FeTable tbl)
+      throws InternalException, AnalysisException {
+    if (tbl instanceof FeIncompleteTable) return Collections.emptySet();
+    Set<TableName> tableNames = new HashSet<>();
+    String dbName = tbl.getDb().getName();
+    String tblName = tbl.getName();
+    List<Column> columns = tbl.getColumnsInHiveOrder();
+    TableMask tableMask = new TableMask(fe_.getAuthzChecker(), dbName, tblName, columns,
+        user_);
+    if (tableMask.needsMaskingOrFiltering()) {
+      for (Column col : columns) {
+        // Use authzCtx=null to avoid audits and privilege checks.
+        SelectStmt stmt = tableMask.createColumnMaskStmt(
+            col.getName(), col.getType(), /*authzCtx*/ null);
+        if (stmt == null) continue;
+        tableNames.addAll(collectTableCandidates(stmt));
+      }
+      // Use authzCtx=null to avoid audits and privilege checks.
+      SelectStmt filterStmt = tableMask.createRowFilterStmt(/*authzCtx*/null);
+      if (filterStmt != null) tableNames.addAll(collectTableCandidates(filterStmt));
     }
     return tableNames;
   }

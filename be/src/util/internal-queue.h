@@ -19,8 +19,9 @@
 #ifndef IMPALA_UTIL_INTERNAL_QUEUE_H
 #define IMPALA_UTIL_INTERNAL_QUEUE_H
 
+#include <mutex>
+
 #include <boost/function.hpp>
-#include <boost/thread/locks.hpp>
 
 #include "util/fake-lock.h"
 #include "util/spinlock.h"
@@ -57,11 +58,11 @@ class InternalQueueBase {
 
     /// Returns the Next/Prev node or nullptr if this is the end/front.
     T* Next() const {
-      boost::lock_guard<LockType> lock(parent_queue->lock_);
+      std::lock_guard<LockType> lock(parent_queue->lock_);
       return reinterpret_cast<T*>(next);
     }
     T* Prev() const {
-      boost::lock_guard<LockType> lock(parent_queue->lock_);
+      std::lock_guard<LockType> lock(parent_queue->lock_);
       return reinterpret_cast<T*>(prev);
     }
 
@@ -79,16 +80,16 @@ class InternalQueueBase {
   /// Returns the element at the head of the list without dequeuing or nullptr
   /// if the queue is empty. This is O(1).
   T* head() const {
-    boost::lock_guard<LockType> lock(lock_);
-    if (empty()) return nullptr;
+    std::lock_guard<LockType> lock(lock_);
+    if (IsEmptyLocked()) return nullptr;
     return reinterpret_cast<T*>(head_);
   }
 
   /// Returns the element at the end of the list without dequeuing or nullptr
   /// if the queue is empty. This is O(1).
   T* tail() {
-    boost::lock_guard<LockType> lock(lock_);
-    if (empty()) return nullptr;
+    std::lock_guard<LockType> lock(lock_);
+    if (IsEmptyLocked()) return nullptr;
     return reinterpret_cast<T*>(tail_);
   }
 
@@ -100,7 +101,7 @@ class InternalQueueBase {
     DCHECK(node->parent_queue == nullptr);
     node->parent_queue = this;
     {
-      boost::lock_guard<LockType> lock(lock_);
+      std::lock_guard<LockType> lock(lock_);
       if (tail_ != nullptr) tail_->next = node;
       node->prev = tail_;
       tail_ = node;
@@ -117,7 +118,7 @@ class InternalQueueBase {
     DCHECK(node->parent_queue == nullptr);
     node->parent_queue = this;
     {
-      boost::lock_guard<LockType> lock(lock_);
+      std::lock_guard<LockType> lock(lock_);
       if (head_ != nullptr) head_->prev = node;
       node->next = head_;
       head_ = node;
@@ -131,8 +132,8 @@ class InternalQueueBase {
   T* Dequeue() {
     Node* result = nullptr;
     {
-      boost::lock_guard<LockType> lock(lock_);
-      if (empty()) return nullptr;
+      std::lock_guard<LockType> lock(lock_);
+      if (IsEmptyLocked()) return nullptr;
       --size_;
       result = head_;
       head_ = head_->next;
@@ -153,8 +154,8 @@ class InternalQueueBase {
   T* PopBack() {
     Node* result = nullptr;
     {
-      boost::lock_guard<LockType> lock(lock_);
-      if (empty()) return nullptr;
+      std::lock_guard<LockType> lock(lock_);
+      if (IsEmptyLocked()) return nullptr;
       --size_;
       result = tail_;
       tail_ = tail_->prev;
@@ -176,7 +177,7 @@ class InternalQueueBase {
     Node* node = (Node*)n;
     if (node->parent_queue != this) return false;
     {
-      boost::lock_guard<LockType> lock(lock_);
+      std::lock_guard<LockType> lock(lock_);
       if (node->next == nullptr && node->prev == nullptr) {
         // Removing only node
         DCHECK(node == head_);
@@ -210,7 +211,7 @@ class InternalQueueBase {
 
   /// Clears all elements in the list.
   void Clear() {
-    boost::lock_guard<LockType> lock(lock_);
+    std::lock_guard<LockType> lock(lock_);
     Node* cur = head_;
     while (cur != nullptr) {
       Node* tmp = cur;
@@ -222,8 +223,14 @@ class InternalQueueBase {
     head_ = tail_ = nullptr;
   }
 
-  int size() const { return size_; }
-  bool empty() const { return head_ == nullptr; }
+  int size() const {
+    std::lock_guard<LockType> lock(lock_);
+    return SizeLocked();
+  }
+  bool empty() const {
+    std::lock_guard<LockType> lock(lock_);
+    return IsEmptyLocked();
+  }
 
   /// Returns if the target is on the queue. This is O(1) and does not acquire any locks.
   bool Contains(const T* target) const {
@@ -233,10 +240,10 @@ class InternalQueueBase {
   /// Validates the internal structure of the list
   bool Validate() {
     int num_elements_found = 0;
-    boost::lock_guard<LockType> lock(lock_);
+    std::lock_guard<LockType> lock(lock_);
     if (head_ == nullptr) {
       if (tail_ != nullptr) return false;
-      if (size() != 0) return false;
+      if (SizeLocked() != 0) return false;
       return true;
     }
 
@@ -253,7 +260,7 @@ class InternalQueueBase {
       }
       current = next;
     }
-    if (num_elements_found != size()) return false;
+    if (num_elements_found != SizeLocked()) return false;
     return true;
   }
 
@@ -261,9 +268,22 @@ class InternalQueueBase {
   // false, terminate iteration. It is invalid to call other InternalQueue methods
   // from 'fn'.
   void Iterate(boost::function<bool(T*)> fn) {
-    boost::lock_guard<LockType> lock(lock_);
+    std::lock_guard<LockType> lock(lock_);
     for (Node* current = head_; current != nullptr; current = current->next) {
       if (!fn(reinterpret_cast<T*>(current))) return;
+    }
+  }
+
+  // Iterate over first 'n' elements of queue, calling 'fn' for each element. If 'n' is
+  // larger than the size of the queue, iteration will finish after the last element
+  // reached. If 'fn' returns false, terminate iteration. It is invalid to call other
+  // InternalQueue methods from 'fn'.
+  void IterateFirstN(boost::function<bool(T*)> fn, int n) {
+    std::lock_guard<LockType> lock(lock_);
+    for (Node* current = head_; (current != nullptr) && (n > 0);
+         current = current->next) {
+      if (!fn(reinterpret_cast<T*>(current))) return;
+      n--;
     }
   }
 
@@ -272,7 +292,7 @@ class InternalQueueBase {
     std::stringstream ss;
     ss << "(";
     {
-      boost::lock_guard<LockType> lock(lock_);
+      std::lock_guard<LockType> lock(lock_);
       Node* curr = head_;
       while (curr != nullptr) {
         ss << (void*)curr;
@@ -285,6 +305,10 @@ class InternalQueueBase {
 
  private:
   friend struct Node;
+
+  inline int SizeLocked() const { return size_; }
+  inline bool IsEmptyLocked() const { return head_ == nullptr; }
+
   mutable LockType lock_;
   Node *head_, *tail_;
   int size_;

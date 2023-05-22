@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import os
+from __future__ import absolute_import, division, print_function
 import pprint
 import pytest
 import shlex
@@ -24,7 +24,7 @@ from subprocess import call
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.environ import HIVE_MAJOR_VERSION
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfFS
 from tests.common.test_dimensions import create_uncompressed_text_dimension
 from tests.util.test_file_parser import QueryTestSectionReader
 
@@ -45,13 +45,9 @@ from tests.util.test_file_parser import QueryTestSectionReader
 # in Impala and Hive would be insufficient.
 
 
-# Missing Coverage: Views created by Hive and Impala being visible and queryble by each
+# Missing Coverage: Views created by Hive and Impala being visible and queryable by each
 # other on non hdfs storage.
-@SkipIfS3.hive
-@SkipIfABFS.hive
-@SkipIfADLS.hive
-@SkipIfIsilon.hive
-@SkipIfLocal.hive
+@SkipIfFS.hive
 class TestViewCompatibility(ImpalaTestSuite):
   VALID_SECTION_NAMES = ["CREATE_VIEW", "CREATE_VIEW_RESULTS",\
                         "QUERY_HIVE_VIEW_RESULTS", "QUERY_IMPALA_VIEW_RESULTS"]

@@ -19,25 +19,72 @@
 #ifndef IMPALA_RUNTIME_KRPC_DATA_STREAM_SENDER_H
 #define IMPALA_RUNTIME_KRPC_DATA_STREAM_SENDER_H
 
-#include <vector>
 #include <string>
+#include <vector>
 
-#include "exec/data-sink.h"
 #include "codegen/impala-ir.h"
 #include "common/global-types.h"
 #include "common/object-pool.h"
 #include "common/status.h"
+#include "exec/data-sink.h"
 #include "exprs/scalar-expr.h"
+#include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
 #include "util/runtime-profile.h"
 
 namespace impala {
 
-class RowDescriptor;
+class KrpcDataStreamSender;
 class MemTracker;
+class RowDescriptor;
 class TDataStreamSink;
 class TNetworkAddress;
-class TPlanFragmentDestination;
+class PlanFragmentDestinationPB;
+
+class KrpcDataStreamSenderConfig : public DataSinkConfig {
+ public:
+  DataSink* CreateSink(RuntimeState* state) const override;
+  void Close() override;
+
+  /// Codegen KrpcDataStreamSender::HashAndAddRows() if partitioning type is
+  /// HASH_PARTITIONED. Replaces KrpcDataStreamSender::HashRow() and
+  /// KrpcDataStreamSender::GetNumChannels() based on runtime information.
+  void Codegen(FragmentState* state) override;
+
+  /// The type of partitioning to perform.
+  TPartitionType::type partition_type_ = TPartitionType::UNPARTITIONED;
+
+  /// Expressions of partition keys. It's used to compute the
+  /// per-row partition values for shuffling exchange;
+  std::vector<ScalarExpr*> partition_exprs_;
+
+  /// The number of channels that this node will create.
+  int  num_channels_;
+
+  /// Hash seed used for exchanges. Query id will be used to seed the hash function.
+  uint64_t exchange_hash_seed_;
+
+  /// Type and pointer for the codegen'd KrpcDataStreamSender::HashAndAddRows()
+  /// function. NULL if codegen is disabled or failed.
+  typedef Status (*HashAndAddRowsFn)(KrpcDataStreamSender*, RowBatch* row);
+  CodegenFnPtr<HashAndAddRowsFn> hash_and_add_rows_fn_;
+
+  ~KrpcDataStreamSenderConfig() override {}
+
+ protected:
+  Status Init(const TDataSink& tsink, const RowDescriptor* input_row_desc,
+      FragmentState* state) override;
+
+ private:
+  /// Codegen the KrpcDataStreamSender::HashRow() function and returns the codegen'd
+  /// function in 'fn'. This involves unrolling the loop in HashRow(), codegens each of
+  /// the partition expressions and replaces the column type argument to the hash function
+  /// with constants to eliminate some branches. Returns error status on failure.
+  Status CodegenHashRow(LlvmCodeGen* codegen, llvm::Function** fn);
+
+  /// Returns the name of the partitioning type of this data stream sender.
+  std::string PartitionTypeName() const;
+};
 
 /// Single sender of an m:n data stream.
 ///
@@ -47,22 +94,20 @@ class TPlanFragmentDestination;
 ///
 /// TODO: capture stats that describe distribution of rows/data volume
 /// across channels.
-/// TODO: create a PlanNode equivalent class for DataSink.
 class KrpcDataStreamSender : public DataSink {
  public:
-  /// Constructs a sender according to the output specification (tsink), sending to the
+  /// Constructs a sender according to the config (sink_config), sending to the
   /// given destinations:
   /// 'sender_id' identifies this sender instance, and is unique within a fragment.
-  /// 'row_desc' is the descriptor of the tuple row. It must out-live the sink.
   /// 'destinations' are the receivers' network addresses. There is one channel for each
   /// destination.
   /// 'per_channel_buffer_size' is the soft limit in bytes of the buffering into the
   /// per-channel's accumulating row batch before it will be sent.
   /// NOTE: supported partition types are UNPARTITIONED (broadcast), HASH_PARTITIONED,
   /// and RANDOM.
-  KrpcDataStreamSender(TDataSinkId sink_id, int sender_id, const RowDescriptor* row_desc,
-      const TDataStreamSink& tsink,
-      const std::vector<TPlanFragmentDestination>& destinations,
+  KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
+      const KrpcDataStreamSenderConfig& sink_config, const TDataStreamSink& sink,
+      const google::protobuf::RepeatedPtrField<PlanFragmentDestinationPB>& destinations,
       int per_channel_buffer_size, RuntimeState* state);
 
   virtual ~KrpcDataStreamSender();
@@ -70,10 +115,6 @@ class KrpcDataStreamSender : public DataSink {
   /// Initializes the sender by initializing all the channels and allocates all
   /// the stat counters. Return error status if any channels failed to initialize.
   virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) override;
-
-  /// Codegen HashAndAddRows() if partitioning type is HASH_PARTITIONED.
-  /// Replaces HashRow() and GetNumChannels() based on runtime information.
-  virtual void Codegen(LlvmCodeGen* codegen) override;
 
   /// Initializes the evaluator of the partitioning expressions. Return error status
   /// if initialization failed.
@@ -99,13 +140,16 @@ class KrpcDataStreamSender : public DataSink {
   /// Counters shared with other parts of the code
   static const char* TOTAL_BYTES_SENT_COUNTER;
 
+  /// KrpcDataStreamSender::HashRow() symbol. Used for call-site replacement.
+  static const char* HASH_ROW_SYMBOL;
+
+  /// An arbitrary constant used to seed the hash.
+  static constexpr uint64_t EXCHANGE_HASH_SEED_CONST = 0x66bd68df22c3ef37;
+
+  static const char* LLVM_CLASS_NAME;
+
  protected:
   friend class DataStreamTest;
-
-  /// Initializes any partitioning expressions based on 'thrift_output_exprs' and stores
-  /// them in 'partition_exprs_'. Returns error status if the initialization failed.
-  virtual Status Init(const std::vector<TExpr>& thrift_output_exprs,
-      const TDataSink& tsink, RuntimeState* state) override;
 
   /// Returns total number of bytes sent. If batches are broadcast to multiple receivers,
   /// they are counted once per receiver.
@@ -129,7 +173,7 @@ class KrpcDataStreamSender : public DataSink {
 
   /// Evaluates the input row against partition expressions and hashes the expression
   /// values. Returns the final hash value.
-  uint64_t HashRow(TupleRow* row);
+  uint64_t HashRow(TupleRow* row, uint64_t seed);
 
   /// Used when 'partition_type_' is HASH_PARTITIONED. Call HashRow() against each row
   /// in the input batch and adds it to the corresponding channel based on the hash value.
@@ -139,15 +183,6 @@ class KrpcDataStreamSender : public DataSink {
 
   /// Adds the given row to 'channels_[channel_id]'.
   Status AddRowToChannel(const int channel_id, TupleRow* row);
-
-  /// Codegen the HashRow() function and returns the codegen'd function in 'fn'.
-  /// This involves unrolling the loop in HashRow(), codegens each of the partition
-  /// expressions and replaces the column type argument to the hash function with
-  /// constants to eliminate some branches. Returns error status on failure.
-  Status CodegenHashRow(LlvmCodeGen* codegen, llvm::Function** fn);
-
-  /// Returns the name of the partitioning type of this data stream sender.
-  string PartitionTypeName() const;
 
   /// Sender instance id, unique within a fragment.
   const int sender_id_;
@@ -172,18 +207,18 @@ class KrpcDataStreamSender : public DataSink {
   /// a RowBatchHeaderPB and buffers for the serialized tuple offsets and data. Used only
   /// when the partitioning strategy is UNPARTITIONED.
   static const int NUM_OUTBOUND_BATCHES = 2;
-  OutboundRowBatch outbound_batches_[NUM_OUTBOUND_BATCHES];
+  std::vector<OutboundRowBatch> outbound_batches_;
 
   /// If true, this sender has called FlushFinal() successfully.
   /// Not valid to call Send() anymore.
   bool flushed_ = false;
 
   /// List of all channels. One for each destination.
-  std::vector<Channel*> channels_;
+  std::vector<std::unique_ptr<Channel>> channels_;
 
   /// Expressions of partition keys. It's used to compute the
   /// per-row partition values for shuffling exchange;
-  std::vector<ScalarExpr*> partition_exprs_;
+  const std::vector<ScalarExpr*>& partition_exprs_;
   std::vector<ScalarExprEvaluator*> partition_expr_evals_;
 
   /// Time for serializing row batches.
@@ -227,22 +262,21 @@ class KrpcDataStreamSender : public DataSink {
   /// Identifier of the destination plan node.
   PlanNodeId dest_node_id_;
 
+  /// Memory tracker from Parent Memory Tracker for tracking memory of OutBoundRowBatch
+  /// serialization
+  std::shared_ptr<MemTracker> outbound_rb_mem_tracker_;
+  std::shared_ptr<CharMemTrackerAllocator> char_mem_tracker_allocator_;
+
   /// Used for Kudu partitioning to round-robin rows that don't correspond to a partition
   /// or when errors are encountered.
   int next_unknown_partition_;
 
-  /// Types and pointers for the codegen'd HashAndAddRows() functions.
+  /// Hash seed used for exchanges. Query id will be used to seed the hash function.
+  uint64_t exchange_hash_seed_;
+
+  /// Pointer for the codegen'd HashAndAddRows() function.
   /// NULL if codegen is disabled or failed.
-  typedef Status (*HashAndAddRowsFn)(KrpcDataStreamSender*, RowBatch* row);
-  HashAndAddRowsFn hash_and_add_rows_fn_ = nullptr;
-
-  /// KrpcDataStreamSender::HashRow() symbol. Used for call-site replacement.
-  static const char* HASH_ROW_SYMBOL;
-
-  /// An arbitrary hash seed used for exchanges.
-  static constexpr uint64_t EXCHANGE_HASH_SEED = 0x66bd68df22c3ef37;
-
-  static const char* LLVM_CLASS_NAME;
+  const CodegenFnPtr<KrpcDataStreamSenderConfig::HashAndAddRowsFn>& hash_and_add_rows_fn_;
 };
 
 } // namespace impala

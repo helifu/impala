@@ -27,6 +27,7 @@ import java.util.Set;
 import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.IcebergTimeTravelTable;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.Type;
@@ -39,6 +40,7 @@ import org.apache.impala.thrift.TDescriptorTableSerialized;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * Repository for tuple (and slot) descriptors.
@@ -75,8 +77,9 @@ public class DescriptorTable {
   public TupleDescriptor copyTupleDescriptor(TupleId srcId, String debugName) {
     TupleDescriptor d = new TupleDescriptor(tupleIdGenerator_.getNextId(), debugName);
     tupleDescs_.put(d.getId(), d);
-    // create copies of slots
+    // Copy path from source and create copies of slots
     TupleDescriptor src = tupleDescs_.get(srcId);
+    if (src.getPath() != null) d.setPath(src.getPath());
     for (SlotDescriptor slot: src.getSlots()) {
       copySlotDescriptor(d, slot);
     }
@@ -131,11 +134,28 @@ public class DescriptorTable {
   }
 
   /**
-   * Marks all slots in list as materialized.
+   * Marks all slots in list as materialized and return the affected Tuples.
    */
-  public void markSlotsMaterialized(List<SlotId> ids) {
+  public Set<TupleDescriptor> markSlotsMaterialized(List<SlotId> ids) {
+    Set<TupleDescriptor> affectedTuples = Sets.newHashSet();
     for (SlotId id: ids) {
-      getSlotDesc(id).setIsMaterialized(true);
+      SlotDescriptor slotDesc = getSlotDesc(id);
+      if (slotDesc.isMaterialized()) continue;
+      slotDesc.setIsMaterialized(true);
+      // If we are inside a struct, we need to materialise all enclosing struct
+      // SlotDescriptors, otherwise these descriptors will be hanging in the air.
+      materializeParentStructSlots(slotDesc);
+      // Don't add the TupleDescriptor that is for struct children.
+      if (slotDesc.getParent().getParentSlotDesc() == null) {
+        affectedTuples.add(slotDesc.getParent());
+      }
+    }
+    return affectedTuples;
+  }
+
+  private void materializeParentStructSlots(SlotDescriptor desc) {
+    for (SlotDescriptor slotDesc : desc.getEnclosingStructSlotDescs()) {
+      slotDesc.setIsMaterialized(true);
     }
   }
 
@@ -174,7 +194,7 @@ public class DescriptorTable {
         // Verify table level consistency in the same query by checking that references to
         // the same Table refer to the same table instance.
         FeTable checkTable = referencedTables.get(tblName);
-        Preconditions.checkState(checkTable == null || table == checkTable);
+        Preconditions.checkState(checkTable == null || isSameTableRef(table, checkTable));
         if (tableId == null) {
           tableId = nextTableId_++;
           tableIdMap.put(table, tableId);
@@ -199,6 +219,20 @@ public class DescriptorTable {
           tbl.toThriftDescriptor(tableIdMap.get(tbl), referencedPartitions));
     }
     return result;
+  }
+
+  /**
+   * @return true if the two tables are the same.
+   * For Iceberg Time Travel tables we compare the underlying base table.
+   */
+  private boolean isSameTableRef(FeTable first, FeTable second) {
+    if (first instanceof IcebergTimeTravelTable) {
+      first = ((IcebergTimeTravelTable) first).getBase();
+    }
+    if (second instanceof IcebergTimeTravelTable) {
+      second = ((IcebergTimeTravelTable) second).getBase();
+    }
+    return first == second;
   }
 
   public TDescriptorTableSerialized toSerializedThrift() throws ImpalaException {

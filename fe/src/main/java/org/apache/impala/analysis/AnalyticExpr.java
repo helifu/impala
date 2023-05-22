@@ -17,7 +17,6 @@
 
 package org.apache.impala.analysis;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -36,7 +35,7 @@ import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.util.TColumnValueUtil;
 
 import com.google.common.base.Joiner;
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -74,15 +73,16 @@ public class AnalyticExpr extends Expr {
   // SQL string of this AnalyticExpr before standardization. Returned in toSqlImpl().
   private String sqlString_;
 
+  public static String DENSERANK = "dense_rank";
+  public static String RANK = "rank";
+  public static String ROWNUMBER = "row_number";
+
   private static String LEAD = "lead";
   private static String LAG = "lag";
   private static String FIRST_VALUE = "first_value";
   private static String LAST_VALUE = "last_value";
   private static String FIRST_VALUE_IGNORE_NULLS = "first_value_ignore_nulls";
   private static String LAST_VALUE_IGNORE_NULLS = "last_value_ignore_nulls";
-  private static String RANK = "rank";
-  private static String DENSERANK = "dense_rank";
-  private static String ROWNUMBER = "row_number";
   private static String MIN = "min";
   private static String MAX = "max";
   private static String PERCENT_RANK = "percent_rank";
@@ -174,7 +174,7 @@ public class AnalyticExpr extends Expr {
 
   @Override
   public String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("fn", getFnCall())
         .add("window", window_)
         .addValue(super.debugString())
@@ -190,7 +190,7 @@ public class AnalyticExpr extends Expr {
         && ((AggregateFunction) fn).isAnalyticFn();
   }
 
-  private static boolean isAnalyticFn(Function fn, String fnName) {
+  public static boolean isAnalyticFn(Function fn, String fnName) {
     return isAnalyticFn(fn) && fn.functionName().equals(fnName);
   }
 
@@ -211,20 +211,20 @@ public class AnalyticExpr extends Expr {
     return isAnalyticFn(fn, NTILE);
   }
 
-  static private boolean isOffsetFn(Function fn) {
+  public static boolean isOffsetFn(Function fn) {
     return isAnalyticFn(fn, LEAD) || isAnalyticFn(fn, LAG);
   }
 
-  static private boolean isMinMax(Function fn) {
+  public static boolean isMinMax(Function fn) {
     return isAnalyticFn(fn, MIN) || isAnalyticFn(fn, MAX);
   }
 
-  static private boolean isRankingFn(Function fn) {
+  public static boolean isRankingFn(Function fn) {
     return isAnalyticFn(fn, RANK) || isAnalyticFn(fn, DENSERANK) ||
         isAnalyticFn(fn, ROWNUMBER);
   }
 
-  static private boolean isFirstOrLastValueFn(Function fn) {
+  public static boolean isFirstOrLastValueFn(Function fn) {
     return isAnalyticFn(fn, LAST_VALUE) || isAnalyticFn(fn, FIRST_VALUE) ||
         isAnalyticFn(fn, LAST_VALUE_IGNORE_NULLS) ||
         isAnalyticFn(fn, FIRST_VALUE_IGNORE_NULLS);
@@ -590,7 +590,7 @@ public class AnalyticExpr extends Expr {
    * 8. first/last_value() with RANGE window:
    *    Rewrite as a ROWS window.
    */
-  private void standardize(Analyzer analyzer) {
+  protected void standardize(Analyzer analyzer) {
     FunctionName analyticFnName = getFnCall().getFnName();
 
     // 1. Set a window from UNBOUNDED PRECEDING to CURRENT_ROW for row_number().
@@ -617,18 +617,17 @@ public class AnalyticExpr extends Expr {
         // Default offset is 1.
         newExprParams.add(NumericLiteral.create(1));
         // Default default value is NULL.
-        newExprParams.add(new NullLiteral());
+        newExprParams.add(createNullLiteral());
       } else if (getFnCall().getChildren().size() == 2) {
         newExprParams = Lists.newArrayListWithExpectedSize(3);
         newExprParams.addAll(getFnCall().getChildren());
         // Default default value is NULL.
-        newExprParams.add(new NullLiteral());
+        newExprParams.add(createNullLiteral());
       } else  {
         Preconditions.checkState(getFnCall().getChildren().size() == 3);
       }
       if (newExprParams != null) {
-        fnCall_ = new FunctionCallExpr(getFnCall().getFnName(),
-            new FunctionParams(newExprParams));
+        fnCall_ = fnCall_.cloneWithNewParams(new FunctionParams(newExprParams));
         fnCall_.setIsAnalyticFnCall(true);
         fnCall_.analyzeNoThrow(analyzer);
       }
@@ -658,7 +657,7 @@ public class AnalyticExpr extends Expr {
       if (window_.getLeftBoundary().getType() != BoundaryType.PRECEDING) {
         window_ = new AnalyticWindow(window_.getType(), window_.getLeftBoundary(),
             window_.getLeftBoundary());
-        fnCall_ = new FunctionCallExpr(new FunctionName(LAST_VALUE),
+        fnCall_ = createRewrittenFunction(new FunctionName(LAST_VALUE),
             getFnCall().getParams());
       } else {
         List<Expr> paramExprs = Expr.cloneList(getFnCall().getParams().exprs());
@@ -677,7 +676,7 @@ public class AnalyticExpr extends Expr {
         window_ = new AnalyticWindow(window_.getType(),
             new Boundary(BoundaryType.UNBOUNDED_PRECEDING, null),
             window_.getLeftBoundary());
-        fnCall_ = new FunctionCallExpr(new FunctionName(FIRST_VALUE_REWRITE),
+        fnCall_ = createRewrittenFunction(new FunctionName(FIRST_VALUE_REWRITE),
             new FunctionParams(paramExprs));
         fnCall_.setIsInternalFnCall(true);
       }
@@ -709,7 +708,7 @@ public class AnalyticExpr extends Expr {
         reversedFnName = new FunctionName(FIRST_VALUE);
       }
       if (reversedFnName != null) {
-        fnCall_ = new FunctionCallExpr(reversedFnName, getFnCall().getParams());
+        fnCall_ = createRewrittenFunction(reversedFnName, getFnCall().getParams());
         fnCall_.setIsAnalyticFnCall(true);
         fnCall_.analyzeNoThrow(analyzer);
       }
@@ -745,11 +744,11 @@ public class AnalyticExpr extends Expr {
     // to allow statement rewriting for subqueries.
     if (getFnCall().getParams().isIgnoreNulls()) {
       if (analyticFnName.getFunction().equals(LAST_VALUE)) {
-        fnCall_ = new FunctionCallExpr(new FunctionName(LAST_VALUE_IGNORE_NULLS),
+        fnCall_ = createRewrittenFunction(new FunctionName(LAST_VALUE_IGNORE_NULLS),
             getFnCall().getParams());
       } else {
         Preconditions.checkState(analyticFnName.getFunction().equals(FIRST_VALUE));
-        fnCall_ = new FunctionCallExpr(new FunctionName(FIRST_VALUE_IGNORE_NULLS),
+        fnCall_ = createRewrittenFunction(new FunctionName(FIRST_VALUE_IGNORE_NULLS),
             getFnCall().getParams());
       }
       getFnCall().getParams().setIsIgnoreNulls(false);
@@ -792,7 +791,7 @@ public class AnalyticExpr extends Expr {
   /**
    * Populate children_ from fnCall_, partitionExprs_, orderByElements_
    */
-  private void setChildren() {
+  protected void setChildren() {
     getChildren().clear();
     addChildren(fnCall_.getChildren());
     addChildren(partitionExprs_);
@@ -827,5 +826,12 @@ public class AnalyticExpr extends Expr {
     // Re-sync state after possible child substitution.
     ((AnalyticExpr) e).syncWithChildren();
     return e;
+  }
+
+  // A wrapper method to create a FunctionCallExpr for a rewritten analytic
+  // function. This can be overridden in a derived class.
+  protected FunctionCallExpr createRewrittenFunction(FunctionName funcName,
+    FunctionParams funcParams) {
+    return new FunctionCallExpr(funcName, funcParams);
   }
 }

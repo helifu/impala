@@ -29,7 +29,6 @@ import org.apache.impala.analysis.TimestampArithmeticExpr.TimeUnit;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.compat.MetastoreShim;
-import org.apache.impala.service.BackendConfig;
 import org.junit.Test;
 
 import com.google.common.base.Preconditions;
@@ -660,6 +659,29 @@ public class ParserTest extends FrontendTestBase {
   }
 
   @Test
+  public void TestTimeTravel() {
+    String timeAsOf = "select * from a for system_time as of";
+    String aliases[] = new String[] {"", " a_snapshot", " as a_snapshot"};
+    for (String alias : aliases) {
+      ParsesOk(timeAsOf + " '2021-08-09 15:14:40'" + alias);
+      ParsesOk(timeAsOf + " days_sub('2021-08-09 15:14:40', 3)" + alias);
+      ParsesOk(timeAsOf + " now()" + alias);
+      ParsesOk(timeAsOf + " days_sub(now(), 12)" + alias);
+      ParsesOk(timeAsOf + " now() - interval 100 days" + alias);
+      // 'system_version as of' only takes numeric literals
+      ParsesOk("select * from a for system_version as of 12345" + alias);
+      ParserError("select * from a for system_version as of -12345" + alias);
+      ParserError("select * from a for system_version as of \"12345\"" + alias);
+      ParserError("select * from a for system_version as of 34 + 34" + alias);
+      ParserError("select * from a for system_version as of b" + alias);
+      ParserError("select * from a for system_version as of b + 4" + alias);
+    }
+
+    ParserError("select * from t for system_time as of");
+    ParserError("select * from t for system_version as of");
+  }
+
+  @Test
   public void TestTableSampleClause() {
     String tblRefs[] = new String[] { "tbl", "db.tbl", "db.tbl.col", "db.tbl.col.fld" };
     String tblAliases[] = new String[] { "", "t" };
@@ -819,110 +841,162 @@ public class ParserTest extends FrontendTestBase {
   }
 
   @Test
-  public void TestUnion() {
-    // Single union test.
-    ParsesOk("select a from test union select a from test");
-    ParsesOk("select a from test union all select a from test");
-    ParsesOk("select a from test union distinct select a from test");
-    // Chained union test.
-    ParsesOk("select a from test union select a from test " +
-        "union select a from test union select a from test");
-    ParsesOk("select a from test union all select a from test " +
-        "union all select a from test union all select a from test");
-    ParsesOk("select a from test union distinct select a from test " +
-        "union distinct select a from test union distinct select a from test ");
-    // Mixed union with all and distinct.
-    ParsesOk("select a from test union select a from test " +
-        "union all select a from test union distinct select a from test");
-    // No from clause.
-    ParsesOk("select sin() union select cos()");
-    ParsesOk("select sin() union all select cos()");
-    ParsesOk("select sin() union distinct select cos()");
+  public void TestSetOperations() {
+    // the ALL modifier isn't currently support with except / intersect
+    String allOp = "union";
+    ParsesOk(String.format("select a from test %s all select a from test", allOp));
+    ParsesOk(String.format("select sin() %s all select cos()", allOp));
+    // Mixed %s with all and distinct.
+    ParsesOk(String.format("select a from test %s select a from test "
+            + "%s all select a from test %s distinct select a from test",
+        allOp, allOp, allOp));
+    ParsesOk(String.format("select a from test %s all select a from test "
+            + "%s all select a from test %s all select a from test",
+        allOp, allOp, allOp));
 
-    // All select blocks in parenthesis.
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union (select a from test) union (select a from test)");
-    // Union with order by,
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union (select a from test) union (select a from test) order by a");
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union (select a from test) union (select a from test) order by a nulls first");
-    // Union with limit.
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union (select a from test) union (select a from test) limit 10");
-    // Union with order by, offset and limit.
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union (select a from test) union (select a from test) order by a limit 10");
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union (select a from test) union (select a from test) order by a " +
-        "nulls first limit 10");
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union (select a from test) union (select a from test) order by a " +
-        "nulls first offset 10");
-    ParserError("select a from test union (select a from test) " +
-        "union (select a from test) union (select a from test) offset 10");
-    // Union with some select blocks in parenthesis, and others not.
-    ParsesOk("(select a from test) union select a from test " +
-        "union (select a from test) union select a from test");
-    ParsesOk("select a from test union (select a from test) " +
-        "union select a from test union (select a from test)");
-    // Union with order by, offset and limit binding to last select.
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union select a from test union select a from test order by a limit 10");
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union select a from test union select a from test order by a offset 10");
-    ParsesOk("(select a from test) union (select a from test) " +
-        "union select a from test union select a from test order by a");
-    // Union with order by and limit.
-    // Last select with order by and limit is in parenthesis.
-    ParsesOk("select a from test union (select a from test) " +
-        "union select a from test union (select a from test order by a limit 10) " +
-        "order by a limit 1");
-    ParsesOk("select a from test union (select a from test) " +
-        "union select a from test union (select a from test order by a offset 10) " +
-        "order by a limit 1");
-    ParsesOk("select a from test union (select a from test) " +
-        "union select a from test union (select a from test order by a) " +
-        "order by a limit 1");
-    // Union with order by, offset in first operand.
-    ParsesOk("select a from test order by a union select a from test");
-    ParsesOk("select a from test order by a offset 5 union select a from test");
-    ParsesOk("select a from test offset 5 union select a from test");
-    // Union with order by and limit.
-    // Last select with order by and limit is not in parenthesis.
-    ParsesOk("select a from test union select a from test " +
-        "union select a from test union select a from test order by a limit 10 " +
-        "order by a limit 1");
+    final String[] noAllOps = new String[] {"except", "intersect", "minus"};
+    for (String noAllOp : noAllOps) {
+      ParserError(String.format("select a from test %s all select a from test", noAllOp));
+      ParserError(String.format("select sin() %s all select cos()", noAllOp));
+      // Mixed %s with all and distinct.
+      ParserError(String.format("select a from test %s select a from test "
+              + "%s all select a from test %s distinct select a from test",
+          noAllOp, noAllOp, noAllOp));
+      ParserError(String.format("select a from test %s all select a from test "
+              + "%s all select a from test %s all select a from test",
+          noAllOp, noAllOp, noAllOp));
+    }
 
-    // Nested unions with order by and limit.
-    ParsesOk("select a union " +
-        "((select b) union (select c) order by 1 limit 1)");
-    ParsesOk("select a union " +
-        "((select b) union " +
-        "  ((select c) union (select d) " +
-        "   order by 1 limit 1) " +
-        " order by 1 limit 1)");
+    final String[] setOperators = new String[] {"union", "except", "intersect", "minus"};
+    for (String op : setOperators) {
+      // Single union test.
+      ParsesOk(String.format("select a from test %s select a from test", op));
+      ParsesOk(String.format("select a from test %s distinct select a from test", op));
+      // Chained union test.
+      ParsesOk(String.format("select a from test %s select a from test "
+              + "%s select a from test %s select a from test",
+          op, op, op));
+      ParsesOk(String.format("select a from test %s distinct select a from test "
+              + "%s distinct select a from test %s distinct select a from test ",
+          op, op, op));
+      // No from clause.
+      ParsesOk(String.format("select sin() %s select cos()", op));
+      ParsesOk(String.format("select sin() %s distinct select cos()", op));
 
-    // Union in insert query.
-    ParsesOk("insert into table t select a from test union select a from test");
-    ParsesOk("insert into table t select a from test union select a from test " +
-        "union select a from test union select a from test");
-    ParsesOk("insert overwrite table t select a from test union select a from test");
-    ParsesOk("insert overwrite table t select a from test union select a from test " +
-        "union select a from test union select a from test");
+      // All select blocks in parenthesis.
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s (select a from test) %s (select a from test)",
+          op, op, op));
+      // op, op, operator with order by,
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s (select a from test) %s (select a from test) order by a",
+          op, op, op));
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s (select a from test) %s (select a from test) order by a nulls first",
+          op, op, op));
+      // op, op, operator with limit.
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s (select a from test) %s (select a from test) limit 10",
+          op, op, op));
+      // op, op, operator with order by, offset and limit.
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s (select a from test) %s (select a from test) order by a limit 10",
+          op, op, op));
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s (select a from test) %s (select a from test) order by a "
+              + "nulls first limit 10",
+          op, op, op));
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s (select a from test) %s (select a from test) order by a "
+              + "nulls first offset 10",
+          op, op, op));
+      ParserError(String.format("select a from test %s (select a from test) "
+              + "%s (select a from test) %s (select a from test) offset 10",
+          op, op, op));
+      // op, op, operator with some select blocks in parenthesis, and others not.
+      ParsesOk(String.format("(select a from test) %s select a from test "
+              + "%s (select a from test) %s select a from test",
+          op, op, op));
+      ParsesOk(String.format("select a from test %s (select a from test) "
+              + "%s select a from test %s (select a from test)",
+          op, op, op));
+      // op, op, operator with order by, offset and limit binding to last select.
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s select a from test %s select a from test order by a limit 10",
+          op, op, op));
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s select a from test %s select a from test order by a offset 10",
+          op, op, op));
+      ParsesOk(String.format("(select a from test) %s (select a from test) "
+              + "%s select a from test %s select a from test order by a",
+          op, op, op));
+      // op, op, operator with order by and limit.
+      // Last select with order by and limit is in parenthesis.
+      ParsesOk(String.format("select a from test %s (select a from test) "
+              + "%s select a from test %s (select a from test order by a limit 10) "
+              + "order by a limit 1",
+          op, op, op));
+      ParsesOk(String.format("select a from test %s (select a from test) "
+              + "%s select a from test %s (select a from test order by a offset 10) "
+              + "order by a limit 1",
+          op, op, op));
+      ParsesOk(String.format("select a from test %s (select a from test) "
+              + "%s select a from test %s (select a from test order by a) "
+              + "order by a limit 1",
+          op, op, op));
+      // operator with order by, offset in first operand.
+      ParsesOk(String.format("select a from test order by a %s select a from test", op));
+      ParsesOk(String.format(
+          "select a from test order by a offset 5 %s select a from test", op, op));
+      ParsesOk(String.format("select a from test offset 5 %s select a from test", op));
+      // operator with order by and limit.
+      // Last select with order by and limit is not in parenthesis.
+      ParsesOk(String.format("select a from test %s select a from test "
+              + "%s select a from test %s select a from test order by a limit 10 "
+              + "order by a limit 1",
+          op, op, op));
 
-    // Union in upsert query.
-    ParsesOk("upsert into table t select a from test union select a from test");
-    ParsesOk("upsert into table t select a from test union select a from test " +
-        "union select a from test union select a from test");
+      // Nested %ss with order by and limit.
+      ParsesOk(String.format("select a %s "
+              + "((select b) %s (select c) order by 1 limit 1)",
+          op, op));
+      ParsesOk(String.format("select a %s "
+              + "((select b) %s "
+              + "  ((select c) %s (select d) "
+              + "   order by 1 limit 1) "
+              + " order by 1 limit 1)",
+          op, op, op));
 
-    // No complete select statement on lhs.
-    ParserError("a from test union select a from test");
-    // No complete select statement on rhs.
-    ParserError("select a from test union a from test");
-    // Union cannot be a column or table since it's a keyword.
-    ParserError("select union from test");
-    ParserError("select a from union");
+      // operator in insert query.
+      ParsesOk(String.format(
+          "insert into table t select a from test %s select a from test", op));
+      ParsesOk(
+          String.format("insert into table t select a from test %s select a from test "
+                  + "%s select a from test %s select a from test",
+              op, op, op));
+      ParsesOk(String.format(
+          "insert overwrite table t select a from test %s select a from test", op));
+      ParsesOk(String.format(
+          "insert overwrite table t select a from test %s select a from test "
+              + "%s select a from test %s select a from test",
+          op, op, op));
+
+      // operator in upsert query.
+      ParsesOk(String.format(
+          "upsert into table t select a from test %s select a from test", op));
+      ParsesOk(
+          String.format("upsert into table t select a from test %s select a from test "
+                  + "%s select a from test %s select a from test",
+              op, op, op));
+
+      // No complete select statement on lhs.
+      ParserError(String.format("a from test %s select a from test", op));
+      // No complete select statement on rhs.
+      ParserError(String.format("select a from test %s a from test", op));
+      // operator cannot be a column or table since it's a keyword.
+      ParserError(String.format("select %s from test", op));
+      ParserError(String.format("select a from %s", op));
+    }
   }
 
   @Test
@@ -1872,7 +1946,6 @@ public class ParserTest extends FrontendTestBase {
 
   @Test
   public void TestKuduUpdate() {
-    //TestUtils.assumeKuduIsSupported();
     ParserError("update (select * from functional_kudu.testtbl) a set name = '10'");
   }
 
@@ -1995,7 +2068,7 @@ public class ParserTest extends FrontendTestBase {
   }
 
   @Test
-  public void TestDescribe() {
+  public void TestDescribeTable() {
     // Missing argument
     ParserError("DESCRIBE");
     ParserError("DESCRIBE FORMATTED");
@@ -2018,6 +2091,19 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("DESCRIBE FORMATTED databasename.tablename.field1.field2");
     ParsesOk("DESCRIBE EXTENDED databasename.tablename.field1");
     ParsesOk("DESCRIBE EXTENDED databasename.tablename.field1.field2");
+  }
+
+  @Test
+  public void TestDescribeHistory() {
+    // Unqualified table ok
+    ParsesOk("DESCRIBE HISTORY tablename");
+
+    // Fully-qualified table ok
+    ParsesOk("DESCRIBE HISTORY databasename.tablename");
+
+    // EXTENDED and FORMATTED not applicable
+    ParserError("DESCRIBE EXTENDED HISTORY tablename");
+    ParserError("DESCRIBE FORMATTED HISTORY tablename");
   }
 
   @Test
@@ -2219,6 +2305,7 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=NULL)");
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=NULL, j=2, k=NULL)");
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=abc, j=(5*8+10), k=!true and false)");
+    ParsesOk("ALTER TABLE Foo ADD PARTITION (i=1) SET FILEFORMAT PARQUET");
 
     // Multiple partition specs
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=1, s='one') " +
@@ -2283,6 +2370,38 @@ public class ParserTest extends FrontendTestBase {
           "<= 20, PARTITION 20 < VALUES <= 30", option));
       ParserError(String.format("ALTER TABLE Foo ADD %s (RANGE PARTITION 10 < VALUES " +
           "<= 20)", option));
+    }
+  }
+
+  @Test
+  public void TestAlterTableSetPartitionSpec() {
+    ParserError("ALTER TABLE t SET PARTITION SPEC",
+        "Syntax error in line 1:\n" +
+        "ALTER TABLE t SET PARTITION SPEC\n" +
+        "                                ^\n" +
+        "Encountered: EOF\n" +
+        "Expected: (");
+
+    ParserError("ALTER TABLE t SET PARTITION SPEC ()",
+        "Syntax error in line 1:\n" +
+        "ALTER TABLE t SET PARTITION SPEC ()\n" +
+        "                                  ^\n" +
+        "Encountered: )\n" +
+        "Expected: TRUNCATE, IDENTIFIER");
+
+    ParserError("ALTER TABLE t PARTITION (c) SET PARTITION SPEC (c)",
+        "Syntax error in line 1:\n" +
+        "ALTER TABLE t PARTITION (c) SET PARTITION SPEC (c)\n" +
+        "                                                 ^\n" +
+        "Encountered: PARTITION\n" +
+        "Expected: SET");
+
+    String partTransf[] = new String[] {"c", "year(c)", "month(c)", "day(c)", "hour(c)",
+        "truncate(5, c)", "bucket(5, c)",
+        "year(c), day(c), truncate(5, c)",
+        "c, month(c), hour(c), bucket(15, c), year(c)"};
+    for (String pt: partTransf) {
+      ParsesOk("alter table t set partition spec (" + pt + ")");
     }
   }
 
@@ -2442,6 +2561,9 @@ public class ParserTest extends FrontendTestBase {
     // Test SET COLUMN STATS.
     ParsesOk("ALTER TABLE Foo SET COLUMN STATS col ('numDVs'='10')");
     ParsesOk("ALTER TABLE Foo SET COLUMN STATS col ('numDVs'='10','maxSize'='20')");
+    ParsesOk("ALTER TABLE Foo SET COLUMN STATS col ('NUM_TRUES'='10')");
+    ParsesOk("ALTER TABLE Foo SET COLUMN STATS col ('NUM_FALSES'='20')");
+    ParsesOk("ALTER TABLE Foo SET COLUMN STATS col ('NUM_TRUES'='10','NUM_FALSES'='20')");
     ParsesOk("ALTER TABLE TestDb.Foo SET COLUMN STATS col ('avgSize'='20')");
     ParserError("ALTER TABLE SET COLUMN STATS col ('numDVs'='10'");
     ParserError("ALTER TABLE Foo SET COLUMN STATS ('numDVs'='10'");
@@ -2468,14 +2590,10 @@ public class ParserTest extends FrontendTestBase {
 
   @Test
   public void TestAlterTableZSortBy() {
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
-
     ParsesOk("ALTER TABLE TEST SORT BY ZORDER (int_col, id)");
     ParsesOk("ALTER TABLE TEST SORT BY ZORDER ()");
     ParserError("ALTER TABLE TEST PARTITION (year=2009, month=4) SORT BY ZORDER " +
         "(int_col, id)");
-
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
   }
 
   @Test
@@ -2607,8 +2725,6 @@ public class ParserTest extends FrontendTestBase {
     ParserError("CREATE TABLE Foo SORT BY (id) LIKE PARQUET '/user/foo'");
 
     // SORT BY ZORDER clause
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
-
     ParsesOk("CREATE TABLE Foo (i int, j int) SORT BY ZORDER ()");
     ParsesOk("CREATE TABLE Foo (i int) SORT BY ZORDER (i)");
     ParsesOk("CREATE TABLE Foo (i int) SORT BY ZORDER (j)");
@@ -2649,8 +2765,6 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("CREATE TABLE Foo LIKE PARQUET '/user/foo' SORT BY ZORDER (id)");
     ParserError("CREATE TABLE Foo SORT BY ZORDER (id) LIKE PARQUET '/user/foo'");
 
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
-
     // Column comments
     ParsesOk("CREATE TABLE Foo (i int COMMENT 'hello', s string)");
     ParsesOk("CREATE TABLE Foo (i int COMMENT 'hello', s string COMMENT 'hi')");
@@ -2680,10 +2794,26 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("CREATE TABLE foo (i INT, j INT, PRIMARY KEY (j, i)) STORED AS KUDU");
     ParsesOk("CREATE TABLE foo (i INT PRIMARY KEY, PRIMARY KEY(i)) STORED AS KUDU");
     ParsesOk("CREATE TABLE foo (i INT PRIMARY KEY, j INT PRIMARY KEY) STORED AS KUDU");
+    ParsesOk("CREATE TABLE foo (i INT NON UNIQUE PRIMARY KEY) STORED AS KUDU");
+    ParsesOk("CREATE TABLE foo (i INT NON UNIQUE PRIMARY KEY, "
+        + "NON UNIQUE PRIMARY KEY(i)) STORED AS KUDU");
+    ParsesOk("CREATE TABLE foo (i INT, j INT, NON UNIQUE PRIMARY KEY (i, j)) "
+        + "STORED AS KUDU");
+    ParsesOk("CREATE TABLE foo (i INT NON UNIQUE PRIMARY KEY, "
+        + "j INT NON UNIQUE PRIMARY KEY) STORED AS KUDU");
     ParserError("CREATE TABLE foo (i INT) PRIMARY KEY (i) STORED AS KUDU");
     ParserError("CREATE TABLE foo (i INT, PRIMARY KEY) STORED AS KUDU");
     ParserError("CREATE TABLE foo (PRIMARY KEY(a), a INT) STORED AS KUDU");
-    ParserError("CREATE TABLE foo (i INT) PRIMARY KEY (i) STORED AS KUDU");
+    ParserError("CREATE TABLE foo (i INT) NON UNIQUE PRIMARY KEY (i) STORED AS KUDU");
+    ParserError("CREATE TABLE foo (i INT, NON UNIQUE PRIMARY KEY) STORED AS KUDU");
+    ParserError("CREATE TABLE foo (NON UNIQUE PRIMARY KEY(a), a INT) STORED AS KUDU");
+
+    // Supported storage engines
+    ParsesOk("CREATE TABLE foo (i INT) STORED BY KUDU");
+    ParsesOk("CREATE TABLE foo (i INT) STORED BY ICEBERG");
+    ParserError("CREATE TABLE foo (i INT) STORED BY PARQUET");
+    ParserError("CREATE TABLE foo (i INT) STORED BY FOOBAR");
+    ParserError("CREATE TABLE foo (i INT) STORED BY");
 
     // Primary key and foreign key specification.
     ParsesOk("create table foo(id int, year int, primary key (id))");
@@ -2876,6 +3006,8 @@ public class ParserTest extends FrontendTestBase {
         "HASH (a) PARTITIONS 3, RANGE (a, b) (PARTITION VALUE = (1, 'abc'), " +
         "PARTITION VALUE = (2, 'def'))");
     ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
+        "(PARTITION VALUE = 10), HASH (a) PARTITIONS 3");
+    ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
         "(PARTITION VALUE = 1 + 1) STORED AS KUDU");
     ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
         "(PARTITION 1 + 1 < VALUES) STORED AS KUDU");
@@ -2888,8 +3020,6 @@ public class ParserTest extends FrontendTestBase {
     ParserError("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) ()");
     ParserError("CREATE TABLE Foo (a int) PARTITION BY HASH (a) PARTITIONS 4, " +
         "RANGE (a) (PARTITION VALUE = 10), RANGE (a) (PARTITION VALUES < 10)");
-    ParserError("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
-        "(PARTITION VALUE = 10), HASH (a) PARTITIONS 3");
     ParserError("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
         "(PARTITION VALUES = 10) STORED AS KUDU");
     ParserError("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
@@ -2923,6 +3053,8 @@ public class ParserTest extends FrontendTestBase {
                   "%s %s %s %s %s) STORED AS KUDU", enc, comp, def, block, nul));
               ParsesOk(String.format("CREATE TABLE Foo (i int PRIMARY KEY " +
                   "%s %s %s %s %s) STORED AS KUDU", enc, comp, block, def, nul));
+              ParsesOk(String.format("CREATE TABLE Foo (i int NON UNIQUE PRIMARY KEY " +
+                  "%s %s %s %s %s) STORED AS KUDU", nul, enc, comp, def, block));
             }
           }
         }
@@ -2939,6 +3071,32 @@ public class ParserTest extends FrontendTestBase {
     ParserError("CREATE TABLE Foo(a int PRIMARY KEY, b int BLOCK_SIZE 1+1) " +
         "STORED AS KUDU");
     ParserError("CREATE TABLE Foo(a int PRIMARY KEY BLOCK_SIZE -1) STORED AS KUDU");
+
+    // Supported bucketed table
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) INTO 24 BUCKETS");
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', a int, s string) " +
+        "CLUSTERED BY (i, a) INTO 24 BUCKETS");
+
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "PARTITIONED BY(dt string) CLUSTERED BY (i) INTO 24 BUCKETS");
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) SORT BY(s) INTO 24 BUCKETS");
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "PARTITIONED BY(dt string) CLUSTERED BY (i) SORT BY (s) " +
+        "INTO 24 BUCKETS");
+
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i)");
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED INTO 24 BUCKETS ");
+    ParserError("CREATE TABLE (i int, s string) CLUSTERED INTO 24 BUCKETS");
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) INTO BUCKETS");
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "PARTITIONED BY(dt string) CLUSTERED BY (i) INTO BUCKETS");
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) INTO 12 BUCKETS SORT BY (s)");
   }
 
   @Test
@@ -3015,6 +3173,16 @@ public class ParserTest extends FrontendTestBase {
     // Mismatched number of columns in column definition and view definition parses ok.
     ParsesOk("CREATE VIEW Bar (x, y) AS SELECT 1, 2, 3");
 
+    ParsesOk("CREATE VIEW Bar (x, y, z) TBLPROPERTIES ('a' = 'b') AS SELECT 1, 2, 3");
+    ParsesOk("CREATE VIEW Bar (x, y, z) TBLPROPERTIES ('a' = 'b', 'c' = 'd')" +
+        " AS SELECT 1, 2, 3");
+    ParsesOk("CREATE VIEW Bar TBLPROPERTIES ('a' = 'b') AS VALUES(1, 2, 3)");
+    ParsesOk("CREATE VIEW Bar TBLPROPERTIES ('a' = 'b') AS SELECT 1, 2, 3");
+    ParsesOk("CREATE VIEW Bar TBLPROPERTIES ('a' = 'b', 'c' = 'd')" +
+        " AS SELECT 1, 2, 3");
+    ParsesOk("CREATE VIEW Foo.Bar COMMENT 'test' TBLPROPERTIES ('a' = 'b')" +
+        " AS SELECT a, b, c from t");
+
     // No view name.
     ParserError("CREATE VIEW AS SELECT c FROM t");
     // Missing AS keyword
@@ -3035,6 +3203,9 @@ public class ParserTest extends FrontendTestBase {
     ParserError("CREATE VIEW Foo.Bar (x) AS ALTER TABLE Foo COLUMNS (i int, s string)");
     ParserError("CREATE VIEW Foo.Bar (x) AS CREATE VIEW Foo.Bar AS SELECT 1");
     ParserError("CREATE VIEW Foo.Bar (x) AS ALTER VIEW Foo.Bar AS SELECT 1");
+
+    ParserError("CREATE VIEW Bar (x, y, z) TBLPROPERTIES () AS SELECT 1, 2, 3");
+    ParserError("CREATE VIEW Bar (x, y, z) TBLPROPERTIES (i int) AS SELECT 1, 2, 3");
   }
 
   @Test
@@ -3056,6 +3227,9 @@ public class ParserTest extends FrontendTestBase {
 
     // Mismatched number of columns in column definition and view definition parses ok.
     ParsesOk("ALTER VIEW Bar (x, y) AS SELECT 1, 2, 3");
+
+    ParsesOk("ALTER VIEW Foo.Bar SET TBLPROPERTIES ('pro1' = '1', 'pro2' = '2')");
+    ParsesOk("ALTER VIEW Foo.Bar UNSET TBLPROPERTIES ('pro1', 'pro2')");
 
     // Must be ALTER VIEW not ALTER TABLE.
     ParserError("ALTER TABLE Foo.Bar AS SELECT 1, 2, 3");
@@ -3080,6 +3254,11 @@ public class ParserTest extends FrontendTestBase {
     ParserError("ALTER VIEW Foo.Bar AS ALTER TABLE Foo COLUMNS (i int, s string)");
     ParserError("ALTER VIEW Foo.Bar AS CREATE VIEW Foo.Bar AS SELECT 1, 2, 3");
     ParserError("ALTER VIEW Foo.Bar AS ALTER VIEW Foo.Bar AS SELECT 1, 2, 3");
+
+    ParserError("ALTER VIEW Foo.Bar SET TBLPROPERTIES ()");
+    ParserError("ALTER VIEW Foo.Bar SET TBLPROPERTIES (int COMMENT 'x')");
+    ParserError("ALTER VIEW Foo.Bar UNSET TBLPROPERTIES ()");
+    ParserError("ALTER VIEW Foo.Bar UNSET TBLPROPERTIES (int COMMENT 'x')");
   }
 
   @Test
@@ -3127,11 +3306,20 @@ public class ParserTest extends FrontendTestBase {
     // Flexible partitioning
     ParsesOk("CREATE TABLE Foo PRIMARY KEY (i) PARTITION BY HASH(i) PARTITIONS 4 AS " +
         "SELECT 1");
-    ParserError("CREATE TABLE Foo PARTITION BY HASH(i) PARTITIONS 4 AS SELECT 1");
+    ParsesOk("CREATE TABLE Foo PARTITION BY HASH(i) PARTITIONS 4 AS SELECT 1");
     ParsesOk("CREATE TABLE Foo PRIMARY KEY (a) PARTITION BY HASH(a) PARTITIONS 4 " +
         "TBLPROPERTIES ('a'='b', 'c'='d') AS SELECT * from bar");
     ParsesOk("CREATE TABLE Foo PRIMARY KEY (a) PARTITION BY RANGE(a) " +
         "(PARTITION 1 < VALUES < 10, PARTITION 10 <= VALUES < 20, PARTITION VALUE = 30) " +
+        "STORED AS KUDU AS SELECT * FROM Bar");
+    ParsesOk("CREATE TABLE Foo NON UNIQUE PRIMARY KEY (a) " +
+        "PARTITION BY HASH (a) PARTITIONS 2 " +
+        "STORED AS KUDU AS SELECT * FROM Bar");
+    ParsesOk("CREATE TABLE Foo PARTITION BY RANGE(a) " +
+        "(PARTITION 1 < VALUES < 10, PARTITION 10 <= VALUES < 20, " +
+        " PARTITION VALUE = 30) " +
+        "STORED AS KUDU AS SELECT * FROM Bar");
+    ParsesOk("CREATE TABLE Foo PARTITION BY HASH (a) PARTITIONS 2 " +
         "STORED AS KUDU AS SELECT * FROM Bar");
   }
 
@@ -3392,7 +3580,7 @@ public class ParserTest extends FrontendTestBase {
         "Encountered: IDENTIFIER\n" +
         "Expected: ALTER, COMMENT, COMPUTE, COPY, CREATE, DELETE, DESCRIBE, DROP, " +
             "EXPLAIN, GRANT, INSERT, INVALIDATE, LOAD, REFRESH, REVOKE, SELECT, SET, " +
-            "SHOW, TRUNCATE, UPDATE, UPSERT, USE, VALUES, WITH\n");
+            "SHOW, TRUNCATE, UNSET, UPDATE, UPSERT, USE, VALUES, WITH\n");
 
     // missing select list
     ParserError("select from t",
@@ -3400,9 +3588,12 @@ public class ParserTest extends FrontendTestBase {
         "select from t\n" +
         "       ^\n" +
         "Encountered: FROM\n" +
-        "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, IF, " +
-        "INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, STRAIGHT_JOIN, TRUNCATE, TRUE, " +
-        "IDENTIFIER");
+        "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, GROUPING, " +
+        "IF, INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, STRAIGHT_JOIN, TRUNCATE, TRUE, " +
+        "UNNEST, IDENTIFIER\n" +
+        "\n" +
+        "Hint: reserved words have to be escaped when used as an identifier, e.g. `from`"
+        );
 
     // missing from
     ParserError("select c, b, c where a = 5",
@@ -3410,8 +3601,12 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c where a = 5\n" +
         "               ^\n" +
         "Encountered: WHERE\n" +
-        "Expected: AND, AS, BETWEEN, DEFAULT, DIV, FROM, ILIKE, IN, IREGEXP, IS, LIKE, " +
-        "LIMIT, NOT, OR, ORDER, REGEXP, RLIKE, UNION, COMMA, IDENTIFIER\n");
+        "Expected: AND, AS, BETWEEN, DEFAULT, DIV, EXCEPT, FROM, ILIKE, IN, INTERSECT, " +
+        "IREGEXP, IS, LIKE, LIMIT, ||, MINUS, NOT, OR, ORDER, REGEXP, RLIKE, UNION, " +
+        "COMMA, IDENTIFIER\n" +
+        "\n" +
+        "Hint: reserved words have to be escaped when used as an identifier, e.g. `where`"
+        );
 
     // missing table list
     ParserError("select c, b, c from where a = 5",
@@ -3419,7 +3614,10 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c from where a = 5\n" +
         "                    ^\n" +
         "Encountered: WHERE\n" +
-        "Expected: DEFAULT, IDENTIFIER\n");
+        "Expected: DEFAULT, UNNEST, IDENTIFIER\n" +
+        "\n" +
+        "Hint: reserved words have to be escaped when used as an identifier, e.g. `where`"
+        );
 
     // missing predicate in where clause (no group by)
     ParserError("select c, b, c from t where",
@@ -3427,8 +3625,9 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c from t where\n" +
         "                           ^\n" +
         "Encountered: EOF\n" +
-        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, IF, INTERVAL, LEFT, NOT, " +
-        "NULL, REPLACE, RIGHT, TRUNCATE, TRUE, IDENTIFIER");
+        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, GROUPING, IF, INTERVAL, " +
+        "LEFT, NOT, NULL, REPLACE, RIGHT, STRAIGHT_JOIN, TRUNCATE, TRUE, UNNEST, " +
+        "IDENTIFIER");
 
     // missing predicate in where clause (group by)
     ParserError("select c, b, c from t where group by a, b",
@@ -3436,8 +3635,12 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c from t where group by a, b\n" +
         "                            ^\n" +
         "Encountered: GROUP\n" +
-        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, IF, INTERVAL, LEFT, NOT, " +
-        "NULL, REPLACE, RIGHT, TRUNCATE, TRUE, IDENTIFIER");
+        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, GROUPING, IF, INTERVAL, " +
+        "LEFT, NOT, NULL, REPLACE, RIGHT, STRAIGHT_JOIN, TRUNCATE, TRUE, UNNEST, " +
+        "IDENTIFIER\n" +
+        "\n" +
+        "Hint: reserved words have to be escaped when used as an identifier, e.g. `group`"
+        );
 
     // unmatched string literal starting with "
     ParserError("select c, \"b, c from t",
@@ -3479,8 +3682,9 @@ public class ParserTest extends FrontendTestBase {
         "... b, c,c,c,c,c,c,c,c,c,a a a,c,c,c,c,c,c,c,cd,c,d,d,,c,...\n" +
         "                             ^\n" +
         "Encountered: IDENTIFIER\n" +
-        "Expected: CROSS, FROM, FULL, GROUP, HAVING, INNER, JOIN, LEFT, LIMIT, OFFSET, " +
-        "ON, ORDER, RIGHT, STRAIGHT_JOIN, TABLESAMPLE, UNION, USING, WHERE, COMMA\n");
+        "Expected: CROSS, EXCEPT, FROM, FULL, GROUP, HAVING, INNER, INTERSECT, JOIN, " +
+        "LEFT, LIMIT, MINUS, OFFSET, ON, ORDER, RIGHT, STRAIGHT_JOIN, TABLESAMPLE, " +
+        "UNION, USING, WHERE, COMMA\n");
 
     // Long line: error close to the start
     ParserError("select a a a, b, c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,cd,c,d,d,,c, from t",
@@ -3488,8 +3692,9 @@ public class ParserTest extends FrontendTestBase {
         "select a a a, b, c,c,c,c,c,c,c,c,c,c,c,...\n" +
         "           ^\n" +
         "Encountered: IDENTIFIER\n" +
-        "Expected: CROSS, FROM, FULL, GROUP, HAVING, INNER, JOIN, LEFT, LIMIT, OFFSET, " +
-        "ON, ORDER, RIGHT, STRAIGHT_JOIN, TABLESAMPLE, UNION, USING, WHERE, COMMA\n");
+        "Expected: CROSS, EXCEPT, FROM, FULL, GROUP, HAVING, INNER, INTERSECT, JOIN, " +
+        "LEFT, LIMIT, MINUS, OFFSET, ON, ORDER, RIGHT, STRAIGHT_JOIN, TABLESAMPLE, " +
+        "UNION, USING, WHERE, COMMA\n");
 
     // Long line: error close to the end
     ParserError("select a, b, c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,cd,c,d,d, ,c, from t",
@@ -3497,8 +3702,8 @@ public class ParserTest extends FrontendTestBase {
         "...c,c,c,c,c,c,c,c,cd,c,d,d, ,c, from t\n" +
         "                             ^\n" +
         "Encountered: COMMA\n" +
-        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, IF, INTERVAL, LEFT, NOT, " +
-        "NULL, REPLACE, RIGHT, TRUNCATE, TRUE, IDENTIFIER");
+        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, GROUPING, IF, INTERVAL, " +
+        "LEFT, NOT, NULL, REPLACE, RIGHT, TRUNCATE, TRUE, UNNEST, IDENTIFIER");
 
     // Parsing identifiers that have different names printed as EXPECTED
     ParserError("DROP DATA SRC foo",
@@ -3534,17 +3739,17 @@ public class ParserTest extends FrontendTestBase {
          "\n" +
          "^\n" +
          "Encountered: EOF\n" +
-         "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, " +
+         "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, GROUPING, " +
          "IF, INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, " +
-         "STRAIGHT_JOIN, TRUNCATE, TRUE, IDENTIFIER\n");
+         "STRAIGHT_JOIN, TRUNCATE, TRUE, UNNEST, IDENTIFIER\n");
     ParserError("SELECT\n\n",
          "Syntax error in line 3:\n" +
          "\n" +
          "^\n" +
          "Encountered: EOF\n" +
-         "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, " +
+         "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, GROUPING, " +
          "IF, INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, " +
-         "STRAIGHT_JOIN, TRUNCATE, TRUE, IDENTIFIER\n");
+         "STRAIGHT_JOIN, TRUNCATE, TRUE, UNNEST, IDENTIFIER\n");
   }
 
   @Test
@@ -3662,6 +3867,102 @@ public class ParserTest extends FrontendTestBase {
     ParserError("SELECT a, count(*) FROM foo ORDER BY SELECT a FROM bar");
     ParserError("SELECT a, count(*) FROM foo ORDER BY (SELECT) a FROM bar DESC");
     ParserError("SELECT a, count(*) FROM foo ORDER BY (SELECT a FROM bar ASC");
+  }
+
+  @Test
+  public void TestRollup() {
+    ParsesOk("SELECT a FROM foo GROUP BY ROLLUP(a)");
+    ParsesOk("SELECT a, b FROM foo GROUP BY ROLLUP(a, b)");
+
+    // Non-standard WITH ROLLUP
+    ParsesOk("SELECT a FROM foo GROUP BY a WITH ROLLUP");
+    ParsesOk("SELECT a, b FROM foo GROUP BY a, b WITH ROLLUP");
+
+    // Can't combine syntaxes
+    ParserError("SELECT a, b FROM foo GROUP BY ROLLUP(a, b) WITH ROLLUP");
+
+    // Nested grouping clauses not supported.
+    ParserError("SELECT a, b FROM foo GROUP BY ROLLUP(a, ROLLUP(b, c))");
+    ParserError("SELECT a, b FROM foo GROUP BY ROLLUP(a, CUBE(b, c))");
+
+    // Multiple clauses not supported with ROLLUP - parser does not handle yet.
+    ParserError("SELECT a, b FROM foo GROUP BY c, ROLLUP(a, b)");
+    ParserError("SELECT a, b FROM foo GROUP BY ROLLUP(a, b), c");
+    ParserError("SELECT a, b FROM foo GROUP BY ROLLUP(a, b), ROLLUP(c)");
+    ParserError("SELECT a, b FROM foo GROUP BY ROLLUP(a, b), CUBE(c, d)");
+
+    // Empty clause not supported
+    ParserError("SELECT count(*) FROM foo GROUP BY ROLLUP()");
+
+    // Extra parentheses in list elements are supported.
+    ParsesOk("SELECT a, b FROM foo GROUP BY ROLLUP((a), (b))");
+  }
+
+  @Test
+  public void TestCube() {
+    ParsesOk("SELECT a FROM foo GROUP BY CUBE(a)");
+    ParsesOk("SELECT a, b FROM foo GROUP BY CUBE(a, b)");
+
+    // Non-standard WITH CUBE is supported
+    ParsesOk("SELECT a FROM foo GROUP BY a WITH CUBE");
+    ParsesOk("SELECT a, b FROM foo GROUP BY a, b WITH CUBE");
+
+    // Can't combine syntaxes
+    ParserError("SELECT a, b FROM foo GROUP BY CUBE(a, b) WITH CUBE");
+
+    // Nested grouping clauses not supported.
+    ParserError("SELECT a, b FROM foo GROUP BY CUBE(a, ROLLUP(b, c))");
+    ParserError("SELECT a, b FROM foo GROUP BY CUBE(a, CUBE(b, c))");
+
+    // Multiple clauses not supported with CUBE - parser does not handle yet.
+    ParserError("SELECT a, b FROM foo GROUP BY c, CUBE(a, b)");
+    ParserError("SELECT a, b FROM foo GROUP BY CUBE(a, b), c");
+    ParserError("SELECT a, b FROM foo GROUP BY CUBE(a, b), CUBE(c)");
+
+    // Empty clause not supported
+    ParserError("SELECT count(*) FROM foo GROUP BY CUBE()");
+
+    // Extra parentheses in list elements are supported.
+    ParsesOk("SELECT a, b FROM foo GROUP BY CUBE((a), (b))");
+  }
+
+  @Test
+  public void TestGroupingSets() {
+    ParsesOk("SELECT a FROM foo GROUP BY GROUPING SETS((a, b))");
+    ParsesOk("SELECT a FROM foo GROUP BY GROUPING SETS((a, b), (a), ())");
+
+    // Nested grouping sets not supported.
+    ParserError("SELECT a FROM foo GROUP BY GROUPING SETS(ROLLUP(a, b), (a), ())");
+    ParserError("SELECT a FROM foo GROUP BY GROUPING SETS((a, b), CUBE(a), ())");
+    ParserError("SELECT a FROM foo " +
+        "GROUP BY GROUPING SETS((a, b), GROUPING SETS ((a, b, c), (b, c)))");
+
+    // Multiple clauses not supported with GROUPING SETS - parser does not handle yet.
+    ParserError("SELECT a FROM foo GROUP BY a, b, GROUPING SETS(a, b)");
+    ParserError("SELECT a FROM foo GROUP BY CUBE(a, b), GROUPING SETS(a, b)");
+
+    // Empty clause not supported, but empty grouping sets are supported.
+    ParsesOk("SELECT a FROM foo GROUP BY GROUPING SETS(())");
+    ParserError("SELECT a FROM foo GROUP BY GROUPING SETS()");
+
+    // Extra parentheses around expressions in list elements are supported.
+    ParserError("SELECT a FROM foo GROUP BY GROUPING SETS((), ((a), (b))");
+  }
+
+  /**
+   * Test that grouping() can be parsed as a function name, but not as a general
+   * identifier.
+   */
+  @Test
+  public void TestGroupingKeyword() {
+    ParsesOk("SELECT a, grouping(a) FROM foo GROUP BY GROUPING SETS((a, b))");
+    ParsesOk("SELECT a, gRoUpInG(a) FROM foo GROUP BY GROUPING SETS((a, b))");
+    ParsesOk("SELECT a, `grouping`(a) FROM foo GROUP BY GROUPING SETS((a, b))");
+
+    ParsesOk("SELECT a, grouping(a) as `grouping` FROM foo " +
+        "GROUP BY GROUPING SETS((a, b))");
+    ParserError("SELECT a, grouping(a) as grouping FROM foo " +
+        "GROUP BY GROUPING SETS((a, b))");
   }
 
   @Test
@@ -3904,10 +4205,22 @@ public class ParserTest extends FrontendTestBase {
         "COMPUTE INCREMENTAL STATS functional.alltypes PARTITION(month=10, year=2010)");
     ParsesOk(
         "DROP INCREMENTAL STATS functional.alltypes PARTITION(month=10, year=2010)");
+    ParsesOk("COMPUTE INCREMENTAL STATS functional.alltypes(tinyint_col, smallint_col)");
+    ParsesOk(
+        "COMPUTE INCREMENTAL STATS functional.alltypes PARTITION(month=10, year=2010)"
+        + "(tinyint_col, smallint_col)");
+
     ParserError("COMPUTE INCREMENTAL STATS");
     ParserError("COMPUTE INCREMENTAL functional.alltypes");
     ParserError("DROP INCREMENTAL STATS functional.alltypes");
     ParserError("COMPUTE INCREMENTAL STATS functional.alltypes TABLESAMPLE SYSTEM(10)");
+    //Missing closing parenthesis
+    ParserError(
+        "COMPUTE INCREMENTAL STATS functional.alltypes(tinyint_col, smallint_col");
+    //Missing opening parenthesis
+    ParserError(
+        "COMPUTE INCREMENTAL STATS functional.alltypes PARTITION(month=10, year=2010)"
+        + "tinyint_col, smallint_col)");
   }
 
   @Test
@@ -4106,11 +4419,5 @@ public class ParserTest extends FrontendTestBase {
 
     ParsesOk("--test\nSELECT 1\n");
     ParsesOk("--test\nSELECT 1\n  ");
-  }
-
-  @Test
-  public void TestCreateBucketedTable() {
-    ParserError("Create table bucketed_tbl(order_id int, order_name string)"
-            + "clustered by (order_id) into 5 buckets", "Syntax error");
   }
 }

@@ -17,6 +17,20 @@
 
 package org.apache.impala.service;
 
+import static org.apache.impala.common.ByteUnits.MEGABYTE;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Predicates;
+import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+import com.google.common.math.IntMath;
+import com.google.common.math.LongMath;
+import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.Uninterruptibles;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -24,15 +38,20 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -43,6 +62,9 @@ import org.apache.hadoop.hive.metastore.api.LockLevel;
 import org.apache.hadoop.hive.metastore.api.LockType;
 import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
 import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
+import org.apache.iceberg.HistoryEntry;
+import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.Table;
 import org.apache.impala.analysis.AlterDbStmt;
 import org.apache.impala.analysis.AnalysisContext;
 import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
@@ -72,10 +94,11 @@ import org.apache.impala.analysis.StmtMetadataLoader;
 import org.apache.impala.analysis.StmtMetadataLoader.StmtTableCache;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.analysis.TruncateStmt;
+import org.apache.impala.authentication.saml.ImpalaSamlClient;
 import org.apache.impala.authorization.AuthorizationChecker;
 import org.apache.impala.authorization.AuthorizationConfig;
-import org.apache.impala.authorization.AuthorizationManager;
 import org.apache.impala.authorization.AuthorizationFactory;
+import org.apache.impala.authorization.AuthorizationManager;
 import org.apache.impala.authorization.ImpalaInternalAdminUser;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.PrivilegeRequest;
@@ -89,21 +112,30 @@ import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeDataSource;
 import org.apache.impala.catalog.FeDataSourceTable;
 import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.ImpaladTableUsageTracker;
+import org.apache.impala.catalog.MaterializedViewHdfsTable;
 import org.apache.impala.catalog.MetaStoreClientPool;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.iceberg.IcebergMetadataTable;
+import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.local.InconsistentMetadataFetchException;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
+import org.apache.impala.common.KuduTransactionManager;
 import org.apache.impala.common.NotImplementedException;
+import org.apache.impala.common.PrintUtils;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.common.TransactionException;
 import org.apache.impala.common.TransactionKeepalive;
 import org.apache.impala.common.TransactionKeepalive.HeartbeatContext;
@@ -114,8 +146,10 @@ import org.apache.impala.hooks.QueryEventHookManager;
 import org.apache.impala.planner.HdfsScanNode;
 import org.apache.impala.planner.PlanFragment;
 import org.apache.impala.planner.Planner;
+import org.apache.impala.planner.ProcessingCost;
 import org.apache.impala.planner.ScanNode;
 import org.apache.impala.thrift.TAlterDbParams;
+import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TCatalogOpRequest;
 import org.apache.impala.thrift.TCatalogOpType;
 import org.apache.impala.thrift.TCatalogServiceRequestHeader;
@@ -123,25 +157,32 @@ import org.apache.impala.thrift.TClientRequest;
 import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TCommentOnParams;
+import org.apache.impala.thrift.TCopyTestCaseReq;
+import org.apache.impala.thrift.TCounter;
 import org.apache.impala.thrift.TCreateDropRoleParams;
 import org.apache.impala.thrift.TDdlExecRequest;
+import org.apache.impala.thrift.TDdlQueryOptions;
 import org.apache.impala.thrift.TDdlType;
+import org.apache.impala.thrift.TDescribeHistoryParams;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeResult;
 import org.apache.impala.thrift.TExecRequest;
+import org.apache.impala.thrift.TExecutorGroupSet;
 import org.apache.impala.thrift.TExplainResult;
 import org.apache.impala.thrift.TFinalizeParams;
 import org.apache.impala.thrift.TFunctionCategory;
 import org.apache.impala.thrift.TGetCatalogMetricsResult;
+import org.apache.impala.thrift.TGetTableHistoryResult;
+import org.apache.impala.thrift.TGetTableHistoryResultItem;
 import org.apache.impala.thrift.TGrantRevokePrivParams;
 import org.apache.impala.thrift.TGrantRevokeRoleParams;
 import org.apache.impala.thrift.TLineageGraph;
 import org.apache.impala.thrift.TLoadDataReq;
 import org.apache.impala.thrift.TLoadDataResp;
-import org.apache.impala.thrift.TCopyTestCaseReq;
 import org.apache.impala.thrift.TMetadataOpRequest;
 import org.apache.impala.thrift.TPlanExecInfo;
 import org.apache.impala.thrift.TPlanFragment;
+import org.apache.impala.thrift.TPoolConfig;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryExecRequest;
 import org.apache.impala.thrift.TQueryOptions;
@@ -149,30 +190,31 @@ import org.apache.impala.thrift.TResetMetadataRequest;
 import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TResultSetMetadata;
+import org.apache.impala.thrift.TRuntimeProfileNode;
 import org.apache.impala.thrift.TShowFilesParams;
 import org.apache.impala.thrift.TShowStatsOp;
 import org.apache.impala.thrift.TStmtType;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.thrift.TTruncateParams;
+import org.apache.impala.thrift.TUniqueId;
+import org.apache.impala.thrift.TUnit;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
 import org.apache.impala.thrift.TUpdateCatalogCacheResponse;
-import org.apache.impala.thrift.TUpdateExecutorMembershipRequest;
 import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.EventSequence;
 import org.apache.impala.util.ExecutorMembershipSnapshot;
+import org.apache.impala.util.IcebergUtil;
+import org.apache.impala.util.KuduUtil;
 import org.apache.impala.util.PatternMatcher;
+import org.apache.impala.util.RequestPoolService;
 import org.apache.impala.util.TResultRowBuilder;
 import org.apache.impala.util.TSessionStateUtil;
+import org.apache.kudu.client.KuduClient;
+import org.apache.kudu.client.KuduException;
+import org.apache.kudu.client.KuduTransaction;
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Predicates;
-import com.google.common.base.Strings;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
-import com.google.common.util.concurrent.Uninterruptibles;
 
 /**
  * Frontend API for the impalad process.
@@ -191,7 +233,28 @@ public class Frontend {
 
   // Maximum number of times to retry a query if it fails due to inconsistent metadata.
   private static final int INCONSISTENT_METADATA_NUM_RETRIES =
-      BackendConfig.INSTANCE.getLocalCatalogMaxFetchRetries();
+      (BackendConfig.INSTANCE != null) ?
+      BackendConfig.INSTANCE.getLocalCatalogMaxFetchRetries() : 0;
+
+  // Maximum number of threads used to check authorization for the user when executing
+  // show tables/databases.
+  private static final int MAX_CHECK_AUTHORIZATION_POOL_SIZE = 128;
+
+  // The default pool name to use when ExecutorMembershipSnapshot is in initial state
+  // (i.e., ExecutorMembershipSnapshot.numExecutors_ == 0).
+  private static final String DEFAULT_POOL_NAME = "default-pool";
+
+  // Labels for various query profile counters.
+  private static final String EXECUTOR_GROUPS_CONSIDERED = "ExecutorGroupsConsidered";
+  private static final String CPU_COUNT_DIVISOR = "CpuCountDivisor";
+  private static final String EFFECTIVE_PARALLELISM = "EffectiveParallelism";
+  private static final String VERDICT = "Verdict";
+  private static final String MEMORY_MAX = "MemoryMax";
+  private static final String MEMORY_ASK = "MemoryAsk";
+  private static final String MEMORY_ASK_UNBOUNDED = "MemoryAskUnbounded";
+  private static final String CPU_MAX = "CpuMax";
+  private static final String CPU_ASK = "CpuAsk";
+  private static final String CPU_ASK_UNBOUNDED = "CpuAskUnbounded";
 
   /**
    * Plan-time context that allows capturing various artifacts created
@@ -217,14 +280,127 @@ public class Frontend {
     // Thrift. For unit testing.
     protected List<PlanFragment> plan_;
 
+    // An inner class to capture the state of compilation for auto-scaling.
+    final class AutoScalingCompilationState {
+      // Flag to indicate whether to disable authorization after analyze. Used by
+      // auto-scalling to avoid redundent authorizations.
+      protected boolean disableAuthorization_ = false;
+
+      // The estimated memory per host for certain queries that do not populate
+      // TExecRequest.query_exec_request field.
+      protected long estimated_memory_per_host_ = -1;
+
+      // The processing cores required to execute the query.
+      // Certain queries such as EXPLAIN do not populate TExecRequest.query_exec_request.
+      // Therefore, cores requirement will be set here through setCoresRequired().
+      protected int cores_required_ = -1;
+
+      // The initial length of content in explain buffer to help return the buffer
+      // to the initial position prior to another auto-scaling compilation.
+      protected int initialExplainBufLen_ = -1;
+
+      // The initial query options seen before any compilations, which will be copied
+      // and used by each iteration of auto-scaling compilation.
+      protected TQueryOptions initialQueryOptions_ = null;
+
+      // The allocated write Id when in an ACID transaction.
+      protected long writeId_ = -1;
+
+      // The transaction token when in a Kudu transaction.
+      protected byte[] kuduTransactionToken_ = null;
+
+      // Indicate whether runtime profile/summary can be accessed. Set at the end of
+      // 1st iteration.
+      protected boolean user_has_profile_access_ = false;
+
+      // The group set being applied in current compilation.
+      protected TExecutorGroupSet group_set_ = null;
+
+      // Available cores per executor node.
+      // Valid value must be >= 0. Set by Frontend.getTExecRequest().
+      protected int availableCoresPerNode_ = -1;
+
+      public boolean disableAuthorization() { return disableAuthorization_; }
+
+      public long getEstimatedMemoryPerHost() { return estimated_memory_per_host_; }
+      public void setEstimatedMemoryPerHost(long x) { estimated_memory_per_host_ = x; }
+
+      public int getCoresRequired() { return cores_required_; }
+      public void setCoresRequired(int x) { cores_required_ = x; }
+
+      public int getAvailableCoresPerNode() {
+        Preconditions.checkState(availableCoresPerNode_ >= 0);
+        return availableCoresPerNode_;
+      }
+      public void setAvailableCoresPerNode(int x) { availableCoresPerNode_ = x; }
+
+      // Capture the current state and initialize before iterative compilations begin.
+      public void captureState() {
+        disableAuthorization_ = false;
+        estimated_memory_per_host_ = -1;
+        initialExplainBufLen_ = PlanCtx.this.explainBuf_.length();
+        initialQueryOptions_ =
+            new TQueryOptions(getQueryContext().client_request.getQuery_options());
+        writeId_ = -1;
+        kuduTransactionToken_ = null;
+      }
+
+      // Restore to the captured state after an iterative compilation
+      public void restoreState() {
+        // Avoid authorization starting from 2nd iteration. This flag can be set to
+        // false when meta-data change is detected.
+        disableAuthorization_ = true;
+
+        // Reset estimated memory
+        estimated_memory_per_host_ = -1;
+
+        // Remove the explain string accumulated
+        explainBuf_.delete(initialExplainBufLen_, explainBuf_.length());
+
+        // Use a brand new copy of query options
+        getQueryContext().client_request.setQuery_options(
+            new TQueryOptions(initialQueryOptions_));
+
+        // Set the flag to false to avoid serializing TQueryCtx.desc_tbl_testonly (a list
+        // of Descriptors.TDescriptorTable) in next iteration of compilation.
+        // TQueryCtx.desc_tbl_testonly is set in current iteration during planner test.
+        queryCtx_.setDesc_tbl_testonlyIsSet(false);
+      }
+
+      // When exception InconsistentMetadataFetchException is received and before
+      // next compilation, disable stmt cache and re-authorize.
+      public void disableStmtCacheAndReauthorize() {
+        restoreState();
+        disableAuthorization_ = false;
+      }
+
+      long getWriteId() { return writeId_; }
+      void setWriteId(long x) { writeId_ = x; }
+
+      byte[] getKuduTransactionToken() { return kuduTransactionToken_; }
+      void setKuduTransactionToken(byte[] token) {
+        kuduTransactionToken_ = (token == null) ? null : token.clone();
+      }
+
+      boolean userHasProfileAccess() { return user_has_profile_access_; }
+      void setUserHasProfileAccess(boolean x) { user_has_profile_access_ = x; }
+
+      TExecutorGroupSet getGroupSet() { return group_set_; }
+      void setGroupSet(TExecutorGroupSet x) { group_set_ = x; }
+    }
+
+    public AutoScalingCompilationState compilationState_;
+
     public PlanCtx(TQueryCtx qCtx) {
       queryCtx_ = qCtx;
       explainBuf_ = new StringBuilder();
+      compilationState_ = new AutoScalingCompilationState();
     }
 
     public PlanCtx(TQueryCtx qCtx, StringBuilder describe) {
       queryCtx_ = qCtx;
       explainBuf_ = describe;
+      compilationState_ = new AutoScalingCompilationState();
     }
 
     /**
@@ -254,13 +430,11 @@ public class Frontend {
   // Privileges in which the user should have any of them to see a database or table,
   private final EnumSet<Privilege> minPrivilegeSetForShowStmts_;
   /**
-   * Authorization checker. Initialized and periodically loaded by a task
-   * running on the {@link #policyReader_} thread.
+   * Authorization checker. Initialized on creation, then it is kept up to date
+   * via calls to updateCatalogCache().
    */
   private final AtomicReference<AuthorizationChecker> authzChecker_ =
       new AtomicReference<>();
-  private final ScheduledExecutorService policyReader_ =
-      Executors.newScheduledThreadPool(1);
 
   private final ImpaladTableUsageTracker impaladTableUsageTracker_;
 
@@ -271,8 +445,15 @@ public class Frontend {
 
   private final TransactionKeepalive transactionKeepalive_;
 
-  public Frontend(AuthorizationFactory authzFactory) throws ImpalaException {
-    this(authzFactory, FeCatalogManager.createFromBackendConfig());
+  private static ExecutorService checkAuthorizationPool_;
+
+  private final ImpalaSamlClient saml2Client_;
+
+  private final KuduTransactionManager kuduTxnManager_;
+
+  public Frontend(AuthorizationFactory authzFactory, boolean isBackendTest)
+      throws ImpalaException {
+    this(authzFactory, FeCatalogManager.createFromBackendConfig(), isBackendTest);
   }
 
   /**
@@ -282,11 +463,12 @@ public class Frontend {
   @VisibleForTesting
   public Frontend(AuthorizationFactory authzFactory, FeCatalog testCatalog)
       throws ImpalaException {
-    this(authzFactory, FeCatalogManager.createForTests(testCatalog));
+    // This signature is only used for frontend tests, so pass false for isBackendTest
+    this(authzFactory, FeCatalogManager.createForTests(testCatalog), false);
   }
 
-  private Frontend(AuthorizationFactory authzFactory, FeCatalogManager catalogManager)
-      throws ImpalaException {
+  private Frontend(AuthorizationFactory authzFactory, FeCatalogManager catalogManager,
+      boolean isBackendTest) throws ImpalaException {
     catalogManager_ = catalogManager;
     authzFactory_ = authzFactory;
 
@@ -294,6 +476,17 @@ public class Frontend {
     if (authzConfig.isEnabled()) {
       authzChecker_.set(authzFactory.newAuthorizationChecker(
           getCatalog().getAuthPolicy()));
+      int numThreads = BackendConfig.INSTANCE.getNumCheckAuthorizationThreads();
+      Preconditions.checkState(numThreads > 0
+        && numThreads <= MAX_CHECK_AUTHORIZATION_POOL_SIZE);
+      if (numThreads == 1) {
+        checkAuthorizationPool_ = MoreExecutors.newDirectExecutorService();
+      } else {
+        LOG.info("Using a thread pool of size {} for authorization", numThreads);
+        checkAuthorizationPool_ = Executors.newFixedThreadPool(numThreads,
+            new ThreadFactoryBuilder()
+                .setNameFormat("AuthorizationCheckerThread-%d").build());
+      }
     } else {
       authzChecker_.set(authzFactory.newAuthorizationChecker());
     }
@@ -304,12 +497,24 @@ public class Frontend {
     impaladTableUsageTracker_ = ImpaladTableUsageTracker.createFromConfig(
         BackendConfig.INSTANCE);
     queryHookManager_ = QueryEventHookManager.createFromConfig(BackendConfig.INSTANCE);
-    metaStoreClientPool_ = new MetaStoreClientPool(1, 0);
-    if (MetastoreShim.getMajorVersion() > 2) {
-      transactionKeepalive_ = new TransactionKeepalive(metaStoreClientPool_);
+    if (!isBackendTest) {
+      TBackendGflags cfg = BackendConfig.INSTANCE.getBackendCfg();
+      metaStoreClientPool_ = new MetaStoreClientPool(1, cfg.initial_hms_cnxn_timeout_s);
+      if (MetastoreShim.getMajorVersion() > 2) {
+        transactionKeepalive_ = new TransactionKeepalive(metaStoreClientPool_);
+      } else {
+        transactionKeepalive_ = null;
+      }
     } else {
+      metaStoreClientPool_ = null;
       transactionKeepalive_ = null;
     }
+    if (!BackendConfig.INSTANCE.getSaml2IdpMetadata().isEmpty()) {
+      saml2Client_ =  ImpalaSamlClient.get();
+    } else {
+      saml2Client_ = null;
+    }
+    kuduTxnManager_ = new KuduTransactionManager();
   }
 
   /**
@@ -332,6 +537,8 @@ public class Frontend {
 
   public FeCatalog getCatalog() { return catalogManager_.getOrCreateCatalog(); }
 
+  public AuthorizationFactory getAuthzFactory() { return authzFactory_; }
+
   public AuthorizationChecker getAuthzChecker() { return authzChecker_.get(); }
 
   public AuthorizationManager getAuthzManager() { return authzManager_; }
@@ -339,6 +546,8 @@ public class Frontend {
   public ImpaladTableUsageTracker getImpaladTableUsageTracker() {
     return impaladTableUsageTracker_;
   }
+
+  public ImpalaSamlClient getSaml2Client() { return saml2Client_; }
 
   public TUpdateCatalogCacheResponse updateCatalogCache(
       TUpdateCatalogCacheRequest req) throws ImpalaException, TException {
@@ -353,18 +562,11 @@ public class Frontend {
   }
 
   /**
-   * Update the cluster membership snapshot with the latest snapshot from the backend.
-   */
-  public void updateExecutorMembership(TUpdateExecutorMembershipRequest req) {
-    ExecutorMembershipSnapshot.update(req);
-  }
-
-  /**
    * Constructs a TCatalogOpRequest and attaches it, plus any metadata, to the
    * result argument.
    */
-  private void createCatalogOpRequest(AnalysisResult analysis,
-      TExecRequest result) throws InternalException {
+  private void createCatalogOpRequest(AnalysisResult analysis, TExecRequest result)
+      throws InternalException {
     TCatalogOpRequest ddl = new TCatalogOpRequest();
     TResultSetMetadata metadata = new TResultSetMetadata();
     if (analysis.isUseStmt()) {
@@ -418,6 +620,14 @@ public class Frontend {
       ddl.op_type = TCatalogOpType.SHOW_FILES;
       ddl.setShow_files_params(analysis.getShowFilesStmt().toThrift());
       metadata.setColumns(Collections.<TColumn>emptyList());
+    } else if (analysis.isDescribeHistoryStmt()) {
+      ddl.op_type = TCatalogOpType.DESCRIBE_HISTORY;
+      ddl.setDescribe_history_params(analysis.getDescribeHistoryStmt().toThrift());
+      metadata.setColumns(Arrays.asList(
+          new TColumn("creation_time", Type.STRING.toThrift()),
+          new TColumn("snapshot_id", Type.STRING.toThrift()),
+          new TColumn("parent_id", Type.STRING.toThrift()),
+          new TColumn("is_current_ancestor", Type.STRING.toThrift())));
     } else if (analysis.isDescribeDbStmt()) {
       ddl.op_type = TCatalogOpType.DESCRIBE_DB;
       ddl.setDescribe_db_params(analysis.getDescribeDbStmt().toThrift());
@@ -436,11 +646,15 @@ public class Frontend {
       if (descStmt.getTable() instanceof FeKuduTable
           && descStmt.getOutputStyle() == TDescribeOutputStyle.MINIMAL) {
         columns.add(new TColumn("primary_key", Type.STRING.toThrift()));
+        columns.add(new TColumn("key_unique", Type.STRING.toThrift()));
         columns.add(new TColumn("nullable", Type.STRING.toThrift()));
         columns.add(new TColumn("default_value", Type.STRING.toThrift()));
         columns.add(new TColumn("encoding", Type.STRING.toThrift()));
         columns.add(new TColumn("compression", Type.STRING.toThrift()));
         columns.add(new TColumn("block_size", Type.STRING.toThrift()));
+      } else if (descStmt.getTable() instanceof FeIcebergTable
+          && descStmt.getOutputStyle() == TDescribeOutputStyle.MINIMAL) {
+        columns.add(new TColumn("nullable", Type.STRING.toThrift()));
       }
       metadata.setColumns(columns);
     } else if (analysis.isAlterTableStmt()) {
@@ -531,7 +745,14 @@ public class Frontend {
       TDdlExecRequest req = new TDdlExecRequest();
       TruncateStmt stmt = analysis.getTruncateStmt();
       req.setDdl_type(TDdlType.TRUNCATE_TABLE);
-      req.setTruncate_params(stmt.toThrift());
+      TTruncateParams truncateParams = stmt.toThrift();
+      TQueryOptions queryOptions = result.getQuery_options();
+      // if DELETE_STATS_IN_TRUNCATE option is unset forward it to catalogd
+      // so that it can skip deleting the statistics during truncate execution
+      if (!queryOptions.isDelete_stats_in_truncate()) {
+        truncateParams.setDelete_stats(false);
+      }
+      req.setTruncate_params(truncateParams);
       ddl.setDdl_params(req);
     } else if (analysis.isDropFunctionStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
@@ -639,11 +860,29 @@ public class Frontend {
       TClientRequest clientRequest = queryCtx.getClient_request();
       header.setRedacted_sql_stmt(clientRequest.isSetRedacted_stmt() ?
           clientRequest.getRedacted_stmt() : clientRequest.getStmt());
+      header.setWant_minimal_response(
+          BackendConfig.INSTANCE.getBackendCfg().use_local_catalog);
       ddl.getDdl_params().setHeader(header);
-      ddl.getDdl_params().setSync_ddl(ddl.isSync_ddl());
-    }
-    if (ddl.getOp_type() == TCatalogOpType.RESET_METADATA) {
+      // Forward relevant query options to the catalogd.
+      TDdlQueryOptions ddlQueryOpts = new TDdlQueryOptions();
+      ddlQueryOpts.setSync_ddl(result.getQuery_options().isSync_ddl());
+      if (result.getQuery_options().isSetDebug_action()) {
+        ddlQueryOpts.setDebug_action(result.getQuery_options().getDebug_action());
+      }
+      ddlQueryOpts.setLock_max_wait_time_s(
+          result.getQuery_options().lock_max_wait_time_s);
+      ddl.getDdl_params().setQuery_options(ddlQueryOpts);
+    } else if (ddl.getOp_type() == TCatalogOpType.RESET_METADATA) {
       ddl.getReset_metadata_params().setSync_ddl(ddl.isSync_ddl());
+      ddl.getReset_metadata_params().setRefresh_updated_hms_partitions(
+          result.getQuery_options().isRefresh_updated_hms_partitions());
+      ddl.getReset_metadata_params().getHeader().setWant_minimal_response(
+          BackendConfig.INSTANCE.getBackendCfg().use_local_catalog);
+      // forward debug_actions to the catalogd
+      if (result.getQuery_options().isSetDebug_action()) {
+        ddl.getReset_metadata_params()
+            .setDebug_action(result.getQuery_options().getDebug_action());
+      }
     }
   }
 
@@ -660,7 +899,10 @@ public class Frontend {
         String.format("load table data %s.%s", tableName.db_name, tableName.table_name));
     while (true) {
       try {
-        return doLoadTableData(request);
+        if (!request.iceberg_tbl)
+          return doLoadTableData(request);
+        else
+          return doLoadIcebergTableData(request);
       } catch(InconsistentMetadataFetchException e) {
         retries.handleRetryOrThrow(e);
       }
@@ -674,10 +916,13 @@ public class Frontend {
     // Get the destination for the load. If the load is targeting a partition,
     // this the partition location. Otherwise this is the table location.
     String destPathString = null;
+    String partitionName = null;
     FeCatalog catalog = getCatalog();
     if (request.isSetPartition_spec()) {
-      destPathString = catalog.getHdfsPartition(tableName.getDb(),
-          tableName.getTbl(), request.getPartition_spec()).getLocation();
+      FeFsPartition partition = catalog.getHdfsPartition(tableName.getDb(),
+          tableName.getTbl(), request.getPartition_spec());
+      destPathString = partition.getLocation();
+      partitionName = partition.getPartitionName();
     } else {
       destPathString = catalog.getTable(tableName.getDb(), tableName.getTbl())
           .getMetaStoreTable().getSd().getLocation();
@@ -692,12 +937,12 @@ public class Frontend {
     // file move.
     Path tmpDestPath = FileSystemUtil.makeTmpSubdirectory(destPath);
 
-    int filesLoaded = 0;
+    int numFilesLoaded = 0;
     if (sourceFs.isDirectory(sourcePath)) {
-      filesLoaded = FileSystemUtil.relocateAllVisibleFiles(sourcePath, tmpDestPath);
+      numFilesLoaded = FileSystemUtil.relocateAllVisibleFiles(sourcePath, tmpDestPath);
     } else {
       FileSystemUtil.relocateFile(sourcePath, tmpDestPath, true);
-      filesLoaded = 1;
+      numFilesLoaded = 1;
     }
 
     // If this is an OVERWRITE, delete all files in the destination.
@@ -705,17 +950,68 @@ public class Frontend {
       FileSystemUtil.deleteAllVisibleFiles(destPath);
     }
 
+    List<Path> filesLoaded = new ArrayList<>();
     // Move the files from the temporary location to the final destination.
-    FileSystemUtil.relocateAllVisibleFiles(tmpDestPath, destPath);
+    FileSystemUtil.relocateAllVisibleFiles(tmpDestPath, destPath, filesLoaded);
     // Cleanup the tmp directory.
     destFs.delete(tmpDestPath, true);
     TLoadDataResp response = new TLoadDataResp();
     TColumnValue col = new TColumnValue();
     String loadMsg = String.format(
         "Loaded %d file(s). Total files in destination location: %d",
-        filesLoaded, FileSystemUtil.getTotalNumVisibleFiles(destPath));
+        numFilesLoaded, FileSystemUtil.getTotalNumVisibleFiles(destPath));
     col.setString_val(loadMsg);
     response.setLoad_summary(new TResultRow(Lists.newArrayList(col)));
+    response.setLoaded_files(filesLoaded.stream().map(Path::toString)
+        .collect(Collectors.toList()));
+    if (partitionName != null && !partitionName.isEmpty()) {
+      response.setPartition_name(partitionName);
+    }
+    return response;
+  }
+
+  private TLoadDataResp doLoadIcebergTableData(TLoadDataReq request)
+      throws ImpalaException, IOException {
+    TLoadDataResp response = new TLoadDataResp();
+    TableName tableName = TableName.fromThrift(request.getTable_name());
+    FeCatalog catalog = getCatalog();
+    String destPathString = catalog.getTable(tableName.getDb(), tableName.getTbl())
+        .getMetaStoreTable().getSd().getLocation();
+    Path destPath = new Path(destPathString);
+    Path sourcePath = new Path(request.source_path);
+    FileSystem sourceFs = sourcePath.getFileSystem(FileSystemUtil.getConfiguration());
+
+    // Create a temporary directory within the final destination directory to stage the
+    // file move.
+    Path tmpDestPath = FileSystemUtil.makeTmpSubdirectory(destPath);
+
+    int numFilesLoaded = 0;
+    List<Path> filesLoaded = new ArrayList<>();
+    String destFile;
+    if (sourceFs.isDirectory(sourcePath)) {
+      numFilesLoaded = FileSystemUtil.relocateAllVisibleFiles(sourcePath,
+          tmpDestPath, filesLoaded);
+      destFile = filesLoaded.get(0).toString();
+    } else {
+      Path destFilePath = FileSystemUtil.relocateFile(sourcePath, tmpDestPath,
+          true);
+      filesLoaded.add(new Path(tmpDestPath.toString() + Path.SEPARATOR
+          + sourcePath.getName()));
+      numFilesLoaded = 1;
+      destFile = destFilePath.toString();
+    }
+
+    String createTmpTblQuery = String.format(request.create_tmp_tbl_query_template,
+        destFile, tmpDestPath.toString());
+
+    TColumnValue col = new TColumnValue();
+    String loadMsg = String.format("Loaded %d file(s).", numFilesLoaded);
+    col.setString_val(loadMsg);
+    response.setLoaded_files(filesLoaded.stream().map(Path::toString)
+        .collect(Collectors.toList()));
+    response.setLoad_summary(new TResultRow(Lists.newArrayList(col)));
+    response.setCreate_tmp_tbl_query(createTmpTblQuery);
+    response.setCreate_location(tmpDestPath.toString());
     return response;
   }
 
@@ -776,6 +1072,31 @@ public class Frontend {
   }
 
   /**
+   * A Callable wrapper used for checking authorization to tables/databases.
+   */
+  private class CheckAuthorization implements Callable<Boolean> {
+    private final String dbName_;
+    private final String tblName_;
+    private final String owner_;
+    private final User user_;
+
+    public CheckAuthorization(String dbName, String tblName, String owner, User user) {
+      // dbName and user cannot be null, tblName and owner can be null.
+      Preconditions.checkNotNull(dbName);
+      Preconditions.checkNotNull(user);
+      dbName_ = dbName;
+      tblName_ = tblName;
+      owner_ = owner;
+      user_ = user;
+    }
+
+    @Override
+    public Boolean call() throws Exception {
+      return Boolean.valueOf(isAccessibleToUser(dbName_, tblName_, owner_, user_));
+    }
+  }
+
+  /**
    * Returns all tables in database 'dbName' that match the pattern of 'matcher' and are
    * accessible to 'user'.
    */
@@ -792,11 +1113,44 @@ public class Frontend {
     }
   }
 
+  /**
+   * This method filters out elements from the given list based on the the results
+   * of the pendingCheckTasks.
+   */
+  private void filterUnaccessibleElements(List<Future<Boolean>> pendingCheckTasks,
+    List<?> checkList) throws InternalException {
+    int failedCheckTasks = 0;
+    int index = 0;
+    Iterator<?> iter = checkList.iterator();
+
+    Preconditions.checkState(checkList.size() == pendingCheckTasks.size());
+    while (iter.hasNext()) {
+      iter.next();
+      try {
+        if (!pendingCheckTasks.get(index).get()) iter.remove();
+        index++;
+      } catch (ExecutionException | InterruptedException e) {
+        failedCheckTasks++;
+        LOG.error("Encountered an error checking access", e);
+        break;
+      }
+    }
+
+    if (failedCheckTasks > 0)
+      throw new InternalException("Failed to check access." +
+          "Check the server log for more details.");
+  }
+
   private List<String> doGetTableNames(String dbName, PatternMatcher matcher,
       User user) throws ImpalaException {
     FeCatalog catalog = getCatalog();
     List<String> tblNames = catalog.getTableNames(dbName, matcher);
-    if (authzFactory_.getAuthorizationConfig().isEnabled()) {
+
+    boolean needsAuthChecks = authzFactory_.getAuthorizationConfig().isEnabled()
+                              && !userHasAccessForWholeDb(user, dbName);
+
+    if (needsAuthChecks) {
+      List<Future<Boolean>> pendingCheckTasks = Lists.newArrayList();
       Iterator<String> iter = tblNames.iterator();
       while (iter.hasNext()) {
         String tblName = iter.next();
@@ -811,18 +1165,15 @@ public class Frontend {
         String tableOwner = table.getOwnerUser();
         if (tableOwner == null) {
           LOG.info("Table {} not yet loaded, ignoring it in table listing.",
-              dbName + "." + tblName);
+            dbName + "." + tblName);
         }
-        Set<PrivilegeRequest> requests = new PrivilegeRequestBuilder(
-            authzFactory_.getAuthorizableFactory())
-            .anyOf(minPrivilegeSetForShowStmts_)
-            .onAnyColumn(dbName, tblName, tableOwner)
-            .buildSet();
-        if (!authzChecker_.get().hasAnyAccess(user, requests)) {
-          iter.remove();
-        }
+        pendingCheckTasks.add(checkAuthorizationPool_.submit(
+            new CheckAuthorization(dbName, tblName, tableOwner, user)));
       }
+
+      filterUnaccessibleElements(pendingCheckTasks, tblNames);
     }
+
     return tblNames;
   }
 
@@ -859,7 +1210,8 @@ public class Frontend {
       throws InternalException {
     Preconditions.checkNotNull(table);
     List<SQLPrimaryKey> pkList;
-    pkList = table.getPrimaryKeys();
+    pkList = table.getSqlConstraints().getPrimaryKeys();
+    Preconditions.checkNotNull(pkList);
     for (SQLPrimaryKey pk : pkList) {
       if (authzFactory_.getAuthorizationConfig().isEnabled()) {
         PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder(
@@ -900,7 +1252,9 @@ public class Frontend {
     // but we return the "SQLFOreignKey" for col3.
     Set<String> omitList = new HashSet<>();
     List<SQLForeignKey> fkList = new ArrayList<>();
-    for (SQLForeignKey fk : table.getForeignKeys()) {
+    List<SQLForeignKey> foreignKeys = table.getSqlConstraints().getForeignKeys();
+    Preconditions.checkNotNull(foreignKeys);
+    for (SQLForeignKey fk : foreignKeys) {
       String fkName = fk.getFk_name();
       if (!omitList.contains(fkName)) {
         if (authzFactory_.getAuthorizationConfig().isEnabled()) {
@@ -925,7 +1279,7 @@ public class Frontend {
         }
       }
     }
-    for (SQLForeignKey fk : table.getForeignKeys()) {
+    for (SQLForeignKey fk : foreignKeys) {
       if (!omitList.contains(fk.getFk_name())) {
         fkList.add(fk);
       }
@@ -940,33 +1294,134 @@ public class Frontend {
   public List<? extends FeDb> getDbs(PatternMatcher matcher, User user)
       throws InternalException {
     List<? extends FeDb> dbs = getCatalog().getDbs(matcher);
-    // If authorization is enabled, filter out the databases the user does not
-    // have permissions on.
-    if (authzFactory_.getAuthorizationConfig().isEnabled()) {
+
+    boolean needsAuthChecks = authzFactory_.getAuthorizationConfig().isEnabled()
+                              && !userHasAccessForWholeServer(user);
+
+    // Filter out the databases the user does not have permissions on.
+    if (needsAuthChecks) {
       Iterator<? extends FeDb> iter = dbs.iterator();
+      List<Future<Boolean>> pendingCheckTasks = Lists.newArrayList();
       while (iter.hasNext()) {
         FeDb db = iter.next();
-        if (!isAccessibleToUser(db, user)) iter.remove();
+        pendingCheckTasks.add(checkAuthorizationPool_.submit(
+            new CheckAuthorization(db.getName(), null, db.getOwnerUser(), user)));
       }
+
+      filterUnaccessibleElements(pendingCheckTasks, dbs);
     }
+
     return dbs;
   }
 
   /**
-   * Check whether database is accessible to given user.
+   *  Handles DESCRIBE HISTORY queries.
    */
-  private boolean isAccessibleToUser(FeDb db, User user)
-      throws InternalException {
-    if (db.getName().toLowerCase().equals(Catalog.DEFAULT_DB.toLowerCase())) {
+  public TGetTableHistoryResult getTableHistory(TDescribeHistoryParams params)
+      throws DatabaseNotFoundException, TableLoadingException {
+    FeTable feTable = getCatalog().getTable(params.getTable_name().db_name,
+        params.getTable_name().table_name);
+    FeIcebergTable feIcebergTable = (FeIcebergTable) feTable;
+    Table table = feIcebergTable.getIcebergApiTable();
+    Set<Long> ancestorIds = Sets.newHashSet(IcebergUtil.currentAncestorIds(table));
+    TGetTableHistoryResult historyResult = new TGetTableHistoryResult();
+
+    List<HistoryEntry> filteredHistoryEntries = table.history();
+    if (params.isSetFrom_time()) {
+      // DESCRIBE HISTORY <table> FROM <ts>
+      filteredHistoryEntries = table.history().stream()
+          .filter(c -> c.timestampMillis() >= params.from_time)
+          .collect(Collectors.toList());
+    } else if (params.isSetBetween_start_time() && params.isSetBetween_end_time()) {
+      // DESCRIBE HISTORY <table> BETWEEN <ts> AND <ts>
+      filteredHistoryEntries = table.history().stream()
+          .filter(x -> x.timestampMillis() >= params.between_start_time &&
+              x.timestampMillis() <= params.between_end_time)
+          .collect(Collectors.toList());
+    }
+
+    List<TGetTableHistoryResultItem> result = Lists.newArrayList();
+    for (HistoryEntry historyEntry : filteredHistoryEntries) {
+      TGetTableHistoryResultItem resultItem = new TGetTableHistoryResultItem();
+      long snapshotId = historyEntry.snapshotId();
+      resultItem.setCreation_time(historyEntry.timestampMillis());
+      resultItem.setSnapshot_id(snapshotId);
+      Snapshot snapshot = table.snapshot(snapshotId);
+      if (snapshot != null && snapshot.parentId() != null) {
+        resultItem.setParent_id(snapshot.parentId());
+      }
+      resultItem.setIs_current_ancestor(ancestorIds.contains(snapshotId));
+      result.add(resultItem);
+    }
+    historyResult.setResult(result);
+    return historyResult;
+  }
+
+  /**
+   * Check whether table/database is accessible to given user.
+   */
+  private boolean isAccessibleToUser(String dbName, String tblName,
+      String owner, User user) throws InternalException {
+    Preconditions.checkNotNull(dbName);
+    if (tblName == null &&
+        dbName.toLowerCase().equals(Catalog.DEFAULT_DB.toLowerCase())) {
       // Default DB should always be shown.
       return true;
     }
-    Set<PrivilegeRequest> requests = new PrivilegeRequestBuilder(
+
+    PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder(
         authzFactory_.getAuthorizableFactory())
-        .anyOf(minPrivilegeSetForShowStmts_)
-        .onAnyColumn(db.getName(), db.getOwnerUser())
-        .buildSet();
-    return authzChecker_.get().hasAnyAccess(user, requests);
+        .anyOf(minPrivilegeSetForShowStmts_);
+    if (tblName == null) {
+      // Check database
+      builder = builder.onAnyColumn(dbName, owner);
+    } else {
+      // Check table
+      builder = builder.onAnyColumn(dbName, tblName, owner);
+    }
+
+    return authzChecker_.get().hasAnyAccess(user, builder.buildSet());
+  }
+
+  /**
+   * Check whether the whole server is accessible to given user.
+   */
+  private boolean userHasAccessForWholeServer(User user)
+      throws InternalException {
+    if (authEngineSupportsDenyRules()) return false;
+    PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder(
+        authzFactory_.getAuthorizableFactory()).anyOf(minPrivilegeSetForShowStmts_)
+        .onServer(authzFactory_.getAuthorizationConfig().getServerName());
+    return authzChecker_.get().hasAnyAccess(user, builder.buildSet());
+  }
+
+  /**
+   * Check whether the whole database is accessible to given user.
+   */
+  private boolean userHasAccessForWholeDb(User user, String dbName)
+      throws InternalException, DatabaseNotFoundException {
+    if (authEngineSupportsDenyRules()) return false;
+    // FeDb is needed to respect ownership in Ranger, dbName would be enough for
+    // the privilege request otherwise.
+    FeDb db = getCatalog().getDb(dbName);
+    if (db == null) {
+      throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
+    }
+    PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder(
+        authzFactory_.getAuthorizableFactory()).anyOf(minPrivilegeSetForShowStmts_)
+        .onDb(db);
+    return authzChecker_.get().hasAnyAccess(user, builder.buildSet());
+  }
+
+  /**
+   * Returns whether the authorization engine supports deny rules. If it does,
+   * then a privilege on a higher level object does not imply privilege on lower
+   * level objects in the hierarchy.
+   */
+  private boolean authEngineSupportsDenyRules() {
+    // Sentry did not support deny rules, but Ranger does. So, this now returns true.
+    // TODO: could check config for Ranger and return true if deny rules are disabled
+    return true;
   }
 
   /**
@@ -982,20 +1437,20 @@ public class Frontend {
   /**
    * Generate result set and schema for a SHOW COLUMN STATS command.
    */
-  public TResultSet getColumnStats(String dbName, String tableName)
+  public TResultSet getColumnStats(String dbName, String tableName, boolean showMinMax)
       throws ImpalaException {
     RetryTracker retries = new RetryTracker(
         String.format("fetching column stats from %s.%s", dbName, tableName));
     while (true) {
       try {
-        return doGetColumnStats(dbName, tableName);
+        return doGetColumnStats(dbName, tableName, showMinMax);
       } catch(InconsistentMetadataFetchException e) {
         retries.handleRetryOrThrow(e);
       }
     }
   }
 
-  private TResultSet doGetColumnStats(String dbName, String tableName)
+  private TResultSet doGetColumnStats(String dbName, String tableName, boolean showMinMax)
       throws ImpalaException {
     FeTable table = getCatalog().getTable(dbName, tableName);
     TResultSet result = new TResultSet();
@@ -1008,13 +1463,38 @@ public class Frontend {
     resultSchema.addToColumns(new TColumn("#Nulls", Type.BIGINT.toThrift()));
     resultSchema.addToColumns(new TColumn("Max Size", Type.BIGINT.toThrift()));
     resultSchema.addToColumns(new TColumn("Avg Size", Type.DOUBLE.toThrift()));
+    resultSchema.addToColumns(new TColumn("#Trues", Type.BIGINT.toThrift()));
+    resultSchema.addToColumns(new TColumn("#Falses", Type.BIGINT.toThrift()));
+    if (showMinMax) {
+      resultSchema.addToColumns(new TColumn("Min", Type.STRING.toThrift()));
+      resultSchema.addToColumns(new TColumn("Max", Type.STRING.toThrift()));
+    }
 
     for (Column c: table.getColumnsInHiveOrder()) {
       TResultRowBuilder rowBuilder = new TResultRowBuilder();
-      // Add name, type, NDVs, numNulls, max size and avg size.
-      rowBuilder.add(c.getName()).add(c.getType().toSql())
-          .add(c.getStats().getNumDistinctValues()).add(c.getStats().getNumNulls())
-          .add(c.getStats().getMaxSize()).add(c.getStats().getAvgSize());
+      // Add name, type, NDVs, numNulls, max size, avg size, and conditionally
+      // the min value and max value.
+      if (showMinMax) {
+        rowBuilder.add(c.getName())
+            .add(c.getType().toSql())
+            .add(c.getStats().getNumDistinctValues())
+            .add(c.getStats().getNumNulls())
+            .add(c.getStats().getMaxSize())
+            .add(c.getStats().getAvgSize())
+            .add(c.getStats().getNumTrues())
+            .add(c.getStats().getNumFalses())
+            .add(c.getStats().getLowValueAsString())
+            .add(c.getStats().getHighValueAsString());
+      } else {
+        rowBuilder.add(c.getName())
+            .add(c.getType().toSql())
+            .add(c.getStats().getNumDistinctValues())
+            .add(c.getStats().getNumNulls())
+            .add(c.getStats().getMaxSize())
+            .add(c.getStats().getAvgSize())
+            .add(c.getStats().getNumTrues())
+            .add(c.getStats().getNumFalses());
+      }
       result.addToRows(rowBuilder.get());
     }
     return result;
@@ -1040,6 +1520,12 @@ public class Frontend {
       throws ImpalaException {
     FeTable table = getCatalog().getTable(dbName, tableName);
     if (table instanceof FeFsTable) {
+      if (table instanceof FeIcebergTable && op == TShowStatsOp.PARTITIONS) {
+        return FeIcebergTable.Utils.getPartitionStats((FeIcebergTable) table);
+      }
+      if (table instanceof FeIcebergTable && op == TShowStatsOp.TABLE_STATS) {
+        return FeIcebergTable.Utils.getTableStats((FeIcebergTable) table);
+      }
       return ((FeFsTable) table).getTableStats();
     } else if (table instanceof FeHBaseTable) {
       return ((FeHBaseTable) table).getTableStats();
@@ -1047,10 +1533,17 @@ public class Frontend {
       return ((FeDataSourceTable) table).getTableStats();
     } else if (table instanceof FeKuduTable) {
       if (op == TShowStatsOp.RANGE_PARTITIONS) {
-        return FeKuduTable.Utils.getRangePartitions((FeKuduTable) table);
+        return FeKuduTable.Utils.getRangePartitions((FeKuduTable) table, false);
+      } else if (op == TShowStatsOp.HASH_SCHEMA) {
+        return FeKuduTable.Utils.getRangePartitions((FeKuduTable) table, true);
+      } else if (op == TShowStatsOp.PARTITIONS) {
+        return FeKuduTable.Utils.getPartitions((FeKuduTable) table);
       } else {
+        Preconditions.checkState(op == TShowStatsOp.TABLE_STATS);
         return FeKuduTable.Utils.getTableStats((FeKuduTable) table);
       }
+    } else if (table instanceof MaterializedViewHdfsTable) {
+      return ((MaterializedViewHdfsTable) table).getTableStats();
     } else {
       throw new InternalException("Invalid table class: " + table.getClass());
     }
@@ -1161,11 +1654,14 @@ public class Frontend {
       filteredColumns = table.getColumnsInHiveOrder();
     }
     if (outputStyle == TDescribeOutputStyle.MINIMAL) {
-      if (!(table instanceof FeKuduTable)) {
+      if (table instanceof FeKuduTable) {
+        return DescribeResultFactory.buildKuduDescribeMinimalResult(filteredColumns);
+      } else if (table instanceof FeIcebergTable) {
+        return DescribeResultFactory.buildIcebergDescribeMinimalResult(filteredColumns);
+      } else {
         return DescribeResultFactory.buildDescribeMinimalResult(
             Column.columnsToStruct(filteredColumns));
       }
-      return DescribeResultFactory.buildKuduDescribeMinimalResult(filteredColumns);
     } else {
       Preconditions.checkArgument(outputStyle == TDescribeOutputStyle.FORMATTED ||
           outputStyle == TDescribeOutputStyle.EXTENDED);
@@ -1218,16 +1714,16 @@ public class Frontend {
   /**
    * Return a TPlanExecInfo corresponding to the plan with root fragment 'planRoot'.
    */
-  private TPlanExecInfo createPlanExecInfo(PlanFragment planRoot, Planner planner,
-      TQueryCtx queryCtx, TQueryExecRequest queryExecRequest) {
+  public static TPlanExecInfo createPlanExecInfo(PlanFragment planRoot,
+      TQueryCtx queryCtx) {
     TPlanExecInfo result = new TPlanExecInfo();
-    List<PlanFragment> fragments = planRoot.getNodesPreOrder();
+    List<PlanFragment> fragments = planRoot.getFragmentsInPlanPreorder();
 
     // collect ScanNodes
     List<ScanNode> scanNodes = Lists.newArrayList();
-    for (PlanFragment fragment: fragments) {
-      Preconditions.checkNotNull(fragment.getPlanRoot());
-      fragment.getPlanRoot().collect(Predicates.instanceOf(ScanNode.class), scanNodes);
+    for (PlanFragment fragment : fragments) {
+      fragment.collectPlanNodes(
+        Predicates.instanceOf(ScanNode.class), scanNodes);
     }
 
     // Set scan ranges/locations for scan nodes.
@@ -1276,33 +1772,23 @@ public class Frontend {
   private TQueryExecRequest createExecRequest(
       Planner planner, PlanCtx planCtx) throws ImpalaException {
     TQueryCtx queryCtx = planner.getQueryCtx();
-    AnalysisResult analysisResult = planner.getAnalysisResult();
-    boolean isMtExec = (analysisResult.isQueryStmt() || analysisResult.isDmlStmt())
-        && queryCtx.client_request.query_options.isSetMt_dop()
-        && queryCtx.client_request.query_options.mt_dop > 0;
-
-    List<PlanFragment> planRoots = Lists.newArrayList();
-    TQueryExecRequest result = new TQueryExecRequest();
-    if (isMtExec) {
-      LOG.trace("create mt plan");
-      planRoots.addAll(planner.createParallelPlans());
-    } else {
-      LOG.trace("create plan");
-      planRoots.add(planner.createPlan().get(0));
-    }
+    List<PlanFragment> planRoots = planner.createPlans();
     if (planCtx.planCaptureRequested()) {
       planCtx.plan_ = planRoots;
     }
 
     // Compute resource requirements of the final plans.
-    planner.computeResourceReqs(planRoots, queryCtx, result);
+    TQueryExecRequest result = new TQueryExecRequest();
+    Planner.computeProcessingCost(planRoots, result, planner.getPlannerCtx());
+    Planner.computeResourceReqs(planRoots, queryCtx, result,
+        planner.getPlannerCtx(), planner.getAnalysisResult().isQueryStmt());
 
     // create per-plan exec info;
     // also assemble list of names of tables with missing or corrupt stats for
     // assembling a warning message
     for (PlanFragment planRoot: planRoots) {
       result.addToPlan_exec_info(
-          createPlanExecInfo(planRoot, planner, queryCtx, result));
+          createPlanExecInfo(planRoot, queryCtx));
     }
 
     // Optionally disable spilling in the backend. Allow spilling if there are plan hints
@@ -1311,7 +1797,7 @@ public class Frontend {
         queryCtx.client_request.query_options.isDisable_unsafe_spills()
           && queryCtx.isSetTables_missing_stats()
           && !queryCtx.tables_missing_stats.isEmpty()
-          && !analysisResult.getAnalyzer().hasPlanHints();
+          && !planner.getAnalysisResult().getAnalyzer().hasPlanHints();
     queryCtx.setDisable_spilling(disableSpilling);
 
     // assign fragment idx
@@ -1325,6 +1811,12 @@ public class Frontend {
     List<PlanFragment> allFragments = planRoots.get(0).getNodesPreOrder();
     planCtx.explainBuf_.append(planner.getExplainString(allFragments, result));
     result.setQuery_plan(planCtx.getExplainString());
+
+    // copy estimated memory per host to planCtx for auto-scaling.
+    planCtx.compilationState_.setEstimatedMemoryPerHost(
+        result.getPer_host_mem_estimate());
+
+    planCtx.compilationState_.setCoresRequired(result.getCores_required());
 
     return result;
   }
@@ -1343,6 +1835,7 @@ public class Frontend {
       timeline.markEvent("Planning finished");
       result.setTimeline(timeline.toThrift());
       result.setProfile(FrontendProfile.getCurrent().emitAsThrift());
+      result.setProfile_children(FrontendProfile.getCurrent().emitChildrenAsThrift());
       return result;
     }
   }
@@ -1359,33 +1852,434 @@ public class Frontend {
             + "%s of %s times: ",numRetries, INCONSISTENT_METADATA_NUM_RETRIES) + msg);
   }
 
+  /**
+   * Examines the input 'executorGroupSets', removes non-default and useless group sets
+   * from it and fills the max_mem_limit field. A group set is considered useless if its
+   * name is not a suffix of 'request_pool'. The max_mem_limit is set to the
+   * max_query_mem_limit from the pool service for the surviving group sets.
+   *
+   * Also imposes the artificial two-executor groups for testing when needed.
+   */
+  public static List<TExecutorGroupSet> setupThresholdsForExecutorGroupSets(
+      List<TExecutorGroupSet> executorGroupSets, String request_pool,
+      boolean default_executor_group, boolean test_replan) throws ImpalaException {
+    RequestPoolService poolService = RequestPoolService.getInstance();
+
+    List<TExecutorGroupSet> result = Lists.newArrayList();
+    if (default_executor_group) {
+      TExecutorGroupSet e = executorGroupSets.get(0);
+      if (e.getCurr_num_executors() == 0) {
+        // The default group has 0 executors. Return one with the number of default
+        // executors as the number of expected executors.
+        result.add(new TExecutorGroupSet(e));
+        result.get(0).setCurr_num_executors(e.getExpected_num_executors());
+        result.get(0).setMax_mem_limit(Long.MAX_VALUE);
+        result.get(0).setNum_cores_per_executor(Integer.MAX_VALUE);
+      } else if (test_replan) {
+        ExecutorMembershipSnapshot cluster = ExecutorMembershipSnapshot.getCluster();
+        int num_nodes = cluster.numExecutors();
+        Preconditions.checkState(e.getCurr_num_executors() == num_nodes);
+        // Form a two-executor group testing environment so that we can exercise
+        // auto-scaling logic (see getTExecRequest()).
+        TExecutorGroupSet s = new TExecutorGroupSet(e);
+        s.setExec_group_name_prefix("small");
+        s.setMax_mem_limit(64*MEGABYTE);
+        s.setNum_cores_per_executor(8);
+        result.add(s);
+        TExecutorGroupSet l = new TExecutorGroupSet(e);
+        String newName = "large";
+        if (e.isSetExec_group_name_prefix()) {
+          String currentName = e.getExec_group_name_prefix();
+          if (currentName.length() > 0) newName = currentName;
+        }
+        l.setExec_group_name_prefix(newName);
+        l.setMax_mem_limit(Long.MAX_VALUE);
+        l.setNum_cores_per_executor(Integer.MAX_VALUE);
+        result.add(l);
+      } else {
+        // Copy and augment the group with the maximally allowed max_mem_limit value.
+        result.add(new TExecutorGroupSet(e));
+        result.get(0).setMax_mem_limit(Long.MAX_VALUE);
+        result.get(0).setNum_cores_per_executor(Integer.MAX_VALUE);
+      }
+      return result;
+    }
+
+    // If there are no executor groups in the cluster, Create a group set with 1 executor.
+    if (executorGroupSets.size() == 0) {
+      result.add(new TExecutorGroupSet(1, 20, DEFAULT_POOL_NAME));
+      result.get(0).setMax_mem_limit(Long.MAX_VALUE);
+      result.get(0).setNum_cores_per_executor(Integer.MAX_VALUE);
+      return result;
+    }
+
+    // Executor groups exist in the cluster. Identify those that can be used.
+    for (TExecutorGroupSet e : executorGroupSets) {
+      // If defined, request_pool can be a suffix of the group name prefix. For example
+      //   group_set_prefix = root.queue1
+      //   request_pool = queue1
+      if (request_pool != null && !e.getExec_group_name_prefix().endsWith(request_pool)) {
+        continue;
+      }
+      TExecutorGroupSet new_entry = new TExecutorGroupSet(e);
+      if (poolService != null) {
+        // Find out the max_mem_limit from the pool service. Set to max_mem_limit when it
+        // is greater than 0, otherwise set to max possible threshold value.
+        TPoolConfig poolConfig =
+            poolService.getPoolConfig(e.getExec_group_name_prefix());
+        Preconditions.checkNotNull(poolConfig);
+        new_entry.setMax_mem_limit(poolConfig.getMax_query_mem_limit() > 0 ?
+            poolConfig.getMax_query_mem_limit() : Long.MAX_VALUE);
+        new_entry.setNum_cores_per_executor(
+            poolConfig.getMax_query_cpu_core_per_node_limit() > 0 ?
+            (int)poolConfig.getMax_query_cpu_core_per_node_limit() : Integer.MAX_VALUE);
+      } else {
+        // Set to max possible threshold value when there is no pool service
+        new_entry.setMax_mem_limit(Long.MAX_VALUE);
+        new_entry.setNum_cores_per_executor(Integer.MAX_VALUE);
+      }
+      result.add(new_entry);
+    }
+    if (executorGroupSets.size() > 0 && result.size() == 0 && request_pool != null) {
+      throw new AnalysisException("Request pool: " + request_pool
+          + " does not map to any known executor group set.");
+    }
+
+    // Sort 'executorGroupSets' by
+    //   <max_mem_limit, expected_num_executors * num_cores_per_executor>
+    // in ascending order. Use exec_group_name_prefix to break the tie.
+    Collections.sort(result, new Comparator<TExecutorGroupSet>() {
+      @Override
+      public int compare(TExecutorGroupSet e1, TExecutorGroupSet e2) {
+        int i = Long.compare(e1.getMax_mem_limit(), e2.getMax_mem_limit());
+        if (i == 0) {
+          i = Long.compare(expectedTotalCores(e1), expectedTotalCores(e2));
+          if (i == 0) {
+            i = e1.getExec_group_name_prefix().compareTo(e2.getExec_group_name_prefix());
+          }
+        }
+        return i;
+      }
+    });
+    return result;
+  }
+
+  // Only the following types of statements are considered auto scalable since each
+  // can be planned by the distributed planner utilizing the number of executors in
+  // an executor group as input.
+  public static boolean canStmtBeAutoScaled(TStmtType type) {
+    return type == TStmtType.EXPLAIN || type == TStmtType.QUERY || type == TStmtType.DML;
+  }
+
+  private static int expectedNumExecutor(TExecutorGroupSet execGroupSet) {
+    return execGroupSet.getCurr_num_executors() > 0 ?
+        execGroupSet.getCurr_num_executors() :
+        execGroupSet.getExpected_num_executors();
+  }
+
+  private static int expectedTotalCores(TExecutorGroupSet execGroupSet) {
+    return IntMath.saturatedMultiply(
+        expectedNumExecutor(execGroupSet), execGroupSet.getNum_cores_per_executor());
+  }
+
   private TExecRequest getTExecRequest(PlanCtx planCtx, EventSequence timeline)
       throws ImpalaException {
     TQueryCtx queryCtx = planCtx.getQueryContext();
     LOG.info("Analyzing query: " + queryCtx.client_request.stmt + " db: "
         + queryCtx.session.database);
 
+    TQueryOptions queryOptions = queryCtx.client_request.getQuery_options();
+    boolean enable_replan = queryOptions.isEnable_replan();
+
+    List<TExecutorGroupSet> originalExecutorGroupSets =
+        ExecutorMembershipSnapshot.getAllExecutorGroupSets();
+
+    LOG.info("The original executor group sets from executor membership snapshot: "
+        + originalExecutorGroupSets);
+
+    boolean default_executor_group = false;
+    if (originalExecutorGroupSets.size() == 1) {
+      TExecutorGroupSet e = originalExecutorGroupSets.get(0);
+      default_executor_group = e.getExec_group_name_prefix() == null
+          || e.getExec_group_name_prefix().isEmpty();
+    }
+    List<TExecutorGroupSet> executorGroupSetsToUse =
+        Frontend.setupThresholdsForExecutorGroupSets(originalExecutorGroupSets,
+            queryOptions.getRequest_pool(), default_executor_group,
+            enable_replan
+                && (RuntimeEnv.INSTANCE.isTestEnv() || queryOptions.isTest_replan()));
+
+    int num_executor_group_sets = executorGroupSetsToUse.size();
+    if (num_executor_group_sets == 0) {
+      throw new AnalysisException(
+          "No suitable executor group sets can be identified and used.");
+    }
+    LOG.info("A total of {} executor group sets to be considered for auto-scaling: "
+            + executorGroupSetsToUse, num_executor_group_sets);
+
+    TExecRequest req = null;
+
+    // Capture the current state.
+    planCtx.compilationState_.captureState();
+    boolean isComputeCost = ProcessingCost.isComputeCost(queryOptions);
+
+    if (isComputeCost) {
+      FrontendProfile.getCurrent().setToCounter(CPU_COUNT_DIVISOR, TUnit.DOUBLE_VALUE,
+          Double.doubleToLongBits(BackendConfig.INSTANCE.getQueryCpuCountDivisor()));
+    }
+
+    TExecutorGroupSet group_set = null;
+    String reason = "Unknown";
     int attempt = 0;
-    String retryMsg = "";
-    while (true) {
-      try {
-        TExecRequest req = doCreateExecRequest(planCtx, timeline);
-        markTimelineRetries(attempt, retryMsg, timeline);
-        return req;
-      } catch (InconsistentMetadataFetchException e) {
-        if (attempt++ == INCONSISTENT_METADATA_NUM_RETRIES) {
-          markTimelineRetries(attempt, e.getMessage(), timeline);
-          throw e;
-        }
-        if (attempt > 1) {
-          // Back-off a bit on later retries.
-          Uninterruptibles.sleepUninterruptibly(200 * attempt, TimeUnit.MILLISECONDS);
-        }
-        retryMsg = e.getMessage();
-        LOG.warn("Retrying plan of query {}: {} (retry #{} of {})",
-            queryCtx.client_request.stmt, retryMsg, attempt,
-            INCONSISTENT_METADATA_NUM_RETRIES);
+    int lastExecutorGroupTotalCores =
+        expectedTotalCores(executorGroupSetsToUse.get(num_executor_group_sets - 1));
+    long memoryAskUnbounded = -1;
+    int cpuAskUnbounded = -1;
+    int i = 0;
+    while (i < num_executor_group_sets) {
+      group_set = executorGroupSetsToUse.get(i);
+      planCtx.compilationState_.setGroupSet(group_set);
+      if (isComputeCost) {
+        planCtx.compilationState_.setAvailableCoresPerNode(
+            Math.max(queryOptions.getProcessing_cost_min_threads(),
+                lastExecutorGroupTotalCores / expectedNumExecutor(group_set)));
+      } else {
+        planCtx.compilationState_.setAvailableCoresPerNode(queryOptions.getMt_dop());
       }
+      LOG.info("Consider executor group set: " + group_set + " with assumption of "
+          + planCtx.compilationState_.getAvailableCoresPerNode() + " cores per node.");
+
+      String retryMsg = "";
+      while (true) {
+        try {
+          req = doCreateExecRequest(planCtx, timeline);
+          markTimelineRetries(attempt, retryMsg, timeline);
+          break;
+        } catch (InconsistentMetadataFetchException e) {
+          if (attempt++ == INCONSISTENT_METADATA_NUM_RETRIES) {
+            markTimelineRetries(attempt, e.getMessage(), timeline);
+            throw e;
+          }
+          planCtx.compilationState_.disableStmtCacheAndReauthorize();
+          if (attempt > 1) {
+            // Back-off a bit on later retries.
+            Uninterruptibles.sleepUninterruptibly(200 * attempt, TimeUnit.MILLISECONDS);
+          }
+          retryMsg = e.getMessage();
+          LOG.warn("Retrying plan of query {}: {} (retry #{} of {})",
+              queryCtx.client_request.stmt, retryMsg, attempt,
+              INCONSISTENT_METADATA_NUM_RETRIES);
+        }
+      }
+
+      // Counters about this group set.
+      int available_cores = expectedTotalCores(group_set);
+      String profileName = "Executor group " + (i + 1);
+      if (group_set.isSetExec_group_name_prefix()
+          && !group_set.getExec_group_name_prefix().isEmpty()) {
+        profileName += " (" + group_set.getExec_group_name_prefix() + ")";
+      }
+      TRuntimeProfileNode groupSetProfile = createTRuntimeProfileNode(profileName);
+      addCounter(groupSetProfile,
+          new TCounter(MEMORY_MAX, TUnit.BYTES,
+              LongMath.saturatedMultiply(
+                  expectedNumExecutor(group_set), group_set.getMax_mem_limit())));
+      if (isComputeCost) {
+        addCounter(groupSetProfile, new TCounter(CPU_MAX, TUnit.UNIT, available_cores));
+      }
+
+      // If it is for a single node plan, enable_replan is disabled, or it is not a query
+      // that can be auto scaled, return the 1st plan generated.
+      boolean notScalable = false;
+      if (queryOptions.num_nodes == 1) {
+        reason = "the number of nodes is 1";
+        notScalable = true;
+      } else if (!enable_replan) {
+        reason = "query option ENABLE_REPLAN=false";
+        notScalable = true;
+      } else if (!Frontend.canStmtBeAutoScaled(req.stmt_type)) {
+        reason = "query is not auto-scalable";
+        notScalable = true;
+      }
+
+      if (notScalable) {
+        setGroupNamePrefix(default_executor_group, req, group_set);
+        addInfoString(
+            groupSetProfile, VERDICT, "Assign to first group because " + reason);
+        FrontendProfile.getCurrent().addChildrenProfile(groupSetProfile);
+        break;
+      }
+
+      // Find out the per host memory estimated from two possible sources.
+      long per_host_mem_estimate = -1;
+      int cores_requirement = -1;
+      if (req.query_exec_request != null) {
+        // For non-explain queries
+        per_host_mem_estimate = req.query_exec_request.per_host_mem_estimate;
+        cores_requirement = req.query_exec_request.getCores_required();
+      } else {
+        // For explain queries
+        per_host_mem_estimate = planCtx.compilationState_.getEstimatedMemoryPerHost();
+        cores_requirement = planCtx.compilationState_.getCoresRequired();
+      }
+
+      Preconditions.checkState(per_host_mem_estimate >= 0);
+      boolean memReqSatisfied = per_host_mem_estimate <= group_set.getMax_mem_limit();
+      addCounter(groupSetProfile,
+          new TCounter(MEMORY_ASK, TUnit.BYTES,
+              LongMath.saturatedMultiply(
+                  expectedNumExecutor(group_set), per_host_mem_estimate)));
+
+      boolean cpuReqSatisfied = true;
+      int scaled_cores_requirement = -1;
+      if (isComputeCost) {
+        Preconditions.checkState(cores_requirement > 0);
+        scaled_cores_requirement = (int) Math.min(Integer.MAX_VALUE,
+            Math.ceil(
+                cores_requirement / BackendConfig.INSTANCE.getQueryCpuCountDivisor()));
+        cpuReqSatisfied = scaled_cores_requirement <= available_cores;
+
+        addCounter(
+            groupSetProfile, new TCounter(CPU_ASK, TUnit.UNIT, scaled_cores_requirement));
+        addCounter(groupSetProfile,
+            new TCounter(EFFECTIVE_PARALLELISM, TUnit.UNIT, cores_requirement));
+
+        if (memoryAskUnbounded > 0) {
+          addCounter(groupSetProfile,
+              new TCounter(MEMORY_ASK_UNBOUNDED, TUnit.BYTES,
+                  LongMath.saturatedMultiply(
+                      expectedNumExecutor(group_set), memoryAskUnbounded)));
+          memoryAskUnbounded = -1;
+        }
+        if (cpuAskUnbounded > 0) {
+          addCounter(groupSetProfile,
+              new TCounter(CPU_ASK_UNBOUNDED, TUnit.UNIT, cpuAskUnbounded));
+          cpuAskUnbounded = -1;
+        }
+      }
+
+      boolean matchFound = false;
+      if (queryOptions.isSetRequest_pool()) {
+        if (!default_executor_group) {
+          Preconditions.checkState(group_set.getExec_group_name_prefix().endsWith(
+              queryOptions.getRequest_pool()));
+        }
+        reason = "query option REQUEST_POOL=" + queryOptions.getRequest_pool()
+            + " is set. Memory and cpu limit checking is skipped.";
+        addInfoString(groupSetProfile, VERDICT, reason);
+        matchFound = true;
+      } else if (memReqSatisfied && cpuReqSatisfied) {
+        reason = "suitable group found (estimated per-host memory="
+            + PrintUtils.printBytes(per_host_mem_estimate)
+            + ", estimated cpu cores required=" + cores_requirement
+            + ", scaled cpu cores=" + scaled_cores_requirement + ")";
+        addInfoString(groupSetProfile, VERDICT, "Match");
+        matchFound = true;
+      }
+
+      if (!matchFound && (i >= num_executor_group_sets - 1)
+          && BackendConfig.INSTANCE.isSkipResourceCheckingOnLastExecutorGroupSet()) {
+        reason = "no executor group set fit. Admit to last executor group set.";
+        addInfoString(groupSetProfile, VERDICT, reason);
+        matchFound = true;
+      }
+
+      // Append this exec group set profile node.
+      FrontendProfile.getCurrent().addChildrenProfile(groupSetProfile);
+
+      if (matchFound) {
+        setGroupNamePrefix(default_executor_group, req, group_set);
+        break;
+      }
+
+      List<String> verdicts = Lists.newArrayListWithCapacity(2);
+      List<String> reasons = Lists.newArrayListWithCapacity(2);
+      if (!memReqSatisfied) {
+        String verdict = "not enough per-host memory";
+        verdicts.add(verdict);
+        reasons.add(verdict + " (require=" + per_host_mem_estimate
+            + ", max=" + group_set.getMax_mem_limit() + ")");
+      }
+      if (!cpuReqSatisfied) {
+        String verdict = "not enough cpu cores";
+        verdicts.add(verdict);
+        reasons.add(verdict + " (require=" + scaled_cores_requirement
+            + ", max=" + available_cores + ")");
+      }
+      reason = String.join(", ", reasons);
+      addInfoString(groupSetProfile, VERDICT, String.join(", ", verdicts));
+      group_set = null;
+
+      // Restore to the captured state.
+      planCtx.compilationState_.restoreState();
+      FrontendProfile.getCurrent().addToCounter(
+          EXECUTOR_GROUPS_CONSIDERED, TUnit.UNIT, 1);
+      i++;
+    }
+
+    if (group_set == null) {
+      if (reason.equals("Unknown")) {
+        throw new AnalysisException("The query does not fit any executor group sets.");
+      } else {
+        throw new AnalysisException(
+            "The query does not fit largest executor group sets. Reason: " + reason
+            + ".");
+      }
+    } else {
+      // This group_set is a match.
+      FrontendProfile.getCurrent().addToCounter(
+          EXECUTOR_GROUPS_CONSIDERED, TUnit.UNIT, 1);
+    }
+
+    LOG.info("Selected executor group: " + group_set + ", reason: " + reason);
+
+    // Transfer the profile access flag which is collected during 1st compilation.
+    req.setUser_has_profile_access(planCtx.compilationState_.userHasProfileAccess());
+
+    return req;
+  }
+
+  private static void setGroupNamePrefix(
+      boolean default_executor_group, TExecRequest req, TExecutorGroupSet group_set) {
+    // Set the group name prefix in both the returned query options and
+    // the query context for non default group setup.
+    if (!default_executor_group) {
+      String namePrefix = group_set.getExec_group_name_prefix();
+      req.query_options.setRequest_pool(namePrefix);
+      req.setRequest_pool_set_by_frontend(true);
+      if (req.query_exec_request != null) {
+        req.query_exec_request.query_ctx.setRequest_pool(namePrefix);
+      }
+    }
+  }
+
+  private static TRuntimeProfileNode createTRuntimeProfileNode(
+      String childrenProfileName) {
+    return new TRuntimeProfileNode(childrenProfileName,
+        /*num_children=*/0,
+        /*counters=*/new ArrayList<>(),
+        /*metadata=*/-1L,
+        /*indent=*/true,
+        /*info_strings=*/new HashMap<>(),
+        /*info_strings_display_order*/ new ArrayList<>(),
+        /*child_counters_map=*/ImmutableMap.of("", new HashSet<>()));
+  }
+
+  /**
+   * Add counter into node profile.
+   * <p>
+   * Caller must make sure that there is no other counter existing in node profile that
+   * share the same counter name.
+   */
+  private static void addCounter(TRuntimeProfileNode node, TCounter counter) {
+    Preconditions.checkNotNull(node.child_counters_map.get(""));
+    node.addToCounters(counter);
+    node.child_counters_map.get("").add(counter.getName());
+  }
+
+  private static void addInfoString(TRuntimeProfileNode node, String key, String value) {
+    if (node.getInfo_strings().put(key, value) == null) {
+      node.getInfo_strings_display_order().add(key);
     }
   }
 
@@ -1395,18 +2289,40 @@ public class Frontend {
     // Parse stmt and collect/load metadata to populate a stmt-local table cache
     StatementBase stmt = Parser.parse(
         queryCtx.client_request.stmt, queryCtx.client_request.query_options);
+    User user = new User(TSessionStateUtil.getEffectiveUser(queryCtx.session));
     StmtMetadataLoader metadataLoader =
-        new StmtMetadataLoader(this, queryCtx.session.database, timeline);
+        new StmtMetadataLoader(this, queryCtx.session.database, timeline, user);
     //TODO (IMPALA-8788): should load table write ids in transaction context.
     StmtTableCache stmtTableCache = metadataLoader.loadTables(stmt);
+
+    // Add referenced tables to frontend profile
+    FrontendProfile.getCurrent().addInfoString("Referenced Tables",
+        stmtTableCache.tables.keySet()
+            .stream()
+            .map(TableName::toString)
+            .collect(Collectors.joining(", ")));
 
     // Analyze and authorize stmt
     AnalysisContext analysisCtx = new AnalysisContext(queryCtx, authzFactory_, timeline);
     AnalysisResult analysisResult = analysisCtx.analyzeAndAuthorize(stmt, stmtTableCache,
-        authzChecker_.get());
-    LOG.info("Analysis and authorization finished.");
+        authzChecker_.get(), planCtx.compilationState_.disableAuthorization());
+    if (!planCtx.compilationState_.disableAuthorization()) {
+      LOG.info("Analysis and authorization finished.");
+      planCtx.compilationState_.setUserHasProfileAccess(
+          analysisResult.userHasProfileAccess());
+    } else {
+      LOG.info("Analysis finished.");
+    }
     Preconditions.checkNotNull(analysisResult.getStmt());
     TExecRequest result = createBaseExecRequest(queryCtx, analysisResult);
+
+    // Transfer the expected number of executors in executor group set to
+    // analyzer's global state. The info is needed to compute the number of nodes to be
+    // used during planner phase for scans (see HdfsScanNode.computeNumNodes()).
+    analysisResult.getAnalyzer().setNumExecutorsForPlanning(
+        expectedNumExecutor(planCtx.compilationState_.getGroupSet()));
+    analysisResult.getAnalyzer().setAvailableCoresPerNode(
+        Math.max(1, planCtx.compilationState_.getAvailableCoresPerNode()));
 
     try {
       TQueryOptions queryOptions = queryCtx.client_request.query_options;
@@ -1422,18 +2338,34 @@ public class Frontend {
         if (!analysisResult.isCreateTableAsSelectStmt()) {
           return result;
         }
-      } else if (analysisResult.isInsertStmt() ||
-          analysisResult.isCreateTableAsSelectStmt()) {
+      }
+      if (!analysisResult.isExplainStmt() &&
+          (analysisResult.isInsertStmt() || analysisResult.isCreateTableAsSelectStmt())) {
         InsertStmt insertStmt = analysisResult.getInsertStmt();
         FeTable targetTable = insertStmt.getTargetTable();
         if (AcidUtils.isTransactionalTable(
             targetTable.getMetaStoreTable().getParameters())) {
-          long txnId = openTransaction(queryCtx);
-          timeline.markEvent("Transaction opened (" + String.valueOf(txnId) + ")");
-          Collection<FeTable> tables = stmtTableCache.tables.values();
-          createLockForInsert(txnId, tables, targetTable, insertStmt.isOverwrite());
-          long writeId = allocateWriteId(queryCtx, targetTable);
-          insertStmt.setWriteId(writeId);
+
+          if (planCtx.compilationState_.getWriteId() == -1) {
+            // 1st time compilation. Open a transaction and save the writeId.
+            long txnId = openTransaction(queryCtx);
+            timeline.markEvent("Transaction opened (" + String.valueOf(txnId) + ")");
+            Collection<FeTable> tables = stmtTableCache.tables.values();
+            String staticPartitionTarget = null;
+            if (insertStmt.isStaticPartitionTarget()) {
+              staticPartitionTarget = FeCatalogUtils.getPartitionName(
+                  insertStmt.getPartitionKeyValues());
+            }
+            long writeId = allocateWriteId(queryCtx, targetTable);
+            insertStmt.setWriteId(writeId);
+            createLockForInsert(txnId, tables, targetTable, insertStmt.isOverwrite(),
+                staticPartitionTarget, queryOptions);
+
+            planCtx.compilationState_.setWriteId(writeId);
+          } else {
+            // Continue the transaction by reusing the writeId.
+            insertStmt.setWriteId(planCtx.compilationState_.getWriteId());
+          }
         }
       } else if (analysisResult.isLoadDataStmt()) {
         result.stmt_type = TStmtType.LOAD;
@@ -1470,6 +2402,27 @@ public class Frontend {
         return result;
       }
 
+      // Open or continue Kudu transaction if Kudu transaction is enabled and target table
+      // is Kudu table.
+      if (!analysisResult.isExplainStmt() && queryOptions.isEnable_kudu_transaction()) {
+        if ((analysisResult.isInsertStmt() || analysisResult.isCreateTableAsSelectStmt())
+            && analysisResult.getInsertStmt().isTargetTableKuduTable()) {
+          // For INSERT/UPSERT/CTAS statements.
+          openOrContinueKuduTransaction(planCtx, queryCtx, analysisResult,
+              analysisResult.getInsertStmt().getTargetTable(), timeline);
+        } else if (analysisResult.isUpdateStmt()
+            && analysisResult.getUpdateStmt().isTargetTableKuduTable()) {
+          // For UPDATE statement.
+          openOrContinueKuduTransaction(planCtx, queryCtx, analysisResult,
+              analysisResult.getUpdateStmt().getTargetTable(), timeline);
+        } else if (analysisResult.isDeleteStmt()
+            && analysisResult.getDeleteStmt().isTargetTableKuduTable()) {
+          // For DELETE statement.
+          openOrContinueKuduTransaction(planCtx, queryCtx, analysisResult,
+              analysisResult.getDeleteStmt().getTargetTable(), timeline);
+        }
+      }
+
       // If unset, set MT_DOP to 0 to simplify the rest of the code.
       if (!queryOptions.isSetMt_dop()) queryOptions.setMt_dop(0);
 
@@ -1491,6 +2444,14 @@ public class Frontend {
         // Return the EXPLAIN request
         createExplainRequest(planCtx.getExplainString(), result);
         return result;
+      }
+
+      // Blocking query execution for queries that contain IcebergMetadataTables
+      for (FeTable table : stmtTableCache.tables.values()) {
+        if (table instanceof IcebergMetadataTable) {
+          throw new NotImplementedException(String.format("'%s' refers to a metadata "
+              + "table which is currently not supported.", table.getFullName()));
+        }
       }
 
       result.setQuery_exec_request(queryExecRequest);
@@ -1519,8 +2480,18 @@ public class Frontend {
     } catch (Exception e) {
       if (queryCtx.isSetTransaction_id()) {
         try {
+          planCtx.compilationState_.setWriteId(-1);
           abortTransaction(queryCtx.getTransaction_id());
           timeline.markEvent("Transaction aborted");
+        } catch (TransactionException te) {
+          LOG.error("Could not abort transaction because: " + te.getMessage());
+        }
+      } else if (queryCtx.isIs_kudu_transactional()) {
+        try {
+          planCtx.compilationState_.setKuduTransactionToken(null);
+          abortKuduTransaction(queryCtx.getQuery_id());
+          timeline.markEvent(
+              "Kudu transaction aborted: " + queryCtx.getQuery_id().toString());
         } catch (TransactionException te) {
           LOG.error("Could not abort transaction because: " + te.getMessage());
         }
@@ -1561,21 +2532,40 @@ public class Frontend {
    */
   private static void addFinalizationParamsForInsert(
       TQueryCtx queryCtx, TQueryExecRequest queryExecRequest, InsertStmt insertStmt) {
-    if (insertStmt.getTargetTable() instanceof FeFsTable) {
+    FeTable targetTable = insertStmt.getTargetTable();
+    addFinalizationParamsForInsert(queryCtx, queryExecRequest,
+        targetTable, insertStmt.getWriteId(), insertStmt.isOverwrite());
+  }
+
+  // This is public to allow external frontends to utilize this method to fill in the
+  // finalization parameters for externally generated INSERTs.
+  public static void addFinalizationParamsForInsert(
+      TQueryCtx queryCtx, TQueryExecRequest queryExecRequest, FeTable targetTable,
+          long writeId, boolean isOverwrite) {
+    if (targetTable instanceof FeFsTable) {
       TFinalizeParams finalizeParams = new TFinalizeParams();
-      finalizeParams.setIs_overwrite(insertStmt.isOverwrite());
-      finalizeParams.setTable_name(insertStmt.getTargetTableName().getTbl());
+      finalizeParams.setIs_overwrite(isOverwrite);
+      finalizeParams.setTable_name(targetTable.getTableName().getTbl());
       finalizeParams.setTable_id(DescriptorTable.TABLE_SINK_ID);
-      String db = insertStmt.getTargetTableName().getDb();
+      String db = targetTable.getTableName().getDb();
       finalizeParams.setTable_db(db == null ? queryCtx.session.database : db);
-      FeFsTable hdfsTable = (FeFsTable) insertStmt.getTargetTable();
+      FeFsTable hdfsTable = (FeFsTable) targetTable;
       finalizeParams.setHdfs_base_dir(hdfsTable.getHdfsBaseDir());
-      finalizeParams.setStaging_dir(
-          hdfsTable.getHdfsBaseDir() + "/_impala_insert_staging");
-      if (insertStmt.getWriteId() != -1) {
+      if (writeId != -1) {
         Preconditions.checkState(queryCtx.isSetTransaction_id());
         finalizeParams.setTransaction_id(queryCtx.getTransaction_id());
-        finalizeParams.setWrite_id(insertStmt.getWriteId());
+        finalizeParams.setWrite_id(writeId);
+      } else if (targetTable instanceof FeIcebergTable) {
+        FeIcebergTable iceTable = (FeIcebergTable)targetTable;
+        finalizeParams.setSpec_id(iceTable.getDefaultPartitionSpecId());
+        finalizeParams.setInitial_snapshot_id(iceTable.snapshotId());
+      } else {
+        // TODO: Currently this flag only controls the removal of the query-level staging
+        // directory. HdfsTableSink (that creates the staging dir) calculates the path
+        // independently. So it'd be better to either remove this option, or make it used
+        // everywhere where the staging directory is referenced.
+        finalizeParams.setStaging_dir(
+            hdfsTable.getHdfsBaseDir() + "/_impala_insert_staging");
       }
       queryExecRequest.setFinalize_params(finalizeParams);
     }
@@ -1783,6 +2773,19 @@ public class Frontend {
   }
 
   /**
+   * Adds a transaction to the keepalive object.
+   * @param queryCtx context that the transaction is associated with
+   * @throws TransactionException
+   */
+  public void addTransaction(TQueryCtx queryCtx) throws TransactionException {
+    Preconditions.checkState(queryCtx.isSetTransaction_id());
+    long transactionId = queryCtx.getTransaction_id();
+    HeartbeatContext ctx = new HeartbeatContext(queryCtx, System.nanoTime());
+    transactionKeepalive_.addTransaction(transactionId, ctx);
+    LOG.info("Opened transaction: " + Long.toString(transactionId));
+  }
+
+  /**
    * Opens a new transaction and registers it to the keepalive object.
    * @param queryCtx context of the query that requires the transaction.
    * @return the transaction id.
@@ -1791,13 +2794,10 @@ public class Frontend {
   private long openTransaction(TQueryCtx queryCtx) throws TransactionException {
     try (MetaStoreClient client = metaStoreClientPool_.getClient()) {
       IMetaStoreClient hmsClient = client.getHiveClient();
-      long transactionId = MetastoreShim.openTransaction(hmsClient);
-      HeartbeatContext ctx = new HeartbeatContext(queryCtx, System.nanoTime());
-      transactionKeepalive_.addTransaction(transactionId, ctx);
-      LOG.info("Opened transaction: " + Long.toString(transactionId));
-      queryCtx.setTransaction_id(transactionId);
-      return transactionId;
+      queryCtx.setTransaction_id(MetastoreShim.openTransaction(hmsClient));
+      addTransaction(queryCtx);
     }
+    return queryCtx.getTransaction_id();
   }
 
   /**
@@ -1850,22 +2850,28 @@ public class Frontend {
    * @param txnId the transaction id to be used.
    * @param tables the tables in the query.
    * @param targetTable the target table of INSERT. Must be transactional.
-   * @param isOverwrite
+   * @param isOverwrite true when the INSERT stmt is an INSERT OVERWRITE
+   * @param staticPartitionTarget the static partition target in case of static partition
+   *   INSERT
+   * @param queryOptions the query options for this INSERT statement
    * @throws TransactionException
    */
   private void createLockForInsert(Long txnId, Collection<FeTable> tables,
-      FeTable targetTable, boolean isOverwrite) throws TransactionException {
+      FeTable targetTable, boolean isOverwrite, String staticPartitionTarget,
+      TQueryOptions queryOptions)
+      throws TransactionException {
     Preconditions.checkState(
         AcidUtils.isTransactionalTable(targetTable.getMetaStoreTable().getParameters()));
     List<LockComponent> lockComponents = new ArrayList<>(tables.size());
-    for (FeTable table : tables) {
+    List<FeTable> lockTables = new ArrayList<>(tables);
+    if (!lockTables.contains(targetTable)) lockTables.add(targetTable);
+    for (FeTable table : lockTables) {
       if (!AcidUtils.isTransactionalTable(table.getMetaStoreTable().getParameters())) {
         continue;
       }
       LockComponent lockComponent = new LockComponent();
       lockComponent.setDbname(table.getDb().getName());
       lockComponent.setTablename(table.getName());
-      lockComponent.setLevel(LockLevel.TABLE);
       if (table == targetTable) {
         if (isOverwrite) {
           lockComponent.setType(LockType.EXCLUSIVE);
@@ -1873,7 +2879,14 @@ public class Frontend {
           lockComponent.setType(LockType.SHARED_READ);
         }
         lockComponent.setOperationType(DataOperationType.INSERT);
+        if (staticPartitionTarget != null) {
+          lockComponent.setLevel(LockLevel.PARTITION);
+          lockComponent.setPartitionname(staticPartitionTarget);
+        } else {
+          lockComponent.setLevel(LockLevel.TABLE);
+        }
       } else {
+        lockComponent.setLevel(LockLevel.TABLE);
         lockComponent.setType(LockType.SHARED_READ);
         lockComponent.setOperationType(DataOperationType.SELECT);
       }
@@ -1881,7 +2894,98 @@ public class Frontend {
     }
     try (MetaStoreClient client = metaStoreClientPool_.getClient()) {
       IMetaStoreClient hmsClient = client.getHiveClient();
-      MetastoreShim.acquireLock(hmsClient, txnId, lockComponents);
+      MetastoreShim.acquireLock(hmsClient, txnId, lockComponents,
+          queryOptions.lock_max_wait_time_s);
+    }
+  }
+
+  /**
+   * Opens or continue a Kudu transaction.
+   */
+  private void openOrContinueKuduTransaction(PlanCtx planCtx, TQueryCtx queryCtx,
+      AnalysisResult analysisResult, FeTable targetTable, EventSequence timeline)
+      throws TransactionException {
+
+    byte[] token = planCtx.compilationState_.getKuduTransactionToken();
+    // Continue the transaction by reusing the token.
+    if (token != null) {
+      if (analysisResult.isUpdateStmt()) {
+        analysisResult.getUpdateStmt().setKuduTransactionToken(token);
+      } else if (analysisResult.isDeleteStmt()) {
+        analysisResult.getDeleteStmt().setKuduTransactionToken(token);
+      } else {
+        analysisResult.getInsertStmt().setKuduTransactionToken(token);
+      }
+      return;
+    }
+
+    FeKuduTable kuduTable = (FeKuduTable) targetTable;
+    KuduClient client = KuduUtil.getKuduClient(kuduTable.getKuduMasterHosts());
+    KuduTransaction txn = null;
+    try {
+      // Open Kudu transaction.
+      LOG.info("Open Kudu transaction: " + queryCtx.getQuery_id().toString());
+      txn = client.newTransaction();
+      timeline.markEvent(
+          "Kudu transaction opened with query id: " + queryCtx.getQuery_id().toString());
+      token = txn.serialize();
+      if (analysisResult.isUpdateStmt()) {
+        analysisResult.getUpdateStmt().setKuduTransactionToken(token);
+      } else if (analysisResult.isDeleteStmt()) {
+        analysisResult.getDeleteStmt().setKuduTransactionToken(token);
+      } else {
+        analysisResult.getInsertStmt().setKuduTransactionToken(token);
+      }
+      kuduTxnManager_.addTransaction(queryCtx.getQuery_id(), txn);
+      queryCtx.setIs_kudu_transactional(true);
+
+      planCtx.compilationState_.setKuduTransactionToken(token);
+
+    } catch (IOException e) {
+      if (txn != null) txn.close();
+      throw new TransactionException(e.getMessage());
+    }
+  }
+
+  /**
+   * Aborts a Kudu transaction.
+   * @param queryId is the id of the query.
+   */
+  public void abortKuduTransaction(TUniqueId queryId) throws TransactionException {
+    LOG.info("Abort Kudu transaction: " + queryId.toString());
+    KuduTransaction txn = kuduTxnManager_.deleteTransaction(queryId);
+    Preconditions.checkNotNull(txn);
+    if (txn != null) {
+      try {
+        txn.rollback();
+      } catch (KuduException e) {
+        throw new TransactionException(e.getMessage());
+      } finally {
+        // Call KuduTransaction.close() explicitly to stop sending automatic
+        // keepalive messages by the 'txn' handle.
+        txn.close();
+      }
+    }
+  }
+
+  /**
+   * Commits a Kudu transaction.
+   * @param queryId is the id of the query.
+   */
+  public void commitKuduTransaction(TUniqueId queryId) throws TransactionException {
+    LOG.info("Commit Kudu transaction: " + queryId.toString());
+    KuduTransaction txn = kuduTxnManager_.deleteTransaction(queryId);
+    Preconditions.checkNotNull(txn);
+    if (txn != null) {
+      try {
+        txn.commit();
+      } catch (KuduException e) {
+        throw new TransactionException(e.getMessage());
+      } finally {
+        // Call KuduTransaction.close() explicitly to stop sending automatic
+        // keepalive messages by the 'txn' handle.
+        txn.close();
+      }
     }
   }
 }

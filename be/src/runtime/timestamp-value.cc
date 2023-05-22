@@ -17,12 +17,10 @@
 
 #include "runtime/timestamp-value.h"
 
-#include <boost/date_time/posix_time/posix_time.hpp>
-
 #include "exprs/timestamp-functions.h"
 #include "exprs/timezone_db.h"
+#include "runtime/datetime-simple-date-format-parser.h"
 #include "runtime/timestamp-parse-util.h"
-#include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
 
 #include "common/names.h"
@@ -37,18 +35,12 @@ using boost::posix_time::ptime_from_tm;
 using boost::posix_time::time_duration;
 using boost::posix_time::to_tm;
 
-DEFINE_bool(use_local_tz_for_unix_timestamp_conversions, false,
-    "When true, TIMESTAMPs are interpreted in the local time zone when converting to "
-    "and from Unix times. When false, TIMESTAMPs are interpreted in the UTC time zone. "
-    "Set to true for Hive compatibility.");
-
-// Boost stores dates as an uint32_t. Since subtraction is needed, convert to signed.
-const int64_t EPOCH_DAY_NUMBER =
-    static_cast<int64_t>(date(1970, boost::gregorian::Jan, 1).day_number());
-
 namespace impala {
 
 using datetime_parse_util::DateTimeFormatContext;
+using datetime_parse_util::SimpleDateFormatTokenizer;
+using impala_udf::FunctionContext;
+using impala_udf::StringVal;
 
 const char* TimestampValue::LLVM_CLASS_NAME = "class.impala::TimestampValue";
 const double TimestampValue::ONE_BILLIONTH = 0.000000001;
@@ -79,8 +71,15 @@ TimestampValue TimestampValue::ParseIsoSqlFormat(const char* str, int len,
   return tv;
 }
 
-string TimestampValue::Format(const DateTimeFormatContext& dt_ctx) const {
-  return TimestampParser::Format(dt_ctx, date_, time_);
+void TimestampValue::Format(const DateTimeFormatContext& dt_ctx, string& dst) const {
+  int max_length = dt_ctx.fmt_out_len;
+  dst.resize(max_length);
+  int written = TimestampParser::Format(dt_ctx, date_, time_, max_length, &dst[0]);
+  if (UNLIKELY(written < 0)) {
+    dst.clear();
+  } else {
+    dst.resize(written);
+  }
 }
 
 namespace {
@@ -181,7 +180,14 @@ void TimestampValue::LocalToUtc(const Timezone& local_tz) {
 }
 
 ostream& operator<<(ostream& os, const TimestampValue& timestamp_value) {
-  return os << timestamp_value.ToString();
+  char dst[SimpleDateFormatTokenizer::DEFAULT_DATE_TIME_FMT_LEN + 1];
+  const int out_len = TimestampParser::FormatDefault(timestamp_value.date(),
+      timestamp_value.time(), dst);
+  if (LIKELY(out_len >= 0)) {
+    dst[out_len] = '\0';
+    os << dst;
+  }
+  return os;
 }
 
 TimestampValue TimestampValue::UnixTimeToLocal(
@@ -199,24 +205,60 @@ TimestampValue TimestampValue::UnixTimeToLocal(
   }
 }
 
-TimestampValue TimestampValue::FromUnixTime(time_t unix_time, const Timezone& local_tz) {
-  if (FLAGS_use_local_tz_for_unix_timestamp_conversions) {
-    return UnixTimeToLocal(unix_time, local_tz);
+TimestampValue TimestampValue::FromUnixTime(time_t unix_time, const Timezone* local_tz) {
+  if (local_tz != UTCPTR) {
+    return UnixTimeToLocal(unix_time, *local_tz);
   } else {
     return UtcFromUnixTimeTicks<1>(unix_time);
   }
 }
 
-string TimestampValue::ToString() const {
-  stringstream ss;
-  if (HasDate()) {
-    ss << boost::gregorian::to_iso_extended_string(date_);
+void TimestampValue::ToString(string& dst) const {
+  dst.resize(SimpleDateFormatTokenizer::DEFAULT_DATE_TIME_FMT_LEN);
+  const int out_len = TimestampParser::FormatDefault(date(), time(), dst.data());
+  if (UNLIKELY(out_len != SimpleDateFormatTokenizer::DEFAULT_DATE_TIME_FMT_LEN)) {
+    if (UNLIKELY(out_len < 0)) {
+      dst.clear();
+    } else {
+      dst.resize(out_len);
+    }
   }
-  if (HasTime()) {
-    if (HasDate()) ss << " ";
-    ss << boost::posix_time::to_simple_string(time_);
-  }
-  return ss.str();
 }
 
+string TimestampValue::ToString() const {
+  string dst;
+  ToString(dst);
+  return dst;
+}
+
+TimestampValue TimestampValue::Add(const boost::posix_time::time_duration& t) const {
+  if (!IsValidTime(t) || !HasDateAndTime()) return TimestampValue();
+
+  int64_t this_in_nano_sec = time_.total_nanoseconds();
+  int64_t t_in_nano_sec = t.total_nanoseconds();
+
+  if (this_in_nano_sec + t_in_nano_sec < NANOS_PER_DAY) {
+    return TimestampValue(date_, time_ + t);
+  } else {
+    int64_t total_in_nano_sec = this_in_nano_sec + t_in_nano_sec;
+    int64_t days = total_in_nano_sec / NANOS_PER_DAY;
+    int64_t nano_secs_remaining = total_in_nano_sec % NANOS_PER_DAY;
+    return TimestampValue(date_ + boost::gregorian::date_duration(days),
+        boost::posix_time::time_duration(0, 0, 0, nano_secs_remaining));
+  }
+}
+
+TimestampValue TimestampValue::Subtract(const boost::posix_time::time_duration& t) const {
+  if (!IsValidTime(t) || !HasDateAndTime()) return TimestampValue();
+
+  int64_t this_in_nano_sec = time_.total_nanoseconds();
+  int64_t t_in_nano_sec = t.total_nanoseconds();
+  if (this_in_nano_sec - t_in_nano_sec >= 0) {
+    return TimestampValue(date_, time_ - t);
+  } else {
+    return TimestampValue(date_ - boost::gregorian::date_duration(1),
+        boost::posix_time::time_duration(
+            0, 0, 0, NANOS_PER_DAY + this_in_nano_sec - t_in_nano_sec));
+  }
+}
 }

@@ -27,7 +27,9 @@ namespace impala {
 
 class AggregationPlanNode : public PlanNode {
  public:
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status Init(const TPlanNode& tnode, FragmentState* state) override;
+  virtual void Codegen(FragmentState* state) override;
+  virtual void Close() override;
   virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
   ~AggregationPlanNode() {}
   /// Configuration for generating aggregators that will be eventually used to aggregate
@@ -44,7 +46,6 @@ class AggregationNodeBase : public ExecNode {
       ObjectPool* pool, const AggregationPlanNode& pnode, const DescriptorTbl& descs);
 
   virtual Status Prepare(RuntimeState* state) override;
-  virtual void Codegen(RuntimeState* state) override;
   virtual Status Reset(RuntimeState* state, RowBatch* row_batch) override;
 
  protected:
@@ -65,6 +66,9 @@ class AggregationNodeBase : public ExecNode {
 
   /// END: Members that must be Reset()
   /////////////////////////////////////////
+
+  /// If true, aggregation can be done ahead of time without computing all the input data
+  bool fast_limit_check_ = false;
 
   /// Splits the rows of 'batch' up according to which tuple of the row is non-null such
   /// that a row with tuple 'i' non-null is copied into the batch 'mini_batches[i]'.

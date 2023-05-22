@@ -17,6 +17,8 @@
 #
 # Superclass of all HS2 tests containing commonly used functions.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from getpass import getuser
 from TCLIService import TCLIService
 from ImpalaService import ImpalaHiveServer2Service
@@ -113,16 +115,22 @@ class HS2TestSuite(ImpalaTestSuite):
                          'doubleVal', 'binaryVal']
 
   def setup(self):
-    host, port = IMPALAD_HS2_HOST_PORT.split(":")
-    self.socket = TSocket(host, port)
-    self.transport = TBufferedTransport(self.socket)
-    self.transport.open()
-    self.protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
-    self.hs2_client = ImpalaHiveServer2Service.Client(self.protocol)
+    self.socket, self.hs2_client = self._open_hs2_connection()
 
   def teardown(self):
     if self.socket:
       self.socket.close()
+
+  @staticmethod
+  def _open_hs2_connection():
+    """Opens a HS2 connection, returning the socket and the thrift client."""
+    host, port = IMPALAD_HS2_HOST_PORT.split(":")
+    socket = TSocket(host, port)
+    transport = TBufferedTransport(socket)
+    transport.open()
+    protocol = TBinaryProtocol.TBinaryProtocol(transport)
+    hs2_client = ImpalaHiveServer2Service.Client(protocol)
+    return socket, hs2_client
 
   @staticmethod
   def check_response(response,
@@ -150,7 +158,7 @@ class HS2TestSuite(ImpalaTestSuite):
       expected_err = "Query id"
     else:
       # We should standardise on this error message.
-      expected_err = "Invalid query handle:"
+      expected_err = "Invalid or unknown query handle:"
     HS2TestSuite.check_response(response, TCLIService.TStatusCode.ERROR_STATUS,
                                 expected_err)
 
@@ -274,13 +282,13 @@ class HS2TestSuite(ImpalaTestSuite):
         num_rows = len(typed_col.values)
         break
 
-    for i in xrange(num_rows):
+    for i in range(num_rows):
       row = []
       for c in columns:
         for col_type in HS2TestSuite.HS2_V6_COLUMN_TYPES:
           typed_col = getattr(c, col_type)
           if typed_col != None:
-            indicator = ord(typed_col.nulls[i / 8])
+            indicator = ord(typed_col.nulls[i // 8])
             if indicator & (1 << (i % 8)):
               row.append("NULL")
             else:
@@ -328,6 +336,18 @@ class HS2TestSuite(ImpalaTestSuite):
       sleep(0.05)
     assert False, 'Did not complete admission control processing in time, current ' \
         'operation state of query: %s' % (get_operation_status_resp.operationState)
+
+  def wait_for_log_message(self, operationHandle, expected_message, timeout=10):
+    start_time = time()
+    while (time() - start_time < timeout):
+      get_log_req = TCLIService.TGetLogReq()
+      get_log_req.operationHandle = operationHandle
+      log = self.hs2_client.GetLog(get_log_req).log
+      if expected_message in log:
+        return log
+      sleep(0.05)
+    assert False, "Did not find expected log message '%s' in time, latest log: '%s'" \
+      % (expected_message, log)
 
   def execute_statement(self, statement, conf_overlay=None,
                         expected_status_code=TCLIService.TStatusCode.SUCCESS_STATUS,

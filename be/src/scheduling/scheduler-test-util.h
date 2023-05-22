@@ -25,15 +25,14 @@
 #include <boost/scoped_ptr.hpp>
 
 #include "common/status.h"
-#include "gen-cpp/ImpalaInternalService.h" // for TQueryOptions
 #include "scheduling/cluster-membership-mgr.h"
 #include "scheduling/scheduler.h"
-#include "scheduling/query-schedule.h"
 #include "util/metrics.h"
 
 namespace impala {
 
 class ClusterMembershipMgr;
+class HdfsFileSplitPB;
 class Scheduler;
 class TTopicDelta;
 
@@ -363,8 +362,8 @@ class Result {
 
   /// Parameter type for callbacks, which are used to filter scheduling results.
   struct AssignmentInfo {
-    const TNetworkAddress& addr;
-    const THdfsFileSplit& hdfs_file_split;
+    const NetworkAddressPB& addr;
+    const HdfsFileSplitPB& hdfs_file_split;
     bool is_cached;
     bool is_remote;
   };

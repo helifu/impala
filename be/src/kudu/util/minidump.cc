@@ -23,25 +23,28 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <initializer_list>
 #include <memory>
 #include <ostream>
 #include <string>
 
 #if defined(__linux__)
-#include <client/linux/handler/exception_handler.h>
-#include <common/linux/linux_libc_support.h>
+#include <breakpad/client/linux/handler/exception_handler.h>
+#include <breakpad/client/linux/handler/minidump_descriptor.h>
+#include <breakpad/common/linux/linux_libc_support.h>
+#include <breakpad/common/using_std_string.h>
+#include <breakpad/third_party/lss/linux_syscall_support.h>
 #endif // defined(__linux__)
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/linux_syscall_support.h"
 #include "kudu/gutil/strings/human_readable.h"
-#include "kudu/util/errno.h"
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
+#include "kudu/util/errno.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
@@ -57,6 +60,7 @@ static constexpr bool kMinidumpPlatformSupported = false;
 #endif // defined(__linux__)
 
 DECLARE_string(log_dir);
+DECLARE_string(log_filename);
 
 DEFINE_bool(enable_minidumps, kMinidumpPlatformSupported,
             "Whether to enable minidump generation upon process crash or SIGUSR1. "
@@ -71,7 +75,13 @@ static bool ValidateMinidumpEnabled(const char* /*flagname*/, bool value) {
 }
 DEFINE_validator(enable_minidumps, &ValidateMinidumpEnabled);
 
-DECLARE_string(minidump_path);
+DEFINE_string(minidump_path, "minidumps", "Directory to write minidump files to. This "
+    "can be either an absolute path or a path relative to --log_dir. Each daemon will "
+    "create an additional sub-directory to prevent naming conflicts and to make it "
+    "easier to identify a crashing daemon. Minidump files contain crash-related "
+    "information in a compressed format. Minidumps will be written when a daemon exits "
+    "unexpectedly, for example on an unhandled exception or signal, or when a "
+    "SIGUSR1 signal is sent to the process. Cannot be set to an empty value.");
 TAG_FLAG(minidump_path, evolving);
 // The minidump path cannot be empty.
 static bool ValidateMinidumpPath(const char* /*flagname*/, const string& value) {
@@ -79,10 +89,14 @@ static bool ValidateMinidumpPath(const char* /*flagname*/, const string& value) 
 }
 DEFINE_validator(minidump_path, &ValidateMinidumpPath);
 
-DECLARE_int32(max_minidumps);
+DEFINE_int32(max_minidumps, 9, "Maximum number of minidump files to keep per daemon. "
+    "Older files are removed first. Set to 0 to keep all minidump files.");
 TAG_FLAG(max_minidumps, evolving);
 
-DECLARE_int32(minidump_size_limit_hint_kb);
+DEFINE_int32(minidump_size_limit_hint_kb, 20480, "Size limit hint for minidump files in "
+    "KB. If a minidump exceeds this value, then breakpad will reduce the stack memory it "
+    "collects for each thread from 8KB to 2KB. However it will always include the full "
+    "stack memory for the first 20 threads, including the thread that crashed.");
 TAG_FLAG(minidump_size_limit_hint_kb, advanced);
 TAG_FLAG(minidump_size_limit_hint_kb, evolving);
 
@@ -198,11 +212,14 @@ Status MinidumpExceptionHandler::InitMinidumpExceptionHandler() {
   RETURN_NOT_OK_PREPEND(CreateDirIfMissing(env, minidump_dir_),
                         "Error creating top-level minidump directory");
 
-  // Add the executable name to the path where minidumps will be written. This makes
-  // identification easier and prevents name collisions between the files.
+  // Add the program_name to the path where minidumps will be written.
+  // This makes identification easier and prevents name collisions between the files.
   // This is also consistent with how Impala organizes its minidump files.
-  const char* exe_name = gflags::ProgramInvocationShortName();
-  minidump_dir_ = JoinPathSegments(minidump_dir_, exe_name);
+  // The log_filename flag will be used if non-empty, otherwise the executable name
+  // will be used.
+  const char* program_name = FLAGS_log_filename.empty() ? gflags::ProgramInvocationShortName() :
+          FLAGS_log_filename.c_str();
+  minidump_dir_ = JoinPathSegments(minidump_dir_, program_name);
 
   // Create the directory if it is not there. The minidump doesn't get written if there is
   // no directory.
@@ -267,8 +284,8 @@ void MinidumpExceptionHandler::UnregisterMinidumpExceptionHandler() {
 Status MinidumpExceptionHandler::StartUserSignalHandlerThread() {
   user_signal_handler_thread_running_.store(true, std::memory_order_relaxed);
   return Thread::Create("minidump", "sigusr1-handler",
-                        &MinidumpExceptionHandler::RunUserSignalHandlerThread,
-                        this, &user_signal_handler_thread_);
+                        [this]() { this->RunUserSignalHandlerThread(); },
+                        &user_signal_handler_thread_);
 }
 
 void MinidumpExceptionHandler::StopUserSignalHandlerThread() {

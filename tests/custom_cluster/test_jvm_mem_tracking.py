@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import logging
 import json
 import pytest
@@ -37,7 +38,8 @@ class TestJvmMemTracker(CustomClusterTestSuite):
       pytest.skip('runs only in exhaustive')
     super(TestJvmMemTracker, cls).setup_class()
 
-  @CustomClusterTestSuite.with_args(impalad_args="--mem_limit_includes_jvm=true",
+  @CustomClusterTestSuite.with_args(impalad_args="--mem_limit_includes_jvm=true \
+                                    --codegen_cache_capacity=0",
                                     start_args="--jvm_args=-Xmx1g", cluster_size=1)
   def test_jvm_mem_tracking(self, vector):
     service = ImpalaCluster.get_e2e_test_cluster().impalads[0].service

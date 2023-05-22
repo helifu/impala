@@ -17,15 +17,15 @@
 
 #include "exprs/timestamp-functions.h"
 
-#include <boost/date_time/compiler_config.hpp>
+#include <ctime>
+#include <iomanip>
+
 #include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/date_time/gregorian/gregorian_types.hpp>
-#include <ctime>
 #include <gutil/strings/substitute.h>
 
 #include "exprs/anyval-util.h"
 #include "runtime/datetime-simple-date-format-parser.h"
-#include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.inline.h"
 #include "runtime/timestamp-value.h"
 #include "udf/udf.h"
@@ -64,25 +64,21 @@ StringVal TimestampFunctions::StringValFromTimestamp(FunctionContext* context,
   DateTimeFormatContext* dt_ctx = reinterpret_cast<DateTimeFormatContext*>(state);
   if (!context->IsArgConstant(1)) {
     dt_ctx->Reset(reinterpret_cast<const char*>(fmt.ptr), fmt.len);
-    if (!SimpleDateFormatTokenizer::Tokenize(dt_ctx)){
+    if (!SimpleDateFormatTokenizer::Tokenize(dt_ctx, FORMAT)){
       ReportBadFormat(context, datetime_parse_util::GENERAL_ERROR, fmt, false);
       return StringVal::null();
     }
   }
 
-  string formatted_timestamp = tv.Format(*dt_ctx);
-  if (formatted_timestamp.empty()) return StringVal::null();
-  StringVal result = AnyValUtil::FromString(context, formatted_timestamp);
-  return result;
+  return tv.ToStringVal(context, *dt_ctx);
 }
 
 template <class TIME>
 StringVal TimestampFunctions::FromUnix(FunctionContext* context, const TIME& intp) {
   if (intp.is_null) return StringVal::null();
   const TimestampValue tv = TimestampValue::FromUnixTime(intp.val,
-      context->impl()->state()->local_time_zone());
-  if (!tv.HasDateAndTime()) return StringVal::null();
-  return AnyValUtil::FromString(context, tv.ToString());
+      context->impl()->state()->time_zone_for_unix_time_conversions());
+  return tv.ToStringVal(context);
 }
 
 template <class TIME>
@@ -95,7 +91,7 @@ StringVal TimestampFunctions::FromUnix(FunctionContext* context, const TIME& int
   if (intp.is_null) return StringVal::null();
 
   const TimestampValue& t = TimestampValue::FromUnixTime(intp.val,
-      context->impl()->state()->local_time_zone());
+      context->impl()->state()->time_zone_for_unix_time_conversions());
   return StringValFromTimestamp(context, t, fmt);
 }
 
@@ -104,23 +100,23 @@ BigIntVal TimestampFunctions::Unix(FunctionContext* context, const StringVal& st
   const TimestampVal& tv_val = ToTimestamp(context, string_val, fmt);
   if (tv_val.is_null) return BigIntVal::null();
   const TimestampValue& tv = TimestampValue::FromTimestampVal(tv_val);
+  const Timezone* tz = context->impl()->state()->time_zone_for_unix_time_conversions();
   time_t result;
-  return (tv.ToUnixTime(context->impl()->state()->local_time_zone(), &result)) ?
-      BigIntVal(result) : BigIntVal::null();
+  return (tv.ToUnixTime(tz, &result)) ? BigIntVal(result) : BigIntVal::null();
 }
 
 BigIntVal TimestampFunctions::Unix(FunctionContext* context, const TimestampVal& ts_val) {
   if (ts_val.is_null) return BigIntVal::null();
   const TimestampValue& tv = TimestampValue::FromTimestampVal(ts_val);
+  const Timezone* tz = context->impl()->state()->time_zone_for_unix_time_conversions();
   time_t result;
-  return (tv.ToUnixTime(context->impl()->state()->local_time_zone(), &result)) ?
-      BigIntVal(result) : BigIntVal::null();
+  return (tv.ToUnixTime(tz, &result)) ? BigIntVal(result) : BigIntVal::null();
 }
 
 BigIntVal TimestampFunctions::Unix(FunctionContext* context) {
   time_t result;
-  if (context->impl()->state()->now()->ToUnixTime(
-      context->impl()->state()->local_time_zone(), &result)) {
+  const Timezone* tz = context->impl()->state()->time_zone_for_unix_time_conversions();
+  if (context->impl()->state()->now()->ToUnixTime(tz, &result)) {
     return BigIntVal(result);
   } else {
     return BigIntVal::null();
@@ -147,8 +143,8 @@ TimestampVal TimestampFunctions::UnixMicrosToUtcTimestamp(FunctionContext* conte
 TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
     const BigIntVal& bigint_val) {
   if (bigint_val.is_null) return TimestampVal::null();
-  const TimestampValue& tv = TimestampValue::FromUnixTime(bigint_val.val,
-      context->impl()->state()->local_time_zone());
+  const Timezone* tz = context->impl()->state()->time_zone_for_unix_time_conversions();
+  const TimestampValue& tv = TimestampValue::FromUnixTime(bigint_val.val, tz);
   TimestampVal tv_val;
   tv.ToTimestampVal(&tv_val);
   return tv_val;
@@ -164,11 +160,11 @@ TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
   void* state = context->GetFunctionState(FunctionContext::THREAD_LOCAL);
   DateTimeFormatContext* dt_ctx = reinterpret_cast<DateTimeFormatContext*>(state);
   if (!context->IsArgConstant(1)) {
-     dt_ctx->Reset(reinterpret_cast<const char*>(fmt.ptr), fmt.len);
-     if (!SimpleDateFormatTokenizer::Tokenize(dt_ctx)) {
-       ReportBadFormat(context, datetime_parse_util::GENERAL_ERROR, fmt, false);
-       return TimestampVal::null();
-     }
+    dt_ctx->Reset(reinterpret_cast<const char*>(fmt.ptr), fmt.len);
+    if (!SimpleDateFormatTokenizer::Tokenize(dt_ctx, PARSE)) {
+      ReportBadFormat(context, datetime_parse_util::GENERAL_ERROR, fmt, false);
+      return TimestampVal::null();
+    }
   }
   const TimestampValue& tv = TimestampValue::ParseSimpleDateFormat(
       reinterpret_cast<const char*>(date.ptr), date.len, *dt_ctx);
@@ -190,9 +186,9 @@ BigIntVal TimestampFunctions::UnixFromString(FunctionContext* context,
   if (sv.is_null) return BigIntVal::null();
   const TimestampValue& tv = TimestampValue::ParseSimpleDateFormat(
       reinterpret_cast<const char *>(sv.ptr), sv.len);
+  const Timezone* tz = context->impl()->state()->time_zone_for_unix_time_conversions();
   time_t result;
-  return (tv.ToUnixTime(context->impl()->state()->local_time_zone(), &result)) ?
-      BigIntVal(result) : BigIntVal::null();
+  return (tv.ToUnixTime(tz, &result)) ? BigIntVal(result) : BigIntVal::null();
 }
 
 IntVal TimestampFunctions::Year(FunctionContext* context, const TimestampVal& ts_val) {
@@ -277,6 +273,47 @@ IntVal TimestampFunctions::Millisecond(FunctionContext* context,
   const TimestampValue& ts_value = TimestampValue::FromTimestampVal(ts_val);
   if (!ts_value.HasTime()) return IntVal::null();
   const boost::posix_time::time_duration& time = ts_value.time();
+  return IntVal(time.total_milliseconds() - time.total_seconds() * 1000);
+}
+
+bool StringToTimeOfDay(
+    const StringVal& str_val, boost::posix_time::time_duration* time) {
+  if (str_val.is_null) return false;
+  boost::gregorian::date dummy_date;
+  return TimestampParser::ParseSimpleDateFormat(
+      reinterpret_cast<char*>(str_val.ptr), str_val.len, &dummy_date, time, true);
+}
+
+IntVal TimestampFunctions::Hour(FunctionContext* context, const StringVal& str_val) {
+  boost::posix_time::time_duration time;
+  if (!StringToTimeOfDay(str_val, &time)) {
+    return IntVal::null();
+  }
+  return IntVal(time.hours());
+}
+
+IntVal TimestampFunctions::Minute(FunctionContext* context, const StringVal& str_val) {
+  boost::posix_time::time_duration time;
+  if (!StringToTimeOfDay(str_val, &time)) {
+    return IntVal::null();
+  }
+  return IntVal(time.minutes());
+}
+
+IntVal TimestampFunctions::Second(FunctionContext* context, const StringVal& str_val) {
+  boost::posix_time::time_duration time;
+  if (!StringToTimeOfDay(str_val, &time)) {
+    return IntVal::null();
+  }
+  return IntVal(time.seconds());
+}
+
+IntVal TimestampFunctions::Millisecond(
+    FunctionContext* context, const StringVal& str_val) {
+  boost::posix_time::time_duration time;
+  if (!StringToTimeOfDay(str_val, &time)) {
+    return IntVal::null();
+  }
   return IntVal(time.total_milliseconds() - time.total_seconds() * 1000);
 }
 
@@ -502,15 +539,20 @@ StringVal TimestampFunctions::TimeOfDay(FunctionContext* context) {
   IntVal sec = Second(context, curr);
   IntVal year = Year(context, curr);
 
-  // Calculate 'start' time point at which query execution started.
-  cctz::time_point<cctz::sys_seconds> start = UnixTimeToTimePoint(
-      context->impl()->state()->query_ctx().start_unix_millis / MILLIS_PER_SEC);
-  // Find 'tz_name' time-zone abbreviation that corresponds to 'local_time_zone' at
-  // 'start' time point.
-  cctz::time_zone::absolute_lookup start_lookup =
-      context->impl()->state()->local_time_zone().lookup(start);
-  const string& tz_name = (start_lookup.abbr != nullptr) ? start_lookup.abbr :
-      context->impl()->state()->local_time_zone().name();
+  string tz_name;
+  if (context->impl()->state()->local_time_zone() != UTCPTR) {
+    // Calculate 'start' time point at which query execution started.
+    cctz::time_point<cctz::sys_seconds> start = UnixTimeToTimePoint(
+        context->impl()->state()->query_ctx().start_unix_millis / MILLIS_PER_SEC);
+    // Find 'tz_name' time-zone abbreviation that corresponds to 'local_time_zone' at
+    // 'start' time point.
+    cctz::time_zone::absolute_lookup start_lookup =
+        context->impl()->state()->local_time_zone()->lookup(start);
+    tz_name = (start_lookup.abbr != nullptr) ? start_lookup.abbr :
+        context->impl()->state()->local_time_zone()->name();
+  } else {
+    tz_name = "UTC";
+  }
 
   stringstream result;
   result << day << " " << month << " " << setw(2) << setfill('0')

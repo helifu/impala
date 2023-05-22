@@ -17,15 +17,19 @@
 
 # Test behaviors specific to --use_local_catalog being enabled.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
-import Queue
+import queue
 import random
+import re
 import threading
 import time
 
 from multiprocessing.pool import ThreadPool
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
+from tests.common.skip import SkipIfHive2, SkipIfFS
 from tests.util.filesystem_utils import WAREHOUSE
 
 RETRY_PROFILE_MSG = 'Retried query planning due to inconsistent metadata'
@@ -141,18 +145,73 @@ class TestCompactCatalogUpdates(CustomClusterTestSuite):
       # catalog pushes a new topic update.
       self.cluster.catalogd.start()
       NUM_ATTEMPTS = 30
-      for attempt in xrange(NUM_ATTEMPTS):
+      for attempt in range(NUM_ATTEMPTS):
         try:
           self.assert_impalad_log_contains('WARNING', 'Detected catalog service restart')
           err = self.execute_query_expect_failure(client, "select * from %s" % view)
           assert "Could not resolve table reference" in str(err)
           break
-        except Exception, e:
+        except Exception as e:
           assert attempt < NUM_ATTEMPTS - 1, str(e)
         time.sleep(1)
 
     finally:
       client.close()
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    impalad_args="--use_local_catalog=true",
+    catalogd_args="--catalog_topic_mode=minimal "
+                  "--enable_incremental_metadata_updates=true")
+  def test_invalidate_stale_partitions(self, unique_database):
+    """
+    Test that partition level invalidations are sent from catalogd and processed
+    correctly in coordinators.
+    TODO: Currently, there are no ways to get the cached partition ids in a LocalCatalog
+     coordinator. So this test infers them based on the query pattern. However, this
+     depends on the implementation details of catalogd which will evolve and may have to
+     change the partition ids in this test. A more robust ways is a) get the cached
+     partition id of a partition, b) run a DML on this partition, c) verify the old
+     partition id is invalidate.
+    """
+    # Creates a partitioned table and inits 3 partitions on it. They are the first 3
+    # partitions loaded in catalogd. So their partition ids are 0,1,2.
+    self.execute_query("use " + unique_database)
+    self.execute_query("create table my_part (id int) partitioned by (p int)")
+    self.execute_query("alter table my_part add partition (p=0)")
+    self.execute_query("alter table my_part add partition (p=1)")
+    self.execute_query("alter table my_part add partition (p=2)")
+    # Trigger a query on all partitions so they are loaded in local catalog cache.
+    self.execute_query("select count(*) from my_part")
+    # Update all partitions. We should receive invalidations for partition id=0,1,2.
+    self.execute_query("insert into my_part partition(p) values (0,0),(1,1),(2,2)")
+
+    log_regex = "Invalidated objects in cache: \[partition %s.my_part:p=\d \(id=%%d\)\]"\
+                % unique_database
+    self.assert_impalad_log_contains('INFO', log_regex % 0)
+    self.assert_impalad_log_contains('INFO', log_regex % 1)
+    self.assert_impalad_log_contains('INFO', log_regex % 2)
+
+    # Trigger a query on all partitions so partitions with id=3,4,5 are loaded in local
+    # catalog cache.
+    self.execute_query("select count(*) from my_part")
+    # Update all partitions. We should receive invalidations for partition id=3,4,5.
+    # The new partitions are using id=6,7,8.
+    self.execute_query(
+        "insert overwrite my_part partition(p) values (0,0),(1,1),(2,2)")
+    self.assert_impalad_log_contains('INFO', log_regex % 3)
+    self.assert_impalad_log_contains('INFO', log_regex % 4)
+    self.assert_impalad_log_contains('INFO', log_regex % 5)
+
+    # Repeat the same test on non-partitioned tables
+    self.execute_query("create table my_tbl (id int)")
+    # Trigger a query to load the only partition which has partition id = 9.
+    self.execute_query("select count(*) from my_tbl")
+    # Update the table. So we should receive an invalidation on partition id = 9.
+    self.execute_query("insert into my_tbl select 0")
+    self.assert_impalad_log_contains(
+        'INFO', "Invalidated objects in cache: \[partition %s.my_tbl: \(id=9\)\]"
+                % unique_database)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -202,7 +261,7 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
     inconsistent_seen = [0]
     inconsistent_seen_lock = threading.Lock()
     # Tracks query failures for all other reasons.
-    failed_queries = Queue.Queue()
+    failed_queries = queue.Queue()
     try:
       client1 = self.cluster.impalads[0].service.create_beeswax_client()
       client2 = self.cluster.impalads[1].service.create_beeswax_client()
@@ -215,8 +274,9 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
           q = random.choice(queries)
           attempt += 1
           try:
+            print('Attempt', attempt, 'client', str(client))
             ret = self.execute_query_unchecked(client, q)
-          except Exception, e:
+          except Exception as e:
             if 'InconsistentMetadataFetchException' in str(e):
               with inconsistent_seen_lock:
                 inconsistent_seen[0] += 1
@@ -229,7 +289,8 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
         t.start()
       for t in threads:
         # When there are failures, they're observed quickly.
-        t.join(30)
+        # 600s is enough for 200 attempts.
+        t.join(600)
 
       assert failed_queries.empty(),\
           "Failed query count non zero: %s" % list(failed_queries.queue)
@@ -260,7 +321,8 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args="--use_local_catalog=true --local_catalog_max_fetch_retries=0",
+      impalad_args="--use_local_catalog=true --local_catalog_max_fetch_retries=0"
+                   " --inject_latency_before_catalog_fetch_ms=500",
       catalogd_args="--catalog_topic_mode=minimal")
   def test_replan_limit(self):
     """
@@ -268,7 +330,8 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
     an inconsistent metadata exception when running concurrent reads/writes
     is seen. With the max retries set to 0, no retries are expected and with
     the concurrent read/write workload, an inconsistent metadata exception is
-    expected.
+    expected. Setting inject_latency_before_catalog_fetch_ms to increases the
+    possibility of a stale request which throws the expected exception.
     """
     queries = [
       'refresh functional.alltypes',
@@ -315,7 +378,7 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
       replans_seen_lock = threading.Lock()
 
       # Queue to propagate exceptions from failed queries, if any.
-      failed_queries = Queue.Queue()
+      failed_queries = queue.Queue()
 
       def stress_thread(client):
         while replans_seen[0] == 0:
@@ -383,9 +446,8 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
     # Prior to fixing IMPALA-7534, this test would fail within 20-30 iterations,
     # so 100 should be quite reliable as a regression test.
     NUM_ITERS = 100
-    for i in t.imap_unordered(do_table, xrange(NUM_ITERS)):
+    for i in t.imap_unordered(do_table, range(NUM_ITERS)):
       pass
-
 
 class TestObservability(CustomClusterTestSuite):
   def get_catalog_cache_metrics(self, impalad):
@@ -432,7 +494,7 @@ class TestObservability(CustomClusterTestSuite):
           "explain select count(*) from functional.alltypes",
           "create table %s (a int)" % test_table_name,
           "drop table %s" % test_table_name]
-      for _ in xrange(0, 10):
+      for _ in range(0, 10):
         for query in queries_to_test:
           ret = self.execute_query_expect_success(client, query)
           assert ret.runtime_profile.count("Frontend:") == 1
@@ -454,3 +516,81 @@ class TestObservability(CustomClusterTestSuite):
           cache_request_count_prev_run = cache_request_count
     finally:
       client.close()
+
+
+class TestFullAcid(CustomClusterTestSuite):
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @SkipIfHive2.acid
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    impalad_args="--use_local_catalog=true",
+    catalogd_args="--catalog_topic_mode=minimal")
+  def test_full_acid_support(self):
+    """IMPALA-9685: canary test for full acid support in local catalog"""
+    self.execute_query("show create table functional_orc_def.alltypestiny")
+    res = self.execute_query("select id from functional_orc_def.alltypestiny")
+    res.data.sort()
+    assert res.data == ['0', '1', '2', '3', '4', '5', '6', '7']
+
+  @SkipIfHive2.acid
+  @SkipIfFS.hive
+  @pytest.mark.execute_serially
+  def test_full_acid_scans(self, vector, unique_database):
+    self.run_test_case('QueryTest/full-acid-scans', vector, use_db=unique_database)
+
+class TestReusePartitionMetadata(CustomClusterTestSuite):
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    impalad_args="--use_local_catalog=true",
+    catalogd_args="--catalog_topic_mode=minimal")
+  def test_reuse_partition_meta(self, unique_database):
+    """
+    Test that unchanged partition metadata can be shared across table versions.
+    """
+    self.execute_query(
+        "create table %s.alltypes like functional.alltypes" % unique_database)
+    self.execute_query("insert into %s.alltypes partition(year, month) "
+                       "select * from functional.alltypes" % unique_database)
+    # Make sure the table is unloaded either in catalogd or coordinator.
+    self.execute_query("invalidate metadata %s.alltypes" % unique_database)
+    # First time: misses all(24) partitions.
+    self.check_missing_partitions(unique_database, 24, 24)
+    # Second time: hits all(24) partitions.
+    self.check_missing_partitions(unique_database, 0, 24)
+
+    # Alter comment on the table. Partition metadata should be reusable.
+    self.execute_query(
+        "comment on table %s.alltypes is null" % unique_database)
+    self.check_missing_partitions(unique_database, 0, 24)
+
+    # Refresh one partition. Although table version bumps, metadata cache of other
+    # partitions should be reusable.
+    self.execute_query(
+        "refresh %s.alltypes partition(year=2009, month=1)" % unique_database)
+    self.check_missing_partitions(unique_database, 1, 24)
+
+    # Drop one partition. Although table version bumps, metadata cache of existing
+    # partitions should be reusable.
+    self.execute_query(
+        "alter table %s.alltypes drop partition(year=2009, month=1)" % unique_database)
+    self.check_missing_partitions(unique_database, 0, 23)
+
+    # Add back one partition. The partition meta is loaded in catalogd but not the
+    # coordinator. So we still miss its meta. For other partitions, we can reuse them.
+    self.execute_query(
+        "insert into %s.alltypes partition(year=2009, month=1) "
+        "select 0,true,0,0,0,0,0,0,'a','a',NULL" % unique_database)
+    self.check_missing_partitions(unique_database, 1, 24)
+
+  def check_missing_partitions(self, unique_database, partition_misses, total_partitions):
+    """Helper method for checking number of missing partitions while selecting
+     all partitions of the alltypes table"""
+    ret = self.execute_query_expect_success(
+        self.client, "explain select count(*) from %s.alltypes" % unique_database)
+    assert ("partitions=%d" % total_partitions) in ret.get_data()
+    match = re.search(r"CatalogFetch.Partitions.Misses: (\d+)", ret.runtime_profile)
+    assert len(match.groups()) == 1
+    assert match.group(1) == str(partition_misses)

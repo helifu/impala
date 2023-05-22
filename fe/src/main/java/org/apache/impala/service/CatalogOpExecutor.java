@@ -19,29 +19,46 @@ package org.apache.impala.service;
 
 import static org.apache.impala.analysis.Analyzer.ACCESSTYPE_READWRITE;
 
+import com.codahale.metrics.Timer;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
 import com.google.common.base.Stopwatch;
 import com.google.common.collect.Iterables;
-
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
+import javax.annotation.Nullable;
 import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileChecksum;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.common.FileUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
+import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+import org.apache.hadoop.hive.metastore.IMetaStoreClient.NotificationFilter;
 import org.apache.hadoop.hive.metastore.PartitionDropOptions;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.Warehouse;
@@ -53,7 +70,9 @@ import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.DataOperationType;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.api.InsertEventRequestData;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
+import org.apache.hadoop.hive.metastore.api.NotificationEvent;
 import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
@@ -61,23 +80,35 @@ import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
 import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.util.StringUtils;
+import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.mr.Catalogs;
 import org.apache.impala.analysis.AlterTableSortByStmt;
 import org.apache.impala.analysis.FunctionName;
+import org.apache.impala.analysis.KuduPartitionParam;
+import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.authorization.AuthorizationDelta;
 import org.apache.impala.authorization.AuthorizationManager;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.CatalogException;
+import org.apache.impala.catalog.CatalogObject;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.ColumnNotFoundException;
 import org.apache.impala.catalog.ColumnStats;
 import org.apache.impala.catalog.DataSource;
+import org.apache.impala.catalog.DatabaseNotFoundException;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.FeCatalogUtils;
+import org.apache.impala.catalog.FileMetadataLoadOpts;
+import org.apache.impala.catalog.IcebergTable;
+import org.apache.impala.catalog.IcebergTableLoadingException;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.HdfsFileFormat;
@@ -85,6 +116,7 @@ import org.apache.impala.catalog.HdfsPartition;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.HiveStorageDescriptorFactory;
 import org.apache.impala.catalog.IncompleteTable;
+import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.catalog.PartitionNotFoundException;
@@ -97,7 +129,20 @@ import org.apache.impala.catalog.TableNotFoundException;
 import org.apache.impala.catalog.Transaction;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
+import org.apache.impala.catalog.events.DeleteEventLog;
+import org.apache.impala.catalog.events.MetastoreEvents.AddPartitionEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.AlterTableEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.CreateDatabaseEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.CreateTableEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.DropDatabaseEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.DropPartitionEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.DropTableEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEvent;
 import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventPropertyKey;
+import org.apache.impala.catalog.events.MetastoreEventsProcessor;
+import org.apache.impala.catalog.events.MetastoreNotificationException;
+import org.apache.impala.catalog.monitor.CatalogMonitor;
+import org.apache.impala.catalog.monitor.CatalogOperationMetrics;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.ImpalaRuntimeException;
@@ -108,6 +153,9 @@ import org.apache.impala.common.Reference;
 import org.apache.impala.common.TransactionException;
 import org.apache.impala.common.TransactionKeepalive.HeartbeatContext;
 import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.hive.common.MutableValidWriteIdList;
+import org.apache.impala.hive.executor.HiveJavaFunction;
+import org.apache.impala.hive.executor.HiveJavaFunctionFactory;
 import org.apache.impala.thrift.JniCatalogConstants;
 import org.apache.impala.thrift.TAlterDbParams;
 import org.apache.impala.thrift.TAlterDbSetOwnerParams;
@@ -117,16 +165,20 @@ import org.apache.impala.thrift.TAlterTableAddPartitionParams;
 import org.apache.impala.thrift.TAlterTableAlterColParams;
 import org.apache.impala.thrift.TAlterTableDropColParams;
 import org.apache.impala.thrift.TAlterTableDropPartitionParams;
+import org.apache.impala.thrift.TAlterTableExecuteParams;
 import org.apache.impala.thrift.TAlterTableOrViewSetOwnerParams;
 import org.apache.impala.thrift.TAlterTableParams;
 import org.apache.impala.thrift.TAlterTableReplaceColsParams;
 import org.apache.impala.thrift.TAlterTableSetCachedParams;
 import org.apache.impala.thrift.TAlterTableSetFileFormatParams;
 import org.apache.impala.thrift.TAlterTableSetLocationParams;
+import org.apache.impala.thrift.TAlterTableSetPartitionSpecParams;
 import org.apache.impala.thrift.TAlterTableSetRowFormatParams;
 import org.apache.impala.thrift.TAlterTableSetTblPropertiesParams;
 import org.apache.impala.thrift.TAlterTableType;
+import org.apache.impala.thrift.TAlterTableUnSetTblPropertiesParams;
 import org.apache.impala.thrift.TAlterTableUpdateStatsParams;
+import org.apache.impala.thrift.TBucketType;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TCatalogServiceRequestHeader;
@@ -137,6 +189,7 @@ import org.apache.impala.thrift.TColumnStats;
 import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TCommentOnParams;
+import org.apache.impala.thrift.TCopyTestCaseReq;
 import org.apache.impala.thrift.TCreateDataSourceParams;
 import org.apache.impala.thrift.TCreateDbParams;
 import org.apache.impala.thrift.TCreateDropRoleParams;
@@ -147,6 +200,7 @@ import org.apache.impala.thrift.TCreateTableParams;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TDdlExecRequest;
 import org.apache.impala.thrift.TDdlExecResponse;
+import org.apache.impala.thrift.TDdlType;
 import org.apache.impala.thrift.TDropDataSourceParams;
 import org.apache.impala.thrift.TDropDbParams;
 import org.apache.impala.thrift.TDropFunctionParams;
@@ -158,7 +212,11 @@ import org.apache.impala.thrift.TGrantRevokePrivParams;
 import org.apache.impala.thrift.TGrantRevokeRoleParams;
 import org.apache.impala.thrift.THdfsCachingOp;
 import org.apache.impala.thrift.THdfsFileFormat;
-import org.apache.impala.thrift.TCopyTestCaseReq;
+import org.apache.impala.thrift.TIcebergCatalog;
+import org.apache.impala.thrift.TImpalaTableType;
+import org.apache.impala.thrift.TIcebergPartitionSpec;
+import org.apache.impala.thrift.TKuduPartitionParam;
+import org.apache.impala.thrift.TOwnerType;
 import org.apache.impala.thrift.TPartitionDef;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TPartitionStats;
@@ -172,30 +230,27 @@ import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.thrift.TStatus;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.thrift.TTablePropertyType;
 import org.apache.impala.thrift.TTableRowFormat;
 import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.thrift.TTestCaseData;
 import org.apache.impala.thrift.TTruncateParams;
 import org.apache.impala.thrift.TUpdateCatalogRequest;
 import org.apache.impala.thrift.TUpdateCatalogResponse;
-import org.apache.impala.util.CompressionUtil;
+import org.apache.impala.thrift.TUpdatedPartition;
 import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.AcidUtils.TblTransaction;
-import org.apache.impala.util.FunctionUtils;
+import org.apache.impala.util.CatalogOpUtil;
+import org.apache.impala.util.CompressionUtil;
+import org.apache.impala.util.DebugUtils;
 import org.apache.impala.util.HdfsCachingUtil;
+import org.apache.impala.util.IcebergUtil;
 import org.apache.impala.util.KuduUtil;
 import org.apache.impala.util.MetaStoreUtil;
-import org.slf4j.Logger;
+import org.apache.impala.util.MetaStoreUtil.TableInsertEventInfo;
+import org.apache.impala.util.ThreadNameAnnotator;
 import org.apache.thrift.TException;
-
-import com.codahale.metrics.Timer;
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
-
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
@@ -208,21 +263,27 @@ import org.slf4j.LoggerFactory;
  * updates, DDL operations should not directly modify the HMS objects of the catalog
  * objects but should operate on copies instead.
  *
- * The CatalogOpExecutor uses table-level locking to protect table metadata during
- * concurrent modifications and is responsible for assigning a new catalog version when
- * a table is modified (e.g. alterTable()).
+ * The CatalogOpExecutor uses table-level or Db object level locking to protect table
+ * metadata or database metadata respectively during concurrent modifications and is
+ * responsible for assigning a new catalog version when a table/Db is modified
+ * (e.g. alterTable() or alterDb()).
  *
  * The following locking protocol is employed to ensure that modifying
- * the table metadata and assigning a new catalog version is performed atomically and
+ * the table/Db metadata and assigning a new catalog version is performed atomically and
  * consistently in the presence of concurrent DDL operations. The following pattern
  * ensures that the catalog lock is never held for a long period of time, preventing
- * other DDL operations from making progress. This pattern only applies to single-table
+ * other DDL operations from making progress. This pattern only applies to single-table/Db
  * update operations and requires the use of fair table locks to prevent starvation.
+ * Additionally, this locking protocol is also followed in case of CREATE/DROP
+ * FUNCTION. In case of CREATE/DROP FUNCTION, we take the Db object lock since
+ * certain FUNCTION are stored in the HMS database parameters. Using this approach
+ * also makes sure that adding or removing functions from different databases do not
+ * block each other.
  *
  *   DO {
  *     Acquire the catalog lock (see CatalogServiceCatalog.versionLock_)
- *     Try to acquire a table lock
- *     IF the table lock acquisition fails {
+ *     Try to acquire a table/Db lock
+ *     IF the table/Db lock acquisition fails {
  *       Release the catalog lock
  *       YIELD()
  *     ELSE
@@ -233,21 +294,22 @@ import org.slf4j.LoggerFactory;
  *
  *   Increment and get a new catalog version
  *   Release the catalog lock
- *   Modify table metadata
- *   Release table lock
+ *   Modify table/Db metadata
+ *   Release table/Db lock
  *
  * Note: The getCatalogObjects() function is the only case where this locking pattern is
  * not used since it accesses multiple catalog entities in order to compute a snapshot
  * of catalog metadata.
  *
- * Operations that CREATE/DROP catalog objects such as tables and databases employ the
- * following locking protocol:
+ * Operations that CREATE/DROP catalog objects such as tables and databases
+ * (except for functions, see above) employ the following locking protocol:
  * 1. Acquire the metastoreDdlLock_
  * 2. Update the Hive Metastore
  * 3. Increment and get a new catalog version
  * 4. Update the catalog
  * 5. Grant/revoke owner privilege if authorization with ownership is enabled.
  * 6. Release the metastoreDdlLock_
+ *
  *
  * It is imperative that other operations that need to hold both the catalog lock and
  * table locks at the same time follow the same locking protocol and acquire these
@@ -269,7 +331,7 @@ import org.slf4j.LoggerFactory;
 public class CatalogOpExecutor {
   private static final Logger LOG = LoggerFactory.getLogger(CatalogOpExecutor.class);
   // Format string for exceptions returned by Hive Metastore RPCs.
-  private final static String HMS_RPC_ERROR_FORMAT_STR =
+  public final static String HMS_RPC_ERROR_FORMAT_STR =
       "Error making '%s' RPC to Hive Metastore: ";
   // Error string for inconsistent blacklisted dbs/tables configs between catalogd and
   // coordinators.
@@ -277,13 +339,20 @@ public class CatalogOpExecutor {
       "--blacklisted_dbs may be inconsistent between catalogd and coordinators";
   private final static String BLACKLISTED_TABLES_INCONSISTENT_ERR_STR =
       "--blacklisted_tables may be inconsistent between catalogd and coordinators";
-
-  // Table capabilities property name
-  private static final String CAPABILITIES_KEY = "OBJCAPABILITIES";
+  private final static String ALTER_TBL_UNSET_NON_EXIST_PROPERTY =
+      "Please use the following syntax if not sure whether the property existed" +
+      " or not:\nALTER TABLE tableName UNSET (TBLPROPERTIES|SERDEPROPERTIES) IF EXISTS" +
+      " (key1, key2, ...)\n";
+  private final static String ALTER_VIEW_UNSET_NON_EXIST_PROPERTY =
+      "Please use the following syntax if not sure whether the property existed" +
+      " or not:\nALTER VIEW viewName UNSET TBLPROPERTIES IF EXISTS" +
+      " (key1, key2, ...)\n";
 
   // Table default capabilities
   private static final String ACIDINSERTONLY_CAPABILITIES =
       "HIVEMANAGEDINSERTREAD,HIVEMANAGEDINSERTWRITE";
+  private static final String FULLACID_CAPABILITIES =
+      "HIVEFULLACIDREAD";
   private static final String NONACID_CAPABILITIES = "EXTREAD,EXTWRITE";
 
   // The maximum number of partitions to update in one Hive Metastore RPC.
@@ -292,20 +361,30 @@ public class CatalogOpExecutor {
   // PARTITION statement.
   public final static short MAX_PARTITION_UPDATES_PER_RPC = 500;
 
+  // Table capabilities property name
+  public static final String CAPABILITIES_KEY = "OBJCAPABILITIES";
+
   private final CatalogServiceCatalog catalog_;
   private final AuthorizationConfig authzConfig_;
   private final AuthorizationManager authzManager_;
+  private final HiveJavaFunctionFactory hiveJavaFuncFactory_;
+
+  // A singleton monitoring class that keeps track of the catalog usage metrics.
+  private final CatalogOperationMetrics catalogOpMetric_ =
+      CatalogMonitor.INSTANCE.getCatalogOperationMetrics();
 
   // Lock used to ensure that CREATE[DROP] TABLE[DATABASE] operations performed in
   // catalog_ and the corresponding RPC to apply the change in HMS are atomic.
-  private final Object metastoreDdlLock_ = new Object();
+  private final ReentrantLock metastoreDdlLock_ = new ReentrantLock();
 
   public CatalogOpExecutor(CatalogServiceCatalog catalog, AuthorizationConfig authzConfig,
-      AuthorizationManager authzManager) throws ImpalaException {
+      AuthorizationManager authzManager,
+      HiveJavaFunctionFactory hiveJavaFuncFactory) throws ImpalaException {
     Preconditions.checkNotNull(authzManager);
     catalog_ = Preconditions.checkNotNull(catalog);
     authzConfig_ = Preconditions.checkNotNull(authzConfig);
     authzManager_ = Preconditions.checkNotNull(authzManager);
+    hiveJavaFuncFactory_ = Preconditions.checkNotNull(hiveJavaFuncFactory);
   }
 
   public CatalogServiceCatalog getCatalog() { return catalog_; }
@@ -318,110 +397,182 @@ public class CatalogOpExecutor {
     response.setResult(new TCatalogUpdateResult());
     response.getResult().setCatalog_service_id(JniCatalog.getServiceId());
     User requestingUser = null;
+    boolean wantMinimalResult = false;
     if (ddlRequest.isSetHeader()) {
-      requestingUser = new User(ddlRequest.getHeader().getRequesting_user());
+      TCatalogServiceRequestHeader header = ddlRequest.getHeader();
+      if (header.isSetRequesting_user()) {
+        requestingUser = new User(ddlRequest.getHeader().getRequesting_user());
+      }
+      wantMinimalResult = ddlRequest.getHeader().isWant_minimal_response();
     }
+    Optional<TTableName> tTableName = Optional.empty();
+    TDdlType ddl_type = ddlRequest.ddl_type;
+    try {
+      boolean syncDdl = ddlRequest.getQuery_options().isSync_ddl();
+      switch (ddl_type) {
+        case ALTER_DATABASE:
+          TAlterDbParams alter_db_params = ddlRequest.getAlter_db_params();
+          tTableName = Optional.of(new TTableName(alter_db_params.db, ""));
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          alterDatabase(alter_db_params, wantMinimalResult, response);
+          break;
+        case ALTER_TABLE:
+          TAlterTableParams alter_table_params = ddlRequest.getAlter_table_params();
+          tTableName = Optional.of(alter_table_params.getTable_name());
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          alterTable(alter_table_params, ddlRequest.getQuery_options().getDebug_action(),
+              wantMinimalResult, response);
+          break;
+        case ALTER_VIEW:
+          TCreateOrAlterViewParams alter_view_params = ddlRequest.getAlter_view_params();
+          tTableName = Optional.of(alter_view_params.getView_name());
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          alterView(alter_view_params, wantMinimalResult, response);
+          break;
+        case CREATE_DATABASE:
+          TCreateDbParams create_db_params = ddlRequest.getCreate_db_params();
+          tTableName = Optional.of(new TTableName(create_db_params.db, ""));
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          createDatabase(create_db_params, response, syncDdl, wantMinimalResult);
+          break;
+        case CREATE_TABLE_AS_SELECT:
+          TCreateTableParams create_table_as_select_params =
+              ddlRequest.getCreate_table_params();
+          tTableName = Optional.of(create_table_as_select_params.getTable_name());
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          response.setNew_table_created(createTable(create_table_as_select_params,
+              response, syncDdl, wantMinimalResult));
+          break;
+        case CREATE_TABLE:
+          TCreateTableParams create_table_params = ddlRequest.getCreate_table_params();
+          tTableName = Optional.of((create_table_params.getTable_name()));
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          createTable(ddlRequest.getCreate_table_params(), response, syncDdl,
+              wantMinimalResult);
+          break;
+        case CREATE_TABLE_LIKE:
+          TCreateTableLikeParams create_table_like_params =
+              ddlRequest.getCreate_table_like_params();
+          tTableName = Optional.of(create_table_like_params.getTable_name());
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          createTableLike(create_table_like_params, response, syncDdl, wantMinimalResult);
+          break;
+        case CREATE_VIEW:
+          TCreateOrAlterViewParams create_view_params =
+              ddlRequest.getCreate_view_params();
+          tTableName = Optional.of(create_view_params.getView_name());
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          createView(create_view_params, wantMinimalResult, response);
+          break;
+        case CREATE_FUNCTION:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          createFunction(ddlRequest.getCreate_fn_params(), response);
+          break;
+        case CREATE_DATA_SOURCE:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          createDataSource(ddlRequest.getCreate_data_source_params(), response);
+          break;
+        case COMPUTE_STATS:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          Preconditions.checkState(false, "Compute stats should trigger an ALTER TABLE.");
+          break;
+        case DROP_STATS:
+          TDropStatsParams drop_stats_params = ddlRequest.getDrop_stats_params();
+          tTableName = Optional.of(drop_stats_params.getTable_name());
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          dropStats(drop_stats_params, wantMinimalResult, response);
+          break;
+        case DROP_DATABASE:
+          TDropDbParams drop_db_params = ddlRequest.getDrop_db_params();
+          tTableName = Optional.of(new TTableName(drop_db_params.getDb(), ""));
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          dropDatabase(drop_db_params, response);
+          break;
+        case DROP_TABLE:
+        case DROP_VIEW:
+          TDropTableOrViewParams drop_table_or_view_params =
+              ddlRequest.getDrop_table_or_view_params();
+          tTableName = Optional.of(drop_table_or_view_params.getTable_name());
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          // Dropped tables and views are already returned as minimal results, so don't
+          // need to pass down wantMinimalResult here.
+          dropTableOrView(drop_table_or_view_params, response,
+              ddlRequest.getQuery_options().getLock_max_wait_time_s());
+          break;
+        case TRUNCATE_TABLE:
+          TTruncateParams truncate_params = ddlRequest.getTruncate_params();
+          tTableName = Optional.of(truncate_params.getTable_name());
+          catalogOpMetric_.increment(ddl_type, tTableName);
+          truncateTable(truncate_params, wantMinimalResult, response,
+              ddlRequest.getQuery_options().getLock_max_wait_time_s());
+          break;
+        case DROP_FUNCTION:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          dropFunction(ddlRequest.getDrop_fn_params(), response);
+          break;
+        case DROP_DATA_SOURCE:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          dropDataSource(ddlRequest.getDrop_data_source_params(), response);
+          break;
+        case CREATE_ROLE:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          createRole(requestingUser, ddlRequest.getCreate_drop_role_params(), response);
+          break;
+        case DROP_ROLE:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          dropRole(requestingUser, ddlRequest.getCreate_drop_role_params(), response);
+          break;
+        case GRANT_ROLE:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          grantRoleToGroup(
+              requestingUser, ddlRequest.getGrant_revoke_role_params(), response);
+          break;
+        case REVOKE_ROLE:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          revokeRoleFromGroup(
+              requestingUser, ddlRequest.getGrant_revoke_role_params(), response);
+          break;
+        case GRANT_PRIVILEGE:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          grantPrivilege(
+              ddlRequest.getHeader(), ddlRequest.getGrant_revoke_priv_params(), response);
+          break;
+        case REVOKE_PRIVILEGE:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          revokePrivilege(
+              ddlRequest.getHeader(), ddlRequest.getGrant_revoke_priv_params(), response);
+          break;
+        case COMMENT_ON:
+          TCommentOnParams comment_on_params = ddlRequest.getComment_on_params();
+          tTableName = Optional.of(new TTableName("", ""));
+          alterCommentOn(comment_on_params, response, tTableName, wantMinimalResult);
+          break;
+        case COPY_TESTCASE:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          copyTestCaseData(ddlRequest.getCopy_test_case_params(), response);
+          break;
+        default:
+          catalogOpMetric_.increment(ddl_type, Optional.empty());
+          throw new IllegalStateException(
+              "Unexpected DDL exec request type: " + ddl_type);
+      }
 
-    boolean syncDdl = ddlRequest.isSync_ddl();
-    switch (ddlRequest.ddl_type) {
-      case ALTER_DATABASE:
-        alterDatabase(ddlRequest.getAlter_db_params(), response);
-        break;
-      case ALTER_TABLE:
-        alterTable(ddlRequest.getAlter_table_params(), response);
-        break;
-      case ALTER_VIEW:
-        alterView(ddlRequest.getAlter_view_params(), response);
-        break;
-      case CREATE_DATABASE:
-        createDatabase(ddlRequest.getCreate_db_params(), response);
-        break;
-      case CREATE_TABLE_AS_SELECT:
-        response.setNew_table_created(createTable(
-            ddlRequest.getCreate_table_params(), response, syncDdl));
-        break;
-      case CREATE_TABLE:
-        createTable(ddlRequest.getCreate_table_params(), response, syncDdl);
-        break;
-      case CREATE_TABLE_LIKE:
-        createTableLike(ddlRequest.getCreate_table_like_params(), response, syncDdl);
-        break;
-      case CREATE_VIEW:
-        createView(ddlRequest.getCreate_view_params(), response);
-        break;
-      case CREATE_FUNCTION:
-        createFunction(ddlRequest.getCreate_fn_params(), response);
-        break;
-      case CREATE_DATA_SOURCE:
-        createDataSource(ddlRequest.getCreate_data_source_params(), response);
-        break;
-      case COMPUTE_STATS:
-        Preconditions.checkState(false, "Compute stats should trigger an ALTER TABLE.");
-        break;
-      case DROP_STATS:
-        dropStats(ddlRequest.getDrop_stats_params(), response);
-        break;
-      case DROP_DATABASE:
-        dropDatabase(ddlRequest.getDrop_db_params(), response);
-        break;
-      case DROP_TABLE:
-      case DROP_VIEW:
-        dropTableOrView(ddlRequest.getDrop_table_or_view_params(), response);
-        break;
-      case TRUNCATE_TABLE:
-        truncateTable(ddlRequest.getTruncate_params(), response);
-        break;
-      case DROP_FUNCTION:
-        dropFunction(ddlRequest.getDrop_fn_params(), response);
-        break;
-      case DROP_DATA_SOURCE:
-        dropDataSource(ddlRequest.getDrop_data_source_params(), response);
-        break;
-      case CREATE_ROLE:
-        createRole(requestingUser, ddlRequest.getCreate_drop_role_params(), response);
-        break;
-      case DROP_ROLE:
-        dropRole(requestingUser, ddlRequest.getCreate_drop_role_params(), response);
-        break;
-      case GRANT_ROLE:
-        grantRoleToGroup(requestingUser, ddlRequest.getGrant_revoke_role_params(),
-            response);
-        break;
-      case REVOKE_ROLE:
-        revokeRoleFromGroup(requestingUser, ddlRequest.getGrant_revoke_role_params(),
-            response);
-        break;
-      case GRANT_PRIVILEGE:
-        grantPrivilege(ddlRequest.getHeader(), ddlRequest.getGrant_revoke_priv_params(),
-            response);
-        break;
-      case REVOKE_PRIVILEGE:
-        revokePrivilege(ddlRequest.getHeader(), ddlRequest.getGrant_revoke_priv_params(),
-            response);
-        break;
-      case COMMENT_ON:
-        alterCommentOn(ddlRequest.getComment_on_params(), response);
-        break;
-      case COPY_TESTCASE:
-        copyTestCaseData(ddlRequest.getCopy_test_case_params(), response);
-        break;
-      default: throw new IllegalStateException("Unexpected DDL exec request type: " +
-          ddlRequest.ddl_type);
+      // If SYNC_DDL is set, set the catalog update that contains the results of this DDL
+      // operation. The version of this catalog update is returned to the requesting
+      // impalad which will wait until this catalog update has been broadcast to all the
+      // coordinators.
+      if (syncDdl) {
+        response.getResult().setVersion(
+            catalog_.waitForSyncDdlVersion(response.getResult()));
+      }
+
+      // At this point, the operation is considered successful. If any errors occurred
+      // during execution, this function will throw an exception and the CatalogServer
+      // will handle setting a bad status code.
+      response.getResult().setStatus(new TStatus(TErrorCode.OK, new ArrayList<String>()));
+    } finally {
+      catalogOpMetric_.decrement(ddl_type, tTableName);
     }
-
-    // If SYNC_DDL is set, set the catalog update that contains the results of this DDL
-    // operation. The version of this catalog update is returned to the requesting
-    // impalad which will wait until this catalog update has been broadcast to all the
-    // coordinators.
-    if (syncDdl) {
-      response.getResult().setVersion(
-          catalog_.waitForSyncDdlVersion(response.getResult()));
-    }
-
-    // At this point, the operation is considered successful. If any errors occurred
-    // during execution, this function will throw an exception and the CatalogServer
-    // will handle setting a bad status code.
-    response.getResult().setStatus(new TStatus(TErrorCode.OK, new ArrayList<String>()));
     return response;
   }
 
@@ -498,11 +649,11 @@ public class CatalogOpExecutor {
         // The table lock is needed here since toTCatalogObject() calls Table#toThrift()
         // which expects the current thread to hold this lock. For more details refer
         // to IMPALA-4092.
-        t.getLock().lock();
+        t.takeReadLock();
         try {
           response.result.addToUpdated_catalog_objects(t.toTCatalogObject());
         } finally {
-          t.getLock().unlock();
+          t.releaseReadLock();
         }
       }
     }
@@ -537,10 +688,284 @@ public class CatalogOpExecutor {
    * This method checks if the write lock of 'catalog_' is unlocked. If it's still locked
    * then it logs an error and unlocks it.
    */
-  private void UnlockWriteLockIfErronouslyLocked() {
+  public void UnlockWriteLockIfErronouslyLocked() {
     if(catalog_.getLock().isWriteLockedByCurrentThread()) {
       LOG.error("Write lock should have been released.");
       catalog_.getLock().writeLock().unlock();
+    }
+  }
+
+  /**
+   * Remove a catalog table based on the given metastore table if it exists and its
+   * id matches with the id of the table in Catalog.
+   *
+   * @param eventId Event Id being processed.
+   * @param dbName Database name of the table to be removed.
+   * @param tblName Name of the table to be removed.
+   * @param tblAddedLater is set to true if the table was not removed because it was
+   *                      created after the event id being processed.
+   * @return True if the table was removed; False otherwise.
+   */
+  public boolean removeTableIfNotAddedLater(long eventId,
+      String dbName, String tblName, Reference<Boolean> tblAddedLater) {
+    tblAddedLater.setRef(false);
+    getMetastoreDdlLock().lock();
+    try {
+      Db db = catalog_.getDb(dbName);
+      if (db == null) {
+        LOG.debug("EventId: {} Not removing the table since database {} does not exist",
+            eventId, dbName);
+        return false;
+      }
+
+      Table tblToBeRemoved = db.getTable(tblName);
+      if (tblToBeRemoved == null) {
+        LOG.debug("EventId: {} Not removing the table since table {} does not exist",
+            eventId, tblName);
+        return false;
+      }
+      // if the table exists, we must make sure that it was not created by this catalog
+      // since the event was generated.
+      if (eventId <= tblToBeRemoved.getCreateEventId()) {
+        LOG.debug(
+            "EventId: {} Not removing the table {} table's create event id is {} ",
+            eventId, new TableName(dbName, tblName), tblToBeRemoved.getCreateEventId());
+        tblAddedLater.setRef(true);
+        return false;
+      }
+      Table removedTbl = db.removeTable(tblToBeRemoved.getName());
+      removedTbl.setCatalogVersion(catalog_.incrementAndGetCatalogVersion());
+      catalog_.getDeleteLog().addRemovedObject(removedTbl.toMinimalTCatalogObject());
+      return true;
+    } finally {
+      getMetastoreDdlLock().unlock();
+    }
+  }
+
+  /**
+   * Adds the given table to the catalog if it does not exists and if there is
+   * no removal event found the deleteEventLog which is greater than the given eventId.
+   * @return true if the table was successfully added; Otherwise returns false.
+   * @throws DatabaseNotFoundException if the db is not found.
+   */
+  public boolean addTableIfNotRemovedLater(long eventId,
+      org.apache.hadoop.hive.metastore.api.Table msTbl) throws DatabaseNotFoundException {
+    getMetastoreDdlLock().lock();
+    try {
+      String dbName = msTbl.getDbName();
+      Db db = catalog_.getDb(dbName);
+      DeleteEventLog deleteEventLog = catalog_.getMetastoreEventProcessor()
+          .getDeleteEventLog();
+      if (db == null) {
+        // if db is not found in the catalog, check if it was removed since the event
+        // was generated.
+        if (!deleteEventLog.wasRemovedAfter(eventId,
+            DeleteEventLog.getDbKey(msTbl.getDbName()))) {
+          throw new DatabaseNotFoundException(dbName + " not found");
+        }
+        LOG.debug(
+            "EventId: {} Table was not added since the database {} was removed later",
+            eventId, dbName);
+        return false;
+      }
+      String tblName = msTbl.getTableName();
+      Table existingTable = db.getTable(tblName);
+      if (existingTable != null) {
+        LOG.debug("EventId: {} Table {} was not added since "
+                + "it already exists in catalog.", eventId, existingTable.getFullName());
+        if (existingTable.getCreateEventId() != eventId) {
+          LOG.warn("Existing table {} create event Id: {} does not match the "
+                  + "event id: {}", existingTable.getFullName(),
+              existingTable.getCreateEventId(), eventId);
+        }
+        return false;
+      }
+      // table does not exist in catalog. We must make sure that the table was
+      // not removed since the event was generated.
+      if (deleteEventLog.wasRemovedAfter(eventId, DeleteEventLog.getKey(msTbl))) {
+        LOG.debug(
+            "EventId: {} Table was not added since it was removed later", eventId);
+        return false;
+      }
+      Table incompleteTable = IncompleteTable.createUninitializedTable(db, tblName,
+          MetastoreShim.mapToInternalTableType(msTbl.getTableType()),
+          MetadataOp.getTableComment(msTbl));
+      incompleteTable.setCatalogVersion(catalog_.incrementAndGetCatalogVersion());
+      // set the createEventId of the table to eventId since we are adding table
+      // due to the given eventId.
+      incompleteTable.setCreateEventId(eventId);
+      db.addTable(incompleteTable);
+      return true;
+    } finally {
+      getMetastoreDdlLock().unlock();
+    }
+  }
+
+  /**
+   * Renames a table based on the event. The rename operation is implemented by
+   * removing the old table and adding an IncompleteTable with the new name.
+   *
+   * @param eventId The eventId which is being processed.
+   * @param msTblBefore The table object before the rename was done.
+   * @param msTblAfter The table object after the rename was processed by metastore.
+   * @param oldTblRemoved This reference is set if the old table was found and removed
+   *                      from catalogd.
+   * @param newTblAdded This reference is set if new table is added to the catalogd.
+   * @throws CatalogException If the rename event could not processed because the
+   * table lock could not acquired.
+   */
+  public void renameTableFromEvent(long eventId,
+      org.apache.hadoop.hive.metastore.api.Table msTblBefore,
+      org.apache.hadoop.hive.metastore.api.Table msTblAfter,
+      Reference<Boolean> oldTblRemoved, Reference<Boolean> newTblAdded)
+      throws CatalogException {
+    getMetastoreDdlLock().lock();
+    try {
+      Table tblBefore = null;
+      try {
+        tblBefore = catalog_
+            .getTable(msTblBefore.getDbName(), msTblBefore.getTableName());
+      } catch (DatabaseNotFoundException e) {
+        // ignore if the database is not found; we consider it same as table
+        // not found and we don't remove it.
+      }
+      boolean beforeTblLocked = false;
+      try {
+        if (tblBefore != null) {
+          // if the before table exists, then we must take a lock on it so that
+          // we block any other concurrent operations on it.
+          tryWriteLock(tblBefore, "ALTER_TABLE RENAME EVENT");
+          beforeTblLocked = true;
+          catalog_.getLock().writeLock().unlock();
+        }
+        Reference<Boolean> tableAddedLater = new Reference<>();
+        boolean tblRemoved = removeTableIfNotAddedLater(eventId,
+            msTblBefore.getDbName(), msTblBefore.getTableName(), tableAddedLater);
+        oldTblRemoved.setRef(tblRemoved);
+        if (!tblRemoved) {
+          LOG.debug("EventId: {} original table not removed since {}", eventId,
+              (tableAddedLater.getRef() ? "it is added later"
+                  : "it doesn't exist anymore"));
+        }
+        boolean tblAdded = addTableIfNotRemovedLater(eventId, msTblAfter);
+        newTblAdded.setRef(tblAdded);
+      } catch (InternalException e) {
+        throw new CatalogException(
+            "Unable to process rename table event " + eventId, e);
+      } finally {
+        UnlockWriteLockIfErronouslyLocked();
+        if (beforeTblLocked) tblBefore.releaseWriteLock();
+      }
+    } finally {
+      getMetastoreDdlLock().unlock();
+    }
+  }
+
+  /**
+   * Adds a database to the catalogd if it does not exists or if it was not removed
+   * since the event was generated.
+   * @param eventId The eventId being processed.
+   * @param msDb the {@link Database} object to be added to catalogd.
+   * @return True if the database was added, false otherwise.
+   */
+  public boolean addDbIfNotRemovedLater(
+      long eventId, org.apache.hadoop.hive.metastore.api.Database msDb) {
+    getMetastoreDdlLock().lock();
+    try {
+      String dbName = msDb.getName();
+      Db db = catalog_.getDb(dbName);
+      DeleteEventLog deleteEventLog = catalog_.getMetastoreEventProcessor()
+          .getDeleteEventLog();
+      if (db == null) {
+        if (!deleteEventLog.wasRemovedAfter(eventId, DeleteEventLog.getKey(msDb))) {
+          catalog_.addDb(dbName, msDb, eventId);
+          return true;
+        }
+      }
+      return false;
+    } finally {
+      getMetastoreDdlLock().unlock();
+    }
+  }
+
+  /**
+   * Removes the database from catalogd if it exists and has not been added since the
+   * eventId was generated.
+   * @param eventId The eventId being processed.
+   * @param dbName Metastore db name used to remove Db from Catalog
+   * @return true if the database was removed; else false.
+   */
+  public boolean removeDbIfNotAddedLater(long eventId, String dbName) {
+    getMetastoreDdlLock().lock();
+    try {
+      Db catalogDb = catalog_.getDb(dbName);
+      if (catalogDb == null) {
+        LOG.info(
+            "EventId: {} Skipping the event since database {} does not exist anymore",
+            eventId, dbName);
+        return false;
+      }
+      // if this database has been created after this drop database event is generated
+      // the createdEventId of the database will be higher than eventId. In such case
+      // if means that catalog has recreated this database again and events processor
+      // is just receiving the earlier drop database event. We should ignore such event.
+      if (catalogDb.getCreateEventId() > eventId) {
+        LOG.info(
+            "EventId: {} Not removing the database {} since the create event id is {}",
+            eventId, dbName, catalogDb.getCreateEventId());
+        return false;
+      }
+      catalog_.removeDb(dbName);
+      return true;
+    } finally {
+      getMetastoreDdlLock().unlock();
+    }
+  }
+
+  /**
+   * Updates the catalog db with alteredMsDb. To do so, first acquire lock on catalog db
+   * and then metastore db is updated. Also update the event id in the db.
+   * No update is done if the catalog db is already synced till this event id
+   * @param eventId: HMS event id for this alter db operation
+   * @param alteredMsDb: metastore db to update in catalogd
+   * @return: true if metastore db was updated in catalog's db
+   *          false otherwise
+   */
+  public boolean alterDbIfExists(long eventId,
+      org.apache.hadoop.hive.metastore.api.Database alteredMsDb) {
+    Preconditions.checkNotNull(alteredMsDb);
+    String dbName = alteredMsDb.getName();
+    Db dbToAlter = catalog_.getDb(dbName);
+    if (dbToAlter == null) {
+      LOG.debug("Event id: {}, not altering db {} since it does not exist in catalogd",
+          eventId, dbName);
+      return false;
+    }
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls();
+    boolean dbLocked = false;
+    try {
+      tryLock(dbToAlter, String.format("alter db from event id: %s", eventId));
+      catalog_.getLock().writeLock().unlock();
+      dbLocked = true;
+      if (syncToLatestEventId && dbToAlter.getLastSyncedEventId() >= eventId) {
+        LOG.debug("Not altering db {} from event id: {} since db is already synced "
+                + "till event id: {}", dbName, eventId, dbToAlter.getLastSyncedEventId());
+        return false;
+      }
+      boolean success = catalog_.updateDbIfExists(alteredMsDb);
+      if (success) {
+        dbToAlter.setLastSyncedEventId(eventId);
+      }
+      return success;
+    } catch (Exception e) {
+      LOG.error("Event id: {}, failed to alter db {}. Error message: {}", eventId, dbName,
+          e.getMessage());
+      return false;
+    } finally {
+      if (dbLocked) {
+        dbToAlter.getLock().unlock();
+      }
     }
   }
 
@@ -549,7 +974,8 @@ public class CatalogOpExecutor {
    * table metadata, except for RENAME, ADD PARTITION and DROP PARTITION. This call is
    * thread-safe, i.e. concurrent operations on the same table are serialized.
    */
-  private void alterTable(TAlterTableParams params, TDdlExecResponse response)
+  private void alterTable(TAlterTableParams params, @Nullable String debugAction,
+      boolean wantMinimalResult, TDdlExecResponse response)
       throws ImpalaException {
     // When true, loads the file/block metadata.
     boolean reloadFileMetadata = false;
@@ -569,7 +995,9 @@ public class CatalogOpExecutor {
           String.format("Can't rename to blacklisted table name: %s. %s", newTableName,
               BLACKLISTED_DBS_INCONSISTENT_ERR_STR));
     }
-    tryLock(tbl);
+    tryWriteLock(tbl);
+    // get table's catalogVersion before altering it
+    long oldCatalogVersion = tbl.getCatalogVersion();
     // Get a new catalog version to assign to the table being altered.
     long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
     addCatalogServiceIdentifiers(tbl, catalog_.getCatalogServiceId(), newCatalogVersion);
@@ -583,7 +1011,7 @@ public class CatalogOpExecutor {
         try {
           alterTableOrViewRename(tbl,
               TableName.fromThrift(params.getRename_params().getNew_table_name()),
-              response);
+              newCatalogVersion, wantMinimalResult, response);
           return;
         } finally {
           // release the version taken in the tryLock call above
@@ -593,54 +1021,77 @@ public class CatalogOpExecutor {
 
       Table refreshedTable = null;
       boolean reloadMetadata = true;
+      String responseSummaryMsg = null;
       catalog_.getLock().writeLock().unlock();
 
       if (tbl instanceof KuduTable && altersKuduTable(params.getAlter_type())) {
-        alterKuduTable(params, response, (KuduTable) tbl, newCatalogVersion);
+        alterKuduTable(params, response, (KuduTable) tbl, newCatalogVersion,
+            wantMinimalResult);
         return;
+      } else if (tbl instanceof IcebergTable &&
+          altersIcebergTable(params.getAlter_type())) {
+        boolean needToUpdateHms = alterIcebergTable(params, response, (IcebergTable)tbl,
+            newCatalogVersion, wantMinimalResult);
+        if (!needToUpdateHms) return;
       }
       switch (params.getAlter_type()) {
         case ADD_COLUMNS:
-          TAlterTableAddColsParams addColParams = params.getAdd_cols_params();
-          boolean added = alterTableAddCols(tbl, addColParams.getColumns(),
-              addColParams.isIf_not_exists());
-          reloadTableSchema = true;
+          boolean added = false;
+          // Columns could be ignored/cleared in AlterTableAddColsStmt,
+          // that may cause columns to be empty.
+          if (params.getAdd_cols_params() != null
+              && params.getAdd_cols_params().getColumnsSize() != 0) {
+            TAlterTableAddColsParams addColParams = params.getAdd_cols_params();
+            added = alterTableAddCols(tbl, addColParams.getColumns(),
+                addColParams.isIf_not_exists());
+            reloadTableSchema = true;
+          }
           if (added) {
-            addSummary(response, "New column(s) have been added to the table.");
+            responseSummaryMsg = "New column(s) have been added to the table.";
           } else {
-            addSummary(response, "No new column(s) have been added to the table.");
+            responseSummaryMsg = "No new column(s) have been added to the table.";
           }
           break;
         case REPLACE_COLUMNS:
           TAlterTableReplaceColsParams replaceColParams = params.getReplace_cols_params();
           alterTableReplaceCols(tbl, replaceColParams.getColumns());
           reloadTableSchema = true;
-          addSummary(response, "Table columns have been replaced.");
+          responseSummaryMsg = "Table columns have been replaced.";
           break;
         case ADD_PARTITION:
           // Create and add HdfsPartition objects to the corresponding HdfsTable and load
           // their block metadata. Get the new table object with an updated catalog
           // version.
-          refreshedTable = alterTableAddPartitions(tbl, params.getAdd_partition_params());
+          THdfsFileFormat format = null;
+          if(params.isSetSet_file_format_params()) {
+            format = params.getSet_file_format_params().file_format;
+          }
+          refreshedTable = alterTableAddPartitions(tbl, params.getAdd_partition_params(),
+              format);
           if (refreshedTable != null) {
             refreshedTable.setCatalogVersion(newCatalogVersion);
-            addTableToCatalogUpdate(refreshedTable, response.result);
+            // the alter table event is only generated when we add the partition. For
+            // instance if not exists clause is provided and the partition is
+            // pre-existing there is no alter table event generated. Hence we should
+            // only add the versions for in-flight events when we are sure that the
+            // partition was really added.
+            catalog_.addVersionsForInflightEvents(false, tbl, newCatalogVersion);
           }
           reloadMetadata = false;
-          addSummary(response, "New partition has been added to the table.");
+          responseSummaryMsg = "New partition has been added to the table.";
           break;
         case DROP_COLUMN:
           TAlterTableDropColParams dropColParams = params.getDrop_col_params();
           alterTableDropCol(tbl, dropColParams.getCol_name());
           reloadTableSchema = true;
-          addSummary(response, "Column has been dropped.");
+          responseSummaryMsg = "Column has been dropped.";
           break;
         case ALTER_COLUMN:
           TAlterTableAlterColParams alterColParams = params.getAlter_col_params();
           alterTableAlterCol(tbl, alterColParams.getCol_name(),
               alterColParams.getNew_col_def());
           reloadTableSchema = true;
-          addSummary(response, "Column has been altered.");
+          responseSummaryMsg = "Column has been altered.";
           break;
         case DROP_PARTITION:
           TAlterTableDropPartitionParams dropPartParams =
@@ -655,10 +1106,13 @@ public class CatalogOpExecutor {
               dropPartParams.isPurge(), numUpdatedPartitions);
           if (refreshedTable != null) {
             refreshedTable.setCatalogVersion(newCatalogVersion);
-            addTableToCatalogUpdate(refreshedTable, response.result);
+            // we don't need to add catalog versions in partition's InflightEvents here
+            // since by the time the event is received, the partition is already
+            // removed from catalog and there is nothing to compare against during
+            // self-event evaluation
           }
-          addSummary(response,
-              "Dropped " + numUpdatedPartitions.getRef() + " partition(s).");
+          responseSummaryMsg =
+              "Dropped " + numUpdatedPartitions.getRef() + " partition(s).";
           reloadMetadata = false;
           break;
         case RENAME_TABLE:
@@ -674,10 +1128,10 @@ public class CatalogOpExecutor {
                   fileFormatParams.getFile_format(), numUpdatedPartitions);
 
           if (fileFormatParams.isSetPartition_set()) {
-            addSummary(response,
-                "Updated " + numUpdatedPartitions.getRef() + " partition(s).");
+            responseSummaryMsg =
+                "Updated " + numUpdatedPartitions.getRef() + " partition(s).";
           } else {
-            addSummary(response, "Updated table.");
+            responseSummaryMsg = "Updated table.";
           }
           break;
         case SET_ROW_FORMAT:
@@ -687,10 +1141,10 @@ public class CatalogOpExecutor {
               rowFormatParams.getPartition_set(), rowFormatParams.getRow_format(),
               numUpdatedPartitions);
           if (rowFormatParams.isSetPartition_set()) {
-            addSummary(response,
-                "Updated " + numUpdatedPartitions.getRef() + " partition(s).");
+            responseSummaryMsg =
+                "Updated " + numUpdatedPartitions.getRef() + " partition(s).";
           } else {
-            addSummary(response, "Updated table.");
+            responseSummaryMsg = "Updated table.";
           }
           break;
         case SET_LOCATION:
@@ -700,9 +1154,9 @@ public class CatalogOpExecutor {
           reloadFileMetadata = alterTableSetLocation(tbl, partitionSpec,
                setLocationParams.getLocation());
           if (partitionSpec == null) {
-            addSummary(response, "New location has been set.");
+            responseSummaryMsg = "New location has been set.";
           } else {
-            addSummary(response, "New location has been set for the specified partition.");
+            responseSummaryMsg = "New location has been set for the specified partition.";
           }
           break;
         case SET_TBL_PROPERTIES:
@@ -710,20 +1164,41 @@ public class CatalogOpExecutor {
               numUpdatedPartitions);
           reloadTableSchema = true;
           if (params.getSet_tbl_properties_params().isSetPartition_set()) {
-            addSummary(response,
-                "Updated " + numUpdatedPartitions.getRef() + " partition(s).");
+            responseSummaryMsg =
+                "Updated " + numUpdatedPartitions.getRef() + " partition(s).";
           } else {
-            addSummary(response, "Updated table.");
+            responseSummaryMsg = "Updated table.";
           }
+          break;
+        case UNSET_TBL_PROPERTIES:
+          alterTableUnSetTblProperties(tbl, params.getUnset_tbl_properties_params(),
+            numUpdatedPartitions);
+          reloadTableSchema = true;
+          if (params.getUnset_tbl_properties_params().isSetPartition_set()) {
+            responseSummaryMsg =
+                "Updated " + numUpdatedPartitions.getRef() + " partition(s).";
+          } else {
+            responseSummaryMsg = "Updated table.";
+          }
+          break;
+        case SET_VIEW_PROPERTIES:
+          alterViewSetTblProperties(tbl, params.getSet_tbl_properties_params());
+          reloadTableSchema = true;
+          responseSummaryMsg = "Updated view.";
+          break;
+        case UNSET_VIEW_PROPERTIES:
+          alterViewUnSetTblProperties(tbl, params.getUnset_tbl_properties_params());
+          reloadTableSchema = true;
+          responseSummaryMsg = "Updated view.";
           break;
         case UPDATE_STATS:
           Preconditions.checkState(params.isSetUpdate_stats_params());
           Reference<Long> numUpdatedColumns = new Reference<>(0L);
           alterTableUpdateStats(tbl, params.getUpdate_stats_params(),
-              numUpdatedPartitions, numUpdatedColumns);
+              numUpdatedPartitions, numUpdatedColumns, debugAction);
           reloadTableSchema = true;
-          addSummary(response, "Updated " + numUpdatedPartitions.getRef() +
-              " partition(s) and " + numUpdatedColumns.getRef() + " column(s).");
+          responseSummaryMsg = "Updated " + numUpdatedPartitions.getRef() +
+              " partition(s) and " + numUpdatedColumns.getRef() + " column(s).";
           break;
         case SET_CACHED:
           Preconditions.checkState(params.isSetSet_cached_params());
@@ -732,40 +1207,49 @@ public class CatalogOpExecutor {
           if (params.getSet_cached_params().getPartition_set() == null) {
             reloadFileMetadata =
                 alterTableSetCached(tbl, params.getSet_cached_params());
-            addSummary(response, op + "table.");
+            responseSummaryMsg = op + "table.";
           } else {
             alterPartitionSetCached(tbl, params.getSet_cached_params(),
                 numUpdatedPartitions);
-            addSummary(response,
-                op + numUpdatedPartitions.getRef() + " partition(s).");
+            responseSummaryMsg = op + numUpdatedPartitions.getRef() + " partition(s).";
           }
           break;
         case RECOVER_PARTITIONS:
-          alterTableRecoverPartitions(tbl);
-          addSummary(response, "Partitions have been recovered.");
+          alterTableRecoverPartitions(tbl, debugAction);
+          responseSummaryMsg = "Partitions have been recovered.";
           break;
         case SET_OWNER:
           Preconditions.checkState(params.isSetSet_owner_params());
           alterTableOrViewSetOwner(tbl, params.getSet_owner_params(), response);
-          addSummary(response, "Updated table/view.");
+          responseSummaryMsg = "Updated table/view.";
           break;
         default:
           throw new UnsupportedOperationException(
               "Unknown ALTER TABLE operation type: " + params.getAlter_type());
       }
 
+      // Make sure we won't forget finalizing the modification.
+      if (tbl.hasInProgressModification()) Preconditions.checkState(reloadMetadata);
       if (reloadMetadata) {
         loadTableMetadata(tbl, newCatalogVersion, reloadFileMetadata,
             reloadTableSchema, null, "ALTER TABLE " + params.getAlter_type().name());
-        addTableToCatalogUpdate(tbl, response.result);
+        // now that HMS alter operation has succeeded, add this version to list of
+        // inflight events in catalog table if event processing is enabled
+        catalog_.addVersionsForInflightEvents(false, tbl, newCatalogVersion);
       }
-      // now that HMS alter operation has succeeded, add this version to list of inflight
-      // events in catalog table if event processing is enabled
-      catalog_.addVersionsForInflightEvents(tbl, newCatalogVersion);
+      addSummary(response, responseSummaryMsg);
+      // add table to catalog update if its old and existing versions do not match
+      if (tbl.getCatalogVersion() != oldCatalogVersion) {
+        addTableToCatalogUpdate(tbl, wantMinimalResult, response.result);
+      }
+      // Make sure all the modifications are done.
+      Preconditions.checkState(!tbl.hasInProgressModification());
     } finally {
       context.stop();
       UnlockWriteLockIfErronouslyLocked();
-      tbl.getLock().unlock();
+      // Clear in-progress modifications in case of exceptions.
+      tbl.resetInProgressModification();
+      tbl.releaseWriteLock();
     }
   }
 
@@ -785,13 +1269,19 @@ public class CatalogOpExecutor {
    * Executes the ALTER TABLE command for a Kudu table and reloads its metadata.
    */
   private void alterKuduTable(TAlterTableParams params, TDdlExecResponse response,
-      KuduTable tbl, long newCatalogVersion) throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+      KuduTable tbl, long newCatalogVersion, boolean wantMinimalResult)
+      throws ImpalaException {
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     switch (params.getAlter_type()) {
       case ADD_COLUMNS:
-        TAlterTableAddColsParams addColParams = params.getAdd_cols_params();
-        KuduCatalogOpExecutor.addColumn(tbl, addColParams.getColumns());
-        addSummary(response, "Column(s) have been added.");
+        if (params.getAdd_cols_params() != null
+            && params.getAdd_cols_params().getColumnsSize() != 0) {
+          TAlterTableAddColsParams addColParams = params.getAdd_cols_params();
+          KuduCatalogOpExecutor.addColumn(tbl, addColParams.getColumns());
+          addSummary(response, "Column(s) have been added.");
+        } else {
+          addSummary(response, "No new column(s) have been added to the table.");
+        }
         break;
       case REPLACE_COLUMNS:
         TAlterTableReplaceColsParams replaceColParams = params.getReplace_cols_params();
@@ -825,7 +1315,179 @@ public class CatalogOpExecutor {
 
     loadTableMetadata(tbl, newCatalogVersion, true, true, null, "ALTER KUDU TABLE " +
         params.getAlter_type().name());
-    addTableToCatalogUpdate(tbl, response.result);
+    addTableToCatalogUpdate(tbl, wantMinimalResult, response.result);
+  }
+
+  /**
+   * Returns true if the given alteration type changes the underlying table stored in
+   * Iceberg in addition to the HMS table.
+   */
+  private boolean altersIcebergTable(TAlterTableType type) {
+    return type == TAlterTableType.ADD_COLUMNS
+        || type == TAlterTableType.REPLACE_COLUMNS
+        || type == TAlterTableType.EXECUTE
+        || type == TAlterTableType.DROP_COLUMN
+        || type == TAlterTableType.ALTER_COLUMN
+        || type == TAlterTableType.SET_PARTITION_SPEC
+        || type == TAlterTableType.SET_TBL_PROPERTIES
+        || type == TAlterTableType.UNSET_TBL_PROPERTIES;
+  }
+
+  /**
+   * Executes the ALTER TABLE command for an Iceberg table and reloads its metadata.
+   */
+  private boolean alterIcebergTable(TAlterTableParams params, TDdlExecResponse response,
+      IcebergTable tbl, long newCatalogVersion, boolean wantMinimalResult)
+      throws ImpalaException {
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
+    boolean needsToUpdateHms = !isIcebergHmsIntegrationEnabled(tbl.getMetaStoreTable());
+    try {
+      boolean needsTxn = true;
+      org.apache.iceberg.Transaction iceTxn = IcebergUtil.getIcebergTransaction(tbl);
+      switch (params.getAlter_type()) {
+        case ADD_COLUMNS:
+          if (params.getAdd_cols_params() != null
+              && params.getAdd_cols_params().getColumnsSize() != 0) {
+            TAlterTableAddColsParams addColParams = params.getAdd_cols_params();
+            IcebergCatalogOpExecutor.addColumns(iceTxn, addColParams.getColumns());
+            addSummary(response, "Column(s) have been added.");
+          } else {
+            addSummary(response, "No new column(s) have been added to the table.");
+          }
+          break;
+        case DROP_COLUMN:
+          TAlterTableDropColParams dropColParams = params.getDrop_col_params();
+          IcebergCatalogOpExecutor.dropColumn(iceTxn, dropColParams.getCol_name());
+          addSummary(response, "Column has been dropped.");
+          break;
+        case ALTER_COLUMN:
+          TAlterTableAlterColParams alterColParams = params.getAlter_col_params();
+          IcebergCatalogOpExecutor.alterColumn(iceTxn, alterColParams.getCol_name(),
+               alterColParams.getNew_col_def());
+          addSummary(response, "Column has been altered.");
+          break;
+        case EXECUTE:
+          Preconditions.checkState(params.isSetSet_execute_params());
+          // All the EXECUTE functions operate only on Iceberg data.
+          needsToUpdateHms = false;
+          TAlterTableExecuteParams setExecuteParams = params.getSet_execute_params();
+          if (setExecuteParams.isSetExecute_rollback_params()) {
+            String rollbackSummary = IcebergCatalogOpExecutor.alterTableExecuteRollback(
+                iceTxn, tbl, setExecuteParams.getExecute_rollback_params());
+            addSummary(response, rollbackSummary);
+          } else if (setExecuteParams.isSetExpire_snapshots_params()) {
+            String expireSummary =
+                IcebergCatalogOpExecutor.alterTableExecuteExpireSnapshots(
+                    iceTxn, setExecuteParams.getExpire_snapshots_params());
+            addSummary(response, expireSummary);
+          } else {
+            // Cannot happen, but throw just in case.
+            throw new IllegalStateException(
+                "Alter table execute statement is not implemented.");
+          }
+          break;
+        case SET_PARTITION_SPEC:
+          // Set partition spec uses 'TableOperations', not transactions.
+          needsTxn = false;
+          // Partition spec is not stored in HMS.
+          needsToUpdateHms = false;
+          TAlterTableSetPartitionSpecParams setPartSpecParams =
+              params.getSet_partition_spec_params();
+          IcebergCatalogOpExecutor.alterTableSetPartitionSpec(tbl,
+              setPartSpecParams.getPartition_spec(),
+              catalog_.getCatalogServiceId(), newCatalogVersion);
+          addSummary(response, "Updated partition spec.");
+          break;
+        case SET_TBL_PROPERTIES:
+          needsToUpdateHms |= !setIcebergTblProperties(tbl, params, iceTxn);
+          addSummary(response, "Updated table.");
+          break;
+        case UNSET_TBL_PROPERTIES:
+          needsToUpdateHms |= !unsetIcebergTblProperties(tbl, params, iceTxn);
+          addSummary(response, "Updated table.");
+          break;
+        case REPLACE_COLUMNS:
+          // It doesn't make sense to replace all the columns of an Iceberg table as it
+          // would basically make all existing data inaccessible.
+        default:
+          throw new UnsupportedOperationException(
+              "Unsupported ALTER TABLE operation for Iceberg tables: " +
+              params.getAlter_type());
+      }
+      if (needsTxn) {
+        if (!needsToUpdateHms) {
+          IcebergCatalogOpExecutor.addCatalogVersionToTxn(iceTxn,
+              catalog_.getCatalogServiceId(), newCatalogVersion);
+        }
+        iceTxn.commitTransaction();
+      }
+    } catch (IllegalArgumentException ex) {
+      throw new ImpalaRuntimeException(String.format(
+          "Failed to ALTER table '%s': %s", params.getTable_name().table_name,
+          ex.getMessage()));
+    }
+
+    if (!needsToUpdateHms) {
+      // We don't need to update HMS because either it is already done by Iceberg's
+      // HiveCatalog, or we modified the Iceberg data which is not stored in HMS.
+      loadTableMetadata(tbl, newCatalogVersion, true, true, null, "ALTER Iceberg TABLE " +
+          params.getAlter_type().name());
+      catalog_.addVersionsForInflightEvents(false, tbl, newCatalogVersion);
+      addTableToCatalogUpdate(tbl, wantMinimalResult, response.result);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Sets table properties for an Iceberg table. Returns true on success, returns false
+   * if the operation is not applicable at the Iceberg table level, e.g. setting SERDE
+   * properties.
+   */
+  private boolean setIcebergTblProperties(IcebergTable tbl, TAlterTableParams params,
+      org.apache.iceberg.Transaction iceTxn) throws ImpalaException {
+    TAlterTableSetTblPropertiesParams setPropsParams =
+        params.getSet_tbl_properties_params();
+    if (setPropsParams.getTarget() != TTablePropertyType.TBL_PROPERTY) return false;
+
+    addMergeOnReadPropertiesIfNeeded(tbl, setPropsParams.getProperties());
+    IcebergCatalogOpExecutor.setTblProperties(iceTxn, setPropsParams.getProperties());
+    return true;
+  }
+
+  /**
+   * Iceberg format from V2 supports row-level modifications. We set write modes to
+   * "merge-on-read" which is the write mode Impala will eventually
+   * support (IMPALA-11664). Unless the user specified otherwise in the table properties.
+   */
+  private void addMergeOnReadPropertiesIfNeeded(IcebergTable tbl,
+      Map<String, String> properties) {
+    String formatVersion = properties.get(TableProperties.FORMAT_VERSION);
+    if (formatVersion == null ||
+        Integer.valueOf(formatVersion) < IcebergTable.ICEBERG_FORMAT_V2) {
+      return;
+    }
+    if (!IcebergUtil.isAnyWriteModeSet(properties) &&
+        !IcebergUtil.isAnyWriteModeSet(tbl.getMetaStoreTable().getParameters())) {
+      final String MERGE_ON_READ = IcebergTable.MERGE_ON_READ;
+      properties.put(TableProperties.DELETE_MODE, MERGE_ON_READ);
+      properties.put(TableProperties.UPDATE_MODE, MERGE_ON_READ);
+      properties.put(TableProperties.MERGE_MODE, MERGE_ON_READ);
+    }
+  }
+
+  /**
+   * Unsets table properties for an Iceberg table. Returns true on success, returns false
+   * if the operation is not applicable at the Iceberg table level, e.g. setting SERDE
+   * properties.
+   */
+  private boolean unsetIcebergTblProperties(IcebergTable tbl, TAlterTableParams params,
+      org.apache.iceberg.Transaction iceTxn) throws ImpalaException {
+    TAlterTableUnSetTblPropertiesParams unsetParams =
+        params.getUnset_tbl_properties_params();
+    if (unsetParams.getTarget() != TTablePropertyType.TBL_PROPERTY) return false;
+    IcebergCatalogOpExecutor.unsetTblProperties(iceTxn, unsetParams.getProperty_keys());
+    return true;
   }
 
   /**
@@ -837,13 +1499,28 @@ public class CatalogOpExecutor {
   private void loadTableMetadata(Table tbl, long newCatalogVersion,
       boolean reloadFileMetadata, boolean reloadTableSchema,
       Set<String> partitionsToUpdate, String reason) throws CatalogException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    loadTableMetadata(tbl, newCatalogVersion, reloadFileMetadata, reloadTableSchema,
+        partitionsToUpdate, null, reason);
+  }
+
+  /**
+   * Same as {@link #loadTableMetadata(Table, long, boolean, boolean, Set, String)} but
+   * takes in a Map of partition name to event id which is passed down to the table load
+   * method.
+   */
+  private void loadTableMetadata(Table tbl, long newCatalogVersion,
+      boolean reloadFileMetadata, boolean reloadTableSchema,
+      Set<String> partitionsToUpdate, @Nullable Map<String, Long> partitionToEventId,
+      String reason)
+      throws CatalogException {
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
       org.apache.hadoop.hive.metastore.api.Table msTbl =
           getMetaStoreTable(msClient, tbl);
       if (tbl instanceof HdfsTable) {
         ((HdfsTable) tbl).load(true, msClient.getHiveClient(), msTbl,
-            reloadFileMetadata, reloadTableSchema, partitionsToUpdate, reason);
+            reloadFileMetadata, reloadTableSchema, false, partitionsToUpdate, null,
+            partitionToEventId, reason);
       } else {
         tbl.load(true, msClient.getHiveClient(), msTbl, reason);
       }
@@ -855,28 +1532,29 @@ public class CatalogOpExecutor {
    * Serializes and adds table 'tbl' to a TCatalogUpdateResult object. Uses the
    * version of the serialized table as the version of the catalog update result.
    */
-  private static void addTableToCatalogUpdate(Table tbl, TCatalogUpdateResult result) {
+  private static void addTableToCatalogUpdate(Table tbl, boolean wantMinimalResult,
+      TCatalogUpdateResult result) {
     Preconditions.checkNotNull(tbl);
-    TCatalogObject updatedCatalogObject = tbl.toTCatalogObject();
-    // TODO(todd): if client is a 'v2' impalad, only send back invalidation
+    // TODO(IMPALA-9937): if client is a 'v1' impalad, only send back incremental updates
+    TCatalogObject updatedCatalogObject = wantMinimalResult ?
+        tbl.toInvalidationObject() : tbl.toTCatalogObject();
     result.addToUpdated_catalog_objects(updatedCatalogObject);
     result.setVersion(updatedCatalogObject.getCatalog_version());
   }
 
-  private Table addHdfsPartitions(Table tbl, List<Partition> partitions)
+  private Table addHdfsPartitions(MetaStoreClient msClient, Table tbl,
+      List<Partition> addedPartitions, Map<String, Long> partitionToEventId)
       throws CatalogException {
     Preconditions.checkNotNull(tbl);
-    Preconditions.checkNotNull(partitions);
+    Preconditions.checkNotNull(addedPartitions);
     if (!(tbl instanceof HdfsTable)) {
       throw new CatalogException("Table " + tbl.getFullName() + " is not an HDFS table");
     }
     HdfsTable hdfsTable = (HdfsTable) tbl;
-    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      List<HdfsPartition> hdfsPartitions = hdfsTable.createAndLoadPartitions(
-          msClient.getHiveClient(), partitions);
-      for (HdfsPartition hdfsPartition: hdfsPartitions) {
-        catalog_.addPartition(hdfsPartition);
-      }
+    List<HdfsPartition> hdfsPartitions = hdfsTable.createAndLoadPartitions(
+        msClient.getHiveClient(), addedPartitions, partitionToEventId);
+    for (HdfsPartition hdfsPartition : hdfsPartitions) {
+      catalog_.addPartition(hdfsPartition);
     }
     return hdfsTable;
   }
@@ -886,8 +1564,8 @@ public class CatalogOpExecutor {
    * if the view does not exist or if the existing metadata entry is
    * a table instead of a a view.
    */
-   private void alterView(TCreateOrAlterViewParams params, TDdlExecResponse resp)
-      throws ImpalaException {
+   private void alterView(TCreateOrAlterViewParams params, boolean wantMinimalResult,
+       TDdlExecResponse resp) throws ImpalaException {
     TableName tableName = TableName.fromThrift(params.getView_name());
     Preconditions.checkState(tableName != null && tableName.isFullyQualified());
     Preconditions.checkState(params.getColumns() != null &&
@@ -897,7 +1575,7 @@ public class CatalogOpExecutor {
         "Load for ALTER VIEW");
     Preconditions.checkState(tbl instanceof View, "Expected view: %s",
         tableName);
-    tryLock(tbl);
+    tryWriteLock(tbl);
     try {
       long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
       catalog_.getLock().writeLock().unlock();
@@ -925,10 +1603,10 @@ public class CatalogOpExecutor {
       }
       addSummary(resp, "View has been altered.");
       tbl.setCatalogVersion(newCatalogVersion);
-      addTableToCatalogUpdate(tbl, resp.result);
+      addTableToCatalogUpdate(tbl, wantMinimalResult, resp.result);
     } finally {
       UnlockWriteLockIfErronouslyLocked();
-      tbl.getLock().unlock();
+      tbl.releaseWriteLock();
     }
   }
 
@@ -938,7 +1616,7 @@ public class CatalogOpExecutor {
    */
   private void addCatalogServiceIdentifiers(Table tbl, String catalogServiceId,
       long newCatalogVersion) {
-    if (!catalog_.isExternalEventProcessingEnabled()) return;
+    if (!catalog_.isEventProcessingActive()) return;
     org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable();
     msTbl.putToParameters(
         MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey(),
@@ -946,6 +1624,18 @@ public class CatalogOpExecutor {
     msTbl.putToParameters(
         MetastoreEventPropertyKey.CATALOG_VERSION.getKey(),
         String.valueOf(newCatalogVersion));
+  }
+
+  private void addCatalogServiceIdentifiers(
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String catalogServiceId,
+      long catalogVersion) {
+    if (!catalog_.isEventProcessingActive()) return;
+    msTbl.putToParameters(
+        MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey(),
+        catalogServiceId);
+    msTbl.putToParameters(
+        MetastoreEventPropertyKey.CATALOG_VERSION.getKey(),
+        String.valueOf(catalogVersion));
   }
 
   /**
@@ -959,9 +1649,10 @@ public class CatalogOpExecutor {
    * and 'numUpdatedColumns', respectively.
    */
   private void alterTableUpdateStats(Table table, TAlterTableUpdateStatsParams params,
-      Reference<Long> numUpdatedPartitions, Reference<Long> numUpdatedColumns)
+      Reference<Long> numUpdatedPartitions, Reference<Long> numUpdatedColumns,
+      @Nullable String debugAction)
       throws ImpalaException {
-    Preconditions.checkState(table.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(table.isWriteLockedByCurrentThread());
     Preconditions.checkState(params.isSetTable_stats() || params.isSetColumn_stats());
 
     TableName tableName = table.getTableName();
@@ -1004,6 +1695,7 @@ public class CatalogOpExecutor {
         throw ex;
       }
     }
+    DebugUtils.executeDebugAction(debugAction, DebugUtils.UPDATE_STATS_DELAY);
   }
 
   private void alterTableUpdateStatsInner(Table table,
@@ -1034,11 +1726,12 @@ public class CatalogOpExecutor {
 
     // Update partition-level row counts and incremental column stats for
     // partitioned Hdfs tables.
-    List<HdfsPartition> modifiedParts = null;
+    List<HdfsPartition.Builder> modifiedParts = null;
     if (params.isSetPartition_stats() && table.getNumClusteringCols() > 0) {
       Preconditions.checkState(table instanceof HdfsTable);
       modifiedParts = updatePartitionStats(params, (HdfsTable) table);
-      bulkAlterPartitions(table, modifiedParts, tblTxn);
+      // TODO: IMPALA-10203: avoid reloading modified partitions when updating stats.
+      bulkAlterPartitions(table, modifiedParts, tblTxn, UpdatePartitionMethod.MARK_DIRTY);
     }
 
     if (params.isSetTable_stats()) {
@@ -1049,9 +1742,13 @@ public class CatalogOpExecutor {
       Table.updateTimestampProperty(msTbl, HdfsTable.TBL_PROP_LAST_COMPUTE_STATS_TIME);
     }
 
-    // Apply property changes like numRows.
-    msTbl.getParameters().remove(StatsSetupConst.COLUMN_STATS_ACCURATE);
-    applyAlterTable(msTbl, false, tblTxn);
+    if (IcebergTable.isIcebergTable(msTbl) && isIcebergHmsIntegrationEnabled(msTbl)) {
+      updateTableStatsViaIceberg((IcebergTable)table, msTbl);
+    } else {
+      // Apply property changes like numRows.
+      msTbl.getParameters().remove(StatsSetupConst.COLUMN_STATS_ACCURATE);
+      applyAlterTable(msTbl, false, tblTxn);
+    }
     numUpdatedPartitions.setRef(0L);
     if (modifiedParts != null) {
       numUpdatedPartitions.setRef((long) modifiedParts.size());
@@ -1061,16 +1758,47 @@ public class CatalogOpExecutor {
   }
 
   /**
+   * For Iceberg tables using HiveCatalog we must avoid updating the HMS table directly to
+   * avoid overriding concurrent modifications to the table. See IMPALA-11583.
+   * Table-level stats (numRows, totalSize) should not be set as Iceberg keeps them
+   * up-to-date.
+   * 'impala.lastComputeStatsTime' still needs to be set, so we'll know when we executed
+   * COMPUTE STATS the last time.
+   * We need to set catalog service id and catalog version to detect self-events.
+   */
+  private void updateTableStatsViaIceberg(IcebergTable iceTbl,
+      org.apache.hadoop.hive.metastore.api.Table msTbl) throws ImpalaException {
+    String CATALOG_SERVICE_ID = MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey();
+    String CATALOG_VERSION    = MetastoreEventPropertyKey.CATALOG_VERSION.getKey();
+    String COMPUTE_STATS_TIME = HdfsTable.TBL_PROP_LAST_COMPUTE_STATS_TIME;
+
+    Preconditions.checkState(msTbl.getParameters().containsKey(CATALOG_SERVICE_ID));
+    Preconditions.checkState(msTbl.getParameters().containsKey(CATALOG_VERSION));
+
+    Map<String, String> props = new HashMap<>();
+    props.put(CATALOG_SERVICE_ID, msTbl.getParameters().get(CATALOG_SERVICE_ID));
+    props.put(CATALOG_VERSION,    msTbl.getParameters().get(CATALOG_VERSION));
+    if (msTbl.getParameters().containsKey(COMPUTE_STATS_TIME)) {
+      props.put(COMPUTE_STATS_TIME, msTbl.getParameters().get(COMPUTE_STATS_TIME));
+    }
+
+    org.apache.iceberg.Transaction iceTxn = IcebergUtil.getIcebergTransaction(iceTbl);
+    IcebergCatalogOpExecutor.setTblProperties(iceTxn, props);
+    iceTxn.commitTransaction();
+  }
+
+
+  /**
    * Updates the row counts and incremental column stats of the partitions in the given
    * Impala table based on the given update stats parameters. Returns the modified Impala
    * partitions.
    * Row counts for missing or new partitions as a result of concurrent table alterations
    * are set to 0.
    */
-  private List<HdfsPartition> updatePartitionStats(TAlterTableUpdateStatsParams params,
-      HdfsTable table) throws ImpalaException {
+  private List<HdfsPartition.Builder> updatePartitionStats(
+      TAlterTableUpdateStatsParams params, HdfsTable table) throws ImpalaException {
     Preconditions.checkState(params.isSetPartition_stats());
-    List<HdfsPartition> modifiedParts = Lists.newArrayList();
+    List<HdfsPartition.Builder> modifiedParts = Lists.newArrayList();
     // TODO(todd) only load the partitions that were modified in 'params'.
     Collection<? extends FeFsPartition> parts =
         FeCatalogUtils.loadAllPartitions(table);
@@ -1107,12 +1835,13 @@ public class CatalogOpExecutor {
         LOG.trace(String.format("Updating stats for partition %s: numRows=%d",
             partition.getValuesAsString(), numRows));
       }
-      PartitionStatsUtil.partStatsToPartition(partitionStats, partition);
-      partition.putToParameters(StatsSetupConst.ROW_COUNT, String.valueOf(numRows));
+      HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
+      PartitionStatsUtil.partStatsToPartition(partitionStats, partBuilder);
+      partBuilder.setRowCountParam(numRows);
       // HMS requires this param for stats changes to take effect.
-      partition.putToParameters(MetastoreShim.statsGeneratedViaStatsTaskParam());
-      partition.getParameters().remove(StatsSetupConst.COLUMN_STATS_ACCURATE);
-      modifiedParts.add(partition);
+      partBuilder.putToParameters(MetastoreShim.statsGeneratedViaStatsTaskParam());
+      partBuilder.getParameters().remove(StatsSetupConst.COLUMN_STATS_ACCURATE);
+      modifiedParts.add(partBuilder);
     }
     return modifiedParts;
   }
@@ -1160,10 +1889,14 @@ public class CatalogOpExecutor {
               ndvCap, entry.getValue(), tableCol.getType());
       if (colStatsData == null) continue;
       if (LOG.isTraceEnabled()) {
-        LOG.trace(String.format("Updating column stats for %s: numDVs=%d numNulls=%d " +
-            "maxSize=%d avgSize=%.2f", colName, entry.getValue().getNum_distinct_values(),
+        LOG.trace(String.format("Updating column stats for %s: numDVs=%d numNulls=%d "
+                + "maxSize=%d avgSize=%.2f minValue=%s maxValue=%s",
+            colName, entry.getValue().getNum_distinct_values(),
             entry.getValue().getNum_nulls(), entry.getValue().getMax_size(),
-            entry.getValue().getAvg_size()));
+            entry.getValue().getAvg_size(), entry.getValue().getLow_value() != null ?
+            entry.getValue().getLow_value().toString() : -1,
+            entry.getValue().getHigh_value() != null ?
+            entry.getValue().getHigh_value().toString() : -1));
       }
       ColumnStatisticsObj colStatsObj = new ColumnStatisticsObj(colName,
           tableCol.getType().toString().toLowerCase(), colStatsData);
@@ -1177,9 +1910,10 @@ public class CatalogOpExecutor {
    * metadata cache, marking its metadata to be lazily loaded on the next access.
    * Re-throws any Hive Meta Store exceptions encountered during the create, these
    * may vary depending on the Meta Store connection type (thrift vs direct db).
+   * @param  syncDdl tells if SYNC_DDL option is enabled on this DDL request.
    */
-  private void createDatabase(TCreateDbParams params, TDdlExecResponse resp)
-      throws ImpalaException {
+  private void createDatabase(TCreateDbParams params, TDdlExecResponse resp,
+      boolean syncDdl, boolean wantMinimalResult) throws ImpalaException {
     Preconditions.checkNotNull(params);
     String dbName = params.getDb();
     Preconditions.checkState(dbName != null && !dbName.isEmpty(),
@@ -1194,9 +1928,30 @@ public class CatalogOpExecutor {
             + "and IF NOT EXISTS was specified.");
       }
       Preconditions.checkNotNull(existingDb);
-      // TODO(todd): if client is a 'v2' impalad, only send back invalidation
-      resp.getResult().addToUpdated_catalog_objects(existingDb.toTCatalogObject());
-      resp.getResult().setVersion(existingDb.getCatalogVersion());
+      if (syncDdl) {
+        tryLock(existingDb, "create database");
+        try {
+          // When SYNC_DDL is enabled and the database already exists, we force a version
+          // bump on it so that it is added to the next statestore update. Without this
+          // we could potentially be referring to a database object that has already been
+          // GC'ed from the TopicUpdateLog and waitForSyncDdlVersion() cannot find a
+          // covering topic version (IMPALA-7961).
+          //
+          // This is a conservative hack to not break the SYNC_DDL semantics and could
+          // possibly result in false-positive invalidates on this database. However,
+          // that is better than breaking the SYNC_DDL semantics and the subsequent
+          // queries referring to this database failing with "database not found" errors.
+          long newVersion = catalog_.incrementAndGetCatalogVersion();
+          existingDb.setCatalogVersion(newVersion);
+          LOG.trace("Database {} version bumped to {} because SYNC_DDL is enabled.",
+              dbName, newVersion);
+        } finally {
+          // Release the locks held in tryLock().
+          catalog_.getLock().writeLock().unlock();
+          existingDb.getLock().unlock();
+        }
+      }
+      addDbToCatalogUpdate(existingDb, wantMinimalResult, resp.result);
       addSummary(resp, "Database already exists.");
       return;
     }
@@ -1209,20 +1964,41 @@ public class CatalogOpExecutor {
     if (params.getLocation() != null) {
       db.setLocationUri(params.getLocation());
     }
+    if (params.getManaged_location() != null) {
+      MetastoreShim.setManagedLocationUri(db, params.getManaged_location());
+    }
     db.setOwnerName(params.getOwner());
     db.setOwnerType(PrincipalType.USER);
     if (LOG.isTraceEnabled()) LOG.trace("Creating database " + dbName);
     Db newDb = null;
-    synchronized (metastoreDdlLock_) {
+    getMetastoreDdlLock().lock();
+    try {
       try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
         try {
+          long eventId = getCurrentEventId(msClient);
           msClient.getHiveClient().createDatabase(db);
-          // Load the database back from the HMS. It's unfortunate we need two
-          // RPCs here, but otherwise we can't populate the location field of the
-          // DB properly. We'll take the slight chance of a race over the incorrect
-          // behavior of showing no location in 'describe database' (IMPALA-7439).
-          db = msClient.getHiveClient().getDatabase(dbName);
-          newDb = catalog_.addDb(dbName, db);
+          List<NotificationEvent> events = getNextMetastoreEventsIfEnabled(eventId,
+              notificationEvent ->
+                  CreateDatabaseEvent.CREATE_DATABASE_EVENT_TYPE
+                      .equals(notificationEvent.getEventType())
+                      && dbName.equalsIgnoreCase(notificationEvent.getDbName()));
+          Pair<Long, Database> eventDbPair = getDatabaseFromEvents(events,
+              params.if_not_exists);
+          if (eventDbPair == null) {
+            // if events processor is not turned on we get it from HMS.
+            // Load the database back from the HMS. It's unfortunate we need two
+            // RPCs here, but otherwise we can't populate the location field of the
+            // DB properly. We'll take the slight chance of a race over the incorrect
+            // behavior of showing no location in 'describe database' (IMPALA-7439).
+            eventDbPair = new Pair<>(-1L, msClient.getHiveClient().getDatabase(dbName));
+          } else {
+            // Due to HIVE-24899 we cannot rely on the database object present in the
+            // event which may or may not include the managed location uri. Once
+            // HIVE-24899 is fixed we can rely on using the Database object from the event
+            // directly and avoid this extra HMS call.
+            eventDbPair.second = msClient.getHiveClient().getDatabase(dbName);
+          }
+          newDb = catalog_.addDb(dbName, eventDbPair.second, eventDbPair.first);
           addSummary(resp, "Database has been created.");
         } catch (AlreadyExistsException e) {
           if (!params.if_not_exists) {
@@ -1251,17 +2027,209 @@ public class CatalogOpExecutor {
         }
       }
 
-      Preconditions.checkNotNull(newDb);
-      // TODO(todd): if client is a 'v2' impalad, only send back invalidation
-      resp.result.addToUpdated_catalog_objects(newDb.toTCatalogObject());
+      addDbToCatalogUpdate(newDb, wantMinimalResult, resp.result);
       if (authzConfig_.isEnabled()) {
         authzManager_.updateDatabaseOwnerPrivilege(params.server_name, newDb.getName(),
             /* oldOwner */ null, /* oldOwnerType */ null,
             newDb.getMetaStoreDb().getOwnerName(), newDb.getMetaStoreDb().getOwnerType(),
             resp);
       }
+    } finally {
+      getMetastoreDdlLock().unlock();
     }
-    resp.result.setVersion(newDb.getCatalogVersion());
+  }
+
+  /**
+   * Wrapper around
+   * {@code MetastoreEventsProcessor#getNextMetastoreEventsInBatches} with the
+   * addition that it checks if events processing is active or not. If not active,
+   * returns an empty list.
+   */
+  private List<NotificationEvent> getNextMetastoreEventsIfEnabled(long eventId,
+      NotificationFilter eventsFilter) throws MetastoreNotificationException {
+    if (!catalog_.isEventProcessingActive()) return Collections.emptyList();
+    return MetastoreEventsProcessor
+        .getNextMetastoreEventsInBatches(catalog_, eventId, eventsFilter);
+  }
+
+  /**
+   * Extracts the database object from the {@link CreateDatabaseEvent} present in the
+   * events.
+   * @param events The metastore events which are already filtered for CREATE_DATABASE
+   *               event type and for the right database name.
+   * @param useLatestEvent If useLatestEvent is true we don't care if there is only one
+   *                       event events or not. We just use the latest event id. This is
+   *                       used when the create database was created with if not exists
+   *                       clause.
+   * @return Pair of eventId and the database object from the events.
+   * @throws CatalogException If the database could not be parsed from the events.
+   */
+  private Pair<Long, Database> getDatabaseFromEvents(List<NotificationEvent> events,
+      boolean useLatestEvent) throws CatalogException {
+    if (events == null || events.isEmpty()) return null;
+    // this means that the database was recreated from some other application while
+    // this create database operation was in progress. We bail out by throwing an error
+    // in this case because it is possible the database which the user was trying to
+    // create was not the one which was eventually recreated in the metastore.
+    Preconditions.checkState(useLatestEvent || events.size() == 1,
+        "Database was recreated in metastore while "
+            + "createDatabase operation was in progress");
+    try {
+      MetastoreEvent event = catalog_
+          .getMetastoreEventProcessor().getEventsFactory()
+          .get(events.get(events.size() - 1), null);
+      Preconditions.checkState(event instanceof CreateDatabaseEvent);
+      return new Pair<>(events.get(0).getEventId(),
+          ((CreateDatabaseEvent) event).getDatabase());
+    } catch (MetastoreNotificationException e) {
+      throw new CatalogException("Unable to create a metastore event ", e);
+    }
+  }
+
+  /**
+   * Similar to {@code getDatabaseFromEvents} but finds the table instead of database
+   * by parsing a CREATE_TABLE event.
+   * @param events Filtered list of events of the type CREATE_TABLE and for the correct
+   *               table name.
+   * @param useLatestEvent if this flag is set then we use the latest event otherwise
+   *                       we make sure that there are only one events. This is used
+   *                       when the table is create with if not exists clause.
+   * @return Pair of eventId and the table object from the event.
+   * @throws CatalogException
+   */
+  private Pair<Long, org.apache.hadoop.hive.metastore.api.Table> getTableFromEvents(
+      List<NotificationEvent> events, boolean useLatestEvent) throws CatalogException {
+    if (events == null || events.isEmpty()) return null;
+    // we bail out by throwing an error here because if the table has been recreated
+    // from another application while this create table was in progress, it is possible
+    // that the schema is different than what user was trying to create.
+    Preconditions.checkState(useLatestEvent || events.size() == 1,
+        "Table was recreated in metastore while createTable operation "
+            + "was in progress.");
+    try {
+      MetastoreEvent event = catalog_
+          .getMetastoreEventProcessor().getEventsFactory()
+          .get(events.get(events.size() - 1), null);
+      Preconditions.checkState(event instanceof CreateTableEvent);
+      return new Pair<>(events.get(0).getEventId(),
+          ((CreateTableEvent) event).getTable());
+    } catch (MetastoreNotificationException e) {
+      throw new CatalogException("Unable to create a metastore event", e);
+    }
+  }
+
+  /**
+   * Processing the given list of events which are prefiltered appropriate to include
+   * on the ALTER_TABLE event types on the target table name.
+   * @param events list of events which are already filtered for ALTER_TABLE type
+   *               and on renamed table names.
+   * @return Pair of eventId and the table object from the event which pertain to the
+   * rename event. If events processing is not active or if rename event is not found
+   * returns null.
+   * @throws CatalogException if the event was found but could not be parsed.
+   */
+  private Pair<Long, Pair<org.apache.hadoop.hive.metastore.api.Table,
+      org.apache.hadoop.hive.metastore.api.Table>> getRenamedTableFromEvents(
+      List<NotificationEvent> events) throws CatalogException {
+    if (events == null || events.isEmpty()) return null;
+    for (NotificationEvent notificationEvent : events) {
+      try {
+        MetastoreEvent event = catalog_
+            .getMetastoreEventProcessor().getEventsFactory().get(notificationEvent, null);
+        Preconditions.checkState(event instanceof AlterTableEvent);
+        AlterTableEvent alterEvent = (AlterTableEvent) event;
+        if (!alterEvent.isRename()) continue;
+        return new Pair<>(events.get(0).getEventId(),
+            new Pair<>(alterEvent.getBeforeTable(), alterEvent.getAfterTable()));
+      } catch (MetastoreNotificationException e) {
+        throw new CatalogException("Unable to create a metastore event", e);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Processes the list of events which contain of the events of the type ADD_PARTITION
+   * and on the target table. The method then extracts the partition objects from the
+   * events and adds to the partitionToEventId along with the event Id which added that
+   * partition in the metastore.
+   * @param events Events which are pre-filtered by type (ADD_PARTITION) and on the target
+   *               table.
+   * @param partitionToEventId Map of Partition to the eventId which is populated by
+   *                           this method.
+   * @throws CatalogException If the event information cannot be parsed.
+   */
+  private void getPartitionsFromEvent(
+      List<NotificationEvent> events, Map<Partition, Long> partitionToEventId)
+      throws CatalogException {
+    if (events == null || events.isEmpty()) return;
+    for (NotificationEvent event : events) {
+      try {
+        MetastoreEvent metastoreEvent = catalog_
+            .getMetastoreEventProcessor().getEventsFactory().get(event, null);
+        Preconditions.checkState(metastoreEvent instanceof AddPartitionEvent);
+        Long eventId = metastoreEvent.getEventId();
+        for (Partition part : ((AddPartitionEvent) metastoreEvent).getPartitions()) {
+          partitionToEventId.put(part, eventId);
+        }
+      } catch (MetastoreNotificationException e) {
+        throw new CatalogException("Unable to create a metastore event", e);
+      }
+    }
+  }
+
+  /**
+   *
+   * @param partColNames The partition column names of the table whose partitions were
+   *                     dropped.
+   * @param events The pre-filtered list of events which contain events of the type
+   *               DROP_PARTITION and on the target table.
+   * @param eventIdToPartVals Map of eventId to a list of list of partition values. The
+   *                          map is populated by this method to include a mapping of the
+   *                          eventId to the partition values from the event.
+   * @throws CatalogException If the event cannot be parsed.
+   */
+  private void addDroppedPartitionsFromEvent(
+      List<String> partColNames, List<NotificationEvent> events,
+      Map<Long, List<List<String>>> eventIdToPartVals) throws CatalogException {
+    if (events == null || events.isEmpty()) return;
+    // in case of DROP partitions, catalog drops the partitions one by one
+    // eventId to list of partition names in the event which are dropped.
+    for (NotificationEvent notificationEvent : events) {
+      try {
+        MetastoreEvent event = catalog_
+            .getMetastoreEventProcessor().getEventsFactory().get(notificationEvent, null);
+        Preconditions.checkState(event instanceof DropPartitionEvent);
+        Long eventId = notificationEvent.getEventId();
+        List<Map<String, String>> droppedPartitions = ((DropPartitionEvent) event)
+            .getDroppedPartitions();
+        // it is important that we create the partition key in the order of partition cols
+        for (Map<String, String> partKeyVals : droppedPartitions) {
+          List<String> partVals = Lists.newArrayList();
+          for (String partColName : partColNames) {
+            String val = Preconditions.checkNotNull(partKeyVals.get(partColName));
+            partVals.add(val);
+          }
+          eventIdToPartVals.computeIfAbsent(eventId, l -> new ArrayList<>())
+              .add(partVals);
+        }
+      } catch (MetastoreNotificationException e) {
+        throw new CatalogException("Unable to create a metastore event", e);
+      }
+    }
+  }
+
+  /**
+   * Returns the latest notification event id from the Hive metastore.
+   */
+  private long getCurrentEventId(MetaStoreClient msClient) throws ImpalaRuntimeException {
+    try {
+      return msClient.getHiveClient().getCurrentNotificationEventId().getEventId();
+    } catch (TException e) {
+      throw new ImpalaRuntimeException(String.format(HMS_RPC_ERROR_FORMAT_STR,
+          "getCurrentNotificationEventId") + e
+          .getMessage());
+    }
   }
 
   private void createFunction(TCreateFunctionParams params, TDdlExecResponse resp)
@@ -1273,21 +2241,26 @@ public class CatalogOpExecutor {
     }
     boolean isPersistentJavaFn =
         (fn.getBinaryType() == TFunctionBinaryType.JAVA) && fn.isPersistent();
-    synchronized (metastoreDdlLock_) {
-      Db db = catalog_.getDb(fn.dbName());
-      if (db == null) {
-        throw new CatalogException("Database: " + fn.dbName() + " does not exist.");
-      }
-      // Get a new catalog version to assign to the database being altered. This is
-      // needed for events processor as this method creates alter database events.
-      long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
-      addCatalogServiceIdentifiers(db, catalog_.getCatalogServiceId(), newCatalogVersion);
+    HiveJavaFunction hiveJavaFunction = (fn.getBinaryType() == TFunctionBinaryType.JAVA) ?
+        hiveJavaFuncFactory_.create((ScalarFunction) fn) :
+        null;
+    Db db = catalog_.getDb(fn.dbName());
+    if (db == null) {
+      throw new CatalogException("Database: " + fn.dbName() + " does not exist.");
+    }
+
+    tryLock(db, "creating function " + fn.getClass().getSimpleName());
+    // Get a new catalog version to assign to the database being altered. This is
+    // needed for events processor as this method creates alter database events.
+    long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+    catalog_.getLock().writeLock().unlock();
+    try {
       // Search for existing functions with the same name or signature that would
       // conflict with the function being added.
-      for (Function function: db.getFunctions(fn.functionName())) {
+      for (Function function : db.getFunctions(fn.functionName())) {
         if (isPersistentJavaFn || (function.isPersistent() &&
             (function.getBinaryType() == TFunctionBinaryType.JAVA)) ||
-                function.compare(fn, Function.CompareMode.IS_INDISTINGUISHABLE)) {
+            function.compare(fn, Function.CompareMode.IS_INDISTINGUISHABLE)) {
           if (!params.if_not_exists) {
             throw new CatalogException("Function " + fn.functionName() +
                 " already exists.");
@@ -1302,16 +2275,10 @@ public class CatalogOpExecutor {
         // For persistent Java functions we extract all supported function signatures from
         // the corresponding Jar and add each signature to the catalog.
         Preconditions.checkState(fn instanceof ScalarFunction);
-        org.apache.hadoop.hive.metastore.api.Function hiveFn =
-            ((ScalarFunction)fn).toHiveFunction();
-        List<Function> funcs = FunctionUtils.extractFunctions(fn.dbName(), hiveFn,
-            BackendConfig.INSTANCE.getBackendCfg().local_library_path);
-        if (funcs.isEmpty()) {
-          throw new CatalogException(
-            "No compatible function signatures found in class: " + hiveFn.getClassName());
-        }
-        if (addJavaFunctionToHms(fn.dbName(), hiveFn, params.if_not_exists)) {
-          for (Function addedFn: funcs) {
+        List<ScalarFunction> funcs = hiveJavaFunction.extract();
+        if (addJavaFunctionToHms(fn.dbName(), hiveJavaFunction.getHiveFunction(),
+            params.if_not_exists)) {
+          for (Function addedFn : funcs) {
             if (LOG.isTraceEnabled()) {
               LOG.trace(String.format("Adding function: %s.%s", addedFn.dbName(),
                   addedFn.signatureString()));
@@ -1321,7 +2288,14 @@ public class CatalogOpExecutor {
           }
         }
       } else {
+        //TODO(Vihang): addFunction method below directly updates the database
+        // parameters. If the applyAlterDatabase method below throws an exception,
+        // catalog might end up in a inconsistent state. Ideally, we should make a copy
+        // of hms Database object and then update the Db once the HMS operation succeeds
+        // similar to what happens in alterDatabaseSetOwner method.
         if (catalog_.addFunction(fn)) {
+          addCatalogServiceIdentifiers(db.getMetaStoreDb(),
+              catalog_.getCatalogServiceId(), newCatalogVersion);
           // Flush DB changes to metastore
           applyAlterDatabase(db.getMetaStoreDb());
           addedFunctions.add(fn.toTCatalogObject());
@@ -1338,6 +2312,8 @@ public class CatalogOpExecutor {
       } else {
         addSummary(resp, "Function already exists.");
       }
+    } finally {
+      db.getLock().unlock();
     }
   }
 
@@ -1389,8 +2365,8 @@ public class CatalogOpExecutor {
    * encountered as part of this operation. Acquires a lock on the modified table
    * to protect against concurrent modifications.
    */
-  private void dropStats(TDropStatsParams params, TDdlExecResponse resp)
-      throws ImpalaException {
+  private void dropStats(TDropStatsParams params, boolean wantMinimalResult,
+      TDdlExecResponse resp) throws ImpalaException {
     Table table = getExistingTable(params.getTable_name().getDb_name(),
         params.getTable_name().getTable_name(), "Load for DROP STATS");
     Preconditions.checkNotNull(table);
@@ -1398,10 +2374,12 @@ public class CatalogOpExecutor {
     Preconditions.checkState(!AcidUtils.isTransactionalTable(
         table.getMetaStoreTable().getParameters()));
 
-    tryLock(table, "dropping stats");
+    tryWriteLock(table, "dropping stats");
     try {
       long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
       catalog_.getLock().writeLock().unlock();
+      addCatalogServiceIdentifiers(table, catalog_.getCatalogServiceId(),
+          newCatalogVersion);
       if (params.getPartition_set() == null) {
         // TODO: Report the number of updated partitions/columns to the user?
         // TODO: bulk alter the partitions.
@@ -1416,23 +2394,23 @@ public class CatalogOpExecutor {
           return;
         }
 
-        for(HdfsPartition partition : partitions) {
+        for (HdfsPartition partition : partitions) {
           if (partition.getPartitionStatsCompressed() != null) {
-            partition.dropPartitionStats();
-            try {
-              applyAlterPartition(table, partition);
-            } finally {
-              partition.markDirty();
-            }
+            HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
+            partBuilder.dropPartitionStats();
+            applyAlterPartition(table, partBuilder);
+            hdfsTbl.updatePartition(partBuilder);
           }
         }
       }
-      loadTableMetadata(table, newCatalogVersion, false, true, null, "DROP STATS");
-      addTableToCatalogUpdate(table, resp.result);
+      loadTableMetadata(table, newCatalogVersion, /*reloadFileMetadata=*/false,
+          /*reloadTableSchema=*/true, /*partitionsToUpdate=*/null, "DROP STATS");
+      catalog_.addVersionsForInflightEvents(false, table, newCatalogVersion);
+      addTableToCatalogUpdate(table, wantMinimalResult, resp.result);
       addSummary(resp, "Stats have been dropped.");
     } finally {
       UnlockWriteLockIfErronouslyLocked();
-      table.getLock().unlock();
+      table.releaseWriteLock();
     }
   }
 
@@ -1441,7 +2419,7 @@ public class CatalogOpExecutor {
    * that were updated as part of this operation.
    */
   private int dropColumnStats(Table table) throws ImpalaRuntimeException {
-    Preconditions.checkState(table.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(table.isWriteLockedByCurrentThread());
     int numColsUpdated = 0;
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
       for (Column col: table.getColumns()) {
@@ -1473,9 +2451,16 @@ public class CatalogOpExecutor {
    * is unpartitioned.
    */
   private int dropTableStats(Table table) throws ImpalaException {
-    Preconditions.checkState(table.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(table.isWriteLockedByCurrentThread());
     // Delete the ROW_COUNT from the table (if it was set).
     org.apache.hadoop.hive.metastore.api.Table msTbl = table.getMetaStoreTable();
+    boolean isIntegratedIcebergTbl =
+        IcebergTable.isIcebergTable(msTbl) && isIcebergHmsIntegrationEnabled(msTbl);
+    if (isIntegratedIcebergTbl) {
+      // We shouldn't modify table-level stats of HMS-integrated Iceberg tables as these
+      // stats are managed by Iceberg.
+      return 0;
+    }
     int numTargetedPartitions = 0;
     boolean droppedRowCount =
         msTbl.getParameters().remove(StatsSetupConst.ROW_COUNT) != null;
@@ -1498,27 +2483,29 @@ public class CatalogOpExecutor {
     Preconditions.checkNotNull(hdfsTable);
 
     // List of partitions that were modified as part of this operation.
-    List<HdfsPartition> modifiedParts = Lists.newArrayList();
+    List<HdfsPartition.Builder> modifiedParts = Lists.newArrayList();
     Collection<? extends FeFsPartition> parts =
         FeCatalogUtils.loadAllPartitions(hdfsTable);
     for (FeFsPartition fePart: parts) {
       // TODO(todd): avoid downcast
       HdfsPartition part = (HdfsPartition) fePart;
-      boolean isModified = false;
+      HdfsPartition.Builder partBuilder = null;
       if (part.getPartitionStatsCompressed() != null) {
-        part.dropPartitionStats();
-        isModified = true;
+        partBuilder = new HdfsPartition.Builder(part).dropPartitionStats();
       }
 
-      // Remove the ROW_COUNT parameter if it has been set.
-      if (part.getParameters().remove(StatsSetupConst.ROW_COUNT) != null) {
-        isModified = true;
+      // We need to update the partition if it has a ROW_COUNT parameter.
+      if (part.getParameters().containsKey(StatsSetupConst.ROW_COUNT)) {
+        if (partBuilder == null) {
+          partBuilder = new HdfsPartition.Builder(part);
+        }
+        partBuilder.removeRowCountParam();
       }
 
-      if (isModified) modifiedParts.add(part);
+      if (partBuilder != null) modifiedParts.add(partBuilder);
     }
 
-    bulkAlterPartitions(table, modifiedParts, null);
+    bulkAlterPartitions(table, modifiedParts, null, UpdatePartitionMethod.IN_PLACE);
     return modifiedParts.size();
   }
 
@@ -1549,13 +2536,15 @@ public class CatalogOpExecutor {
     }
 
     TCatalogObject removedObject = null;
-    synchronized (metastoreDdlLock_) {
+    getMetastoreDdlLock().lock();
+    try {
       // Remove all the Kudu tables of 'db' from the Kudu storage engine.
       if (db != null && params.cascade) dropTablesFromKudu(db);
 
       // The Kudu tables in the HMS should have been dropped at this point
       // with the Hive Metastore integration enabled.
       try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+        long eventId = getCurrentEventId(msClient);
         // HMS client does not have a way to identify if the database was dropped or
         // not if the ignoreIfUnknown flag is true. Hence we always pass the
         // ignoreIfUnknown as false and catch the NoSuchObjectFoundException and
@@ -1563,6 +2552,11 @@ public class CatalogOpExecutor {
         msClient.getHiveClient().dropDatabase(
             dbName, /* deleteData */true, /* ignoreIfUnknown */false,
             params.cascade);
+        List<NotificationEvent> events = getNextMetastoreEventsIfEnabled(eventId,
+            event -> dbName.equalsIgnoreCase(event.getDbName()) && (
+                DropDatabaseEvent.DROP_DATABASE_EVENT_TYPE.equals(event.getEventType()) ||
+                    DropTableEvent.DROP_TABLE_EVENT_TYPE.equals(event.getEventType())));
+        addToDeleteEventLog(events);
         addSummary(resp, "Database has been dropped.");
       } catch (TException e) {
         if (e instanceof NoSuchObjectException && params.if_exists) {
@@ -1590,6 +2584,8 @@ public class CatalogOpExecutor {
             db.getMetaStoreDb().getOwnerName(), db.getMetaStoreDb().getOwnerType(),
             /* newOwner */ null, /* newOwnerType */ null, resp);
       }
+    } finally {
+      getMetastoreDdlLock().unlock();
     }
 
     Preconditions.checkNotNull(removedObject);
@@ -1599,6 +2595,29 @@ public class CatalogOpExecutor {
     // such a case we still would want to add the summary of the operation as database
     // has been dropped since we cleaned up state from CatalogServer
     addSummary(resp, "Database has been dropped.");
+  }
+
+  /**
+   * Adds the events to the deleteEventLog if the event processing is active.
+   */
+  public void addToDeleteEventLog(List<NotificationEvent> events) {
+    if (events == null || events.isEmpty()) return;
+    for (NotificationEvent event : events) {
+      String eventType = event.getEventType();
+      Preconditions.checkState(
+          eventType.equals(DropDatabaseEvent.DROP_DATABASE_EVENT_TYPE) ||
+          eventType.equals(DropTableEvent.DROP_TABLE_EVENT_TYPE) ||
+          eventType.equals(DropPartitionEvent.EVENT_TYPE), "Can not add event type: " +
+              "%s to deleteEventLog", eventType);
+      String key;
+      if (DropDatabaseEvent.DROP_DATABASE_EVENT_TYPE.equals(event.getEventType())) {
+        key = DeleteEventLog.getDbKey(event.getDbName());
+      } else {
+        Preconditions.checkNotNull(event.getTableName());
+        key = DeleteEventLog.getTblKey(event.getDbName(), event.getTableName());
+      }
+      addToDeleteEventLog(event.getEventId(), key);
+    }
   }
 
   /**
@@ -1640,15 +2659,35 @@ public class CatalogOpExecutor {
     }
   }
 
+  private boolean isHmsIntegrationAutomatic(
+      org.apache.hadoop.hive.metastore.api.Table msTbl) throws ImpalaRuntimeException {
+    if (KuduTable.isKuduTable(msTbl)) {
+      return isKuduHmsIntegrationEnabled(msTbl);
+    }
+    if (IcebergTable.isIcebergTable(msTbl)) {
+      return isIcebergHmsIntegrationEnabled(msTbl);
+    }
+    return false;
+  }
+
   private boolean isKuduHmsIntegrationEnabled(
-      org.apache.hadoop.hive.metastore.api.Table msTbl)
-          throws ImpalaRuntimeException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl) throws ImpalaRuntimeException {
     // Check if Kudu's integration with the Hive Metastore is enabled, and validate
     // the configuration.
     Preconditions.checkState(KuduTable.isKuduTable(msTbl));
     String masterHosts = msTbl.getParameters().get(KuduTable.KEY_MASTER_HOSTS);
     String hmsUris = MetaStoreUtil.getHiveMetastoreUris();
     return KuduTable.isHMSIntegrationEnabledAndValidate(masterHosts, hmsUris);
+  }
+
+  private boolean isIcebergHmsIntegrationEnabled(
+      org.apache.hadoop.hive.metastore.api.Table msTbl) throws ImpalaRuntimeException {
+    // Check if Iceberg's integration with the Hive Metastore is enabled, and validate
+    // the configuration.
+    Preconditions.checkState(IcebergTable.isIcebergTable(msTbl));
+    // Only synchronized tables can be integrated.
+    if (!IcebergTable.isSynchronizedTable(msTbl)) return false;
+    return IcebergUtil.isHiveCatalog(msTbl);
   }
 
   /**
@@ -1659,8 +2698,8 @@ public class CatalogOpExecutor {
    * In case of transactional tables acquires an exclusive HMS table lock before
    * executing the drop operation.
    */
-  private void dropTableOrView(TDropTableOrViewParams params, TDdlExecResponse resp)
-      throws ImpalaException {
+  private void dropTableOrView(TDropTableOrViewParams params, TDdlExecResponse resp,
+      int lockMaxWaitTime) throws ImpalaException {
     TableName tableName = TableName.fromThrift(params.getTable_name());
     Preconditions.checkState(tableName != null && tableName.isFullyQualified());
     Preconditions.checkState(!catalog_.isBlacklistedTable(tableName) || params.if_exists,
@@ -1683,8 +2722,10 @@ public class CatalogOpExecutor {
     // be loaded because the planning phase on the impalad side triggered the loading.
     // In the LocalCatalog configuration, however, this is often necessary.
     try {
+      // we pass null validWriteIdList here since we don't really care what version of
+      // table is loaded, eventually its going to be dropped below.
       catalog_.getOrLoadTable(params.getTable_name().db_name,
-          params.getTable_name().table_name, "Load for DROP TABLE/VIEW");
+          params.getTable_name().table_name, "Load for DROP TABLE/VIEW", null);
 
     } catch (CatalogException e) {
       // Ignore exceptions -- the above was just to trigger loading. Failure to load
@@ -1698,7 +2739,8 @@ public class CatalogOpExecutor {
       HeartbeatContext ctx = new HeartbeatContext(
           String.format("Drop table/view %s.%s", tableName.getDb(), tableName.getTbl()),
           System.nanoTime());
-      lockId = catalog_.lockTableStandalone(tableName.getDb(), tableName.getTbl(), ctx);
+      lockId = catalog_.lockTableStandalone(tableName.getDb(), tableName.getTbl(), ctx,
+          lockMaxWaitTime);
     }
 
     try {
@@ -1714,7 +2756,8 @@ public class CatalogOpExecutor {
   private void dropTableOrViewInternal(TDropTableOrViewParams params,
       TableName tableName, TDdlExecResponse resp) throws ImpalaException {
     TCatalogObject removedObject = new TCatalogObject();
-    synchronized (metastoreDdlLock_) {
+    getMetastoreDdlLock().lock();
+    try {
       Db db = catalog_.getDb(params.getTable_name().db_name);
       if (db == null) {
         String dbNotExist = "Database does not exist: " + params.getTable_name().db_name;
@@ -1731,28 +2774,6 @@ public class CatalogOpExecutor {
           return;
         }
         throw new CatalogException("Table/View does not exist.");
-      }
-
-      // Retrieve the HMS table to determine if this is a Kudu table.
-      org.apache.hadoop.hive.metastore.api.Table msTbl = existingTbl.getMetaStoreTable();
-      if (msTbl == null) {
-        Preconditions.checkState(existingTbl instanceof IncompleteTable);
-        Stopwatch hmsLoadSW = new Stopwatch().start();
-        long hmsLoadTime;
-        try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-          msTbl = msClient.getHiveClient().getTable(tableName.getDb(),
-              tableName.getTbl());
-        } catch (TException e) {
-          LOG.error(String.format(HMS_RPC_ERROR_FORMAT_STR, "getTable") + e.getMessage());
-        } finally {
-          hmsLoadTime = hmsLoadSW.elapsed(TimeUnit.NANOSECONDS);
-        }
-        existingTbl.updateHMSLoadTableSchemaTime(hmsLoadTime);
-      }
-      boolean isSynchronizedTable = msTbl != null &&
-              KuduTable.isKuduTable(msTbl) && KuduTable.isSynchronizedTable(msTbl);
-      if (isSynchronizedTable) {
-        KuduCatalogOpExecutor.dropTable(msTbl, /* if exists */ true);
       }
 
       // Check to make sure we don't drop a view with "drop table" statement and
@@ -1772,10 +2793,65 @@ public class CatalogOpExecutor {
         throw new CatalogException(errorMsg);
       }
 
-      // When Kudu's HMS integration is enabled, Kudu will drop the managed table
-      // entries automatically. In all other cases, we need to drop the HMS table
-      // entry ourselves.
-      if (!isSynchronizedTable || !isKuduHmsIntegrationEnabled(msTbl)) {
+      // Retrieve the HMS table to determine if this is a Kudu or Iceberg table.
+      org.apache.hadoop.hive.metastore.api.Table msTbl = existingTbl.getMetaStoreTable();
+      if (msTbl == null) {
+        Preconditions.checkState(existingTbl instanceof IncompleteTable);
+        Stopwatch hmsLoadSW = Stopwatch.createStarted();
+        long hmsLoadTime;
+        try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+          msTbl = msClient.getHiveClient().getTable(tableName.getDb(),
+              tableName.getTbl());
+        } catch (TException e) {
+          LOG.error(String.format(HMS_RPC_ERROR_FORMAT_STR, "getTable") + e.getMessage());
+        } finally {
+          hmsLoadTime = hmsLoadSW.elapsed(TimeUnit.NANOSECONDS);
+        }
+        existingTbl.updateHMSLoadTableSchemaTime(hmsLoadTime);
+      }
+      boolean isSynchronizedKuduTable = msTbl != null &&
+              KuduTable.isKuduTable(msTbl) && KuduTable.isSynchronizedTable(msTbl);
+      if (isSynchronizedKuduTable) {
+        KuduCatalogOpExecutor.dropTable(msTbl, /* if exists */ true);
+      }
+
+      long eventId;
+      try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+        eventId = getCurrentEventId(msClient);
+      }
+      boolean isSynchronizedIcebergTable = msTbl != null &&
+          IcebergTable.isIcebergTable(msTbl) &&
+          IcebergTable.isSynchronizedTable(msTbl);
+      // When HMS integration is automatic, the table is dropped automatically. In all
+      // other cases, we need to drop the HMS table entry ourselves.
+      boolean isSynchronizedTable = isSynchronizedKuduTable || isSynchronizedIcebergTable;
+      boolean needsHmsDropTable =
+          (existingTbl instanceof IncompleteTable && isSynchronizedIcebergTable) ||
+              !isSynchronizedTable ||
+              !isHmsIntegrationAutomatic(msTbl);
+
+      if (!(existingTbl instanceof IncompleteTable) && isSynchronizedIcebergTable) {
+        Preconditions.checkState(existingTbl instanceof IcebergTable);
+        try {
+          IcebergCatalogOpExecutor.dropTable((IcebergTable)existingTbl, params.if_exists);
+        } catch (TableNotFoundException e) {
+          // This is unusual as normally this would have already shown up as
+          // (existingTbl instanceof IncompleteTable), but this can happen if
+          // for example the Iceberg metadata is removed.
+          if (!needsHmsDropTable) {
+            // There is no more work to be done, so throw exception.
+            throw e;
+          }
+          // Although dropTable() failed in Iceberg we need to also drop the table in
+          // HMS, so we continue here.
+          LOG.warn(String.format("Could not drop Iceberg table %s.%s " +
+                  "proceeding to drop table in HMS", tableName.getDb(),
+              tableName.getTbl()), e);
+        }
+      }
+
+
+      if (needsHmsDropTable) {
         try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
           msClient.getHiveClient().dropTable(
               tableName.getDb(), tableName.getTbl(), true,
@@ -1789,8 +2865,14 @@ public class CatalogOpExecutor {
               String.format(HMS_RPC_ERROR_FORMAT_STR, "dropTable"), e);
         }
       }
+      List<NotificationEvent> events = Collections.EMPTY_LIST;
+      final org.apache.hadoop.hive.metastore.api.Table finalMsTbl = msTbl;
+      events = getNextMetastoreEventsIfEnabled(eventId,
+          event -> DropTableEvent.DROP_TABLE_EVENT_TYPE.equals(event.getEventType())
+              && finalMsTbl.getDbName().equalsIgnoreCase(event.getDbName())
+              && finalMsTbl.getTableName().equalsIgnoreCase(event.getTableName()));
       addSummary(resp, (params.is_table ? "Table " : "View ") + "has been dropped.");
-
+      addToDeleteEventLog(events);
       Table table = catalog_.removeTable(params.getTable_name().db_name,
           params.getTable_name().table_name);
       if (table == null) {
@@ -1809,8 +2891,11 @@ public class CatalogOpExecutor {
               /* newOwnerType */ null, resp);
         }
       }
+    } finally {
+      getMetastoreDdlLock().unlock();
     }
-    removedObject.setType(TCatalogObjectType.TABLE);
+    removedObject.setType(params.is_table ?
+        TCatalogObjectType.TABLE : TCatalogObjectType.VIEW);
     removedObject.setTable(new TTable());
     removedObject.getTable().setTbl_name(tableName.getTbl());
     removedObject.getTable().setDb_name(tableName.getDb());
@@ -1838,8 +2923,12 @@ public class CatalogOpExecutor {
           FeCatalogUtils.loadAllPartitions(hdfsTable);
       for (FeFsPartition part: parts) {
         if (part.isMarkedCached()) {
+          HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(
+              (HdfsPartition) part);
           try {
-            HdfsCachingUtil.removePartitionCacheDirective(part);
+            HdfsCachingUtil.removePartitionCacheDirective(partBuilder);
+            // We are dropping the table. Don't need to update the existing partition so
+            // ignore the partBuilder here.
           } catch (Exception e) {
             LOG.error("Unable to uncache partition: " + part.getPartitionName(), e);
           }
@@ -1854,7 +2943,8 @@ public class CatalogOpExecutor {
    * concurrent table modifications.
    * TODO truncate specified partitions.
    */
-  private void truncateTable(TTruncateParams params, TDdlExecResponse resp)
+  private void truncateTable(TTruncateParams params, boolean wantMinimalResult,
+      TDdlExecResponse resp, int lockMaxWaitTime)
       throws ImpalaException {
     TTableName tblName = params.getTable_name();
     Table table = null;
@@ -1869,7 +2959,7 @@ public class CatalogOpExecutor {
       throw e;
     }
     Preconditions.checkNotNull(table);
-    if (!(table instanceof HdfsTable)) {
+    if (!(table instanceof FeFsTable)) {
       throw new CatalogException(
           String.format("TRUNCATE TABLE not supported on non-HDFS table: %s",
           table.getFullName()));
@@ -1879,12 +2969,14 @@ public class CatalogOpExecutor {
     // If transactional, the lock will be released for some time to acquire the HMS Acid
     // lock. It's safe because transactional -> non-transactional conversion is not
     // allowed.
-    tryLock(table, "truncating");
+    tryWriteLock(table, "truncating");
     try {
       long newCatalogVersion = 0;
       try {
         if (AcidUtils.isTransactionalTable(table.getMetaStoreTable().getParameters())) {
-          newCatalogVersion = truncateTransactionalTable(params, table);
+          newCatalogVersion = truncateTransactionalTable(params, table, lockMaxWaitTime);
+        } else if (table instanceof FeIcebergTable) {
+          newCatalogVersion = truncateIcebergTable(params, table);
         } else {
           newCatalogVersion = truncateNonTransactionalTable(params, table);
         }
@@ -1896,11 +2988,12 @@ public class CatalogOpExecutor {
       Preconditions.checkState(newCatalogVersion > 0);
       addSummary(resp, "Table has been truncated.");
       loadTableMetadata(table, newCatalogVersion, true, true, null, "TRUNCATE");
-      addTableToCatalogUpdate(table, resp.result);
+      catalog_.addVersionsForInflightEvents(false, table, newCatalogVersion);
+      addTableToCatalogUpdate(table, wantMinimalResult, resp.result);
     } finally {
       UnlockWriteLockIfErronouslyLocked();
-      if (table.getLock().isHeldByCurrentThread()) {
-        table.getLock().unlock();
+      if (table.isWriteLockedByCurrentThread()) {
+        table.releaseWriteLock();
       }
     }
   }
@@ -1913,12 +3006,13 @@ public class CatalogOpExecutor {
    * After that empty directory creation it removes stats-related parameters of
    * the table and its partitions.
    */
-  private long truncateTransactionalTable(TTruncateParams params, Table table)
-      throws ImpalaException {
-    Preconditions.checkState(table.getLock().isHeldByCurrentThread());
+  private long truncateTransactionalTable(TTruncateParams params, Table table,
+      int lockMaxWaitTime) throws ImpalaException {
+    Preconditions.checkState(table.isWriteLockedByCurrentThread());
     Preconditions.checkState(catalog_.getLock().isWriteLockedByCurrentThread());
     catalog_.getLock().writeLock().unlock();
     TableName tblName = TableName.fromThrift(params.getTable_name());
+    Stopwatch sw = Stopwatch.createStarted();
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
       long newCatalogVersion = 0;
       IMetaStoreClient hmsClient = msClient.getHiveClient();
@@ -1929,71 +3023,172 @@ public class CatalogOpExecutor {
         Preconditions.checkState(txn.getId() > 0);
         // We need to release catalog table lock here, because HMS Acid table lock
         // must be locked in advance to avoid dead lock.
-        table.getLock().unlock();
+        table.releaseWriteLock();
         //TODO: if possible, set DataOperationType to something better than NO_TXN.
         catalog_.lockTableInTransaction(tblName.getDb(), tblName.getTbl(), txn,
-            DataOperationType.NO_TXN, ctx);
-        tryLock(table, "truncating");
+            DataOperationType.NO_TXN, ctx, lockMaxWaitTime);
+        tryWriteLock(table, "truncating");
+        LOG.trace("Time elapsed after taking write lock on table {}: {} msec",
+            table.getFullName(), sw.elapsed(TimeUnit.MILLISECONDS));
         newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
         catalog_.getLock().writeLock().unlock();
+        addCatalogServiceIdentifiers(table, catalog_.getCatalogServiceId(),
+            newCatalogVersion);
         TblTransaction tblTxn = MetastoreShim.createTblTransaction(hmsClient,
             table.getMetaStoreTable(), txn.getId());
-        HdfsTable hdfsTable = (HdfsTable)table;
-        Collection<? extends FeFsPartition> parts =
-            FeCatalogUtils.loadAllPartitions(hdfsTable);
-        createEmptyBaseDirectories(parts, tblTxn.writeId);
-        // Currently Impala cannot update the statistics properly. So instead of
-        // writing correct stats, let's just remove COLUMN_STATS_ACCURATE parameter from
-        // each partition.
-        // TODO(IMPALA-8883): properly update statistics
-        List<org.apache.hadoop.hive.metastore.api.Partition> hmsPartitions =
-            Lists.newArrayListWithCapacity(parts.size());
-        if (table.getNumClusteringCols() > 0) {
-          for (FeFsPartition part: parts) {
-            org.apache.hadoop.hive.metastore.api.Partition hmsPart =
-                ((HdfsPartition)part).toHmsPartition();
-            Preconditions.checkNotNull(hmsPart);
-            if (hmsPart.getParameters() != null) {
-              hmsPart.getParameters().remove(StatsSetupConst.COLUMN_STATS_ACCURATE);
-              hmsPartitions.add(hmsPart);
+        HdfsTable hdfsTable = (HdfsTable) table;
+        // if the table is replicated we should use the HMS API to truncate it so that
+        // if moves the files into in replication change manager location which is later
+        // used for replication.
+        if (isTableBeingReplicated(hmsClient, hdfsTable)) {
+          String dbName = Preconditions.checkNotNull(hdfsTable.getDb()).getName();
+          MetastoreShim.truncateTable(hmsClient, dbName, hdfsTable.getName(), null,
+              tblTxn.validWriteIds, tblTxn.writeId);
+          LOG.trace("Time elapsed to truncate table {} using HMS API: {} msec",
+              hdfsTable.getFullName(), sw.elapsed(TimeUnit.MILLISECONDS));
+        } else {
+          Collection<? extends FeFsPartition> parts =
+              FeCatalogUtils.loadAllPartitions(hdfsTable);
+          createEmptyBaseDirectories(parts, tblTxn.writeId);
+          LOG.trace("Time elapsed after creating empty base directories for table {}: {} "
+                  + "msec", table.getFullName(), sw.elapsed(TimeUnit.MILLISECONDS));
+          // Currently Impala cannot update the statistics properly. So instead of
+          // writing correct stats, let's just remove COLUMN_STATS_ACCURATE parameter from
+          // each partition.
+          // TODO(IMPALA-8883): properly update statistics
+          List<org.apache.hadoop.hive.metastore.api.Partition> hmsPartitions =
+              Lists.newArrayListWithCapacity(parts.size());
+          if (table.getNumClusteringCols() > 0) {
+            for (FeFsPartition part : parts) {
+              org.apache.hadoop.hive.metastore.api.Partition hmsPart =
+                  ((HdfsPartition) part).toHmsPartition();
+              Preconditions.checkNotNull(hmsPart);
+              if (hmsPart.getParameters() != null) {
+                hmsPart.getParameters().remove(StatsSetupConst.COLUMN_STATS_ACCURATE);
+                hmsPartitions.add(hmsPart);
+              }
             }
           }
+          // For partitioned tables we need to alter all the partitions in HMS.
+          if (!hmsPartitions.isEmpty()) {
+            unsetPartitionsColStats(table.getMetaStoreTable(), hmsPartitions, tblTxn);
+          }
+          // Remove COLUMN_STATS_ACCURATE property from the table.
+          unsetTableColStats(table.getMetaStoreTable(), tblTxn);
+          LOG.trace("Time elapsed after unset partition and column statistics for table "
+              + "{}: {} msec", table.getFullName(), sw.elapsed(TimeUnit.MILLISECONDS));
         }
-        // For partitioned tables we need to alter all the partitions in HMS.
-        if (!hmsPartitions.isEmpty()) {
-          unsetPartitionsColStats(table.getMetaStoreTable(), hmsPartitions, tblTxn);
-        }
-        // Remove COLUMN_STATS_ACCURATE property from the table.
-        unsetTableColStats(table.getMetaStoreTable(), tblTxn);
         txn.commit();
       }
       return newCatalogVersion;
     } catch (Exception e) {
       throw new ImpalaRuntimeException(
           String.format(HMS_RPC_ERROR_FORMAT_STR, "truncateTable"), e);
+    } finally {
+      LOG.trace("Time taken to do metastore and file system operations for"
+              + " truncating table {}: {} msec", table.getFullName(),
+          sw.stop().elapsed(TimeUnit.MILLISECONDS));
     }
+  }
+
+  /**
+   * Helper method to check if the database which table belongs to is a source of
+   * Hive replication. We cannot rely on the Db object here due to eventual nature of
+   * cache updates.
+   */
+  private boolean isTableBeingReplicated(IMetaStoreClient metastoreClient,
+      HdfsTable tbl) throws CatalogException {
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
+    String dbName = tbl.getDb().getName();
+    try {
+      Database db = metastoreClient.getDatabase(dbName);
+      if (!db.isSetParameters()) return false;
+      return org.apache.commons.lang.StringUtils
+          .isNotEmpty(db.getParameters().get("repl.source.for"));
+    } catch (TException tException) {
+      throw new CatalogException(
+          String.format("Could not determine if the table %s is a replication source",
+          tbl.getFullName()), tException);
+    }
+  }
+
+  private long truncateIcebergTable(TTruncateParams params, Table table)
+      throws Exception {
+    Preconditions.checkState(table.isWriteLockedByCurrentThread());
+    Preconditions.checkState(catalog_.getLock().isWriteLockedByCurrentThread());
+    Preconditions.checkState(table instanceof FeIcebergTable);
+    long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+    catalog_.getLock().writeLock().unlock();
+    addCatalogServiceIdentifiers(table, catalog_.getCatalogServiceId(),
+        newCatalogVersion);
+    FeIcebergTable iceTbl = (FeIcebergTable)table;
+    if (params.isDelete_stats()) {
+      dropColumnStats(table);
+      dropTableStats(table);
+    }
+    org.apache.iceberg.Transaction iceTxn = IcebergUtil.getIcebergTransaction(iceTbl);
+    IcebergCatalogOpExecutor.truncateTable(iceTxn);
+    if (isIcebergHmsIntegrationEnabled(iceTbl.getMetaStoreTable())) {
+      catalog_.addVersionsForInflightEvents(false, table, newCatalogVersion);
+      IcebergCatalogOpExecutor.addCatalogVersionToTxn(iceTxn,
+          catalog_.getCatalogServiceId(), newCatalogVersion);
+    }
+    iceTxn.commitTransaction();
+    return newCatalogVersion;
   }
 
   private long truncateNonTransactionalTable(TTruncateParams params, Table table)
       throws Exception {
-    Preconditions.checkState(table.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(table.isWriteLockedByCurrentThread());
     Preconditions.checkState(catalog_.getLock().isWriteLockedByCurrentThread());
     long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
     catalog_.getLock().writeLock().unlock();
+    addCatalogServiceIdentifiers(table, catalog_.getCatalogServiceId(),
+        newCatalogVersion);
     HdfsTable hdfsTable = (HdfsTable) table;
-    Collection<? extends FeFsPartition> parts = FeCatalogUtils
-        .loadAllPartitions(hdfsTable);
-    for (FeFsPartition part : parts) {
-      FileSystemUtil.deleteAllVisibleFiles(new Path(part.getLocation()));
+    boolean isTableBeingReplicated = false;
+    Stopwatch sw = Stopwatch.createStarted();
+    try {
+      // if the table is being replicated we issue the HMS API to truncate the table
+      // since it generates additional events which are used by Hive Replication.
+      try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
+        if (isTableBeingReplicated(metaStoreClient.getHiveClient(), hdfsTable)) {
+          isTableBeingReplicated = true;
+          String dbName = Preconditions.checkNotNull(hdfsTable.getDb()).getName();
+          metaStoreClient.getHiveClient()
+              .truncateTable(dbName, hdfsTable.getName(), null);
+          LOG.trace("Time elapsed after truncating table {} using HMS API: {} msec",
+              hdfsTable.getFullName(), sw.elapsed(TimeUnit.MILLISECONDS));
+        }
+      }
+      if (!isTableBeingReplicated) {
+        // when table is replicated we let the HMS API handle the file deletion logic
+        // otherwise we delete the files.
+        Collection<? extends FeFsPartition> parts = FeCatalogUtils
+            .loadAllPartitions(hdfsTable);
+        for (FeFsPartition part : parts) {
+          FileSystemUtil.deleteAllVisibleFiles(new Path(part.getLocation()));
+        }
+        LOG.trace("Time elapsed after deleting files for table {}: {} msec",
+            table.getFullName(), sw.elapsed(TimeUnit.MILLISECONDS));
+      }
+      if (params.isDelete_stats()) {
+        dropColumnStats(table);
+        dropTableStats(table);
+        LOG.trace("Time elapsed after deleting statistics for table {}: {} msec ",
+            table.getFullName(), sw.elapsed(TimeUnit.MILLISECONDS));
+      }
+      return newCatalogVersion;
+    } finally {
+      LOG.debug("Time taken for metastore and filesystem operations for truncating "
+              + "table {}: {} msec", table.getFullName(),
+          sw.stop().elapsed(TimeUnit.MILLISECONDS));
     }
-    dropColumnStats(table);
-    dropTableStats(table);
-    return newCatalogVersion;
   }
 
   /**
    * Creates new empty base directories for an ACID table. The directories won't be
-   * really empty, they will contain the hidden "_empty" file. It's needed because
+   * really empty, they will contain the "empty" file. It's needed because
    * FileSystemUtil.listFiles() doesn't see empty directories. See IMPALA-8739.
    * @param partitions the partitions in which we create new directories.
    * @param writeId the write id of the new base directory.
@@ -2007,32 +3202,34 @@ public class CatalogOpExecutor {
       String baseDirStr =
           part.getLocation() + Path.SEPARATOR + "base_" + String.valueOf(writeId);
       fs.mkdirs(new Path(baseDirStr));
-      String emptyFile = baseDirStr + Path.SEPARATOR + "_empty";
-      fs.create(new Path(emptyFile));
+      String emptyFile = baseDirStr + Path.SEPARATOR + "empty";
+      fs.create(new Path(emptyFile)).close();
     }
   }
 
   private void dropFunction(TDropFunctionParams params, TDdlExecResponse resp)
       throws ImpalaException {
     FunctionName fName = FunctionName.fromThrift(params.fn_name);
-    synchronized (metastoreDdlLock_) {
-      Db db = catalog_.getDb(fName.getDb());
-      if (db == null) {
-        if (!params.if_exists) {
-            throw new CatalogException("Database: " + fName.getDb()
-                + " does not exist.");
-        }
-        addSummary(resp, "Database does not exist.");
-        return;
+    Db db = catalog_.getDb(fName.getDb());
+    if (db == null) {
+      if (!params.if_exists) {
+        throw new CatalogException("Database: " + fName.getDb()
+            + " does not exist.");
       }
-      // Get a new catalog version to assign to the database being altered. This is
-      // needed for events processor as this method creates alter database events.
-      long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
-      addCatalogServiceIdentifiers(db, catalog_.getCatalogServiceId(), newCatalogVersion);
+      addSummary(resp, "Database does not exist.");
+      return;
+    }
+
+    tryLock(db, "dropping function " + fName);
+    // Get a new catalog version to assign to the database being altered. This is
+    // needed for events processor as this method creates alter database events.
+    long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+    catalog_.getLock().writeLock().unlock();
+    try {
       List<TCatalogObject> removedFunctions = Lists.newArrayList();
       if (!params.isSetSignature()) {
         dropJavaFunctionFromHms(fName.getDb(), fName.getFunction(), params.if_exists);
-        for (Function fn: db.getFunctions(fName.getFunction())) {
+        for (Function fn : db.getFunctions(fName.getFunction())) {
           if (fn.getBinaryType() != TFunctionBinaryType.JAVA
               || !fn.isPersistent()) {
             continue;
@@ -2042,7 +3239,7 @@ public class CatalogOpExecutor {
         }
       } else {
         ArrayList<Type> argTypes = Lists.newArrayList();
-        for (TColumnType t: params.arg_types) {
+        for (TColumnType t : params.arg_types) {
           argTypes.add(Type.fromThrift(t));
         }
         Function desc = new Function(fName, argTypes, Type.INVALID, false);
@@ -2053,6 +3250,8 @@ public class CatalogOpExecutor {
                 "Function: " + desc.signatureString() + " does not exist.");
           }
         } else {
+          addCatalogServiceIdentifiers(db.getMetaStoreDb(),
+              catalog_.getCatalogServiceId(), newCatalogVersion);
           // Flush DB changes to metastore
           applyAlterDatabase(db.getMetaStoreDb());
           removedFunctions.add(fn.toTCatalogObject());
@@ -2069,6 +3268,8 @@ public class CatalogOpExecutor {
         addSummary(resp, "Function does not exist.");
       }
       resp.result.setVersion(catalog_.getCatalogVersion());
+    } finally {
+      db.getLock().unlock();
     }
   }
 
@@ -2082,7 +3283,7 @@ public class CatalogOpExecutor {
    * otherwise.
    */
   private boolean createTable(TCreateTableParams params, TDdlExecResponse response,
-      boolean syncDdl) throws ImpalaException {
+      boolean syncDdl, boolean wantMinimalResult) throws ImpalaException {
     Preconditions.checkNotNull(params);
     TableName tableName = TableName.fromThrift(params.getTable_name());
     Preconditions.checkState(tableName != null && tableName.isFullyQualified());
@@ -2097,7 +3298,7 @@ public class CatalogOpExecutor {
       addSummary(response, "Table already exists.");
       LOG.trace("Skipping table creation because {} already exists and " +
           "IF NOT EXISTS was specified.", tableName);
-      tryLock(existingTbl);
+      tryWriteLock(existingTbl);
       try {
         if (syncDdl) {
           // When SYNC_DDL is enabled and the table already exists, we force a version
@@ -2115,21 +3316,29 @@ public class CatalogOpExecutor {
           LOG.trace("Table {} version bumped to {} because SYNC_DDL is enabled.",
               tableName, newVersion);
         }
-        addTableToCatalogUpdate(existingTbl, response.result);
+        addTableToCatalogUpdate(existingTbl, wantMinimalResult, response.result);
       } finally {
         // Release the locks held in tryLock().
         catalog_.getLock().writeLock().unlock();
-        existingTbl.getLock().unlock();
+        existingTbl.releaseWriteLock();
       }
       return false;
     }
     org.apache.hadoop.hive.metastore.api.Table tbl = createMetaStoreTable(params);
     LOG.trace("Creating table {}", tableName);
-    if (KuduTable.isKuduTable(tbl)) return createKuduTable(tbl, params, response);
+    if (KuduTable.isKuduTable(tbl)) {
+      return createKuduTable(tbl, params, wantMinimalResult, response);
+    } else if (IcebergTable.isIcebergTable(tbl)) {
+      return createIcebergTable(tbl, wantMinimalResult, response, params.if_not_exists,
+          params.getColumns(), params.getPartition_spec(), params.getTable_properties(),
+          params.getComment());
+    }
     Preconditions.checkState(params.getColumns().size() > 0,
         "Empty column list given as argument to Catalog.createTable");
+    MetastoreShim.setTableLocation(catalog_.getDb(tbl.getDbName()), tbl);
     return createTable(tbl, params.if_not_exists, params.getCache_op(),
-        params.server_name, params.getPrimary_keys(), params.getForeign_keys(), response);
+        params.server_name, params.getPrimary_keys(), params.getForeign_keys(),
+        wantMinimalResult, response);
   }
 
   /**
@@ -2172,6 +3381,11 @@ public class CatalogOpExecutor {
       tbl.setTableType(TableType.MANAGED_TABLE.toString());
     }
 
+    // Set bucketing_version to table parameter
+    if (params.getBucket_info() != null
+        && params.getBucket_info().getBucket_type() != TBucketType.NONE) {
+      tbl.getParameters().put("bucketing_version", "2");
+    }
     tbl.setSd(createSd(params));
     if (params.getPartition_columns() != null) {
       // Add in any partition keys that were specified
@@ -2196,6 +3410,13 @@ public class CatalogOpExecutor {
     }
 
     if (params.getLocation() != null) sd.setLocation(params.getLocation());
+
+    // Add bucket desc
+    if (params.getBucket_info() != null
+        && params.getBucket_info().getBucket_type() != TBucketType.NONE) {
+      sd.setBucketCols(params.getBucket_info().getBucket_columns());
+      sd.setNumBuckets(params.getBucket_info().getNum_bucket());
+    }
 
     // Add in all the columns
     sd.setCols(buildFieldSchemaList(params.getColumns()));
@@ -2225,9 +3446,14 @@ public class CatalogOpExecutor {
    * table was created as part of this call, false otherwise.
    */
   private boolean createKuduTable(org.apache.hadoop.hive.metastore.api.Table newTable,
-      TCreateTableParams params, TDdlExecResponse response) throws ImpalaException {
+      TCreateTableParams params, boolean wantMinimalResult, TDdlExecResponse response)
+      throws ImpalaException {
     Preconditions.checkState(KuduTable.isKuduTable(newTable));
     boolean createHMSTable;
+    long eventId;
+    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      eventId = getCurrentEventId(msClient);
+    }
     if (!KuduTable.isSynchronizedTable(newTable)) {
       // if this is not a synchronized table, we assume that the table must be existing
       // in kudu and use the column spec from Kudu
@@ -2242,17 +3468,45 @@ public class CatalogOpExecutor {
     try {
       // Add the table to the HMS and the catalog cache. Acquire metastoreDdlLock_ to
       // ensure the atomicity of these operations.
-      synchronized (metastoreDdlLock_) {
-        if (createHMSTable) {
-          try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      List<NotificationEvent> events = Collections.EMPTY_LIST;
+      getMetastoreDdlLock().lock();
+      if (createHMSTable) {
+        try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+          boolean tableInMetastore =
+              msClient.getHiveClient().tableExists(newTable.getDbName(),
+                                                   newTable.getTableName());
+          if (!tableInMetastore) {
             msClient.getHiveClient().createTable(newTable);
+          } else {
+            addSummary(response, "Table already exists.");
+            return false;
           }
+          events = getNextMetastoreEventsIfEnabled(eventId,
+                  event -> CreateTableEvent.CREATE_TABLE_EVENT_TYPE
+                      .equals(event.getEventType())
+                      && newTable.getDbName().equalsIgnoreCase(event.getDbName())
+                      && newTable.getTableName()
+                      .equalsIgnoreCase(event.getTableName()));
         }
-        // Add the table to the catalog cache
-        Table newTbl = catalog_.addIncompleteTable(newTable.getDbName(),
-            newTable.getTableName());
-        addTableToCatalogUpdate(newTbl, response.result);
       }
+      // in case of synchronized tables it is possible that Kudu doesn't generate
+      // any metastore events.
+      long createEventId = -1;
+      Pair<Long, org.apache.hadoop.hive.metastore.api.Table> eventTblPair =
+          getTableFromEvents(events, params.if_not_exists);
+      createEventId = eventTblPair == null ? -1 : eventTblPair.first;
+      org.apache.hadoop.hive.metastore.api.Table msTable =
+          eventTblPair == null ? null : eventTblPair.second;
+      setTableNameAndCreateTimeInResponse(msTable,
+          newTable.getDbName(), newTable.getTableName(), response);
+
+      // Add the table to the catalog cache
+      Table newTbl = catalog_
+          .addIncompleteTable(newTable.getDbName(), newTable.getTableName(),
+              TImpalaTableType.TABLE, params.getComment(), createEventId);
+      LOG.debug("Created a Kudu table {} with create event id {}", newTbl.getFullName(),
+          createEventId);
+      addTableToCatalogUpdate(newTbl, wantMinimalResult, response.result);
     } catch (Exception e) {
       try {
         // Error creating the table in HMS, drop the synchronized table from Kudu.
@@ -2274,6 +3528,8 @@ public class CatalogOpExecutor {
       }
       throw new ImpalaRuntimeException(
           String.format(HMS_RPC_ERROR_FORMAT_STR, "createTable"), e);
+    } finally {
+      getMetastoreDdlLock().unlock();
     }
     addSummary(response, "Table has been created.");
     return true;
@@ -2288,10 +3544,14 @@ public class CatalogOpExecutor {
   private boolean createTable(org.apache.hadoop.hive.metastore.api.Table newTable,
       boolean if_not_exists, THdfsCachingOp cacheOp, String serverName,
       List<SQLPrimaryKey> primaryKeys, List<SQLForeignKey> foreignKeys,
-      TDdlExecResponse response) throws ImpalaException {
+      boolean wantMinimalResult, TDdlExecResponse response) throws ImpalaException {
     Preconditions.checkState(!KuduTable.isKuduTable(newTable));
-    synchronized (metastoreDdlLock_) {
+    getMetastoreDdlLock().lock();
+    try {
+      org.apache.hadoop.hive.metastore.api.Table msTable;
+      Pair<Long, org.apache.hadoop.hive.metastore.api.Table> eventIdTblPair = null;
       try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+        long eventId = getCurrentEventId(msClient);
         if (primaryKeys == null && foreignKeys == null) {
           msClient.getHiveClient().createTable(newTable);
         } else {
@@ -2300,14 +3560,26 @@ public class CatalogOpExecutor {
               primaryKeys == null ? new ArrayList<>() : primaryKeys,
               foreignKeys == null ? new ArrayList<>() : foreignKeys);
         }
-        // TODO (HIVE-21807): Creating a table and retrieving the table information is
-        // not atomic.
+
         addSummary(response, "Table has been created.");
-        org.apache.hadoop.hive.metastore.api.Table msTable = msClient.getHiveClient()
-            .getTable(newTable.getDbName(), newTable.getTableName());
-        long tableCreateTime = msTable.getCreateTime();
-        response.setTable_name(newTable.getDbName() + "." + newTable.getTableName());
-        response.setTable_create_time(tableCreateTime);
+        final org.apache.hadoop.hive.metastore.api.Table finalNewTable = newTable;
+        List<NotificationEvent> events = getNextMetastoreEventsIfEnabled(eventId,
+            notificationEvent -> CreateTableEvent.CREATE_TABLE_EVENT_TYPE
+                .equals(notificationEvent.getEventType())
+                && finalNewTable.getDbName()
+                .equalsIgnoreCase(notificationEvent.getDbName())
+                && finalNewTable.getTableName()
+                .equalsIgnoreCase(notificationEvent.getTableName()));
+        eventIdTblPair = getTableFromEvents(events, if_not_exists);
+        if (eventIdTblPair == null) {
+          // TODO (HIVE-21807): Creating a table and retrieving the table information is
+          // not atomic.
+          eventIdTblPair = new Pair<>(-1L, msClient.getHiveClient()
+              .getTable(newTable.getDbName(), newTable.getTableName()));
+        }
+        msTable = eventIdTblPair.second;
+        setTableNameAndCreateTimeInResponse(msTable, newTable.getDbName(),
+            newTable.getTableName(), response);
         // For external tables set table location needed for lineage generation.
         if (newTable.getTableType() == TableType.EXTERNAL_TABLE.toString()) {
           String tableLocation = newTable.getSd().getLocation();
@@ -2318,13 +3590,6 @@ public class CatalogOpExecutor {
           }
           response.setTable_location(tableLocation);
         }
-        // If this table should be cached, and the table location was not specified by
-        // the user, an extra step is needed to read the table to find the location.
-        if (cacheOp != null && cacheOp.isSet_cached() &&
-            newTable.getSd().getLocation() == null) {
-          newTable = msClient.getHiveClient().getTable(
-              newTable.getDbName(), newTable.getTableName());
-        }
       } catch (Exception e) {
         if (e instanceof AlreadyExistsException && if_not_exists) {
           addSummary(response, "Table already exists");
@@ -2333,28 +3598,60 @@ public class CatalogOpExecutor {
         throw new ImpalaRuntimeException(
             String.format(HMS_RPC_ERROR_FORMAT_STR, "createTable"), e);
       }
+      Table newTbl = catalog_.addIncompleteTable(msTable.getDbName(),
+          msTable.getTableName(),
+          MetastoreShim.mapToInternalTableType(msTable.getTableType()),
+          MetadataOp.getTableComment(msTable),
+          eventIdTblPair.first);
+      Preconditions.checkNotNull(newTbl);
+      LOG.debug("Created catalog table {} with create event id {}", newTbl.getFullName(),
+          eventIdTblPair.first);
       // Submit the cache request and update the table metadata.
       if (cacheOp != null && cacheOp.isSet_cached()) {
         short replication = cacheOp.isSetReplication() ? cacheOp.getReplication() :
             JniCatalogConstants.HDFS_DEFAULT_CACHE_REPLICATION_FACTOR;
-        long id = HdfsCachingUtil.submitCacheTblDirective(newTable,
+        long id = HdfsCachingUtil.submitCacheTblDirective(msTable,
             cacheOp.getCache_pool_name(), replication);
         catalog_.watchCacheDirs(Lists.<Long>newArrayList(id),
-            new TTableName(newTable.getDbName(), newTable.getTableName()),
+            new TTableName(msTable.getDbName(), msTable.getTableName()),
                 "CREATE TABLE CACHED");
-        applyAlterTable(newTable);
+        // in this case we don't really bump up the catalog version and apply the alter
+        // we know that the table is just created above and we hold the lock. We
+        // reuse the table's catalog version to add to the in-flight events to avoid
+        // reloading the table when the alter_table event is received later.
+        addCatalogServiceIdentifiers(msTable, catalog_.getCatalogServiceId(),
+            newTbl.getCatalogVersion());
+        applyAlterTable(msTable);
+        newTbl.addToVersionsForInflightEvents(false, newTbl.getCatalogVersion());
       }
-      Table newTbl = catalog_.addIncompleteTable(newTable.getDbName(),
-          newTable.getTableName());
-      addTableToCatalogUpdate(newTbl, response.result);
+      addTableToCatalogUpdate(newTbl, wantMinimalResult, response.result);
       if (authzConfig_.isEnabled()) {
-        authzManager_.updateTableOwnerPrivilege(serverName, newTable.getDbName(),
-            newTable.getTableName(), /* oldOwner */ null,
-            /* oldOwnerType */ null, newTable.getOwner(), newTable.getOwnerType(),
+        authzManager_.updateTableOwnerPrivilege(serverName, msTable.getDbName(),
+            msTable.getTableName(), /* oldOwner */ null,
+            /* oldOwnerType */ null, msTable.getOwner(), msTable.getOwnerType(),
             response);
       }
+    } finally {
+      getMetastoreDdlLock().unlock();
     }
     return true;
+  }
+
+  /**
+   * Sets table name and creation time in 'response' based on 'msTable'.
+   * If 'msTable' is null, then it loads the table from HMS.
+   * Throws exception if table is not found.
+   */
+  private void setTableNameAndCreateTimeInResponse(
+      org.apache.hadoop.hive.metastore.api.Table msTable, String dbName, String tblName,
+      TDdlExecResponse response) throws org.apache.thrift.TException {
+    if (msTable == null) {
+      try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+        msTable = msClient.getHiveClient().getTable(dbName, tblName);
+      }
+    }
+    response.setTable_name(dbName + "." + tblName);
+    response.setTable_create_time(msTable.getCreateTime());
   }
 
   /**
@@ -2362,8 +3659,8 @@ public class CatalogOpExecutor {
    * lazily load the new metadata on the next access. Re-throws any Metastore
    * exceptions encountered during the create.
    */
-  private void createView(TCreateOrAlterViewParams params, TDdlExecResponse response)
-      throws ImpalaException {
+  private void createView(TCreateOrAlterViewParams params, boolean wantMinimalResult,
+      TDdlExecResponse response) throws ImpalaException {
     TableName tableName = TableName.fromThrift(params.getView_name());
     Preconditions.checkState(tableName != null && tableName.isFullyQualified());
     Preconditions.checkState(params.getColumns() != null &&
@@ -2384,13 +3681,162 @@ public class CatalogOpExecutor {
     setCreateViewAttributes(params, view);
     LOG.trace(String.format("Creating view %s", tableName));
     if (!createTable(view, params.if_not_exists, null, params.server_name,
-        new ArrayList<>(), new ArrayList<>(), response)) {
+        new ArrayList<>(), new ArrayList<>(), wantMinimalResult, response)) {
       addSummary(response, "View already exists.");
     } else {
       addSummary(response, "View has been created.");
     }
   }
 
+  /**
+   * Creates a new Iceberg table.
+   */
+  private boolean createIcebergTable(org.apache.hadoop.hive.metastore.api.Table newTable,
+      boolean wantMinimalResult, TDdlExecResponse response, boolean ifNotExists,
+      List<TColumn> columns, TIcebergPartitionSpec partitionSpec,
+      Map<String, String> tableProperties, String tblComment) throws ImpalaException {
+    Preconditions.checkState(IcebergTable.isIcebergTable(newTable));
+
+    getMetastoreDdlLock().lock();
+    try {
+      // Add the table to the HMS and the catalog cache. Acquire metastoreDdlLock_ to
+      // ensure the atomicity of these operations.
+      List<NotificationEvent> events = Collections.emptyList();
+      try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+        boolean tableInMetastore =
+            msClient.getHiveClient().tableExists(newTable.getDbName(),
+                newTable.getTableName());
+        if (!tableInMetastore) {
+          long eventId = getCurrentEventId(msClient);
+          TIcebergCatalog catalog = IcebergUtil.getTIcebergCatalog(newTable);
+          String location = newTable.getSd().getLocation();
+          //Create table in iceberg if necessary
+          if (IcebergTable.isSynchronizedTable(newTable)) {
+            //Set location here if not been specified in sql
+            if (location == null) {
+              if (catalog == TIcebergCatalog.HADOOP_CATALOG) {
+                // Using catalog location to create table
+                // We cannot set location for 'hadoop.catalog' table in SQL
+                location = IcebergUtil.getIcebergCatalogLocation(newTable);
+              } else {
+                // Using normal location as 'hadoop.tables' table location and create
+                // table
+                location = MetastoreShim.getPathForNewTable(
+                    msClient.getHiveClient().getDatabase(newTable.getDbName()),
+                    newTable);
+              }
+            }
+            String tableLoc = IcebergCatalogOpExecutor.createTable(catalog,
+                IcebergUtil.getIcebergTableIdentifier(newTable), location, columns,
+                partitionSpec, tableProperties).location();
+            newTable.getSd().setLocation(tableLoc);
+          } else {
+            // If this is not a synchronized table, we assume that the table must be
+            // existing in an Iceberg Catalog.
+            TIcebergCatalog underlyingCatalog =
+                IcebergUtil.getUnderlyingCatalog(newTable);
+            String locationToLoadFrom;
+            if (underlyingCatalog == TIcebergCatalog.HADOOP_TABLES) {
+              if (location == null) {
+                addSummary(response,
+                    "Location is necessary for external iceberg table.");
+                return false;
+              }
+              locationToLoadFrom = location;
+            } else {
+              // For HadoopCatalog tables 'locationToLoadFrom' is the location of the
+              // hadoop catalog. For HiveCatalog tables it remains null.
+              locationToLoadFrom = IcebergUtil.getIcebergCatalogLocation(newTable);
+            }
+            TableIdentifier identifier = IcebergUtil.getIcebergTableIdentifier(newTable);
+            org.apache.iceberg.Table iceTable = IcebergUtil.loadTable(
+                catalog, identifier, locationToLoadFrom, newTable.getParameters());
+            // Populate the HMS table schema based on the Iceberg table's schema because
+            // the Iceberg metadata is the source of truth. This also avoids an
+            // unnecessary ALTER TABLE.
+            IcebergCatalogOpExecutor.populateExternalTableCols(newTable, iceTable);
+            if (location == null) {
+              // Using the location of the loaded Iceberg table we can also get the
+              // correct location for tables stored in nested namespaces.
+              newTable.getSd().setLocation(iceTable.location());
+            }
+          }
+
+          // Iceberg tables are always unpartitioned. The partition columns are
+          // derived from the TCreateTableParams.partition_spec field, and could
+          // include one or more of the table columns
+          Preconditions.checkState(newTable.getPartitionKeys() == null ||
+              newTable.getPartitionKeys().isEmpty());
+          if (!isIcebergHmsIntegrationEnabled(newTable)) {
+            msClient.getHiveClient().createTable(newTable);
+          }
+          events = getNextMetastoreEventsIfEnabled(eventId, event ->
+              CreateTableEvent.CREATE_TABLE_EVENT_TYPE.equals(event.getEventType())
+                  && newTable.getDbName().equalsIgnoreCase(event.getDbName())
+                  && newTable.getTableName().equalsIgnoreCase(event.getTableName()));
+        } else {
+          addSummary(response, "Table already exists.");
+          return false;
+        }
+      }
+      Pair<Long, org.apache.hadoop.hive.metastore.api.Table> eventTblPair
+          = getTableFromEvents(events, ifNotExists);
+      long createEventId = eventTblPair == null ? -1 : eventTblPair.first;
+      org.apache.hadoop.hive.metastore.api.Table msTable =
+          eventTblPair == null ? null : eventTblPair.second;
+      setTableNameAndCreateTimeInResponse(msTable,
+          newTable.getDbName(), newTable.getTableName(), response);
+      // Add the table to the catalog cache
+      Table newTbl = catalog_.addIncompleteTable(newTable.getDbName(),
+          newTable.getTableName(), TImpalaTableType.TABLE, tblComment,
+          createEventId);
+      LOG.debug("Created an iceberg table {} in catalog with create event Id {} ",
+          newTbl.getFullName(), createEventId);
+      addTableToCatalogUpdate(newTbl, wantMinimalResult, response.result);
+
+      try {
+        // Currently we create Iceberg tables using the Iceberg API, however, table owner
+        // is hardcoded to be the user running the Iceberg process. In our case it's the
+        // user running Catalogd and not the user running the create table DDL. Hence, an
+        // extra "ALTER TABLE SET OWNER" step is required.
+        setIcebergTableOwnerAfterCreateTable(newTable.getDbName(),
+            newTable.getTableName(), newTable.getOwner());
+        LOG.debug("Table owner has been changed to " + newTable.getOwner());
+      } catch (Exception e) {
+        LOG.warn("Failed to set table owner after creating " +
+            "Iceberg table but the table {} has been created successfully. Reason: {}",
+            newTable.toString(), e);
+        addSummary(response, "Table has been created. However, unable to change table " +
+            "owner to " + newTable.getOwner());
+        return true;
+      }
+    } catch (Exception e) {
+      if (e instanceof AlreadyExistsException && ifNotExists) {
+        addSummary(response, "Table already exists.");
+        return false;
+      }
+      throw new ImpalaRuntimeException(
+          String.format(HMS_RPC_ERROR_FORMAT_STR, "createTable"), e);
+    } finally {
+      getMetastoreDdlLock().unlock();
+    }
+
+    addSummary(response, "Table has been created.");
+    return true;
+  }
+
+  private void setIcebergTableOwnerAfterCreateTable(String dbName, String tableName,
+      String newOwner) throws ImpalaException {
+    TAlterTableOrViewSetOwnerParams setOwnerParams = new TAlterTableOrViewSetOwnerParams(
+        TOwnerType.USER, newOwner);
+    TAlterTableParams alterTableParams = new TAlterTableParams(
+        TAlterTableType.SET_OWNER, new TTableName(dbName, tableName));
+    alterTableParams.setSet_owner_params(setOwnerParams);
+    TDdlExecResponse dummyResponse = new TDdlExecResponse();
+    dummyResponse.result = new TCatalogUpdateResult();
+
+    alterTable(alterTableParams, null, true, dummyResponse);
+  }
   /**
    * Creates a new table in the metastore based on the definition of an existing table.
    * No data is copied as part of this process, it is a metadata only operation. If the
@@ -2399,9 +3845,8 @@ public class CatalogOpExecutor {
    * @param  syncDdl tells is SYNC_DDL is enabled for this DDL request.
    */
   private void createTableLike(TCreateTableLikeParams params, TDdlExecResponse response,
-      boolean syncDdl) throws ImpalaException {
+      boolean syncDdl, boolean wantMinimalResult) throws ImpalaException {
     Preconditions.checkNotNull(params);
-
     THdfsFileFormat fileFormat =
         params.isSetFile_format() ? params.getFile_format() : null;
     String comment = params.isSetComment() ? params.getComment() : null;
@@ -2418,7 +3863,7 @@ public class CatalogOpExecutor {
       addSummary(response, "Table already exists.");
       LOG.trace(String.format("Skipping table creation because %s already exists and " +
           "IF NOT EXISTS was specified.", tblName));
-      tryLock(existingTbl);
+      tryWriteLock(existingTbl);
       try {
         if (syncDdl) {
           // When SYNC_DDL is enabled and the table already exists, we force a version
@@ -2436,11 +3881,11 @@ public class CatalogOpExecutor {
           LOG.trace("Table {} version bumped to {} because SYNC_DDL is enabled.",
               existingTbl.getFullName(), newVersion);
         }
-        addTableToCatalogUpdate(existingTbl, response.result);
+        addTableToCatalogUpdate(existingTbl, wantMinimalResult, response.result);
       } finally {
         // Release the locks held in tryLock().
         catalog_.getLock().writeLock().unlock();
-        existingTbl.getLock().unlock();
+        existingTbl.releaseWriteLock();
       }
       return;
     }
@@ -2448,8 +3893,6 @@ public class CatalogOpExecutor {
         "Load source for CREATE TABLE LIKE");
     org.apache.hadoop.hive.metastore.api.Table tbl =
         srcTable.getMetaStoreTable().deepCopy();
-    Preconditions.checkState(!KuduTable.isKuduTable(tbl),
-        "CREATE TABLE LIKE is not supported for Kudu tables.");
     tbl.setDbName(tblName.getDb());
     tbl.setTableName(tblName.getTbl());
     tbl.setOwner(params.getOwner());
@@ -2505,8 +3948,91 @@ public class CatalogOpExecutor {
     tbl.putToParameters(StatsSetupConst.ROW_COUNT, "-1");
     setDefaultTableCapabilities(tbl);
     LOG.trace(String.format("Creating table %s LIKE %s", tblName, srcTblName));
-    createTable(tbl, params.if_not_exists, null, params.server_name, null, null,
-        response);
+
+    if (srcTable instanceof IcebergTable && IcebergTable.isIcebergTable(tbl)) {
+      IcebergTable srcIceTable = (IcebergTable) srcTable;
+      Map<String, String> tableProperties = Maps
+          .newHashMap(srcIceTable.getIcebergApiTable().properties());
+      tableProperties.remove(Catalogs.NAME);
+      tableProperties.remove(Catalogs.LOCATION);
+      tableProperties.remove(IcebergTable.ICEBERG_CATALOG);
+      tableProperties.remove(IcebergTable.ICEBERG_TABLE_IDENTIFIER);
+
+      // The table identifier of the new table will be 'database.table'
+      TableIdentifier identifier = IcebergUtil
+          .getIcebergTableIdentifier(tbl.getDbName(), tbl.getTableName());
+      if (tbl.getParameters().containsKey(Catalogs.NAME)) {
+        tbl.getParameters().put(Catalogs.NAME, identifier.toString());
+        tableProperties.put(Catalogs.NAME, identifier.toString());
+      }
+      if (tbl.getParameters().containsKey(IcebergTable.ICEBERG_CATALOG)) {
+        tableProperties.put(IcebergTable.ICEBERG_CATALOG,
+            tbl.getParameters().get(IcebergTable.ICEBERG_CATALOG));
+      }
+      if (tbl.getParameters().containsKey(IcebergTable.ICEBERG_TABLE_IDENTIFIER)) {
+        tbl.getParameters()
+            .put(IcebergTable.ICEBERG_TABLE_IDENTIFIER, identifier.toString());
+        tableProperties.put(IcebergTable.ICEBERG_TABLE_IDENTIFIER, identifier.toString());
+      }
+      List<TColumn> columns = new ArrayList<>();
+      for (Column col: srcIceTable.getColumns()) columns.add(col.toThrift());
+      TIcebergPartitionSpec partitionSpec = srcIceTable.getDefaultPartitionSpec()
+          .toThrift();
+      createIcebergTable(tbl, wantMinimalResult, response, params.if_not_exists, columns,
+          partitionSpec, tableProperties, params.getComment());
+    } else if (srcTable instanceof KuduTable && KuduTable.isKuduTable(tbl)) {
+      TCreateTableParams createTableParams =
+          extractKuduCreateTableParams(params, tblName, (KuduTable) srcTable, tbl);
+      createKuduTable(tbl, createTableParams, wantMinimalResult, response);
+    } else {
+      MetastoreShim.setTableLocation(catalog_.getDb(tbl.getDbName()), tbl);
+      createTable(tbl, params.if_not_exists, null, params.server_name, null, null,
+          wantMinimalResult, response);
+    }
+  }
+
+  /**
+   * Build TCreateTableParams by source
+   */
+  private TCreateTableParams extractKuduCreateTableParams(TCreateTableLikeParams params,
+      TableName tblName, KuduTable kuduTable,
+      org.apache.hadoop.hive.metastore.api.Table tbl) throws ImpalaRuntimeException {
+    TCreateTableParams createTableParams = new TCreateTableParams();
+    createTableParams.if_not_exists = params.if_not_exists;
+    createTableParams.setComment(params.getComment());
+    List<TColumn> columns = new ArrayList<>();
+    for (Column col : kuduTable.getColumns()) {
+      // Omit cloning auto-incrementing column of Kudu table since the column will be
+      // created by Kudu engine.
+      if (((KuduColumn) col).isAutoIncrementing()) continue;
+      columns.add(col.toThrift());
+    }
+    createTableParams.setColumns(columns);
+    // Omit auto-incrementing column as primary key.
+    List<String> primaryColumnNames =
+        new ArrayList<>(kuduTable.getPrimaryKeyColumnNames());
+    if (kuduTable.hasAutoIncrementingColumn()) {
+      primaryColumnNames.remove(KuduUtil.getAutoIncrementingColumnName());
+    }
+    createTableParams.setPrimary_key_column_names(primaryColumnNames);
+
+    List<TKuduPartitionParam> partitionParams = new ArrayList<>();
+    for (KuduPartitionParam kuduPartitionParam : kuduTable.getPartitionBy()) {
+      partitionParams.add(kuduPartitionParam.toThrift());
+    }
+    createTableParams.setPartition_by(partitionParams);
+
+    Map<String, String> tableProperties = tbl.getParameters();
+    tableProperties.remove(KuduTable.KEY_TABLE_NAME);
+    tableProperties.remove(KuduTable.KEY_TABLE_ID);
+
+    String kuduMasters = tbl.getParameters().get(KuduTable.KEY_MASTER_HOSTS);
+    boolean isKuduHmsIntegrationEnabled = KuduTable.isHMSIntegrationEnabled(kuduMasters);
+    tableProperties.put(KuduTable.KEY_TABLE_NAME,
+        KuduUtil.getDefaultKuduTableName(
+            tblName.getDb(), tblName.getTbl(), isKuduHmsIntegrationEnabled));
+    tbl.setParameters(tableProperties);
+    return createTableParams;
   }
 
   private static void setDefaultTableCapabilities(
@@ -2518,8 +4044,11 @@ public class CatalogOpExecutor {
       // Set table default capabilities in HMS
       if (tbl.getParameters().containsKey(CAPABILITIES_KEY)) return;
       if (AcidUtils.isTransactionalTable(tbl.getParameters())) {
-        Preconditions.checkState(!AcidUtils.isFullAcidTable(tbl.getParameters()));
-        tbl.getParameters().put(CAPABILITIES_KEY, ACIDINSERTONLY_CAPABILITIES);
+        if (AcidUtils.isFullAcidTable(tbl.getParameters())) {
+          tbl.getParameters().put(CAPABILITIES_KEY, FULLACID_CAPABILITIES);
+        } else {
+          tbl.getParameters().put(CAPABILITIES_KEY, ACIDINSERTONLY_CAPABILITIES);
+        }
       } else {
         // Managed KUDU table has issues with extra table properties:
         // 1. The property is not stored. 2. The table cannot be found after created.
@@ -2548,6 +4077,9 @@ public class CatalogOpExecutor {
     if (params.isSetComment() && params.getComment() != null) {
       view.getParameters().put("comment", params.getComment());
     }
+    if (params.getTblproperties() != null && params.getTblpropertiesSize() != 0) {
+      view.getParameters().putAll(params.getTblproperties());
+    }
     StorageDescriptor sd = new StorageDescriptor();
     // Add all the columns to a new storage descriptor.
     sd.setCols(buildFieldSchemaList(params.getColumns()));
@@ -2567,6 +4099,9 @@ public class CatalogOpExecutor {
     if (params.isSetComment() && params.getComment() != null) {
       view.getParameters().put("comment", params.getComment());
     }
+    if (params.getTblproperties() != null && params.getTblpropertiesSize() != 0) {
+      view.getParameters().putAll(params.getTblproperties());
+    }
     // Add all the columns to a new storage descriptor.
     view.getSd().setCols(buildFieldSchemaList(params.getColumns()));
   }
@@ -2577,7 +4112,7 @@ public class CatalogOpExecutor {
    */
   private boolean alterTableAddCols(Table tbl, List<TColumn> columns, boolean ifNotExists)
       throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable().deepCopy();
     List<TColumn> colsToAdd = new ArrayList<>();
     for (TColumn column: columns) {
@@ -2605,7 +4140,7 @@ public class CatalogOpExecutor {
    */
   private void alterTableReplaceCols(Table tbl, List<TColumn> columns)
       throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable().deepCopy();
     List<FieldSchema> newColumns = buildFieldSchemaList(columns);
     msTbl.getSd().setCols(newColumns);
@@ -2625,7 +4160,7 @@ public class CatalogOpExecutor {
    */
   private void alterTableAlterCol(Table tbl, String colName,
       TColumn newCol) throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable().deepCopy();
     // Find the matching column name and change it.
     Iterator<FieldSchema> iterator = msTbl.getSd().getColsIterator();
@@ -2672,8 +4207,9 @@ public class CatalogOpExecutor {
    * catalog cache and the HMS.
    */
   private Table alterTableAddPartitions(Table tbl,
-      TAlterTableAddPartitionParams addPartParams) throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+      TAlterTableAddPartitionParams addPartParams, THdfsFileFormat fileFormat)
+      throws ImpalaException {
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
 
     TableName tableName = tbl.getTableName();
     org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable().deepCopy();
@@ -2698,6 +4234,10 @@ public class CatalogOpExecutor {
           createHmsPartition(partitionSpec, msTbl, tableName, partParams.getLocation());
       allHmsPartitionsToAdd.add(hmsPartition);
 
+      if (fileFormat != null) {
+        setStorageDescriptorFileFormat(hmsPartition.getSd(), fileFormat);
+      }
+
       THdfsCachingOp cacheOp = partParams.getCache_op();
       if (cacheOp != null) partitionCachingOpMap.put(hmsPartition.getValues(), cacheOp);
     }
@@ -2705,18 +4245,10 @@ public class CatalogOpExecutor {
     if (allHmsPartitionsToAdd.isEmpty()) return null;
 
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      List<Partition> addedHmsPartitions = Lists.newArrayList();
-
-      for (List<Partition> hmsSublist :
-          Lists.partition(allHmsPartitionsToAdd, MAX_PARTITION_UPDATES_PER_RPC)) {
-        try {
-          addedHmsPartitions.addAll(msClient.getHiveClient().add_partitions(hmsSublist,
-              ifNotExists, true));
-        } catch (TException e) {
-          throw new ImpalaRuntimeException(
-              String.format(HMS_RPC_ERROR_FORMAT_STR, "add_partitions"), e);
-        }
-      }
+      Map<String, Long> partitionToEventId = catalog_.isEventProcessingActive() ?
+          Maps.newHashMap() : null;
+      List<Partition> addedHmsPartitions = addHmsPartitionsInTransaction(msClient,
+          tbl, allHmsPartitionsToAdd, partitionToEventId, ifNotExists);
       // Handle HDFS cache. This is done in a separate round bacause we have to apply
       // caching only to newly added partitions.
       alterTableCachePartitions(msTbl, msClient, tableName, addedHmsPartitions,
@@ -2729,11 +4261,686 @@ public class CatalogOpExecutor {
         List<Partition> difference = computeDifference(allHmsPartitionsToAdd,
             addedHmsPartitions);
         addedHmsPartitions.addAll(
-            getPartitionsFromHms(msTbl, msClient, tableName, difference));
+            getPartitionsFromHms(msTbl, msClient, difference));
       }
-      addHdfsPartitions(tbl, addedHmsPartitions);
+      addHdfsPartitions(msClient, tbl, addedHmsPartitions, partitionToEventId);
     }
     return tbl;
+  }
+
+  /**
+   * Adds partition if table exists, is loaded and if the partitions have not been
+   * removed since the event is generated. This method uses the deleteEventLog to
+   * determine if the partitions which need to be added have not been removed since
+   * the event was generated.
+   * @param eventId the EventId being processed
+   * @param dbName The database name for the table where partition needs to be added
+   * @param tblName The table for which partitions need to be added.
+   * @param partitions List of partitions from the event to be added.
+   * @param reason Reason for adding the partitions. Useful for logging purposes.
+   * @return The number of partitions which were added.
+   * @throws CatalogException if partition reload threw an error.
+   * @throws DatabaseNotFoundException if Db doesn't exist.
+   * @throws TableNotFoundException if table doesn't exist.
+   */
+  public int addPartitionsIfNotRemovedLater(long eventId, String dbName,
+      String tblName, List<Partition> partitions, String reason)
+      throws CatalogException {
+    Table table;
+    try {
+      table = catalog_.getTable(dbName, tblName);
+    } catch (DatabaseNotFoundException e) {
+      LOG.info("EventId: {} Not adding partitions since the database {} "
+              + "does not exist anymore.", eventId, dbName);
+      return 0;
+    }
+    if (table == null) {
+      LOG.info("EventId: {} Not adding partitions since the table {}.{} "
+              + "does not exist anymore.", eventId, dbName, tblName);
+      return 0;
+    }
+    if (table instanceof IncompleteTable) {
+      LOG.info("EventId: {} Table {} is not loaded. Skipping add partitions", eventId,
+          table.getFullName());
+      return 0;
+    }
+    if(!(table instanceof HdfsTable)) {
+      throw new CatalogException(
+          "Partition event " + eventId + " received on a non-hdfs table");
+    }
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls();
+    try {
+      tryWriteLock(table, reason);
+      if (syncToLatestEventId && table.getLastSyncedEventId() >= eventId) {
+        LOG.info("Not adding partitions from event id: {} since table {} is already "
+                + "synced till event id {}", eventId, table.getFullName(),
+            table.getLastSyncedEventId());
+        return 0;
+      }
+      long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+      catalog_.getLock().writeLock().unlock();
+      HdfsTable hdfsTable = (HdfsTable) table;
+      List<Partition> partitionsToAdd = filterPartitionsToAddFromEvent(eventId, hdfsTable,
+          partitions);
+      int partitionsAdded = 0;
+      if (!partitionsToAdd.isEmpty()) {
+        LOG.debug("Found {}/{} partitions to add in table {} from event {}",
+            partitionsToAdd.size(), partitions.size(), table.getFullName(), eventId);
+        Map<String, Long> partToEventId = Maps.newHashMap();
+        for (Partition part : partitionsToAdd) {
+          partToEventId
+              .put(FeCatalogUtils.getPartitionName(hdfsTable, part.getValues()), eventId);
+        }
+        try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
+          addHdfsPartitions(metaStoreClient, table, partitionsToAdd, partToEventId);
+        }
+        table.setCatalogVersion(newCatalogVersion);
+        partitionsAdded = partitionsToAdd.size();
+      }
+      if (syncToLatestEventId) {
+        table.setLastSyncedEventId(eventId);
+      }
+      return partitionsAdded;
+    } catch (InternalException | UnsupportedEncodingException e) {
+      throw new CatalogException(
+          "Unable to add partition for table " + table.getFullName(), e);
+    } finally {
+      UnlockWriteLockIfErronouslyLocked();
+      if (table.isWriteLockedByCurrentThread()) {
+        table.releaseWriteLock();
+      }
+    }
+  }
+
+  /**
+   * Filters out the partitions which need to be added in catalogd based on the delete
+   * event log. If the some of the partitions which are being added have been removed
+   * since the event was generated, those are filtered out.
+   * @return List of partitions which need to be added.
+   */
+  private List<Partition> filterPartitionsToAddFromEvent(long eventId,
+      HdfsTable hdfsTable, List<Partition> partitions)
+      throws UnsupportedEncodingException, CatalogException {
+    Preconditions.checkNotNull(hdfsTable);
+    // it is possible that when the event is received, the table was dropped
+    // and recreated. Hence we should make sure that the deleteEventLog
+    // does not have the table removed after this eventid
+    List<Partition> partsToBeAdded = Lists.newArrayList();
+    org.apache.hadoop.hive.metastore.api.Table msTbl = hdfsTable.getMetaStoreTable();
+    DeleteEventLog deleteEventLog = catalog_.getMetastoreEventProcessor()
+        .getDeleteEventLog();
+    if (deleteEventLog.wasRemovedAfter(eventId,
+        DeleteEventLog.getDbKey(msTbl.getDbName()))) {
+      LOG.info(
+          "EventId: {} Not adding partitions since the database {} was removed later",
+          eventId, msTbl.getDbName());
+      return partsToBeAdded;
+    }
+    // check if the table is removed since the event was generated.
+    if (deleteEventLog.wasRemovedAfter(eventId,
+        DeleteEventLog.getTblKey(msTbl.getDbName(), msTbl.getTableName()))) {
+      LOG.info(
+          "EventId: {} Not adding partitions since the table {} was removed later",
+          eventId, hdfsTable.getFullName());
+      return partsToBeAdded;
+    }
+    Preconditions.checkState(!partitions.isEmpty());
+    for (Partition part : partitions) {
+      List<LiteralExpr> partExprs = FeCatalogUtils
+          .parsePartitionKeyValues(hdfsTable, part.getValues());
+      HdfsPartition hdfsPartition = hdfsTable.getPartition(partExprs);
+      // if partition is not present and if it was not removed later
+      // it can be added.
+      if (hdfsPartition == null) {
+        boolean removed = deleteEventLog.wasRemovedAfter(eventId,
+            DeleteEventLog.getPartitionKey(hdfsTable, part.getValues()));
+        // it is possible that the partition doesn't exist anymore because it was removed
+        // later
+        if (removed) {
+          LOG.info(
+              "EventId: {} Skipping addition of partition {} since it was removed later"
+                  + "in catalog for table {}", eventId,
+              FileUtils.makePartName(hdfsTable.getClusteringColNames(), part.getValues()),
+              hdfsTable.getFullName());
+        } else {
+          partsToBeAdded.add(part);
+        }
+      }
+    }
+    return partsToBeAdded;
+  }
+
+  /**
+   * Remove the partitions from the event if the table exists, is loaded and if the
+   * partitions have not been added again since the event was generated.
+   * @param eventId The eventId being processed.
+   * @param dbName Database name of the table whose partitions need to be removed.
+   * @param tblName Table name whose partitions need to be removed.
+   * @param droppedPartitions List of mapping of partition key to value for all the
+   *                          partitions in the event.
+   * @param reason Reason for removing the partitions for logging.
+   * @return Number of partitions which were removed from the table.
+   * @throws CatalogException
+   */
+  public int removePartitionsIfNotAddedLater(long eventId,
+      String dbName, String tblName, List<Map<String, String>> droppedPartitions,
+      String reason) throws CatalogException {
+    Table table;
+    try {
+      table = catalog_.getTable(dbName, tblName);
+    } catch (DatabaseNotFoundException e) {
+      LOG.info("EventId: {} Not removing partitions since the database {}"
+              + " does not exist anymore.", eventId, dbName);
+      return 0;
+    }
+    if (table == null) {
+      LOG.info("EventId: {} Not dropping partitions since the table {}.{} "
+              + "does not exist anymore", eventId, dbName, tblName);
+      return 0;
+    }
+    if (table instanceof IncompleteTable) {
+      LOG.info("EventId: {} Table {} is not loaded. Not processing the event.",
+          eventId, table.getFullName());
+      return 0;
+    }
+    if (!(table instanceof HdfsTable)) {
+      throw new CatalogException("Partition event received on a non-hdfs table");
+    }
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls();
+
+    boolean errorOccured = false;
+    try {
+      tryWriteLock(table, reason);
+      if (syncToLatestEventId && table.getLastSyncedEventId() >= eventId) {
+        LOG.info("Not dropping partitions from event id: {} since table {} is already "
+                + "synced till event id {}", eventId, table.getFullName(),
+            table.getLastSyncedEventId());
+        return 0;
+      }
+      long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+      catalog_.getLock().writeLock().unlock();
+      HdfsTable hdfsTable = (HdfsTable) table;
+      // check if the table or database has been dropped and recreated since the
+      // eventId, if yes, we should not process this event.
+      if (eventId <= hdfsTable.getCreateEventId()) {
+        LOG.info(
+            "EventId: {} Not dropping partitions table's create event id is {}",
+            eventId, hdfsTable.getCreateEventId());
+        return 0;
+      }
+      List<Map<String, String>> skippedPartitions = Lists.newArrayList();
+      for (Map<String, String> partKeyVals : droppedPartitions) {
+        if (!canDropPartitionFromEvent(eventId, hdfsTable,
+            Lists.newArrayList(partKeyVals.values()))) {
+          skippedPartitions.add(partKeyVals);
+        }
+      }
+      droppedPartitions.removeAll(skippedPartitions);
+      if (droppedPartitions.isEmpty()) {
+        return 0;
+      } else {
+        LOG.info(
+            "EventId: {} Skipping removal of {}/{} partitions since they don't exist or"
+                + " were created later in table {}.", eventId, skippedPartitions.size(),
+            droppedPartitions.size(), table.getFullName());
+      }
+      List<List<TPartitionKeyValue>> allTPartKeyVals = Lists
+          .newArrayListWithCapacity(droppedPartitions.size());
+      List<Column> partitionCols = hdfsTable.getClusteringColumns();
+      for (Map<String, String> droppedPartitionKeyVals : droppedPartitions) {
+        List<TPartitionKeyValue> tPartKeyVals = Lists
+            .newArrayListWithCapacity(partitionCols.size());
+        for (Column partitionCol : partitionCols) {
+          String val = droppedPartitionKeyVals.get(partitionCol.getName());
+          if (val == null) {
+            // the event doesn't have the partition value for the key
+            throw new CatalogException(
+                String.format(
+                    "Event does not contain partition value for key %s. Event contains "
+                        + "%s", partitionCol.getName(),
+                    Joiner.on(",").withKeyValueSeparator("=")
+                        .join(droppedPartitionKeyVals)));
+          }
+          tPartKeyVals.add(new TPartitionKeyValue(partitionCol.getName(), val));
+        }
+        allTPartKeyVals.add(tPartKeyVals);
+      }
+      Preconditions.checkState(!allTPartKeyVals.isEmpty());
+      catalog_.dropPartitions(table, allTPartKeyVals);
+      table.setCatalogVersion(newCatalogVersion);
+      return allTPartKeyVals.size();
+    } catch (InternalException e) {
+      errorOccured = true;
+      throw new CatalogException(
+          "Unable to add partition for table " + table.getFullName(), e);
+    } finally {
+      //  set table's last sycned event id  if no error occurred and
+      //  table's last synced event id < current event id
+      if (!errorOccured && syncToLatestEventId &&
+          table.getLastSyncedEventId() < eventId) {
+        table.setLastSyncedEventId(eventId);
+      }
+      UnlockWriteLockIfErronouslyLocked();
+      table.releaseWriteLock();
+    }
+  }
+
+  /**
+   * Checks if the partition represented by its values from the event can be dropped
+   * from catalog or not based on it's createEventId.
+   * @return True if the partition can be dropped, else false.
+   */
+  private boolean canDropPartitionFromEvent(long eventId, HdfsTable hdfsTable,
+      List<String> values) throws CatalogException {
+    List<LiteralExpr> partExprs = FeCatalogUtils
+        .parsePartitionKeyValues(hdfsTable, values);
+    HdfsPartition hdfsPartition = hdfsTable.getPartition(partExprs);
+    // partition doesn't exist
+    if (hdfsPartition == null) {
+      return false;
+    }
+    // if the partition has been created since the event was generated, skip
+    // dropping the event.
+    if (hdfsPartition.getCreateEventId() > eventId) {
+      LOG.info("Not dropping partition {} of table {} since it's create event id {} is "
+              + "higher than eventid {}", hdfsPartition.getPartitionName(),
+          hdfsTable.getFullName(), hdfsPartition.getCreateEventId(), eventId);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Reloads the given partitions if they exist and have not been removed since the event
+   * was generated.
+   *
+   * @param eventId EventId being processed.
+   * @param dbName Database name for the partition
+   * @param tblName Table name for the partition
+   * @param partsFromEvent List of {@link Partition} objects from the events to be
+   *                       reloaded.
+   * @param reason Reason for reloading the partitions for logging purposes.
+   * @param fileMetadataLoadOpts describes how to reload file metadata for partsFromEvent
+   * @return the number of partitions which were reloaded. If the table does not exist,
+   * returns 0. Some partitions could be skipped if they don't exist anymore.
+   */
+  public int reloadPartitionsIfExist(long eventId, String dbName, String tblName,
+      List<Partition> partsFromEvent, String reason,
+      FileMetadataLoadOpts fileMetadataLoadOpts) throws CatalogException {
+    List<String> partNames = new ArrayList<>();
+    Table table = catalog_.getTable(dbName, tblName);
+    if (table instanceof HdfsTable) {
+      HdfsTable hdfsTable = (HdfsTable) table;
+      for (Partition part : partsFromEvent) {
+        partNames.add(FileUtils.makePartName(hdfsTable.getClusteringColNames(),
+            part.getValues(), null));
+      }
+    }
+    return reloadPartitionsFromNamesIfExists(eventId, dbName, tblName, partNames,
+        reason, fileMetadataLoadOpts);
+  }
+
+  /**
+   * Reloads the given partitions from partiton names if they exist and have not been
+   * removed since the event was generated.
+   *
+   * @param eventId EventId being processed.
+   * @param dbName Database name for the partition
+   * @param tblName Table name for the partition
+   * @param partNames List of partition names from the events to be reloaded.
+   * @param reason Reason for reloading the partitions for logging purposes.
+   * @param fileMetadataLoadOpts describes how to reload file metadata for partsFromEvent
+   * @return the number of partitions which were reloaded. If the table does not exist,
+   * returns 0. Some partitions could be skipped if they don't exist anymore.
+   */
+  public int reloadPartitionsFromNamesIfExists (long eventId, String dbName,
+      String tblName, List<String> partNames, String reason,
+      FileMetadataLoadOpts fileMetadataLoadOpts) throws CatalogException {
+    Table table = catalog_.getTable(dbName, tblName);
+    if (table == null) {
+      DeleteEventLog deleteEventLog = catalog_.getMetastoreEventProcessor()
+          .getDeleteEventLog();
+      if (deleteEventLog
+          .wasRemovedAfter(eventId, DeleteEventLog.getTblKey(dbName, tblName))) {
+        LOG.info(
+            "Not reloading the partition of table {} since it was removed "
+                + "later in catalog", new TableName(dbName, tblName));
+        return 0;
+      } else {
+        throw new TableNotFoundException(
+            "Table " + dbName + "." + tblName + " not found");
+      }
+    }
+    if (table instanceof IncompleteTable) {
+      LOG.info("Table {} is not loaded. Skipping drop partition event {}",
+          table.getFullName(), eventId);
+      return 0;
+    }
+    if (!(table instanceof HdfsTable)) {
+      throw new CatalogException("Partition event received on a non-hdfs table");
+    }
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls();
+
+    boolean errorOccured = false;
+    try {
+      tryWriteLock(table, reason);
+      long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+      catalog_.getLock().writeLock().unlock();
+      if (syncToLatestEventId && table.getLastSyncedEventId() >= eventId) {
+        LOG.info("Not reloading partition from event id: {} since table {} is already "
+                + "synced till event id {}", eventId, table.getFullName(),
+            table.getLastSyncedEventId());
+        return 0;
+      }
+      HdfsTable hdfsTable = (HdfsTable) table;
+      // some partitions from the event or the table itself
+      // may not exist in HMS anymore. Hence, we re-fetch
+      // the partitions from HMS.
+      int numOfPartsReloaded;
+      try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
+        numOfPartsReloaded = hdfsTable.reloadPartitionsFromNames(
+            metaStoreClient.getHiveClient(), partNames, reason, fileMetadataLoadOpts);
+      }
+      hdfsTable.setCatalogVersion(newCatalogVersion);
+      return numOfPartsReloaded;
+    } catch (TableLoadingException e) {
+      LOG.info("Could not reload {} partitions of table {}", partNames.size(),
+          table.getFullName(), e);
+    } catch (InternalException e) {
+      errorOccured = true;
+      throw new CatalogException(
+          "Could not acquire lock on the table " + table.getFullName(), e);
+    } finally {
+      //  set table's last sycned event id  if no error occurred and
+      //  table's last synced event id < current event id
+      if (!errorOccured && syncToLatestEventId &&
+          table.getLastSyncedEventId() < eventId) {
+        table.setLastSyncedEventId(eventId);
+      }
+      UnlockWriteLockIfErronouslyLocked();
+      table.releaseWriteLock();
+    }
+    return 0;
+  }
+
+  /**
+   * Reloads the given partitions if they exist and have not been removed since the event
+   * was generated. We don't retrieve partitions from HMS but use partitions from event.
+   * This api does NOT reload file metadata when reloading partitions
+   *
+   * @param eventId EventId being processed.
+   * @param dbName Database name for the partition
+   * @param tblName Table name for the partition
+   * @param partsFromEvent List of {@link Partition} objects from the events to be
+   *                       reloaded.
+   * @param reason Reason for reloading the partitions for logging purposes.
+   * @return the number of partitions which were reloaded. If the table does not exist,
+   * returns 0. Some partitions could be skipped if they don't exist anymore.
+   */
+  public int reloadPartitionsFromEvent(long eventId, String dbName, String tblName,
+      List<Partition> partsFromEvent, String reason)
+      throws CatalogException {
+    Table table = catalog_.getTable(dbName, tblName);
+    if (table == null) {
+      DeleteEventLog deleteEventLog = catalog_.getMetastoreEventProcessor()
+          .getDeleteEventLog();
+      if (deleteEventLog
+          .wasRemovedAfter(eventId, DeleteEventLog.getTblKey(dbName, tblName))) {
+        LOG.info(
+            "Not reloading the partition of table {} since it was removed "
+                + "later in catalog", new TableName(dbName, tblName));
+        return 0;
+      } else {
+        throw new TableNotFoundException(
+            "Table " + dbName + "." + tblName + " not found");
+      }
+    }
+    if (table instanceof IncompleteTable) {
+      LOG.info("Table {} is not loaded. Skipping drop partition event {}",
+          table.getFullName(), eventId);
+      return 0;
+    }
+    if (!(table instanceof HdfsTable)) {
+      throw new CatalogException("Partition event received on a non-hdfs table");
+    }
+    if (eventId > 0 && eventId <= table.getCreateEventId()) {
+      LOG.debug("Not reloading partitions of table {}.{} for event {} since it is " +
+          "recreated at event {}.", dbName, tblName, eventId, table.getCreateEventId());
+      return 0;
+    }
+    try {
+      tryWriteLock(table, reason);
+      long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+      catalog_.getLock().writeLock().unlock();
+      HdfsTable hdfsTable = (HdfsTable) table;
+      int numOfPartsReloaded;
+      try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
+        numOfPartsReloaded = hdfsTable.reloadPartitionsFromEvent(
+            metaStoreClient.getHiveClient(), partsFromEvent, false, reason);
+      }
+      hdfsTable.setCatalogVersion(newCatalogVersion);
+      return numOfPartsReloaded;
+    } catch (InternalException e) {
+      throw new CatalogException(
+          "Could not acquire lock on the table " + table.getFullName(), e);
+    } finally {
+      UnlockWriteLockIfErronouslyLocked();
+      table.releaseWriteLock();
+    }
+  }
+
+  /**
+   * This function is only used by CommitTxnEvent to mark write ids as committed and
+   * reload partitions from events atomically.
+   *
+   * @param eventId EventId being processed
+   * @param dbName Database name for the partition
+   * @param tblName Table name for the partition
+   * @param writeIds List of write ids for this transaction
+   * @param partsFromEvent List of Partition objects from the events to be reloaded
+   * @param reason Reason for reloading the partitions for logging purposes.
+   * @return the number of partitions which were reloaded. Some partitions can be
+   * skipped if they don't exist anymore, or they have stale write ids.
+   */
+  public int addCommittedWriteIdsAndReloadPartitionsIfExist(long eventId, String dbName,
+      String tblName, List<Long> writeIds, List<Partition> partsFromEvent, String reason)
+      throws CatalogException {
+    Table table = catalog_.getTable(dbName, tblName);
+    if (table == null) {
+      DeleteEventLog deleteEventLog = catalog_.getMetastoreEventProcessor()
+          .getDeleteEventLog();
+      if (deleteEventLog
+          .wasRemovedAfter(eventId, DeleteEventLog.getTblKey(dbName, tblName))) {
+        LOG.info(
+            "Not reloading partitions of table {} for event {} since it was removed "
+                + "later in catalog", new TableName(dbName, tblName), eventId);
+        return 0;
+      } else {
+        throw new TableNotFoundException(
+            "Table " + dbName + "." + tblName + " not found");
+      }
+    }
+    if (table instanceof IncompleteTable) {
+      LOG.info("Table {} is not loaded. Skipping partition event {}",
+          table.getFullName(), eventId);
+      return 0;
+    }
+    if (!(table instanceof HdfsTable)) {
+      throw new CatalogException("Partition event received on a non-hdfs table");
+    }
+
+    HdfsTable hdfsTable = (HdfsTable) table;
+    ValidWriteIdList previousWriteIdList = hdfsTable.getValidWriteIds();
+    try {
+      tryWriteLock(table, reason);
+      long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+      catalog_.getLock().writeLock().unlock();
+      boolean syncToLatestEvent =
+          BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls();
+      if (hdfsTable.getLastSyncedEventId() > eventId) {
+        LOG.info("EventId: {}, Skipping addition of committed writeIds and partitions"
+            + " reload for table {} since it is already synced till eventId: {}",
+            eventId, hdfsTable.getFullName(), hdfsTable.getLastSyncedEventId());
+        return 0;
+      }
+      Preconditions.checkState(previousWriteIdList != null,
+          "Write id list of table %s should not be null", table.getFullName());
+      // get a copy of previous write id list
+      previousWriteIdList = MetastoreShim.getValidWriteIdListFromString(
+          previousWriteIdList.toString());
+      // some partitions from the event or the table itself
+      // may not exist in HMS anymore. Hence, we collect the names here and re-fetch
+      // the partitions from HMS.
+      List<Partition> partsToRefresh = new ArrayList<>();
+      List<Long> writeIdsToRefresh = new ArrayList<>();
+      ListIterator<Partition> it = partsFromEvent.listIterator();
+      while (it.hasNext()) {
+        // The partition objects from HMS event was persisted when transaction was not
+        // committed, so its write id is smaller than the write id of the write event.
+        // Since the event is committed at this point, we need to update the partition
+        // object's write id by event's write id.
+        long writeId = writeIds.get(it.nextIndex());
+        Partition part = it.next();
+        // Aborted write id is not allowed. The write id can be committed if the table
+        // in cache is ahead of this commit event.
+        Preconditions.checkState(!previousWriteIdList.isWriteIdAborted(writeId),
+            "Write id %d of Table %s should not be aborted",
+            writeId, table.getFullName());
+        // Valid write id means committed write id here.
+        if (!previousWriteIdList.isWriteIdValid(writeId)) {
+          MetastoreShim.setWriteIdToMSPartition(part, writeId);
+          partsToRefresh.add(part);
+          writeIdsToRefresh.add(writeId);
+        }
+      }
+      if (partsToRefresh.isEmpty()) {
+        LOG.info("Not reloading partitions of table {} for event {} since the cache is "
+            + "already up-to-date", table.getFullName(), eventId);
+        if (syncToLatestEvent) {
+          hdfsTable.setLastSyncedEventId(eventId);
+        }
+        return 0;
+      }
+      // set write id as committed before reload the partitions so that we can get
+      // up-to-date filemetadata.
+      hdfsTable.addWriteIds(writeIdsToRefresh,
+          MutableValidWriteIdList.WriteIdStatus.COMMITTED);
+      int numOfPartsReloaded;
+      try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
+        numOfPartsReloaded = hdfsTable.reloadPartitionsFromEvent(
+            metaStoreClient.getHiveClient(), partsToRefresh, true, reason);
+      }
+      hdfsTable.setCatalogVersion(newCatalogVersion);
+      if (syncToLatestEvent) {
+        hdfsTable.setLastSyncedEventId(eventId);
+      }
+      return numOfPartsReloaded;
+    } catch (InternalException e) {
+      throw new CatalogException(
+          "Could not acquire lock on the table " + table.getFullName(), e);
+    } catch (Exception e) {
+      LOG.info("Rolling back the write id list of table {} because reloading "
+          + "for event {} is failed: {}", table.getFullName(), eventId, e.getMessage());
+      // roll back the original writeIdList
+      hdfsTable.setValidWriteIds(previousWriteIdList);
+      throw e;
+    } finally {
+      UnlockWriteLockIfErronouslyLocked();
+      table.releaseWriteLock();
+    }
+  }
+
+  public ReentrantLock getMetastoreDdlLock() {
+    return metastoreDdlLock_;
+  }
+
+  /**
+   * Adds partitions in 'allHmsPartitionsToAdd' in batches via 'msClient'.
+   * Returns the created partitions.
+   */
+  private List<Partition> addHmsPartitions(MetaStoreClient msClient,
+      Table tbl, List<Partition> allHmsPartitionsToAdd,
+      @Nullable Map<String, Long> partitionToEventId, boolean ifNotExists)
+      throws ImpalaRuntimeException, CatalogException {
+    long eventId = getCurrentEventId(msClient);
+    List<Partition> addedHmsPartitions = Lists
+        .newArrayListWithCapacity(allHmsPartitionsToAdd.size());
+    long numDone = 0;
+    for (List<Partition> hmsSublist :
+        Lists.partition(allHmsPartitionsToAdd, MAX_PARTITION_UPDATES_PER_RPC)) {
+      try {
+        List<Partition> addedPartitions = MetaStoreUtil.addPartitions(
+            msClient.getHiveClient(), tbl.getMetaStoreTable(),
+            hmsSublist, ifNotExists, true);
+        numDone += hmsSublist.size();
+        LOG.info("Added {}/{} partitions in HMS for table {}", numDone,
+            allHmsPartitionsToAdd.size(), tbl.getFullName());
+        org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable();
+        List<NotificationEvent> events = getNextMetastoreEventsIfEnabled(eventId,
+                event -> AddPartitionEvent.ADD_PARTITION_EVENT_TYPE
+                    .equals(event.getEventType())
+                    && msTbl.getDbName().equalsIgnoreCase(event.getDbName())
+                    && msTbl.getTableName().equalsIgnoreCase(event.getTableName()));
+        Map<Partition, Long> partitionToEventSubMap = Maps.newHashMap();
+        getPartitionsFromEvent(events, partitionToEventSubMap);
+        // set the eventId to last one which we received so the we fetch the next
+        // set of events correctly
+        if (!events.isEmpty()) {
+          eventId = events.get(events.size() - 1).getEventId();
+        }
+        if (partitionToEventSubMap.isEmpty()) {
+          // if partitions couldn't be fetched from events, use the one returned by
+          // add_partitions call above.
+          addedHmsPartitions.addAll(addedPartitions);
+        } else {
+          Preconditions.checkNotNull(partitionToEventId);
+          addedHmsPartitions.addAll(partitionToEventSubMap.keySet());
+          // we cannot keep a mapping of Partition to event ids because the
+          // partition objects are changed later in the cachePartitions code path.
+          // hence it better to map the partitionName to eventId since partitionName
+          // remains unchanged.
+          for (Partition part : partitionToEventSubMap.keySet()) {
+            partitionToEventId
+                .put(FeCatalogUtils.getPartitionName((FeFsTable) tbl, part.getValues()),
+                    partitionToEventSubMap.get(part));
+          }
+        }
+      } catch (MetastoreNotificationException | TException e) {
+        throw new ImpalaRuntimeException(
+            String.format(HMS_RPC_ERROR_FORMAT_STR, "add_partitions"), e);
+      }
+    }
+    return addedHmsPartitions;
+  }
+
+  /**
+   * Invokes addHmsPartitions() in transaction for transactional tables. For
+   * non-transactional tables it just simply invokes addHmsPartitions().
+   * Please note that once addHmsPartitions() succeeded, then even if the transaction
+   * fails, the HMS table modification won't be reverted.
+   * Returns the list of the newly added partitions.
+   */
+  private List<Partition> addHmsPartitionsInTransaction(MetaStoreClient msClient,
+      Table tbl, List<Partition> partitions, Map<String, Long> partitionToEventId,
+      boolean ifNotExists) throws ImpalaException {
+    if (!AcidUtils.isTransactionalTable(tbl.getMetaStoreTable().getParameters())) {
+      return addHmsPartitions(msClient, tbl, partitions, partitionToEventId,
+          ifNotExists);
+    }
+    try (Transaction txn = new Transaction(
+        msClient.getHiveClient(),
+        catalog_.getAcidUserId(),
+        String.format("ADD PARTITION for %s", tbl.getFullName()))) {
+      MetastoreShim.allocateTableWriteId(msClient.getHiveClient(), txn.getId(),
+          tbl.getDb().getName(), tbl.getName());
+      List<Partition> ret = addHmsPartitions(msClient, tbl, partitions,
+          partitionToEventId, ifNotExists);
+      txn.commit();
+      return ret;
+    }
   }
 
   /**
@@ -2757,8 +4964,7 @@ public class CatalogOpExecutor {
    */
   private List<Partition> getPartitionsFromHms(
       org.apache.hadoop.hive.metastore.api.Table msTbl, MetaStoreClient msClient,
-      TableName tableName, List<Partition> hmsPartitions)
-      throws ImpalaException {
+      List<Partition> hmsPartitions) throws ImpalaException {
     List<String> partitionCols = Lists.newArrayList();
     for (FieldSchema fs: msTbl.getPartitionKeys()) partitionCols.add(fs.getName());
 
@@ -2769,8 +4975,8 @@ public class CatalogOpExecutor {
       partitionNames.add(partName);
     }
     try {
-      return msClient.getHiveClient().getPartitionsByNames(tableName.getDb(),
-          tableName.getTbl(), partitionNames);
+      return MetaStoreUtil.fetchPartitionsByName(msClient.getHiveClient(),
+          partitionNames, msTbl);
     } catch (TException e) {
       throw new ImpalaRuntimeException("Metadata inconsistency has occured. Please run "
           + "'invalidate metadata <tablename>' to resolve the problem.", e);
@@ -2827,6 +5033,9 @@ public class CatalogOpExecutor {
 
     // Update the partition metadata to include the cache directive id.
     if (!cacheIds.isEmpty()) {
+      for (Partition part : hmsPartitionsToCache) {
+        addCatalogServiceIdentifiers(msTbl, part);
+      }
       applyAlterHmsPartitions(msTbl, msClient, tableName, hmsPartitionsToCache);
       catalog_.watchCacheDirs(cacheIds, tableName.toThrift(),
          "ALTER TABLE CACHE PARTITIONS");
@@ -2846,7 +5055,7 @@ public class CatalogOpExecutor {
       List<List<TPartitionKeyValue>> partitionSet,
       boolean ifExists, boolean purge, Reference<Long> numUpdatedPartitions)
       throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     Preconditions.checkNotNull(partitionSet);
 
     TableName tableName = tbl.getTableName();
@@ -2872,7 +5081,12 @@ public class CatalogOpExecutor {
     PartitionDropOptions dropOptions = PartitionDropOptions.instance();
     dropOptions.purgeData(purge);
     long numTargetedPartitions = 0L;
+    // droppedPartitionsFromEvent maps the eventId to the list of partition values
+    // for all the partitions which are received in that event.
+    Map<Long, List<List<String>>> droppedPartsFromEvent = Maps.newHashMap();
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      long currentEventId = getCurrentEventId(msClient);
+      //TODO batch drop the partitions instead of one-by-one.
       for (HdfsPartition part : parts) {
         try {
           msClient.getHiveClient().dropPartition(tableName.getDb(), tableName.getTbl(),
@@ -2888,19 +5102,38 @@ public class CatalogOpExecutor {
               " ifExists is true.", e, tableName));
         }
       }
+      List<NotificationEvent> events = getNextMetastoreEventsIfEnabled(currentEventId,
+              notificationEvent ->
+                  tableName.getDb().equalsIgnoreCase(notificationEvent.getDbName())
+                  && tableName.getTbl().equalsIgnoreCase(notificationEvent.getTableName())
+                  && DropPartitionEvent.EVENT_TYPE
+                  .equals(notificationEvent.getEventType()));
+      addDroppedPartitionsFromEvent(
+          ((HdfsTable) tbl).getClusteringColNames(), events, droppedPartsFromEvent);
     } catch (TException e) {
       throw new ImpalaRuntimeException(
           String.format(HMS_RPC_ERROR_FORMAT_STR, "dropPartition"), e);
     }
     numUpdatedPartitions.setRef(numTargetedPartitions);
-    return catalog_.dropPartitions(tbl, partitionSet);
+    Table retTbl = catalog_.dropPartitions(tbl, partitionSet);
+    for (Entry<Long, List<List<String>>> eventToPartitionNames : droppedPartsFromEvent
+        .entrySet()) {
+      //TODO we add partitions one by one above and hence we expect each event to contain
+      // one partition. If this changes, we should change the eventLog logic as well
+      // to support multiple partitions removed per event.
+      Preconditions.checkState(eventToPartitionNames.getValue().size() == 1);
+      addToDeleteEventLog(eventToPartitionNames.getKey(),
+          DeleteEventLog.getPartitionKey((HdfsTable) tbl,
+                  eventToPartitionNames.getValue().get(0)));
+    }
+    return retTbl;
   }
 
   /**
    * Removes a column from the given table.
    */
   private void alterTableDropCol(Table tbl, String colName) throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable().deepCopy();
     // Find the matching column name and remove it.
     Iterator<FieldSchema> iterator = msTbl.getSd().getColsIterator();
@@ -2930,33 +5163,42 @@ public class CatalogOpExecutor {
    * reloaded on the next access.
    */
   private void alterTableOrViewRename(Table oldTbl, TableName newTableName,
-      TDdlExecResponse response) throws ImpalaException {
-    Preconditions.checkState(oldTbl.getLock().isHeldByCurrentThread()
+      long newCatalogVersion, boolean wantMinimalResult, TDdlExecResponse response)
+      throws ImpalaException {
+    Preconditions.checkState(oldTbl.isWriteLockedByCurrentThread()
         && catalog_.getLock().isWriteLockedByCurrentThread());
     TableName tableName = oldTbl.getTableName();
     org.apache.hadoop.hive.metastore.api.Table msTbl =
         oldTbl.getMetaStoreTable().deepCopy();
     msTbl.setDbName(newTableName.getDb());
     msTbl.setTableName(newTableName.getTbl());
-
+    long eventId = -1;
+    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      eventId = getCurrentEventId(msClient);
+    }
     // If oldTbl is a synchronized Kudu table, rename the underlying Kudu table.
-    boolean isSynchronizedTable = (oldTbl instanceof KuduTable) &&
+    boolean isSynchronizedKuduTable = (oldTbl instanceof KuduTable) &&
                                  KuduTable.isSynchronizedTable(msTbl);
-    boolean altersHMSTable = true;
-    if (isSynchronizedTable) {
+    boolean integratedHmsTable = isHmsIntegrationAutomatic(msTbl);
+    if (isSynchronizedKuduTable) {
       Preconditions.checkState(KuduTable.isKuduTable(msTbl));
-      boolean isKuduHmsIntegrationEnabled = isKuduHmsIntegrationEnabled(msTbl);
-      altersHMSTable = !isKuduHmsIntegrationEnabled;
-      renameManagedKuduTable((KuduTable) oldTbl, msTbl, newTableName,
-          isKuduHmsIntegrationEnabled);
+      renameManagedKuduTable((KuduTable) oldTbl, msTbl, newTableName, integratedHmsTable);
     }
 
-    // Always updates the HMS metadata for non-Kudu tables. For Kudu tables, when
-    // Kudu is not integrated with the Hive Metastore or if this is an external table,
-    // Kudu will not automatically update the HMS metadata, we have to do it
-    // manually.
-    if (altersHMSTable) {
+    // If oldTbl is a synchronized Iceberg table, rename the underlying Iceberg table.
+    boolean isSynchronizedIcebergTable = (oldTbl instanceof IcebergTable) &&
+        IcebergTable.isSynchronizedTable(msTbl);
+    if (isSynchronizedIcebergTable) {
+      renameManagedIcebergTable((IcebergTable) oldTbl, msTbl, newTableName);
+    }
+
+    boolean isSynchronizedTable = isSynchronizedKuduTable || isSynchronizedIcebergTable;
+    // Update the HMS table, unless the table is synchronized and the HMS integration
+    // is automatic.
+    boolean needsHmsAlterTable = !isSynchronizedTable || !integratedHmsTable;
+    if (needsHmsAlterTable) {
       try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+        Table.updateTimestampProperty(msTbl, Table.TBL_PROP_LAST_DDL_TIME);
         msClient.getHiveClient().alter_table(
             tableName.getDb(), tableName.getTbl(), msTbl);
       } catch (TException e) {
@@ -2964,25 +5206,64 @@ public class CatalogOpExecutor {
             String.format(HMS_RPC_ERROR_FORMAT_STR, "alter_table"), e);
       }
     }
+    List<NotificationEvent> events = null;
+    events = getNextMetastoreEventsIfEnabled(eventId,
+        event -> "ALTER_TABLE".equals(event.getEventType())
+            // the alter table event is generated on the renamed table
+            && msTbl.getDbName().equalsIgnoreCase(event.getDbName())
+            && msTbl.getTableName().equalsIgnoreCase(event.getTableName()));
+    Pair<Long, Pair<org.apache.hadoop.hive.metastore.api.Table,
+        org.apache.hadoop.hive.metastore.api.Table>> renamedTable =
+        getRenamedTableFromEvents(events);
     // Rename the table in the Catalog and get the resulting catalog object.
     // ALTER TABLE/VIEW RENAME is implemented as an ADD + DROP.
     Pair<Table, Table> result =
         catalog_.renameTable(tableName.toThrift(), newTableName.toThrift());
+    if (renamedTable != null) {
+      org.apache.hadoop.hive.metastore.api.Table tblBefore = renamedTable.second.first;
+      addToDeleteEventLog(renamedTable.first, DeleteEventLog
+          .getTblKey(tblBefore.getDbName(), tblBefore.getTableName()));
+      if (result.second != null) {
+        result.second.setCreateEventId(renamedTable.first);
+      }
+    }
     if (result.first == null || result.second == null) {
       // The rename succeeded in the HMS but failed in the catalog cache. The cache is in
       // an inconsistent state, but can likely be fixed by running "invalidate metadata".
       throw new ImpalaRuntimeException(String.format(
           "Table/view rename succeeded in the Hive Metastore, but failed in Impala's " +
           "Catalog Server. Running 'invalidate metadata <tbl>' on the old table name " +
-          "'%s' and the new table name '%s' may fix the problem." , tableName.toString(),
-          newTableName.toString()));
+          "'%s' and the new table name '%s' may fix the problem." , tableName,
+          newTableName));
     }
-
-    // TODO(todd): if client is a 'v2' impalad, only send back invalidation
-    response.result.addToRemoved_catalog_objects(result.first.toMinimalTCatalogObject());
-    response.result.addToUpdated_catalog_objects(result.second.toTCatalogObject());
+    catalog_.addVersionsForInflightEvents(false, result.second, newCatalogVersion);
+    if (wantMinimalResult) {
+      response.result.addToRemoved_catalog_objects(result.first.toInvalidationObject());
+      response.result.addToUpdated_catalog_objects(result.second.toInvalidationObject());
+    } else {
+      response.result.addToRemoved_catalog_objects(
+          result.first.toMinimalTCatalogObject());
+      response.result.addToUpdated_catalog_objects(result.second.toTCatalogObject());
+    }
     response.result.setVersion(result.second.getCatalogVersion());
     addSummary(response, "Renaming was successful.");
+  }
+
+  /**
+   * Adds the eventId and it's associated object key to the
+   * {@link MetastoreEventsProcessor}'s delete event log. The event information is
+   * not added to the delete event log if events processor is not active in order
+   * to make sure that we don't keep adding events when they are not being garbage
+   * collected.
+   */
+  public void addToDeleteEventLog(long eventId, String objectKey) {
+    if (!catalog_.isEventProcessingActive()) {
+      LOG.trace("Not adding event {}:{} since events processing is not active", eventId,
+          objectKey);
+      return;
+    }
+    catalog_.getMetastoreEventProcessor().getDeleteEventLog()
+        .addRemovedObject(eventId, objectKey);
   }
 
   /**
@@ -3007,6 +5288,24 @@ public class CatalogOpExecutor {
   }
 
   /**
+   * Renames the underlying Iceberg table for the given managed table. If the new Iceberg
+   * table name is the same as the old Iceberg table name, this method does nothing.
+   */
+  private void renameManagedIcebergTable(IcebergTable oldTbl,
+      org.apache.hadoop.hive.metastore.api.Table msTbl,
+      TableName newTableName) throws ImpalaRuntimeException {
+    TableIdentifier tableId = TableIdentifier.of(newTableName.getDb(),
+        newTableName.getTbl());
+    IcebergCatalogOpExecutor.renameTable(oldTbl, tableId);
+
+    if (msTbl.getParameters().get(IcebergTable.ICEBERG_TABLE_IDENTIFIER) != null) {
+      // We need update table identifier for HadoopCatalog managed table if exists.
+      msTbl.getParameters().put(IcebergTable.ICEBERG_TABLE_IDENTIFIER,
+          tableId.toString());
+    }
+  }
+
+  /**
    * Changes the file format for the given table or partitions. This is a metadata only
    * operation, existing table data will not be converted to the new format. Returns
    * true if the file metadata to be reloaded.
@@ -3015,7 +5314,7 @@ public class CatalogOpExecutor {
       List<List<TPartitionKeyValue>> partitionSet, THdfsFileFormat fileFormat,
       Reference<Long> numUpdatedPartitions)
       throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     boolean reloadFileMetadata = false;
     if (partitionSet == null) {
       org.apache.hadoop.hive.metastore.api.Table msTbl =
@@ -3030,12 +5329,12 @@ public class CatalogOpExecutor {
       Preconditions.checkArgument(tbl instanceof HdfsTable);
       List<HdfsPartition> partitions =
           ((HdfsTable) tbl).getPartitionsFromPartitionSet(partitionSet);
-      List<HdfsPartition> modifiedParts = Lists.newArrayList();
+      List<HdfsPartition.Builder> modifiedParts = Lists.newArrayList();
       for(HdfsPartition partition: partitions) {
-        partition.setFileFormat(HdfsFileFormat.fromThrift(fileFormat));
-        modifiedParts.add(partition);
+        modifiedParts.add(new HdfsPartition.Builder(partition).setFileFormat(
+            HdfsFileFormat.fromThrift(fileFormat)));
       }
-      bulkAlterPartitions(tbl, modifiedParts, null);
+      bulkAlterPartitions(tbl, modifiedParts, null, UpdatePartitionMethod.MARK_DIRTY);
       numUpdatedPartitions.setRef((long) modifiedParts.size());
     }
     return reloadFileMetadata;
@@ -3050,7 +5349,7 @@ public class CatalogOpExecutor {
       List<List<TPartitionKeyValue>> partitionSet, TTableRowFormat tRowFormat,
       Reference<Long> numUpdatedPartitions)
       throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     Preconditions.checkArgument(tbl instanceof HdfsTable);
     boolean reloadFileMetadata = false;
     RowFormat rowFormat = RowFormat.fromThrift(tRowFormat);
@@ -3067,12 +5366,13 @@ public class CatalogOpExecutor {
     } else {
       List<HdfsPartition> partitions =
           ((HdfsTable) tbl).getPartitionsFromPartitionSet(partitionSet);
-      List<HdfsPartition> modifiedParts = Lists.newArrayList();
+      List<HdfsPartition.Builder> modifiedParts = Lists.newArrayList();
       for(HdfsPartition partition: partitions) {
-        HiveStorageDescriptorFactory.setSerdeInfo(rowFormat, partition.getSerdeInfo());
-        modifiedParts.add(partition);
+        HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
+        HiveStorageDescriptorFactory.setSerdeInfo(rowFormat, partBuilder.getSerdeInfo());
+        modifiedParts.add(partBuilder);
       }
-      bulkAlterPartitions(tbl, modifiedParts, null);
+      bulkAlterPartitions(tbl, modifiedParts, null, UpdatePartitionMethod.MARK_DIRTY);
       numUpdatedPartitions.setRef((long) modifiedParts.size());
     }
     return reloadFileMetadata;
@@ -3096,7 +5396,7 @@ public class CatalogOpExecutor {
    */
   private boolean alterTableSetLocation(Table tbl,
       List<TPartitionKeyValue> partitionSpec, String location) throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     boolean reloadFileMetadata = false;
     if (partitionSpec == null) {
       org.apache.hadoop.hive.metastore.api.Table msTbl =
@@ -3108,11 +5408,12 @@ public class CatalogOpExecutor {
       TableName tableName = tbl.getTableName();
       HdfsPartition partition = catalog_.getHdfsPartition(
           tableName.getDb(), tableName.getTbl(), partitionSpec);
-      partition.setLocation(location);
+      HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
+      partBuilder.setLocation(location);
       try {
-        applyAlterPartition(tbl, partition);
+        applyAlterPartition(tbl, partBuilder);
       } finally {
-        partition.markDirty();
+        ((HdfsTable) tbl).markDirtyPartition(partBuilder);
       }
     }
     return reloadFileMetadata;
@@ -3125,7 +5426,7 @@ public class CatalogOpExecutor {
   private void alterTableSetTblProperties(Table tbl,
       TAlterTableSetTblPropertiesParams params, Reference<Long> numUpdatedPartitions)
       throws ImpalaException {
-    Preconditions.checkState(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
     Map<String, String> properties = params.getProperties();
     Preconditions.checkNotNull(properties);
     if (params.isSetPartition_set()) {
@@ -3133,27 +5434,27 @@ public class CatalogOpExecutor {
       List<HdfsPartition> partitions =
           ((HdfsTable) tbl).getPartitionsFromPartitionSet(params.getPartition_set());
 
-      List<HdfsPartition> modifiedParts = Lists.newArrayList();
+      List<HdfsPartition.Builder> modifiedParts = Lists.newArrayList();
       for(HdfsPartition partition: partitions) {
+        HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
         switch (params.getTarget()) {
           case TBL_PROPERTY:
-            partition.getParameters().putAll(properties);
+            partBuilder.getParameters().putAll(properties);
             break;
           case SERDE_PROPERTY:
-            partition.getSerdeInfo().getParameters().putAll(properties);
+            partBuilder.getSerdeInfo().getParameters().putAll(properties);
             break;
           default:
             throw new UnsupportedOperationException(
                 "Unknown target TTablePropertyType: " + params.getTarget());
         }
-        modifiedParts.add(partition);
+        modifiedParts.add(partBuilder);
       }
       try {
-        bulkAlterPartitions(tbl, modifiedParts, null);
+        // Do not mark the partitions dirty here since it's done in finally clause.
+        bulkAlterPartitions(tbl, modifiedParts, null, UpdatePartitionMethod.NONE);
       } finally {
-        for (HdfsPartition modifiedPart : modifiedParts) {
-          modifiedPart.markDirty();
-        }
+        ((HdfsTable) tbl).markDirtyPartitions(modifiedParts);
       }
       numUpdatedPartitions.setRef((long) modifiedParts.size());
     } else {
@@ -3192,6 +5493,120 @@ public class CatalogOpExecutor {
     }
   }
 
+  private void alterTableUnSetTblProperties(Table tbl,
+      TAlterTableUnSetTblPropertiesParams params, Reference<Long> numUpdatedPartitions)
+      throws ImpalaException {
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
+    List<String> removeProperties = params.getProperty_keys();
+    boolean ifExists = params.isIf_exists();
+    Preconditions.checkNotNull(removeProperties);
+
+    if (params.isSetPartition_set()) {
+      Preconditions.checkArgument(tbl instanceof HdfsTable,
+          "Partition spec not allowed for non-HDFS table");
+      List<HdfsPartition> partitions =
+          ((HdfsTable) tbl).getPartitionsFromPartitionSet(params.getPartition_set());
+
+      List<HdfsPartition.Builder> modifiedParts = Lists.newArrayList();
+      for(HdfsPartition partition: partitions) {
+        HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
+        Set<String> keys;
+        switch (params.getTarget()) {
+          case TBL_PROPERTY:
+            keys = partBuilder.getParameters().keySet();
+            break;
+          case SERDE_PROPERTY:
+            keys = partBuilder.getSerdeInfo().getParameters().keySet();
+            break;
+          default:
+            throw new UnsupportedOperationException(
+                "Unknown target TTablePropertyType: " + params.getTarget());
+        }
+        removeKeys(removeProperties, ifExists, keys, "partition " +
+            partition.getPartitionName(), ALTER_TBL_UNSET_NON_EXIST_PROPERTY);
+        modifiedParts.add(partBuilder);
+      }
+      try {
+        // Do not mark the partitions dirty here since it's done in finally clause.
+        bulkAlterPartitions(tbl, modifiedParts, null, UpdatePartitionMethod.NONE);
+      } finally {
+        ((HdfsTable) tbl).markDirtyPartitions(modifiedParts);
+      }
+      numUpdatedPartitions.setRef((long) modifiedParts.size());
+    } else {
+      // Alter table params.
+      org.apache.hadoop.hive.metastore.api.Table msTbl =
+          tbl.getMetaStoreTable().deepCopy();
+      Set<String> keys;
+      switch (params.getTarget()) {
+        case TBL_PROPERTY:
+          keys = msTbl.getParameters().keySet();
+          break;
+        case SERDE_PROPERTY:
+          keys = msTbl.getSd().getSerdeInfo().getParameters().keySet();
+          break;
+        default:
+          throw new UnsupportedOperationException(
+              "Unknown target TTablePropertyType: " + params.getTarget());
+      }
+      removeKeys(removeProperties, ifExists, keys,
+          "table " + tbl.getFullName(), ALTER_TBL_UNSET_NON_EXIST_PROPERTY);
+      // Validate that the new table properties are valid and that
+      // the Kudu table is accessible.
+      if (KuduTable.isKuduTable(msTbl)) {
+        KuduCatalogOpExecutor.validateKuduTblExists(msTbl);
+      }
+      applyAlterTable(msTbl);
+    }
+  }
+
+  /**
+   * Appends to the view property metadata for the given view, replacing
+   * the values of any keys that already exist.
+   */
+  private void alterViewSetTblProperties(Table tbl,
+      TAlterTableSetTblPropertiesParams params) throws ImpalaException {
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
+    Map<String, String> properties = params.getProperties();
+    Preconditions.checkNotNull(properties);
+
+    // Alter view params.
+    org.apache.hadoop.hive.metastore.api.Table msTbl =
+        tbl.getMetaStoreTable().deepCopy();
+    msTbl.getParameters().putAll(properties);
+    applyAlterTable(msTbl);
+  }
+
+  private void alterViewUnSetTblProperties(Table tbl,
+      TAlterTableUnSetTblPropertiesParams params) throws ImpalaException {
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
+    List<String> removeProperties = params.getProperty_keys();
+    boolean ifExists = params.isIf_exists();
+    Preconditions.checkNotNull(removeProperties);
+    // Alter view params.
+    org.apache.hadoop.hive.metastore.api.Table msTbl =
+            tbl.getMetaStoreTable().deepCopy();
+    Set<String> keys = msTbl.getParameters().keySet();
+    removeKeys(removeProperties, ifExists, keys,
+        "view " + tbl.getFullName(), ALTER_VIEW_UNSET_NON_EXIST_PROPERTY);
+    applyAlterTable(msTbl);
+  }
+
+  private void removeKeys(List<String> removeProperties, boolean ifExists,
+      Set<String> keys, String fullName, String excepInfo) throws CatalogException {
+    if (ifExists || keys.containsAll(removeProperties)) {
+      keys.removeAll(removeProperties);
+    } else {
+      List<String> removeCopy = new ArrayList(removeProperties);
+      removeCopy.removeAll(keys);
+      throw new CatalogException(
+          String.format("These properties do not exist for %s: %s.\n%s",
+              fullName,
+              String.join(",", removeCopy),
+              excepInfo));
+    }
+  }
+
   /**
    * Caches or uncaches the HDFS location of the target table and updates the
    * table's metadata in Hive Metastore Store. If this is a partitioned table,
@@ -3204,7 +5619,7 @@ public class CatalogOpExecutor {
    */
   private boolean alterTableSetCached(Table tbl, TAlterTableSetCachedParams params)
       throws ImpalaException {
-    Preconditions.checkArgument(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkArgument(tbl.isWriteLockedByCurrentThread());
     THdfsCachingOp cacheOp = params.getCache_op();
     Preconditions.checkNotNull(cacheOp);
     // Alter table params.
@@ -3250,17 +5665,18 @@ public class CatalogOpExecutor {
           // needs to be updated
           if (!partition.isMarkedCached() ||
               HdfsCachingUtil.isUpdateOp(cacheOp, partition.getParameters())) {
+            HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
             try {
               // If the partition was already cached, update the directive otherwise
               // issue new cache directive
               if (!partition.isMarkedCached()) {
                 cacheDirIds.add(HdfsCachingUtil.submitCachePartitionDirective(
-                    partition, cacheOp.getCache_pool_name(), cacheReplication));
+                    partBuilder, cacheOp.getCache_pool_name(), cacheReplication));
               } else {
                 Long directiveId = HdfsCachingUtil.getCacheDirectiveId(
                     partition.getParameters());
                 cacheDirIds.add(HdfsCachingUtil.modifyCacheDirective(directiveId,
-                    partition, cacheOp.getCache_pool_name(), cacheReplication));
+                    partBuilder, cacheOp.getCache_pool_name(), cacheReplication));
               }
             } catch (ImpalaRuntimeException e) {
               if (partition.isMarkedCached()) {
@@ -3274,9 +5690,9 @@ public class CatalogOpExecutor {
 
             // Update the partition metadata.
             try {
-              applyAlterPartition(tbl, partition);
+              applyAlterPartition(tbl, partBuilder);
             } finally {
-              partition.markDirty();
+              ((HdfsTable) tbl).markDirtyPartition(partBuilder);
             }
           }
         }
@@ -3302,11 +5718,12 @@ public class CatalogOpExecutor {
           // TODO(todd): avoid downcast
           HdfsPartition partition = (HdfsPartition) fePartition;
           if (partition.isMarkedCached()) {
-            HdfsCachingUtil.removePartitionCacheDirective(partition);
+            HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
+            HdfsCachingUtil.removePartitionCacheDirective(partBuilder);
             try {
-              applyAlterPartition(tbl, partition);
+              applyAlterPartition(tbl, partBuilder);
             } finally {
-              partition.markDirty();
+              ((HdfsTable) tbl).markDirtyPartition(partBuilder);
             }
           }
         }
@@ -3330,7 +5747,7 @@ public class CatalogOpExecutor {
   private void alterPartitionSetCached(Table tbl,
       TAlterTableSetCachedParams params, Reference<Long> numUpdatedPartitions)
       throws ImpalaException {
-    Preconditions.checkArgument(tbl.getLock().isHeldByCurrentThread());
+    Preconditions.checkArgument(tbl.isWriteLockedByCurrentThread());
     THdfsCachingOp cacheOp = params.getCache_op();
     Preconditions.checkNotNull(cacheOp);
     Preconditions.checkNotNull(params.getPartition_set());
@@ -3338,23 +5755,25 @@ public class CatalogOpExecutor {
     Preconditions.checkArgument(tbl instanceof HdfsTable);
     List<HdfsPartition> partitions =
         ((HdfsTable) tbl).getPartitionsFromPartitionSet(params.getPartition_set());
-    List<HdfsPartition> modifiedParts = Lists.newArrayList();
+    List<HdfsPartition.Builder> modifiedParts = Lists.newArrayList();
     if (cacheOp.isSet_cached()) {
       for (HdfsPartition partition : partitions) {
         // The directive is null if the partition is not cached
         Long directiveId =
             HdfsCachingUtil.getCacheDirectiveId(partition.getParameters());
+        HdfsPartition.Builder partBuilder = null;
         short replication = HdfsCachingUtil.getReplicationOrDefault(cacheOp);
         List<Long> cacheDirs = Lists.newArrayList();
         if (directiveId == null) {
+          partBuilder = new HdfsPartition.Builder(partition);
           cacheDirs.add(HdfsCachingUtil.submitCachePartitionDirective(
-              partition, cacheOp.getCache_pool_name(), replication));
+              partBuilder, cacheOp.getCache_pool_name(), replication));
         } else {
           if (HdfsCachingUtil.isUpdateOp(cacheOp, partition.getParameters())) {
+            partBuilder = new HdfsPartition.Builder(partition);
             HdfsCachingUtil.validateCachePool(cacheOp, directiveId, tableName, partition);
             cacheDirs.add(HdfsCachingUtil.modifyCacheDirective(
-                directiveId, partition, cacheOp.getCache_pool_name(),
-                replication));
+                directiveId, partBuilder, cacheOp.getCache_pool_name(), replication));
           }
         }
 
@@ -3364,24 +5783,22 @@ public class CatalogOpExecutor {
           catalog_.watchCacheDirs(cacheDirs, tableName.toThrift(),
               "ALTER PARTITION SET CACHED");
         }
-        if (!partition.isMarkedCached()) {
-          modifiedParts.add(partition);
-        }
+        if (partBuilder != null) modifiedParts.add(partBuilder);
       }
     } else {
       for (HdfsPartition partition : partitions) {
         if (partition.isMarkedCached()) {
-          HdfsCachingUtil.removePartitionCacheDirective(partition);
-          modifiedParts.add(partition);
+          HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
+          HdfsCachingUtil.removePartitionCacheDirective(partBuilder);
+          modifiedParts.add(partBuilder);
         }
       }
     }
     try {
-      bulkAlterPartitions(tbl, modifiedParts, null);
+      // Do not mark the partitions dirty here since it's done in finally clause.
+      bulkAlterPartitions(tbl, modifiedParts, null, UpdatePartitionMethod.NONE);
     } finally {
-      for (HdfsPartition modifiedPart : modifiedParts) {
-        modifiedPart.markDirty();
-      }
+      ((HdfsTable) tbl).markDirtyPartitions(modifiedParts);
     }
     numUpdatedPartitions.setRef((long) modifiedParts.size());
   }
@@ -3390,13 +5807,15 @@ public class CatalogOpExecutor {
    * Recover partitions of specified table.
    * Add partitions to metastore which exist in HDFS but not in metastore.
    */
-  private void alterTableRecoverPartitions(Table tbl) throws ImpalaException {
-    Preconditions.checkArgument(tbl.getLock().isHeldByCurrentThread());
+  private void alterTableRecoverPartitions(Table tbl, @Nullable String debugAction)
+      throws ImpalaException {
+    Preconditions.checkArgument(tbl.isWriteLockedByCurrentThread());
     if (!(tbl instanceof HdfsTable)) {
       throw new CatalogException("Table " + tbl.getFullName() + " is not an HDFS table");
     }
     HdfsTable hdfsTable = (HdfsTable) tbl;
-    List<List<String>> partitionsNotInHms = hdfsTable.getPathsWithoutPartitions();
+    List<List<String>> partitionsNotInHms = hdfsTable
+        .getPathsWithoutPartitions(debugAction);
     if (partitionsNotInHms.isEmpty()) return;
 
     List<Partition> hmsPartitions = Lists.newArrayList();
@@ -3422,24 +5841,31 @@ public class CatalogOpExecutor {
     }
 
     // Add partitions to metastore.
-    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      // Apply the updates in batches of 'MAX_PARTITION_UPDATES_PER_RPC'.
-      for (List<Partition> hmsSublist :
-          Lists.partition(hmsPartitions, MAX_PARTITION_UPDATES_PER_RPC)) {
-        // ifNotExists and needResults are true.
-        List<Partition> hmsAddedPartitions =
-            msClient.getHiveClient().add_partitions(hmsSublist, true, true);
-        addHdfsPartitions(tbl, hmsAddedPartitions);
-        // Handle HDFS cache.
-        if (cachePoolName != null) {
-          for (Partition partition: hmsAddedPartitions) {
+    Map<String, Long> partitionToEventId = catalog_.isEventProcessingActive() ?
+        Maps.newHashMap() : null;
+    String annotation = String.format("Recovering %d partitions for %s",
+        hmsPartitions.size(), tbl.getFullName());
+    try (ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation);
+        MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      List<Partition> addedPartitions = addHmsPartitions(msClient, tbl, hmsPartitions,
+          partitionToEventId, true);
+      addHdfsPartitions(msClient, tbl, addedPartitions, partitionToEventId);
+      // Handle HDFS cache.
+      if (cachePoolName != null) {
+        int numDone = 0;
+        for (List<Partition> hmsSublist :
+            Lists.partition(addedPartitions, MAX_PARTITION_UPDATES_PER_RPC)) {
+          for (Partition partition: hmsSublist) {
             long id = HdfsCachingUtil.submitCachePartitionDirective(partition,
                 cachePoolName, replication);
             cacheIds.add(id);
           }
           // Update the partition metadata to include the cache directive id.
           MetastoreShim.alterPartitions(msClient.getHiveClient(), tableName.getDb(),
-              tableName.getTbl(), hmsAddedPartitions);
+              tableName.getTbl(), hmsSublist);
+          numDone += hmsSublist.size();
+          LOG.info("Updated cache directive id for {}/{} partitions for table {}",
+              numDone, addedPartitions.size(), tableName);
         }
       }
     } catch (TException e) {
@@ -3459,7 +5885,21 @@ public class CatalogOpExecutor {
     PrincipalType oldOwnerType = msTbl.getOwnerType();
     msTbl.setOwner(params.owner_name);
     msTbl.setOwnerType(PrincipalType.valueOf(params.owner_type.name()));
-    applyAlterTable(msTbl);
+
+    // A KuduTable is synchronized if it is a managed KuduTable, or an external table
+    // with the property of 'external.table.purge' being true.
+    boolean isSynchronizedKuduTable = (tbl instanceof KuduTable) &&
+        KuduTable.isSynchronizedTable(msTbl);
+    boolean altersHMSTable = true;
+    if (isSynchronizedKuduTable) {
+      boolean isKuduHmsIntegrationEnabled = isKuduHmsIntegrationEnabled(msTbl);
+      // We need to update HMS when the integration between Kudu and HMS is not enabled.
+      altersHMSTable = !isKuduHmsIntegrationEnabled;
+      KuduCatalogOpExecutor.alterSetOwner((KuduTable) tbl, params.owner_name);
+    }
+
+    if (altersHMSTable) applyAlterTable(msTbl);
+
     if (authzConfig_.isEnabled()) {
       authzManager_.updateTableOwnerPrivilege(params.server_name, msTbl.getDbName(),
           msTbl.getTableName(), oldOwner, oldOwnerType, msTbl.getOwner(),
@@ -3497,24 +5937,21 @@ public class CatalogOpExecutor {
     partition.setDbName(tableName.getDb());
     partition.setTableName(tableName.getTbl());
     partition.setValues(partitionSpecValues);
-    StorageDescriptor sd = msTbl.getSd().deepCopy();
+    StorageDescriptor sd = MetaStoreUtil.shallowCopyStorageDescriptor(msTbl.getSd());
     sd.setLocation(location);
     partition.setSd(sd);
-    // if external event processing is enabled, add the catalog service identifiers
-    // from table to the partition
-    addCatalogServiceIdentifiers(msTbl, partition);
     return partition;
   }
 
   /**
-   * Adds this catalog service id and the given catalog version to the partition
-   * parameters from table parameters. No-op if event processing is disabled
+   * No-op if event processing is disabled. Adds this catalog service id and the given
+   * catalog version to the partition parameters from table parameters.
    */
   private void addCatalogServiceIdentifiers(
       org.apache.hadoop.hive.metastore.api.Table msTbl, Partition partition) {
-    if (!catalog_.isExternalEventProcessingEnabled())
-      return;
+    if (!catalog_.isEventProcessingActive()) return;
     Preconditions.checkState(msTbl.isSetParameters());
+    Preconditions.checkNotNull(partition, "Partition is null");
     Map<String, String> tblParams = msTbl.getParameters();
     Preconditions
         .checkState(tblParams.containsKey(
@@ -3526,12 +5963,39 @@ public class CatalogOpExecutor {
             MetastoreEventPropertyKey.CATALOG_VERSION.getKey()),
             "Table parameters must contain catalog version before adding "
                 + "it to partition parameters");
-    partition.putToParameters(
-        MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey(),
-        tblParams.get(MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey()));
-    partition.putToParameters(
-        MetastoreEventPropertyKey.CATALOG_VERSION.getKey(),
-        tblParams.get(MetastoreEventPropertyKey.CATALOG_VERSION.getKey()));
+    // make sure that the service id from the table matches with our own service id to
+    // avoid issues where the msTbl has an older (other catalogs' service identifiers)
+    String serviceIdFromTbl =
+        tblParams.get(MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey());
+    String version = tblParams.get(MetastoreEventPropertyKey.CATALOG_VERSION.getKey());
+    if (catalog_.getCatalogServiceId().equals(serviceIdFromTbl)) {
+      partition.putToParameters(
+          MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey(), serviceIdFromTbl);
+      partition.putToParameters(
+          MetastoreEventPropertyKey.CATALOG_VERSION.getKey(), version);
+    }
+  }
+
+  /**
+   * This method extracts the catalog version from the tbl parameters and adds it to
+   * the HdfsPartition's inflight events. This information is used by event
+   * processor to skip the event generated on the partition.
+   */
+  private void addToInflightVersionsOfPartition(
+      Map<String, String> partitionParams, HdfsPartition.Builder partBuilder) {
+    if (!catalog_.isEventProcessingActive()) return;
+    Preconditions.checkState(partitionParams != null);
+    String version = partitionParams
+        .get(MetastoreEventPropertyKey.CATALOG_VERSION.getKey());
+    String serviceId = partitionParams
+        .get(MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey());
+
+    // make sure that we are adding the catalog version from our own instance of
+    // catalog service identifiers
+    if (catalog_.getCatalogServiceId().equals(serviceId)) {
+      Preconditions.checkNotNull(version);
+      partBuilder.addToVersionsForInflightEvents(false, Long.parseLong(version));
+    }
   }
 
   /**
@@ -3645,13 +6109,14 @@ public class CatalogOpExecutor {
     }
   }
 
-  private void applyAlterPartition(Table tbl, HdfsPartition partition)
+  private void applyAlterPartition(Table tbl, HdfsPartition.Builder partBuilder)
       throws ImpalaException {
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      Partition hmsPartition = partition.toHmsPartition();
+      Partition hmsPartition = partBuilder.toHmsPartition();
       addCatalogServiceIdentifiers(tbl.getMetaStoreTable(), hmsPartition);
       applyAlterHmsPartitions(tbl.getMetaStoreTable().deepCopy(), msClient,
           tbl.getTableName(), Arrays.asList(hmsPartition));
+      addToInflightVersionsOfPartition(hmsPartition.getParameters(), partBuilder);
     }
   }
 
@@ -3783,50 +6248,73 @@ public class CatalogOpExecutor {
     addSummary(resp, "Privilege(s) have been revoked.");
   }
 
+  private static enum UpdatePartitionMethod {
+    // Do not apply updates to the partition. The caller is responsible for updating
+    // the state of any modified partitions to reflect changes applied.
+    NONE,
+    // Update the state of the Partition objects in place in the catalog.
+    IN_PLACE,
+    // Mark the partition dirty so that it will be later reloaded from scratch when
+    // the table is reloaded.
+    MARK_DIRTY,
+  }
+  ;
+
   /**
-   * Alters partitions in batches of size 'MAX_PARTITION_UPDATES_PER_RPC'. This
-   * reduces the time spent in a single update and helps avoid metastore client
+   * Alters partitions in the HMS in batches of size 'MAX_PARTITION_UPDATES_PER_RPC'.
+   * This reduces the time spent in a single update and helps avoid metastore client
    * timeouts.
+   * @param updateMethod controls how the same updates are applied to 'tbl' to reflect
+   *                     the changes written to the HMS.
    */
-  private void bulkAlterPartitions(Table tbl, List<HdfsPartition> modifiedParts,
-      TblTransaction tblTxn) throws ImpalaException {
-    List<org.apache.hadoop.hive.metastore.api.Partition> hmsPartitions =
-        Lists.newArrayList();
-    for (HdfsPartition p: modifiedParts) {
-      org.apache.hadoop.hive.metastore.api.Partition msPart = p.toHmsPartition();
+  private void bulkAlterPartitions(Table tbl, List<HdfsPartition.Builder> modifiedParts,
+      TblTransaction tblTxn, UpdatePartitionMethod updateMethod) throws ImpalaException {
+    // Map from msPartitions to the partition builders. Use IdentityHashMap since
+    // modifications will change hash codes of msPartitions.
+    Map<Partition, HdfsPartition.Builder> msPartitionToBuilders =
+        Maps.newIdentityHashMap();
+    for (HdfsPartition.Builder p: modifiedParts) {
+      Partition msPart = p.toHmsPartition();
       if (msPart != null) {
         addCatalogServiceIdentifiers(tbl.getMetaStoreTable(), msPart);
-        hmsPartitions.add(msPart);
+        msPartitionToBuilders.put(msPart, p);
       }
     }
-    if (hmsPartitions.isEmpty()) return;
+    if (msPartitionToBuilders.isEmpty()) return;
 
     String dbName = tbl.getDb().getName();
     String tableName = tbl.getName();
+    int numDone = 0;
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
       // Apply the updates in batches of 'MAX_PARTITION_UPDATES_PER_RPC'.
-      for (List<Partition> hmsPartitionsSubList :
-        Lists.partition(hmsPartitions, MAX_PARTITION_UPDATES_PER_RPC)) {
+      for (List<Partition> msPartitionsSubList : Iterables.partition(
+          msPartitionToBuilders.keySet(), MAX_PARTITION_UPDATES_PER_RPC)) {
         try {
           // Alter partitions in bulk.
           if (tblTxn != null) {
             MetastoreShim.alterPartitionsWithTransaction(msClient.getHiveClient(), dbName,
-                tableName, hmsPartitionsSubList, tblTxn);
-          }
-          else {
+                tableName, msPartitionsSubList, tblTxn);
+          } else {
             MetastoreShim.alterPartitions(msClient.getHiveClient(), dbName, tableName,
-                hmsPartitionsSubList);
+                msPartitionsSubList);
           }
+          numDone += msPartitionsSubList.size();
+          LOG.info("HMS alterPartitions done on {}/{} partitions of table {}", numDone,
+              msPartitionToBuilders.size(), tbl.getFullName());
           // Mark the corresponding HdfsPartition objects as dirty
-          for (org.apache.hadoop.hive.metastore.api.Partition msPartition:
-              hmsPartitionsSubList) {
-            try {
-              catalog_.getHdfsPartition(dbName, tableName, msPartition).markDirty();
-            } catch (PartitionNotFoundException e) {
-              LOG.error(String.format("Partition of table %s could not be found: %s",
-                  tableName, e.getMessage()));
-              continue;
+          for (Partition msPartition : msPartitionsSubList) {
+            HdfsPartition.Builder partBuilder = msPartitionToBuilders.get(msPartition);
+            Preconditions.checkNotNull(partBuilder);
+            // The partition either needs to be reloaded or updated in place to apply
+            // the modifications.
+            if (updateMethod == UpdatePartitionMethod.MARK_DIRTY) {
+              ((HdfsTable) tbl).markDirtyPartition(partBuilder);
+            } else if (updateMethod == UpdatePartitionMethod.IN_PLACE) {
+              ((HdfsTable) tbl).updatePartition(partBuilder);
             }
+            // If event processing is turned on add the version number from partition
+            // parameters to the HdfsPartition's list of in-flight events.
+            addToInflightVersionsOfPartition(msPartition.getParameters(), partBuilder);
           }
         } catch (TException e) {
           throw new ImpalaRuntimeException(
@@ -3846,7 +6334,7 @@ public class CatalogOpExecutor {
     Preconditions.checkNotNull(msClient);
     Db db = tbl.getDb();
     org.apache.hadoop.hive.metastore.api.Table msTbl = null;
-    Stopwatch hmsLoadSW = new Stopwatch().start();
+    Stopwatch hmsLoadSW = Stopwatch.createStarted();
     long hmsLoadTime;
     try {
       msTbl = msClient.getHiveClient().getTable(db.getName(), tbl.getName());
@@ -3892,7 +6380,7 @@ public class CatalogOpExecutor {
   /**
    * Executes a TResetMetadataRequest and returns the result as a
    * TResetMetadataResponse. Based on the request parameters, this operation
-   * may do one of three things:
+   * may do one of these things:
    * 1) invalidate the entire catalog, forcing the metadata for all catalog
    *    objects to be reloaded.
    * 2) invalidate a specific table, forcing the metadata to be reloaded
@@ -3905,9 +6393,7 @@ public class CatalogOpExecutor {
    */
   public TResetMetadataResponse execResetMetadata(TResetMetadataRequest req)
       throws CatalogException {
-    String cmdString = String.format("%s issued by %s",
-        req.is_refresh ? "REFRESH":"INVALIDATE",
-        req.header != null ? req.header.requesting_user : " unknown user");
+    String cmdString = CatalogOpUtil.getShortDescForReset(req);
     TResetMetadataResponse resp = new TResetMetadataResponse();
     resp.setResult(new TCatalogUpdateResult());
     resp.getResult().setCatalog_service_id(JniCatalog.getServiceId());
@@ -3917,18 +6403,21 @@ public class CatalogOpExecutor {
           String.format("Can't refresh functions in blacklisted database: %s. %s",
               req.getDb_name(), BLACKLISTED_DBS_INCONSISTENT_ERR_STR));
       // This is a "refresh functions" operation.
-      synchronized (metastoreDdlLock_) {
+      getMetastoreDdlLock().lock();
+      try {
+        List<TCatalogObject> addedFuncs = Lists.newArrayList();
+        List<TCatalogObject> removedFuncs = Lists.newArrayList();
         try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-          List<TCatalogObject> addedFuncs = Lists.newArrayList();
-          List<TCatalogObject> removedFuncs = Lists.newArrayList();
           catalog_.refreshFunctions(msClient, req.getDb_name(), addedFuncs, removedFuncs);
-          resp.result.setUpdated_catalog_objects(addedFuncs);
-          resp.result.setRemoved_catalog_objects(removedFuncs);
-          resp.result.setVersion(catalog_.getCatalogVersion());
-          for (TCatalogObject removedFn: removedFuncs) {
-            catalog_.getDeleteLog().addRemovedObject(removedFn);
-          }
         }
+        resp.result.setUpdated_catalog_objects(addedFuncs);
+        resp.result.setRemoved_catalog_objects(removedFuncs);
+        resp.result.setVersion(catalog_.getCatalogVersion());
+        for (TCatalogObject removedFn: removedFuncs) {
+          catalog_.getDeleteLog().addRemovedObject(removedFn);
+        }
+      } finally {
+        getMetastoreDdlLock().unlock();
       }
     } else if (req.isSetTable_name()) {
       // Results of an invalidate operation, indicating whether the table was removed
@@ -3938,49 +6427,63 @@ public class CatalogOpExecutor {
       Reference<Boolean> dbWasAdded = new Reference<Boolean>(false);
       // Thrift representation of the result of the invalidate/refresh operation.
       TCatalogObject updatedThriftTable = null;
-      if (req.isIs_refresh()) {
-        TableName tblName = TableName.fromThrift(req.getTable_name());
+      TableName tblName = TableName.fromThrift(req.getTable_name());
+      Table tbl = null;
+      if (!req.isIs_refresh()) {
+        // For INVALIDATE METADATA <db>.<table>, the db might be unloaded.
+        // So we can't update 'tbl' here.
+        updatedThriftTable = catalog_.invalidateTable(
+            req.getTable_name(), tblWasRemoved, dbWasAdded);
+      } else {
         // Quick check to see if the table exists in the catalog without triggering
         // a table load.
-        Table tbl = catalog_.getTable(tblName.getDb(), tblName.getTbl());
+        tbl = catalog_.getTable(tblName.getDb(), tblName.getTbl());
         if (tbl != null) {
           // If the table is not loaded, no need to perform refresh after the initial
           // metadata load.
           boolean isTableLoadedInCatalog = tbl.isLoaded();
           tbl = getExistingTable(tblName.getDb(), tblName.getTbl(),
               "Load triggered by " + cmdString);
-          if (tbl != null) {
-            if (isTableLoadedInCatalog) {
-              if (req.isSetPartition_spec()) {
-                boolean isTransactional = AcidUtils.isTransactionalTable(
-                    tbl.getMetaStoreTable().getParameters());
-                Preconditions.checkArgument(!isTransactional);
-                updatedThriftTable = catalog_.reloadPartition(tbl,
-                    req.getPartition_spec(), cmdString);
-              } else {
-                // TODO IMPALA-8809: Optimisation for partitioned tables:
-                //   1: Reload the whole table if schema change happened. Identify
-                //     such scenario by checking Table.TBL_PROP_LAST_DDL_TIME property.
-                //     Note, table level writeId is not updated by HMS for partitioned
-                //     ACID tables, there is a Jira to cover this: HIVE-22062.
-                //   2: If no need for a full table reload then fetch partition level
-                //     writeIds and reload only the ones that changed.
-                updatedThriftTable = catalog_.reloadTable(tbl, cmdString);
-              }
+          CatalogObject.ThriftObjectType resultType =
+              req.header.want_minimal_response ?
+                  CatalogObject.ThriftObjectType.INVALIDATION :
+                  CatalogObject.ThriftObjectType.FULL;
+          if (isTableLoadedInCatalog) {
+            if (req.isSetPartition_spec()) {
+              boolean isTransactional = AcidUtils.isTransactionalTable(
+                  tbl.getMetaStoreTable().getParameters());
+              Preconditions.checkArgument(!isTransactional);
+              Reference<Boolean> wasPartitionRefreshed = new Reference<>(false);
+              // TODO if the partition was not really refreshed because the partSpec
+              // was wrong, do we still need to send back the table?
+              updatedThriftTable = catalog_.reloadPartition(tbl,
+                  req.getPartition_spec(), wasPartitionRefreshed, resultType, cmdString);
             } else {
-              // Table was loaded from scratch, so it's already "refreshed".
-              tbl.getLock().lock();
+              // TODO IMPALA-8809: Optimisation for partitioned tables:
+              //   1: Reload the whole table if schema change happened. Identify
+              //     such scenario by checking Table.TBL_PROP_LAST_DDL_TIME property.
+              //     Note, table level writeId is not updated by HMS for partitioned
+              //     ACID tables, there is a Jira to cover this: HIVE-22062.
+              //   2: If no need for a full table reload then fetch partition level
+              //     writeIds and reload only the ones that changed.
               try {
-                updatedThriftTable = tbl.toTCatalogObject();
-              } finally {
-                tbl.getLock().unlock();
+                updatedThriftTable = catalog_.reloadTable(tbl, req, resultType, cmdString,
+                    -1);
+              } catch (IcebergTableLoadingException e) {
+                updatedThriftTable = catalog_.invalidateTable(
+                    req.getTable_name(), tblWasRemoved, dbWasAdded);
               }
+            }
+          } else {
+            // Table was loaded from scratch, so it's already "refreshed".
+            tbl.takeReadLock();
+            try {
+              updatedThriftTable = tbl.toTCatalogObject(resultType);
+            } finally {
+              tbl.releaseReadLock();
             }
           }
         }
-      } else {
-        updatedThriftTable = catalog_.invalidateTable(
-            req.getTable_name(), tblWasRemoved, dbWasAdded);
       }
 
       if (updatedThriftTable == null) {
@@ -3990,11 +6493,23 @@ public class CatalogOpExecutor {
             req.getTable_name().getTable_name());
       }
 
+      if (BackendConfig.INSTANCE.enableReloadEvents()) {
+        // For INVALIDATE METADATA <table>, 'tbl' can only be got after it succeeds.
+        if (!req.isIs_refresh()) {
+          tbl = catalog_.getTable(tblName.getDb(), tblName.getTbl());
+        }
+        Preconditions.checkNotNull(tbl, "tbl is null in " + cmdString);
+        // fire event for refresh event and update the last refresh event id
+        fireReloadEventAndUpdateRefreshEventId(req, updatedThriftTable, tblName, tbl);
+      }
+
       // Return the TCatalogObject in the result to indicate this request can be
       // processed as a direct DDL operation.
       if (tblWasRemoved.getRef()) {
         resp.getResult().addToRemoved_catalog_objects(updatedThriftTable);
       } else {
+        // TODO(IMPALA-9937): if client is a 'v1' impalad, only send back incremental
+        //  updates
         resp.getResult().addToUpdated_catalog_objects(updatedThriftTable);
       }
 
@@ -4005,7 +6520,7 @@ public class CatalogOpExecutor {
               updatedThriftTable.getTable().getDb_name() + " was removed by a " +
               "concurrent operation. Try invalidating the table again.");
         }
-        resp.getResult().addToUpdated_catalog_objects(addedDb.toTCatalogObject());
+        addDbToCatalogUpdate(addedDb, req.header.want_minimal_response, resp.getResult());
       }
       resp.getResult().setVersion(updatedThriftTable.getCatalog_version());
     } else if (req.isAuthorization()) {
@@ -4027,6 +6542,64 @@ public class CatalogOpExecutor {
   }
 
   /**
+   * Helper class for refresh event.
+   * This class invokes metastore shim's fireReloadEvent to fire event to HMS
+   * and update the last refresh event id in the cache
+   * @param req - request object for TResetMetadataRequest.
+   * @param updatedThriftTable - updated thrift table after refresh query
+   * @param tblName
+   * @param tbl
+   */
+  private void fireReloadEventAndUpdateRefreshEventId(TResetMetadataRequest req,
+      TCatalogObject updatedThriftTable, TableName tblName, Table tbl) {
+    List<String> partVals = null;
+    if (req.isSetPartition_spec()) {
+      partVals = req.getPartition_spec().stream().
+          map(partSpec -> partSpec.getValue()).collect(Collectors.toList());
+    }
+    try {
+      // Get new catalog version for table refresh/invalidate.
+      long newCatalogVersion = updatedThriftTable.getCatalog_version();
+      Map<String, String> tableParams = new HashMap<>();
+      tableParams.put(MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey(),
+          catalog_.getCatalogServiceId());
+      tableParams.put(MetastoreEventPropertyKey.CATALOG_VERSION.getKey(),
+          String.valueOf(newCatalogVersion));
+      List<Long> eventIds = MetastoreShim.fireReloadEventHelper(
+          catalog_.getMetaStoreClient(), req.isIs_refresh(), partVals, tblName.getDb(),
+          tblName.getTbl(), tableParams);
+      if (req.isIs_refresh()) {
+        if (catalog_.tryLock(tbl, true, 600000)) {
+          catalog_.addVersionsForInflightEvents(false, tbl, newCatalogVersion);
+          if (!eventIds.isEmpty()) {
+            if (req.isSetPartition_spec()) {
+              HdfsPartition partition = ((HdfsTable) tbl)
+                  .getPartitionFromThriftPartitionSpec(req.getPartition_spec());
+              HdfsPartition.Builder partBuilder = new HdfsPartition.Builder(partition);
+              partBuilder.setLastRefreshEventId(eventIds.get(0));
+              ((HdfsTable) tbl).updatePartition(partBuilder);
+            } else {
+              tbl.setLastRefreshEventId(eventIds.get(0));
+            }
+          }
+        } else {
+          LOG.warn(String.format("Couldn't obtain a version lock for the table: %s. " +
+              "Self events may go undetected in that case",
+              tbl.getName()));
+        }
+      }
+    } catch (TException | CatalogException e) {
+      LOG.error(String.format(HMS_RPC_ERROR_FORMAT_STR,
+          "fireReloadEvent") + e.getMessage());
+    } finally {
+      if (tbl.isWriteLockedByCurrentThread()) {
+        tbl.releaseWriteLock();
+        catalog_.getLock().writeLock().unlock();
+      }
+    }
+  }
+
+  /**
    * Create any new partitions required as a result of an INSERT statement and refreshes
    * the table metadata after every INSERT statement. Any new partitions will inherit
    * their cache configuration from the parent table. That is, if the parent is cached
@@ -4042,12 +6615,12 @@ public class CatalogOpExecutor {
     // Only update metastore for Hdfs tables.
     Table table = getExistingTable(update.getDb_name(), update.getTarget_table(),
         "Load for INSERT");
-    if (!(table instanceof HdfsTable)) {
+    if (!(table instanceof FeFsTable)) {
       throw new InternalException("Unexpected table type: " +
           update.getTarget_table());
     }
 
-    tryLock(table, "updating the catalog");
+    tryWriteLock(table, "updating the catalog");
     final Timer.Context context
         = table.getMetrics().getTimer(HdfsTable.CATALOG_UPDATE_DURATION_METRIC).time();
 
@@ -4085,10 +6658,21 @@ public class CatalogOpExecutor {
       List<String> errorMessages = Lists.newArrayList();
       HashSet<String> partsToLoadMetadata = null;
       Collection<? extends FeFsPartition> parts =
-          FeCatalogUtils.loadAllPartitions((HdfsTable) table);
+          FeCatalogUtils.loadAllPartitions((FeFsTable)table);
       List<FeFsPartition> affectedExistingPartitions = new ArrayList<>();
       List<org.apache.hadoop.hive.metastore.api.Partition> hmsPartitionsStatsUnset =
           Lists.newArrayList();
+      // Names of the partitions that are added with add_partitions() RPC.
+      // add_partitions() fires events for these partitions, so we don't need to
+      // fire an insert event. Collect the partition name both as a single string and
+      // as a list of values for convenience.
+      Map<String, List<String>> addedPartitionNames = new HashMap<>();
+      // if event processing is enabled we collect the events ids generated for the added
+      // partitions in this map. This is used later on when table is reloaded to set
+      // the createEventId for the partitions.
+      Map<String, Long> partitionToEventId = new HashMap<>();
+      addCatalogServiceIdentifiers(table, catalog_.getCatalogServiceId(),
+          newCatalogVersion);
       if (table.getNumClusteringCols() > 0) {
         // Set of all partition names targeted by the insert that need to be created
         // in the Metastore (partitions that do not currently exist in the catalog).
@@ -4096,13 +6680,10 @@ public class CatalogOpExecutor {
         // are new and which already exist, so initialize the set with all targeted
         // partition names and remove the ones that are found to exist.
         HashSet<String> partsToCreate =
-            Sets.newHashSet(update.getCreated_partitions());
+            Sets.newHashSet(update.getUpdated_partitions().keySet());
         partsToLoadMetadata = Sets.newHashSet(partsToCreate);
         for (FeFsPartition partition: parts) {
-          // TODO: In the BE we build partition names without a trailing char. In FE
-          // we build partition name with a trailing char. We should make this
-          // consistent.
-          String partName = partition.getPartitionName() + "/";
+          String partName = partition.getPartitionName();
           // Attempt to remove this partition name from partsToCreate. If remove
           // returns true, it indicates the partition already exists.
           if (partsToCreate.remove(partName)) {
@@ -4144,11 +6725,9 @@ public class CatalogOpExecutor {
               partition.setDbName(tblName.getDb());
               partition.setTableName(tblName.getTbl());
               partition.setValues(MetaStoreUtil.getPartValsFromName(msTbl, partName));
-              partition.setParameters(new HashMap<String, String>());
-              partition.setSd(msTbl.getSd().deepCopy());
-              partition.getSd().setSerdeInfo(msTbl.getSd().getSerdeInfo().deepCopy());
-              partition.getSd().setLocation(msTbl.getSd().getLocation() + "/" +
-                  partName.substring(0, partName.length() - 1));
+              partition.setSd(MetaStoreUtil.shallowCopyStorageDescriptor(msTbl.getSd()));
+              partition.getSd().setLocation(msTbl.getSd().getLocation() + "/" + partName);
+              addCatalogServiceIdentifiers(msTbl, partition);
               MetastoreShim.updatePartitionStatsFast(partition, msTbl, warehouse);
             }
 
@@ -4156,9 +6735,13 @@ public class CatalogOpExecutor {
             // caching directives. The reason is that some partitions could have been
             // added concurrently, and we want to avoid caching a partition twice and
             // leaking a caching directive.
-            List<org.apache.hadoop.hive.metastore.api.Partition> addedHmsParts =
-                msClient.getHiveClient().add_partitions(hmsParts, true, true);
-
+            List<Partition> addedHmsParts = addHmsPartitions(
+                msClient, table, hmsParts, partitionToEventId, true);
+            for (Partition part: addedHmsParts) {
+              String part_name =
+                  FeCatalogUtils.getPartitionName((FeFsTable)table, part.getValues());
+              addedPartitionNames.put(part_name, part.getValues());
+            }
             if (addedHmsParts.size() > 0) {
               if (cachePoolName != null) {
                 List<org.apache.hadoop.hive.metastore.api.Partition> cachedHmsParts =
@@ -4189,7 +6772,7 @@ public class CatalogOpExecutor {
                   for (org.apache.hadoop.hive.metastore.api.Partition part:
                       cachedHmsParts) {
                     try {
-                      HdfsCachingUtil.removePartitionCacheDirective(part);
+                      HdfsCachingUtil.removePartitionCacheDirective(part.getParameters());
                     } catch (ImpalaException e1) {
                       String msg = String.format(
                           "Partition %s.%s(%s): State: Leaked caching directive. " +
@@ -4203,9 +6786,6 @@ public class CatalogOpExecutor {
                 }
               }
             }
-          } catch (AlreadyExistsException e) {
-            throw new InternalException(
-                "AlreadyExistsException thrown although ifNotExists given", e);
           } catch (Exception e) {
             throw new InternalException("Error adding partitions", e);
           }
@@ -4220,7 +6800,6 @@ public class CatalogOpExecutor {
         // For non-partitioned table, only single part exists
         FeFsPartition singlePart = Iterables.getOnlyElement((List<FeFsPartition>) parts);
         affectedExistingPartitions.add(singlePart);
-
       }
       unsetTableColStats(table.getMetaStoreTable(), tblTxn);
       // Submit the watch request for the given cache directives.
@@ -4241,6 +6820,11 @@ public class CatalogOpExecutor {
             new TStatus(TErrorCode.OK, new ArrayList<String>()));
       }
 
+      // Before commit fire insert events if external event processing is
+      // enabled.
+      createInsertEvents((FeFsTable)table, update.getUpdated_partitions(),
+          addedPartitionNames, update.is_overwrite, tblTxn);
+
       // Commit transactional inserts on success. We don't abort the transaction
       // here in case of failures, because the client, i.e. query coordinator, is
       // always responsible for aborting transactions when queries hit errors.
@@ -4249,109 +6833,231 @@ public class CatalogOpExecutor {
           commitTransaction(update.getTransaction_id());
         }
       }
+
+      if (table instanceof FeIcebergTable && update.isSetIceberg_operation()) {
+        FeIcebergTable iceTbl = (FeIcebergTable)table;
+        org.apache.iceberg.Transaction iceTxn = IcebergUtil.getIcebergTransaction(iceTbl);
+        IcebergCatalogOpExecutor.appendFiles(iceTbl, iceTxn,
+            update.getIceberg_operation());
+        if (isIcebergHmsIntegrationEnabled(iceTbl.getMetaStoreTable())) {
+          // Add catalog service id and the 'newCatalogVersion' to the table parameters.
+          // This way we can avoid reloading the table on self-events (Iceberg generates
+          // an ALTER TABLE statement to set the new metadata_location).
+          IcebergCatalogOpExecutor.addCatalogVersionToTxn(iceTxn,
+              catalog_.getCatalogServiceId(), newCatalogVersion);
+          catalog_.addVersionsForInflightEvents(false, table, newCatalogVersion);
+        }
+        iceTxn.commitTransaction();
+      }
+
       loadTableMetadata(table, newCatalogVersion, true, false, partsToLoadMetadata,
-          "INSERT");
-      // After loading metadata, fire insert events if external event processing is
-      // enabled.
-      createInsertEvents(table, affectedExistingPartitions, update.is_overwrite);
-      addTableToCatalogUpdate(table, response.result);
+          partitionToEventId, "INSERT");
+      addTableToCatalogUpdate(table, update.header.want_minimal_response,
+          response.result);
     } finally {
       context.stop();
       UnlockWriteLockIfErronouslyLocked();
-      table.getLock().unlock();
+      table.releaseWriteLock();
     }
 
     if (update.isSync_ddl()) {
       response.getResult().setVersion(
           catalog_.waitForSyncDdlVersion(response.getResult()));
     }
+
+    if (update.isSetDebug_action()) {
+      DebugUtils.executeDebugAction(update.getDebug_action(),
+          DebugUtils.INSERT_FINISH_DELAY);
+    }
     return response;
   }
 
   /**
-   * Populates insert event data and calls fireInsertEvent() if external event processing
-   * is enabled. This is no-op if event processing is disabled or there are no existing
-   * partitions affected by this insert.
-   *
-   * @param affectedExistingPartitions List of existing partitions touched by the insert.
-   * @param isInsertOverwrite indicates if the operation was an insert overwrite. If it
-   *     is not, all the new files added by this insert is calculated.
+   * Populates insert event data and calls fireInsertEvents() if external event
+   * processing is enabled. This is no-op if event processing is disabled.
+   *   TODO: I am not sure that it is the right thing to connect event polling and
+   *         event sending to the same config. This means that turning off automatic
+   *         refresh will also break replication.
+   * This method is replicating what Hive does in case a table or partition is inserts
+   * into. There are 2 cases:
+   * 1. If the table is transactional, we should first generate ADD_PARTITION events
+   * for new partitions which are generated. This is taken care of in the updateCatalog
+   * method. Additionally, for each partition including existing partitions which were
+   * inserted into, this method creates an ACID_WRITE event using the HMS API
+   * addWriteNotificationLog.
+   * 2. If the table is not transactional, this method generates INSERT_EVENT for only
+   * the pre-existing partitions which were inserted into. This is in-line with what hive
+   * does, see:
+   * https://github.com/apache/hive/blob/25892ea409/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java#L3251
+   * @param table The target table.
+   * @param updatedPartitions All affected partitions with the list of new files
+   *                          inserted.
+   * @param addedPartitionNames List of new partitions created during the insert.
+   * @param isInsertOverwrite Indicates if the operation was an insert overwrite.
+   * @param tblTxn Contains the transactionId and the writeId for the insert.
    */
-  private void createInsertEvents(Table table,
-      List<FeFsPartition> affectedExistingPartitions, boolean isInsertOverwrite) {
-    if (!catalog_.isExternalEventProcessingEnabled() ||
-        affectedExistingPartitions.size() == 0) return;
-
-    // Map of partition names to file names of all existing partitions touched by the
-    // insert.
-    Map<String, Set<String>> partitionFilesMapBeforeInsert = new HashMap<>();
-    if (!isInsertOverwrite) {
-      partitionFilesMapBeforeInsert =
-          getPartitionNameFilesMap(affectedExistingPartitions);
+  private void createInsertEvents(FeFsTable table,
+      Map<String, TUpdatedPartition> updatedPartitions,
+      Map<String, List<String>> addedPartitionNames,
+      boolean isInsertOverwrite, TblTransaction tblTxn) throws CatalogException {
+    if (!shouldGenerateInsertEvents(table)) {
+      return;
     }
-    // If table is partitioned, we add all existing partitions touched by this insert
-    // to the insert event.
-    Collection<? extends FeFsPartition> partsPostInsert;
-    partsPostInsert =
-        ((HdfsTable) table).getPartitionsForNames(
-            partitionFilesMapBeforeInsert.keySet());
+    long txnId = tblTxn == null ? -1 : tblTxn.txnId;
+    long writeId = tblTxn == null ? -1: tblTxn.writeId;
+    // If the table is transaction table we should generate a transactional
+    // insert event type. This would show up in HMS as an ACID_WRITE event.
+    boolean isTransactional = AcidUtils.isTransactionalTable(table.getMetaStoreTable()
+        .getParameters());
+    Preconditions.checkState(!isTransactional || txnId > 0, String
+        .format("Invalid transaction id %s for generating insert events on table %s",
+            txnId, table.getFullName()));
+    Preconditions.checkState(!isTransactional || writeId > 0,
+        String.format("Invalid write id %s for generating insert events on table %s",
+            writeId, table.getFullName()));
 
-    // If it is not an insert overwrite operation, we find new files added by this insert.
-    Map<String, Set<String>> partitionFilesMapPostInsert = new HashMap<>();
-    if (!isInsertOverwrite) {
-      partitionFilesMapPostInsert =
-          getPartitionNameFilesMap(partsPostInsert);
+    boolean isPartitioned = table.getNumClusteringCols() > 0;
+    // List of all insert events that we call HMS fireInsertEvent() on.
+    List<InsertEventRequestData> insertEventReqDatas = new ArrayList<>();
+    // The partition val list corresponding to insertEventReqDatas for Apache Hive-3
+    List<List<String>> insertEventPartVals = new ArrayList<>();
+    // List of all existing partitions that we insert into.
+    List<HdfsPartition> existingPartitions = new ArrayList<>();
+    if (isPartitioned) {
+      Set<String> existingPartSet = new HashSet<String>(updatedPartitions.keySet());
+      existingPartSet.removeAll(addedPartitionNames.keySet());
+      // Only HdfsTable can have partitions, Iceberg tables are treated as unpartitioned.
+      existingPartitions = ((HdfsTable) table).getPartitionsForNames(existingPartSet);
+    } else {
+      Preconditions.checkState(updatedPartitions.size() == 1);
+      // Unpartitioned tables have a single partition with empty name,
+      // see HdfsTable.DEFAULT_PARTITION_NAME.
+      List<String> newFiles = updatedPartitions.get("").getFiles();
+      List<String> partVals = new ArrayList<>();
+      LOG.info(String.format("%s new files detected for table %s", newFiles.size(),
+          table.getFullName()));
+      if (!newFiles.isEmpty() || isInsertOverwrite) {
+        insertEventReqDatas.add(
+            makeInsertEventData( table, partVals, newFiles, isInsertOverwrite));
+        insertEventPartVals.add(partVals);
+      }
     }
 
-    for (FeFsPartition part : partsPostInsert) {
-      // Find the delta of the files added by the insert if it is not an overwrite
-      // operation. HMS fireListenerEvent() expects an empty list if no new files are
-      // added or if the operation is an insert overwrite.
-      Set<String> deltaFiles = new HashSet<>();
-      List<String> partVals = null;
-      if (!isInsertOverwrite) {
-        String partitionName = part.getPartitionName() + "/";
-        Set<String> filesPostInsert =
-            partitionFilesMapPostInsert.get(partitionName);
-        if (table.getNumClusteringCols() > 0) {
-          Set<String> filesBeforeInsert =
-              partitionFilesMapBeforeInsert.get(partitionName);
-          deltaFiles = Sets.difference(filesBeforeInsert, filesPostInsert);
-          partVals = part.getPartitionValuesAsStrings(true);
+    // Create events for existing partitions in partitioned tables.
+    for (HdfsPartition part : existingPartitions) {
+      List<String> newFiles = updatedPartitions.get(part.getPartitionName()).getFiles();
+      List<String> partVals  = part.getPartitionValuesAsStrings(true);
+      Preconditions.checkState(!partVals.isEmpty());
+      if (!newFiles.isEmpty() || isInsertOverwrite) {
+        LOG.info(String.format("%s new files detected for table %s partition %s",
+            newFiles.size(), table.getFullName(), part.getPartitionName()));
+        insertEventReqDatas.add(
+            makeInsertEventData(table, partVals, newFiles, isInsertOverwrite));
+        insertEventPartVals.add(partVals);
+      }
+    }
+
+    // Create events for new partitions only in ACID tables.
+    if (isTransactional) {
+      for (Map.Entry<String, List<String>> part : addedPartitionNames.entrySet()) {
+        List<String> newFiles = updatedPartitions.get(part.getKey()).getFiles();
+        List<String> partVals  = part.getValue();
+        Preconditions.checkState(!partVals.isEmpty());
+        LOG.info(String.format("%s new files detected for table %s new partition %s",
+            newFiles.size(), table.getFullName(), part.getKey()));
+        insertEventReqDatas.add(
+            makeInsertEventData(table, partVals, newFiles, isInsertOverwrite));
+        insertEventPartVals.add(partVals);
+      }
+    }
+
+    if (insertEventReqDatas.isEmpty()) {
+      return;
+    }
+
+    MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient();
+    TableInsertEventInfo insertEventInfo = new TableInsertEventInfo(
+        insertEventReqDatas, insertEventPartVals, isTransactional, txnId, writeId);
+    List<Long> eventIds = MetastoreShim.fireInsertEvents(metaStoreClient,
+        insertEventInfo, table.getDb().getName(), table.getName());
+    if (isTransactional) {
+      // ACID inserts do not generate INSERT events as it is enough to listen to the
+      // COMMIT event fired by HMS. Impala ignores COMMIT events, so we don't
+      // have to worry about reloading as a result of this "self" event.
+      // Note that Hive inserts also lead to an ALTER event which is the actual event
+      // that causes Impala to reload the table.
+      Preconditions.checkState(eventIds.isEmpty());
+      return;
+    }
+    if (!eventIds.isEmpty()) {
+      if (!isPartitioned) { // insert into table
+        Preconditions.checkState(eventIds.size() == 1);
+        catalog_.addVersionsForInflightEvents(true, (Table)table, eventIds.get(0));
+      } else { // insert into partition
+        Preconditions.checkState(existingPartitions.size() == eventIds.size());
+        for (int par_idx = 0; par_idx < existingPartitions.size(); par_idx++) {
+          existingPartitions.get(par_idx).addToVersionsForInflightEvents(
+              true, eventIds.get(par_idx));
+        }
+      }
+    }
+  }
+
+  private boolean shouldGenerateInsertEvents(FeFsTable table) {
+    if (table instanceof FeIcebergTable) return false;
+    return BackendConfig.INSTANCE.isInsertEventsEnabled();
+  }
+
+  private InsertEventRequestData makeInsertEventData(FeFsTable tbl, List<String> partVals,
+      List<String> newFiles, boolean isInsertOverwrite) throws CatalogException {
+    Preconditions.checkNotNull(newFiles);
+    Preconditions.checkNotNull(partVals);
+    InsertEventRequestData insertEventRequestData = new InsertEventRequestData(
+        Lists.newArrayListWithCapacity(
+            newFiles.size()));
+    boolean isTransactional = AcidUtils
+        .isTransactionalTable(tbl.getMetaStoreTable().getParameters());
+    // in case of unpartitioned table, partVals will be empty
+    boolean isPartitioned = !partVals.isEmpty();
+    if (isPartitioned) {
+      MetastoreShim.setPartitionVal(insertEventRequestData, partVals);
+    }
+    // Get table file system with table location.
+    FileSystem tableFs = tbl.getFileSystem();
+    FileSystem fs;
+    for (String file : newFiles) {
+      try {
+        Path filePath = new Path(file);
+        if (!isPartitioned) {
+          fs = tableFs;
         } else {
-          Map.Entry<String, Set<String>> entry =
-              partitionFilesMapBeforeInsert.entrySet().iterator().next();
-          deltaFiles = Sets.difference(entry.getValue(), filesPostInsert);
+          // Partitions may be in different file systems.
+          fs = FeFsTable.getFileSystem(filePath);
         }
-        LOG.info("{} new files detected for table {} partition {}.",
-            filesPostInsert.size(), table.getTableName(), part.getPartitionName());
-      }
-      if (deltaFiles != null || isInsertOverwrite) {
-        try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
-          MetaStoreUtil
-              .fireInsertEvent(metaStoreClient.getHiveClient(), table.getDb().getName(),
-                  table.getName(), partVals, deltaFiles, isInsertOverwrite);
-        } catch (Exception e) {
-          LOG.error("Failed to fire insert event. Some tables might not be"
-              + " refreshed on other impala clusters.", e);
+        FileChecksum checkSum = fs.getFileChecksum(filePath);
+        String checksumStr = checkSum == null ? ""
+            : StringUtils.byteToHexString(checkSum.getBytes(), 0, checkSum.getLength());
+        insertEventRequestData.addToFilesAdded(file);
+        insertEventRequestData.addToFilesAddedChecksum(checksumStr);
+        if (isTransactional) {
+          String acidDirPath = AcidUtils.getFirstLevelAcidDirPath(filePath, fs);
+          if (acidDirPath != null) {
+            MetastoreShim.addToSubDirectoryList(insertEventRequestData, acidDirPath);
+          }
         }
-      }
-      else {
-        LOG.info("No new files were created, and is not a replace. Skipping "
-            + "generating INSERT event.");
+        insertEventRequestData.setReplace(isInsertOverwrite);
+      } catch (IOException e) {
+        if (tbl instanceof FeIcebergTable) {
+          // TODO IMPALA-10254: load data files via Iceberg API. Currently we load
+          // Iceberg data files via file listing, so we might see files being written.
+          continue;
+        }
+        throw new CatalogException("Could not get the file checksum for file " + file, e);
       }
     }
+    return insertEventRequestData;
   }
 
-  /**
-   * Util method to return a map of partition names to list of files for that partition.
-   */
-  private static Map<String, Set<String>> getPartitionNameFilesMap(Collection<?
-      extends FeFsPartition> partitions) {
-        return partitions.stream().collect(
-            Collectors.toMap(p -> p.getPartitionName() + "/",
-                p -> ((HdfsPartition) p).getFileNames()));
-  }
 
   /**
    * Returns an existing, loaded table from the Catalog. Throws an exception if any
@@ -4368,9 +7074,11 @@ public class CatalogOpExecutor {
    * TODO: Track object IDs to
    * know when a table has been dropped and re-created with the same name.
    */
-  private Table getExistingTable(String dbName, String tblName, String reason)
+  public Table getExistingTable(String dbName, String tblName, String reason)
       throws CatalogException {
-    Table tbl = catalog_.getOrLoadTable(dbName, tblName, reason);
+    // passing null validWriteIdList makes sure that we return the table if it is
+    // already loaded.
+    Table tbl = catalog_.getOrLoadTable(dbName, tblName, reason, null);
     if (tbl == null) {
       throw new TableNotFoundException("Table not found: " + dbName + "." + tblName);
     }
@@ -4394,34 +7102,50 @@ public class CatalogOpExecutor {
     return tbl;
   }
 
-  private void alterCommentOn(TCommentOnParams params, TDdlExecResponse response)
+  private void alterCommentOn(TCommentOnParams params, TDdlExecResponse response,
+      Optional<TTableName> tTableName, boolean wantMinimalResult)
       throws ImpalaRuntimeException, CatalogException, InternalException {
     if (params.getDb() != null) {
       Preconditions.checkArgument(!params.isSetTable_name() &&
           !params.isSetColumn_name());
-      alterCommentOnDb(params.getDb(), params.getComment(), response);
+      tTableName.get().setDb_name(params.db);
+      catalogOpMetric_.increment(TDdlType.COMMENT_ON, tTableName);
+      alterCommentOnDb(params.getDb(), params.getComment(), wantMinimalResult, response);
     } else if (params.getTable_name() != null) {
       Preconditions.checkArgument(!params.isSetDb() && !params.isSetColumn_name());
+      tTableName.get().setDb_name(params.table_name.db_name);
+      tTableName.get().setTable_name(params.table_name.table_name);
+      catalogOpMetric_.increment(TDdlType.COMMENT_ON, tTableName);
       alterCommentOnTableOrView(TableName.fromThrift(params.getTable_name()),
-          params.getComment(), response);
+          params.getComment(), wantMinimalResult, response);
     } else if (params.getColumn_name() != null) {
       Preconditions.checkArgument(!params.isSetDb() && !params.isSetTable_name());
       TColumnName columnName = params.getColumn_name();
+      tTableName.get().setDb_name(columnName.table_name.table_name);
+      tTableName.get().setTable_name(columnName.table_name.table_name);
+      catalogOpMetric_.increment(TDdlType.COMMENT_ON, tTableName);
       alterCommentOnColumn(TableName.fromThrift(columnName.getTable_name()),
-          columnName.getColumn_name(), params.getComment(), response);
+          columnName.getColumn_name(), params.getComment(), wantMinimalResult, response);
     } else {
       throw new UnsupportedOperationException("Unsupported COMMENT ON operation");
     }
   }
 
-  private void alterCommentOnDb(String dbName, String comment, TDdlExecResponse response)
-      throws ImpalaRuntimeException, CatalogException {
+  private void alterCommentOnDb(String dbName, String comment, boolean wantMinimalResult,
+      TDdlExecResponse response)
+      throws ImpalaRuntimeException, CatalogException, InternalException {
     Db db = catalog_.getDb(dbName);
     if (db == null) {
       throw new CatalogException("Database: " + dbName + " does not exist.");
     }
-    synchronized (metastoreDdlLock_) {
+    tryLock(db, "altering the comment");
+    // Get a new catalog version to assign to the database being altered.
+    long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+    catalog_.getLock().writeLock().unlock();
+    try {
       Database msDb = db.getMetaStoreDb().deepCopy();
+      addCatalogServiceIdentifiers(msDb, catalog_.getCatalogServiceId(),
+          newCatalogVersion);
       msDb.setDescription(comment);
       try {
         applyAlterDatabase(msDb);
@@ -4429,13 +7153,18 @@ public class CatalogOpExecutor {
         throw e;
       }
       Db updatedDb = catalog_.updateDb(msDb);
-      addDbToCatalogUpdate(updatedDb, response.result);
+      addDbToCatalogUpdate(updatedDb, wantMinimalResult, response.result);
+      // now that HMS alter operation has succeeded, add this version to list of inflight
+      // events in catalog database if event processing is enabled
+      catalog_.addVersionsForInflightEvents(db, newCatalogVersion);
+    } finally {
+      db.getLock().unlock();
     }
     addSummary(response, "Updated database.");
   }
 
-  private void alterDatabase(TAlterDbParams params, TDdlExecResponse response)
-      throws ImpalaException {
+  private void alterDatabase(TAlterDbParams params, boolean wantMinimalResult,
+      TDdlExecResponse response) throws ImpalaException {
     Preconditions.checkNotNull(params);
     String dbName = params.getDb();
     Db db = catalog_.getDb(dbName);
@@ -4444,7 +7173,8 @@ public class CatalogOpExecutor {
     }
     switch (params.getAlter_type()) {
       case SET_OWNER:
-        alterDatabaseSetOwner(db, params.getSet_owner_params(), response);
+        alterDatabaseSetOwner(db, params.getSet_owner_params(), wantMinimalResult,
+            response);
         break;
       default:
         throw new UnsupportedOperationException(
@@ -4453,14 +7183,17 @@ public class CatalogOpExecutor {
   }
 
   private void alterDatabaseSetOwner(Db db, TAlterDbSetOwnerParams params,
-      TDdlExecResponse response) throws ImpalaException {
+      boolean wantMinimalResult, TDdlExecResponse response) throws ImpalaException {
     Preconditions.checkNotNull(params.owner_name);
     Preconditions.checkNotNull(params.owner_type);
-    synchronized (metastoreDdlLock_) {
-      // Get a new catalog version to assign to the database being altered.
-      long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
-      addCatalogServiceIdentifiers(db, catalog_.getCatalogServiceId(), newCatalogVersion);
+    tryLock(db, "altering the owner");
+    // Get a new catalog version to assign to the database being altered.
+    long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+    catalog_.getLock().writeLock().unlock();
+    try {
       Database msDb = db.getMetaStoreDb().deepCopy();
+      addCatalogServiceIdentifiers(msDb, catalog_.getCatalogServiceId(),
+          newCatalogVersion);
       String originalOwnerName = msDb.getOwnerName();
       PrincipalType originalOwnerType = msDb.getOwnerType();
       msDb.setOwnerName(params.owner_name);
@@ -4476,10 +7209,12 @@ public class CatalogOpExecutor {
             msDb.getOwnerType(), response);
       }
       Db updatedDb = catalog_.updateDb(msDb);
-      addDbToCatalogUpdate(updatedDb, response.result);
+      addDbToCatalogUpdate(updatedDb, wantMinimalResult, response.result);
       // now that HMS alter operation has succeeded, add this version to list of inflight
       // events in catalog database if event processing is enabled
       catalog_.addVersionsForInflightEvents(db, newCatalogVersion);
+    } finally {
+      db.getLock().unlock();
     }
     addSummary(response, "Updated database.");
   }
@@ -4489,30 +7224,30 @@ public class CatalogOpExecutor {
    * No-op if event processing is disabled
    */
   private void addCatalogServiceIdentifiers(
-      Db db, String catalogServiceId, long newCatalogVersion) {
-    if (!catalog_.isExternalEventProcessingEnabled()) return;
-    org.apache.hadoop.hive.metastore.api.Database msDb = db.getMetaStoreDb();
+      Database msDb, String catalogServiceId, long newCatalogVersion) {
+    if (!catalog_.isEventProcessingActive()) return;
+    Preconditions.checkNotNull(msDb);
     msDb.putToParameters(MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey(),
         catalogServiceId);
     msDb.putToParameters(MetastoreEventPropertyKey.CATALOG_VERSION.getKey(),
         String.valueOf(newCatalogVersion));
   }
 
-  private void addDbToCatalogUpdate(Db db, TCatalogUpdateResult result) {
+  private void addDbToCatalogUpdate(Db db, boolean wantMinimalResult,
+      TCatalogUpdateResult result) {
     Preconditions.checkNotNull(db);
-    TCatalogObject updatedCatalogObject = db.toTCatalogObject();
-    updatedCatalogObject.setCatalog_version(updatedCatalogObject.getCatalog_version());
-    // TODO(todd): if client is a 'v2' impalad, only send back invalidation
+    TCatalogObject updatedCatalogObject = wantMinimalResult ?
+        db.toMinimalTCatalogObject() : db.toTCatalogObject();
     result.addToUpdated_catalog_objects(updatedCatalogObject);
     result.setVersion(updatedCatalogObject.getCatalog_version());
   }
 
   private void alterCommentOnTableOrView(TableName tableName, String comment,
-      TDdlExecResponse response) throws CatalogException, InternalException,
-      ImpalaRuntimeException {
+      boolean wantMinimalResult, TDdlExecResponse response)
+      throws CatalogException, InternalException, ImpalaRuntimeException {
     Table tbl = getExistingTable(tableName.getDb(), tableName.getTbl(),
         "Load for ALTER COMMENT");
-    tryLock(tbl);
+    tryWriteLock(tbl);
     try {
       long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
       catalog_.getLock().writeLock().unlock();
@@ -4529,22 +7264,25 @@ public class CatalogOpExecutor {
       }
       applyAlterTable(msTbl);
       loadTableMetadata(tbl, newCatalogVersion, false, false, null, "ALTER COMMENT");
-      addTableToCatalogUpdate(tbl, response.result);
+      catalog_.addVersionsForInflightEvents(false, tbl, newCatalogVersion);
+      addTableToCatalogUpdate(tbl, wantMinimalResult, response.result);
       addSummary(response, String.format("Updated %s.", (isView) ? "view" : "table"));
     } finally {
-      tbl.getLock().unlock();
+      tbl.releaseWriteLock();
     }
   }
 
   private void alterCommentOnColumn(TableName tableName, String columnName,
-      String comment, TDdlExecResponse response) throws CatalogException,
-      InternalException, ImpalaRuntimeException {
+      String comment, boolean wantMinimalResult, TDdlExecResponse response)
+      throws CatalogException, InternalException, ImpalaRuntimeException {
     Table tbl = getExistingTable(tableName.getDb(), tableName.getTbl(),
         "Load for ALTER COLUMN COMMENT");
-    tryLock(tbl);
+    tryWriteLock(tbl);
     try {
       long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
       catalog_.getLock().writeLock().unlock();
+      addCatalogServiceIdentifiers(tbl, catalog_.getCatalogServiceId(),
+          newCatalogVersion);
       if (tbl instanceof KuduTable) {
         TColumn new_col = new TColumn(columnName,
             tbl.getColumn(columnName).getType().toThrift());
@@ -4564,10 +7302,11 @@ public class CatalogOpExecutor {
       }
       loadTableMetadata(tbl, newCatalogVersion, false, true, null,
           "ALTER COLUMN COMMENT");
-      addTableToCatalogUpdate(tbl, response.result);
+      catalog_.addVersionsForInflightEvents(false, tbl, newCatalogVersion);
+      addTableToCatalogUpdate(tbl, wantMinimalResult, response.result);
       addSummary(response, "Column has been altered.");
     } finally {
-      tbl.getLock().unlock();
+      tbl.releaseWriteLock();
     }
   }
 
@@ -4588,22 +7327,33 @@ public class CatalogOpExecutor {
   }
 
   /**
-   * Try to lock a table in the catalog. Throw an InternalException if the catalog is
-   * unable to lock the given table.
+   * Tries to take the write lock of the table in the catalog. Throws an InternalException
+   * if the catalog is unable to lock the given table.
    */
-  private void tryLock(Table tbl) throws InternalException {
-    tryLock(tbl, "altering");
+  private void tryWriteLock(Table tbl) throws InternalException {
+    tryWriteLock(tbl, "altering");
   }
 
   /**
    * Try to lock a table in the catalog for a given operation. Throw an InternalException
    * if the catalog is unable to lock the given table.
    */
-  private void tryLock(Table tbl, String operation) throws InternalException {
+  private void tryWriteLock(Table tbl, String operation) throws InternalException {
     String type = tbl instanceof View ? "view" : "table";
-    if (!catalog_.tryLockTable(tbl)) {
+    if (!catalog_.tryWriteLock(tbl)) {
       throw new InternalException(String.format("Error %s (for) %s %s due to " +
           "lock contention.", operation, type, tbl.getFullName()));
+    }
+  }
+
+  /**
+   * Try to lock the given Db in the catalog for the given operation. Throws
+   * InternalException if catalog is unable to lock the database.
+   */
+  private void tryLock(Db db, String operation) throws InternalException {
+    if (!catalog_.tryLockDb(db)) {
+      throw new InternalException(String.format("Error %s of database %s due to lock "
+          + "contention.", operation, db.getName()));
     }
   }
 

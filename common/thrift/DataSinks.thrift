@@ -23,13 +23,15 @@ include "Exprs.thrift"
 include "Types.thrift"
 include "Descriptors.thrift"
 include "Partitions.thrift"
+include "PlanNodes.thrift"
 include "ResourceProfile.thrift"
 
 enum TDataSinkType {
   DATA_STREAM_SINK = 0
   TABLE_SINK = 1
-  JOIN_BUILD_SINK = 2
+  HASH_JOIN_BUILDER = 2
   PLAN_ROOT_SINK = 3
+  NESTED_LOOP_JOIN_BUILDER = 4
 }
 
 enum TSinkAction {
@@ -85,6 +87,20 @@ struct THdfsTableSink {
   // Sorting order. If not lexical, the backend should not populate the
   // RowGroup::sorting_columns list in parquet files.
   7: required Types.TSortingOrder sorting_order
+
+  // Indicates that this HdfsTableSink is writing query results
+  8: optional bool is_result_sink = false;
+
+  // Indicates that an external FE is expecting results here
+  9: optional string external_output_dir;
+
+  // Indicates how deep into the partition specification in which to start creating
+  // partition directories
+  10: optional i32 external_output_partition_depth;
+
+  // Mapping from column names to Parquet Bloom filter bitset sizes. Columns for which no
+  // Parquet Bloom filter should be written should not be listed here.
+  11: optional map<string, i64> parquet_bloom_filter_col_info;
 }
 
 // Structure to encapsulate specific options that are passed down to the KuduTableSink
@@ -96,14 +112,32 @@ struct TKuduTableSink {
 
   // Defines if duplicate or not found keys should be ignored
   2: optional bool ignore_not_found_or_duplicate
+
+  // Serialized metadata of KuduTransaction object.
+  3: optional binary kudu_txn_token
 }
 
 // Sink to create the build side of a JoinNode.
 struct TJoinBuildSink {
-  1: required Types.TJoinTableId join_table_id
+  // destination join node id
+  1: required Types.TPlanNodeId dest_node_id
 
-  // only set for hash join build sinks
-  2: required list<Exprs.TExpr> build_exprs
+  // Join operation implemented by the JoinNode
+  2: required PlanNodes.TJoinOp join_op
+
+  // Equi-join conjunctions. Only set for hash join builds.
+  3: optional list<PlanNodes.TEqJoinCondition> eq_join_conjuncts
+
+  // Runtime filters produced by this sink.
+  4: optional list<PlanNodes.TRuntimeFilterDesc> runtime_filters
+
+  // Hash seed to use. Only set for hash join builds. Must be the same as the join node's
+  // hash seed. Must be positive.
+  5: optional i32 hash_seed
+
+  // If true, join build sharing is enabled and, if multiple instances of a join node are
+  // scheduled on the same backend, they will share the join build on that backend.
+  6: optional bool share_build
 }
 
 struct TPlanRootSink {
@@ -136,4 +170,7 @@ struct TDataSink {
   // Exprs that produce values for slots of output tuple (one expr per slot).
   // Only set by the DataSink implementations that require it.
   8: optional list<Exprs.TExpr> output_exprs
+
+  // Resource profile for this data sink. Always set.
+  9: optional ResourceProfile.TBackendResourceProfile resource_profile
 }

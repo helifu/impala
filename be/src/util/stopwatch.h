@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_UTIL_STOPWATCH_H
-#define IMPALA_UTIL_STOPWATCH_H
+#include <cstdint>
+#include <mutex>
 
-#include <boost/cstdint.hpp>
-#include <boost/thread/lock_guard.hpp>
 #include <util/os-info.h>
 #include <util/spinlock.h>
 #include <util/time.h>
@@ -39,6 +38,10 @@ namespace impala {
 #define SCOPED_CONCURRENT_STOP_WATCH(c) \
   ScopedStopWatch<ConcurrentStopWatch> \
   MACRO_CONCAT(CONCURRENT_STOP_WATCH, __COUNTER__)(c)
+
+#define CONDITIONAL_SCOPED_CONCURRENT_STOP_WATCH(c, enabled) \
+  ScopedStopWatch<ConcurrentStopWatch> \
+  MACRO_CONCAT(CONCURRENT_STOP_WATCH, __COUNTER__)(c, enabled)
 
 /// Utility class to measure time.  This is measured using the cpu tick counter which
 /// is very low overhead but can be inaccurate if the thread is switched away.  This
@@ -69,6 +72,13 @@ class StopWatch {
     return total_time_ + RunningTime();
   }
 
+#if defined(__aarch64__)
+  static uint64_t Rdtsc() {
+    uint64_t virtual_timer_value;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(virtual_timer_value));
+    return virtual_timer_value;
+  }
+#else
   static uint64_t Rdtsc() {
     uint32_t lo, hi;
     __asm__ __volatile__ (
@@ -77,6 +87,7 @@ class StopWatch {
     __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
     return (uint64_t)hi << 32 | lo;
   }
+#endif
 
  private:
   /// Returns total time in cpu ticks since Start() was called. If not running, returns 0.
@@ -194,7 +205,7 @@ class ConcurrentStopWatch {
   ConcurrentStopWatch() : busy_threads_(0), last_lap_start_(0) {}
 
   void Start() {
-    boost::lock_guard<SpinLock> l(thread_counter_lock_);
+    std::lock_guard<SpinLock> l(thread_counter_lock_);
     if (busy_threads_ == 0) {
       msw_.Start();
     }
@@ -202,7 +213,7 @@ class ConcurrentStopWatch {
   }
 
   void Stop() {
-    boost::lock_guard<SpinLock> l(thread_counter_lock_);
+    std::lock_guard<SpinLock> l(thread_counter_lock_);
     DCHECK_GT(busy_threads_, 0);
     --busy_threads_;
     if (busy_threads_ == 0) {
@@ -212,20 +223,30 @@ class ConcurrentStopWatch {
 
   /// Returns delta wall time since last time LapTime() is called.
   uint64_t LapTime() {
-    boost::lock_guard<SpinLock> l(thread_counter_lock_);
+    std::lock_guard<SpinLock> l(thread_counter_lock_);
     uint64_t now = msw_.ElapsedTime();
     uint64_t lap_duration = now - last_lap_start_;
     last_lap_start_ = now;
     return lap_duration;
   }
 
-  uint64_t TotalRunningTime() const {  return msw_.ElapsedTime(); }
+  uint64_t TotalRunningTime() const {
+    std::lock_guard<SpinLock> l(thread_counter_lock_);
+    return msw_.ElapsedTime();
+  }
+
+  /// Set the time ceiling of the stop watch to Now(). The stop watch won't run past the
+  /// ceiling.
+  void SetTimeCeiling() {
+    std::lock_guard<SpinLock> l(thread_counter_lock_);
+    msw_.SetTimeCeiling();
+  }
 
  private:
   MonotonicStopWatch msw_;
 
   /// Lock with busy_threads_.
-  SpinLock thread_counter_lock_;
+  mutable SpinLock thread_counter_lock_;
 
   /// Track how many threads are currently busy.
   int busy_threads_;
@@ -255,7 +276,4 @@ class ScopedStopWatch {
   T* sw_;
   bool enabled_;
 };
-
 }
-
-#endif

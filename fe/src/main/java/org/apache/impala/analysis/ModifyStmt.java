@@ -19,6 +19,7 @@ package org.apache.impala.analysis;
 
 import static java.lang.String.format;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -30,11 +31,13 @@ import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.planner.DataSink;
 import org.apache.impala.rewrite.ExprRewriter;
+import org.apache.thrift.TBaseHelper;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -80,6 +83,10 @@ public abstract class ModifyStmt extends StatementBase {
   // concrete table class. Result of analysis.
   protected FeKuduTable table_;
 
+  // Serialized metadata of transaction object which is set by the Frontend if the
+  // target table is Kudu table and Kudu's transaction is enabled.
+  protected java.nio.ByteBuffer kuduTxnToken_;
+
   // END: Members that need to be reset()
   /////////////////////////////////////////
 
@@ -97,6 +104,7 @@ public abstract class ModifyStmt extends StatementBase {
     fromClause_ = Preconditions.checkNotNull(fromClause);
     assignments_ = Preconditions.checkNotNull(assignmentExprs);
     wherePredicate_ = wherePredicate;
+    kuduTxnToken_ = null;
   }
 
   @Override
@@ -278,7 +286,10 @@ public abstract class ModifyStmt extends StatementBase {
       }
 
       if (keySlots.contains(lhsSlotRef.getSlotId())) {
-        throw new AnalysisException(format("Key column '%s' cannot be updated.",
+        boolean isSystemGeneratedColumn =
+            c instanceof KuduColumn && ((KuduColumn)c).isAutoIncrementing();
+        throw new AnalysisException(format("%s column '%s' cannot be updated.",
+            isSystemGeneratedColumn ? "System generated key" : "Key",
             lhsSlotRef.toSql()));
       }
 
@@ -314,6 +325,33 @@ public abstract class ModifyStmt extends StatementBase {
 
   public QueryStmt getQueryStmt() { return sourceStmt_; }
   public abstract DataSink createDataSink(List<Expr> resultExprs);
+
+  /**
+   * Return true if the target table is Kudu table.
+   * Since only Kudu tables can be updated, it must be true.
+   */
+  public boolean isTargetTableKuduTable() { return (table_ instanceof FeKuduTable); }
+
+  /**
+   * Return target table.
+   */
+  public FeTable getTargetTable() { return table_; }
+
+  /**
+   * Set Kudu transaction token.
+   */
+  public void setKuduTransactionToken(byte[] kuduTxnToken) {
+    Preconditions.checkNotNull(kuduTxnToken);
+    kuduTxnToken_ = java.nio.ByteBuffer.wrap(kuduTxnToken.clone());
+  }
+
+  /**
+   * Return bytes of Kudu transaction token.
+   */
+  public byte[] getKuduTransactionToken() {
+    return kuduTxnToken_ == null ? null : kuduTxnToken_.array();
+  }
+
   @Override
   public abstract String toSql(ToSqlOptions options);
 }

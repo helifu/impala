@@ -28,15 +28,18 @@
 #include "exprs/cast-functions.h"
 #include "exprs/compound-predicates.h"
 #include "exprs/conditional-functions.h"
+#include "exprs/datasketches-functions.h"
 #include "exprs/date-functions.h"
 #include "exprs/decimal-functions.h"
 #include "exprs/decimal-operators.h"
 #include "exprs/hive-udf-call.h"
+#include "exprs/iceberg-functions.h"
 #include "exprs/in-predicate.h"
 #include "exprs/is-not-empty-predicate.h"
 #include "exprs/is-null-predicate.h"
 #include "exprs/like-predicate.h"
 #include "exprs/literal.h"
+#include "exprs/mask-functions.h"
 #include "exprs/math-functions.h"
 #include "exprs/null-literal.h"
 #include "exprs/operators.h"
@@ -88,6 +91,12 @@ Status ScalarExprEvaluator::Create(const ScalarExpr& root, RuntimeState* state,
     DCHECK_EQ(root.fn_ctx_idx_, -1);
     DCHECK((*eval)->fn_ctxs_ptr_ == nullptr);
   }
+  if (root.type().IsStructType()) {
+    DCHECK(root.GetNumChildren() > 0);
+    Status status = Create(root.children(), state, pool, expr_perm_pool,
+        expr_results_pool, &((*eval)->childEvaluators_));
+    DCHECK((*eval)->childEvaluators_.size() == root.GetNumChildren());
+  }
   (*eval)->initialized_ = true;
   return Status::OK();
 }
@@ -110,9 +119,15 @@ void ScalarExprEvaluator::CreateFnCtxs(RuntimeState* state, const ScalarExpr& ex
   const int fn_ctx_idx = expr.fn_ctx_idx();
   const bool has_fn_ctx = fn_ctx_idx != -1;
   vector<FunctionContext::TypeDesc> arg_types;
-  for (const ScalarExpr* child : expr.children()) {
-    CreateFnCtxs(state, *child, expr_perm_pool, expr_results_pool);
-    if (has_fn_ctx) arg_types.push_back(AnyValUtil::ColumnTypeToTypeDesc(child->type()));
+  // It's not needed to create contexts for the children of structs here as Create() is
+  // called recursively for each of their children and that will take care of the context
+  // creation as well.
+  if (!expr.type().IsStructType()) {
+    for (const ScalarExpr* child : expr.children()) {
+      CreateFnCtxs(state, *child, expr_perm_pool, expr_results_pool);
+      if (has_fn_ctx) arg_types.push_back(
+          AnyValUtil::ColumnTypeToTypeDesc(child->type()));
+    }
   }
   if (has_fn_ctx) {
     FunctionContext::TypeDesc return_type =
@@ -155,6 +170,7 @@ void ScalarExprEvaluator::Close(RuntimeState* state) {
     delete fn_ctxs_[i];
   }
   fn_ctxs_.clear();
+  for (ScalarExprEvaluator* child : childEvaluators_) child->Close(state);
   // Memory allocated by 'fn_ctx_' is still in the MemPools. It's the responsibility of
   // the owners of those pools to free it.
   closed_ = true;
@@ -352,6 +368,12 @@ void* ScalarExprEvaluator::GetValue(const ScalarExpr& expr, const TupleRow* row)
       result_.collection_val.num_tuples = v.num_tuples;
       return &result_.collection_val;
     }
+    case TYPE_STRUCT: {
+      StructVal v = expr.GetStructVal(this, row);
+      if (v.is_null) return nullptr;
+      result_.struct_val = v;
+      return &result_.struct_val;
+    }
     default:
       DCHECK(false) << "Type not implemented: " << expr.type_.DebugString();
       return nullptr;
@@ -410,6 +432,10 @@ CollectionVal ScalarExprEvaluator::GetCollectionVal(const TupleRow* row) {
   return root_.GetCollectionVal(this, row);
 }
 
+StructVal ScalarExprEvaluator::GetStructVal(const TupleRow* row) {
+  return root_.GetStructVal(this, row);
+}
+
 TimestampVal ScalarExprEvaluator::GetTimestampVal(const TupleRow* row) {
   return root_.GetTimestampVal(this, row);
 }
@@ -430,16 +456,19 @@ void ScalarExprEvaluator::InitBuiltinsDummy() {
   CastFunctions::CastToBooleanVal(nullptr, TinyIntVal::null());
   CompoundPredicate::Not(nullptr, BooleanVal::null());
   ConditionalFunctions::NullIfZero(nullptr, TinyIntVal::null());
+  DataSketchesFunctions::DsHllEstimate(nullptr, StringVal::null());
   DecimalFunctions::Precision(nullptr, DecimalVal::null());
   DecimalOperators::CastToDecimalVal(nullptr, DecimalVal::null());
+  IcebergFunctions::TruncatePartitionTransform(nullptr, IntVal::null(), IntVal::null());
   InPredicate::InIterate(nullptr, BigIntVal::null(), 0, nullptr);
   IsNullPredicate::IsNull(nullptr, BooleanVal::null());
   LikePredicate::Like(nullptr, StringVal::null(), StringVal::null());
   Operators::Add_IntVal_IntVal(nullptr, IntVal::null(), IntVal::null());
+  MaskFunctions::MaskShowFirstN(nullptr, StringVal::null());
   MathFunctions::Pi(nullptr);
   StringFunctions::Length(nullptr, StringVal::null());
   TimestampFunctions::Year(nullptr, TimestampVal::null());
-  TimestampFunctions::UnixAndFromUnixPrepare(nullptr, FunctionContext::FRAGMENT_LOCAL);
+  TimestampFunctions::FromUnixPrepare(nullptr, FunctionContext::FRAGMENT_LOCAL);
   DateFunctions::Year(nullptr, DateVal::null());
   UdfBuiltins::Pi(nullptr);
   UtilityFunctions::Pid(nullptr);

@@ -23,11 +23,10 @@
 #include <boost/accumulators/statistics/variance.hpp>
 
 #include "exprs/aggregate-functions.h"
-#include "runtime/multi-precision.h"
 #include "testutil/gtest-util.h"
 #include "udf/udf.h"
 #include "udf/uda-test-harness.h"
-#include "util/decimal-util.h"
+#include "util/decimal-constants.h"
 
 #include "common/names.h"
 
@@ -124,7 +123,7 @@ TEST(HistogramTest, TestDecimal) {
   // All input values are x, result should be constant.
   {
     vector<DecimalVal> input;
-    int128_t val = DecimalUtil::MAX_UNSCALED_DECIMAL16;
+    __int128_t val = MAX_UNSCALED_DECIMAL16;
     stringstream ss;
     for (int i = 0; i < INPUT_SIZE; ++i) input.push_back(DecimalVal(val));
     for (int i = 0; i < NUM_BUCKETS; ++i) {
@@ -161,6 +160,21 @@ TEST(HistogramTest, TestString) {
       "x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, "
       "x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x";
   EXPECT_TRUE(test.Execute(input, StringVal(&expected[0]))) << test.GetErrorMsg();
+}
+
+TEST(DsThetaSketch, DataToSketch) {
+  UdaTestHarness<BigIntVal, StringVal, IntVal> test(AggregateFunctions::DsThetaInit,
+      AggregateFunctions::DsThetaUpdate<IntVal>, AggregateFunctions::DsThetaMerge,
+      AggregateFunctions::DsThetaSerialize, AggregateFunctions::DsThetaFinalize);
+  std::vector<IntVal> input;
+
+  EXPECT_TRUE(test.Execute(input, BigIntVal(0)))
+      << "DsThetaSketch empty: " << test.GetErrorMsg();
+
+  for (int key = 0; key < 6; key++) input.push_back(key);
+
+  EXPECT_TRUE(test.Execute(input, BigIntVal(6)))
+      << "DsThetaSketch: " << test.GetErrorMsg();
 }
 
 IMPALA_TEST_MAIN();

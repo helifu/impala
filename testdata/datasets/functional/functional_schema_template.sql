@@ -183,6 +183,35 @@ FROM {db_name}.{table_name};
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
+alltypessmall_bool_sorted
+---- PARTITION_COLUMNS
+year int
+month int
+---- COLUMNS
+id int
+bool_col boolean
+tinyint_col tinyint
+smallint_col smallint
+int_col int
+bigint_col bigint
+float_col float
+double_col double
+date_string_col string
+string_col string
+timestamp_col timestamp
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition (year, month)
+SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+FROM {db_name}.alltypessmall
+where bool_col;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} partition (year, month)
+SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+FROM {db_name}.alltypessmall
+where not bool_col;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
 alltypestiny
 ---- PARTITION_COLUMNS
 year int
@@ -199,6 +228,8 @@ double_col double
 date_string_col string
 string_col string
 timestamp_col timestamp
+---- COMMENT
+Tiny table
 ---- ROW_FORMAT
 delimited fields terminated by ','  escaped by '\\'
 ---- ALTER
@@ -232,12 +263,27 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
   year INT,
   month INT
 )
-PARTITION BY HASH (id) PARTITIONS 3 STORED AS KUDU;
+PARTITION BY HASH (id) PARTITIONS 3 COMMENT 'Tiny table' STORED AS KUDU;
 ---- DEPENDENT_LOAD_KUDU
 INSERT INTO TABLE {db_name}{db_suffix}.{table_name}
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col,
        timestamp_col, year, month
 FROM {db_name}.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypestiny_negative
+---- CREATE
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+LIKE {db_name}{db_suffix}.alltypestiny STORED AS {file_format};
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition (year, month)
+SELECT id, bool_col,
+       -tinyint_col, -smallint_col, -int_col, -bigint_col, -float_col, -double_col,
+       date_string_col, 'x', timestamp_col, year, month
+FROM functional.alltypestiny
+WHERE int_col = 1;
 ====
 ---- DATASET
 functional
@@ -332,6 +378,8 @@ LOCATION '{hdfs_location}';
 ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION (year=2009, month=1);
 ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION (year=2009, month=2);
 ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION (year=2009, month=3);
+---- TABLE_PROPERTIES
+transactional=false
 ---- DEPENDENT_LOAD
 USE {db_name}{db_suffix};
 -- Step 4: Stream the data from tmp text table to desired format tmp table
@@ -368,6 +416,31 @@ WITH SERDEPROPERTIES (
   ":key,d:bool_col,d:tinyint_col,d:smallint_col,d:int_col,d:bigint_col,d:float_col,d:double_col,d:date_string_col,d:string_col,d:timestamp_col"
 )
 TBLPROPERTIES("hbase.table.name" = "functional_hbase.hbasealltypeserror");
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypes_promoted
+---- PARTITION_COLUMNS
+year int
+month int
+---- COLUMNS
+id int COMMENT 'Add a comment'
+bool_col boolean
+tinyint_col tinyint
+smallint_col smallint
+int_col int
+bigint_col bigint
+float_col float
+double_col double
+date_string_col string
+string_col string
+timestamp_col timestamp
+---- DEPENDENT_LOAD_HIVE
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.alltypes;
+ALTER TABLE {db_name}{db_suffix}.{table_name} SET tblproperties('EXTERNAL'='FALSE','transactional'='true');
+---- TABLE_PROPERTIES
+transactional=false
 ====
 ---- DATASET
 functional
@@ -458,6 +531,8 @@ USE {db_name}{db_suffix};
 ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION (year=2009, month=1);
 ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION (year=2009, month=2);
 ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION (year=2009, month=3);
+---- TABLE_PROPERTIES
+transactional=false
 ---- DEPENDENT_LOAD
 USE {db_name}{db_suffix};
 -- Step 4: Stream the data from tmp text table to desired format tmp table
@@ -494,6 +569,31 @@ WITH SERDEPROPERTIES (
   ":key,d:bool_col,d:tinyint_col,d:smallint_col,d:int_col,d:bigint_col,d:float_col,d:double_col,d:date_string_col,d:string_col,d:timestamp_col"
 )
 TBLPROPERTIES("hbase.table.name" = "functional_hbase.hbasealltypeserrornonulls");
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypes_deleted_rows
+---- PARTITION_COLUMNS
+year int
+month int
+---- COLUMNS
+id int COMMENT 'Add a comment'
+bool_col boolean
+tinyint_col tinyint
+smallint_col smallint
+int_col int
+bigint_col bigint
+float_col float
+double_col double
+date_string_col string
+string_col string
+timestamp_col timestamp
+---- DEPENDENT_LOAD_ACID
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.alltypes;
+DELETE FROM {db_name}{db_suffix}.{table_name} WHERE month % 2 = 0 and year % 2 = 0 and id % 10 = 0;
+---- TABLE_PROPERTIES
+transactional=true
 ====
 ---- DATASET
 functional
@@ -699,12 +799,162 @@ nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: i
 hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nullable.parq \
 /test-warehouse/complextypestbl_parquet/ && \
 hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nonnullable.parq \
-/test-warehouse/complextypestbl_parquet/ && \
-hadoop fs -mkdir -p /test-warehouse/complextypestbl_orc_def && \
+/test-warehouse/complextypestbl_parquet/
+---- DEPENDENT_LOAD_ACID
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM functional_parquet.complextypestbl;
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypes_structs
+---- PARTITION_COLUMNS
+year int
+month int
+---- COLUMNS
+id int
+struct_val struct<bool_col:boolean, tinyint_col:tinyint, smallint_col:smallint, int_col:int, bigint_col:bigint, float_col:float, double_col:double, date_string_col:string, string_col:string>
+---- DEPENDENT_LOAD_HIVE
+INSERT INTO {db_name}{db_suffix}.{table_name}
+PARTITION (year, month)
+    SELECT
+        id,
+        named_struct(
+            'bool_col', bool_col,
+            'tinyint_col', tinyint_col,
+            'smallint_col', smallint_col,
+            'int_col', int_col,
+            'bigint_col', bigint_col,
+            'float_col', float_col,
+            'double_col', double_col,
+            'date_string_col', date_string_col,
+            'string_col', string_col),
+        year,
+        month
+    FROM {db_name}.alltypes;
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypes_structs
+---- COLUMNS
+id int
+str string
+alltypes struct<ti:tinyint, si:smallint, i:int, bi:bigint, b:boolean, f:float, do:double, da:date, ts:timestamp, s1:string, s2:string, c1:char(1), c2:char(3), vc:varchar(10), de1:decimal(5, 0), de2:decimal(10, 3)>
+tiny_struct struct<b:boolean>
+small_struct struct<i:int, s:string>
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/complextypes_structs_parquet && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/structs.parq \
+/test-warehouse/complextypes_structs_parquet/
+---- DEPENDENT_LOAD_ACID
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/ComplexTypesTbl/structs.orc' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypes_nested_structs
+---- COLUMNS
+id int
+outer_struct struct<str:string,inner_struct1:struct<str:string,de:decimal(8,2)>,inner_struct2:struct<i:int,str:string>,inner_struct3:struct<s:struct<i:int,s:string>>>
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/complextypes_nested_structs_parquet && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/structs_nested.parq \
+/test-warehouse/complextypes_nested_structs_parquet/
+---- DEPENDENT_LOAD_ACID
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/ComplexTypesTbl/structs_nested.orc' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypes_arrays
+---- COLUMNS
+id int
+arr1 array<int>
+arr2 array<string>
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/complextypes_arrays_parquet && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/arrays.parq \
+/test-warehouse/complextypes_arrays_parquet/
+---- DEPENDENT_LOAD_ACID
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/ComplexTypesTbl/arrays.orc' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypestbl_minor_compacted
+---- COLUMNS
+id bigint
+int_array array<int>
+int_array_array array<array<int>>
+int_map map<string, int>
+int_map_array array<map<string, int>>
+nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: int, f: string>>>>, g: map<string, struct<h: struct<i: array<double>>>>>
+---- DEPENDENT_LOAD_ACID
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.complextypestbl where id = 1;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.complextypestbl where id = 2;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.complextypestbl where id = 3;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.complextypestbl where id = 4;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.complextypestbl where id = 5;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.complextypestbl where id = 6;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.complextypestbl where id = 7;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.complextypestbl where id = 8;
+ALTER TABLE {db_name}{db_suffix}.{table_name} compact 'minor';
+---- TABLE_PROPERTIES
+transactional=true
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypestbl_deleted_rows
+---- COLUMNS
+id bigint
+int_array array<int>
+int_array_array array<array<int>>
+int_map map<string, int>
+int_map_array array<map<string, int>>
+nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: int, f: string>>>>, g: map<string, struct<h: struct<i: array<double>>>>>
+---- DEPENDENT_LOAD_ACID
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}{db_suffix}.complextypestbl;
+DELETE FROM {db_name}{db_suffix}.{table_name} WHERE id % 2 = 0;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+pos_item_key_value_complextypestbl
+---- COLUMNS
+pos bigint
+item int
+key string
+value int
+int_array array<int>
+int_map map<string, int>
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT id, id, CAST(id AS STRING), CAST(id AS STRING), int_array, int_map FROM {db_name}{db_suffix}.complextypestbl;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypestbl_non_transactional
+---- COLUMNS
+id bigint
+int_array array<int>
+int_array_array array<array<int>>
+int_map map<string, int>
+int_map_array array<map<string, int>>
+nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: int, f: string>>>>, g: map<string, struct<h: struct<i: array<double>>>>>
+---- TABLE_PROPERTIES
+transactional=false
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/complextypestbl_non_transactional_orc_def && \
 hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nullable.orc \
-/test-warehouse/complextypestbl_orc_def/ && \
+/test-warehouse/complextypestbl_non_transactional_orc_def/ && \
 hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nonnullable.orc \
-/test-warehouse/complextypestbl_orc_def/
+/test-warehouse/complextypestbl_non_transactional_orc_def/
 ---- LOAD
 ====
 ---- DATASET
@@ -722,6 +972,23 @@ nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: i
 -- This INSERT must run in Hive, because Impala doesn't support inserting into tables
 -- with complex types.
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT c.* FROM functional_parquet.complextypestbl c join functional.alltypes sort by id;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+multipartformat
+---- CREATE_HIVE
+-- Used to test dynamic and static insert into partitioned tables which contains
+-- supported and unsupported file formats.
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (id int)
+  PARTITIONED BY (p string);
+---- LOAD
+ALTER TABLE {db_name}{db_suffix}.{table_name} ADD PARTITION (p='parquet');
+ALTER TABLE {db_name}{db_suffix}.{table_name} ADD PARTITION (p='orc');
+ALTER TABLE {db_name}{db_suffix}.{table_name} PARTITION (p='parquet')
+  SET FILEFORMAT PARQUET;
+ALTER TABLE {db_name}{db_suffix}.{table_name} PARTITION (p='orc')
+  SET FILEFORMAT ORC;
 ====
 ---- DATASET
 functional
@@ -925,6 +1192,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
   double_col double,
   date_string_col string,
   string_col string,
+  binary_col binary,
   timestamp_col timestamp,
   year int,
   month int,
@@ -932,7 +1200,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
 STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'
 WITH SERDEPROPERTIES (
   "hbase.columns.mapping" =
-  ":key#b,d:bool_col#b,d:tinyint_col#b,d:smallint_col#b,d:int_col#b,d:bigint_col#b,d:float_col#b,d:double_col#b,d:date_string_col,d:string_col,d:timestamp_col,d:year#b,d:month#b,d:day#b"
+  ":key#b,d:bool_col#b,d:tinyint_col#b,d:smallint_col#b,d:int_col#b,d:bigint_col#b,d:float_col#b,d:double_col#b,d:date_string_col,d:string_col,d:binary_col,d:timestamp_col,d:year#b,d:month#b,d:day#b"
 )
 TBLPROPERTIES("hbase.table.name" = "functional_hbase.insertalltypesaggbinary");
 ====
@@ -955,6 +1223,7 @@ float_col float
 double_col double
 date_string_col string
 string_col string
+binary_col binary
 timestamp_col timestamp
 ====
 ---- DATASET
@@ -984,6 +1253,7 @@ functional
 alltypes_view
 ---- CREATE
 CREATE VIEW IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+COMMENT 'View on alltypes'
 AS SELECT * FROM {db_name}{db_suffix}.alltypes;
 ---- LOAD
 ====
@@ -1255,7 +1525,7 @@ date_string_col string
 string_col string
 timestamp_col timestamp
 ---- DEPENDENT_LOAD
-insert overwrite table {db_name}{db_suffix}.{table_name} SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col FROM {db_name}.{table_name} where id % 4 = 0;
+insert into table {db_name}{db_suffix}.{table_name} SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col FROM {db_name}.{table_name} where id % 4 = 0;
 insert into table {db_name}{db_suffix}.{table_name} SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col FROM {db_name}.{table_name} where id % 4 = 1;
 insert into table {db_name}{db_suffix}.{table_name} SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col FROM {db_name}.{table_name} where id % 4 = 2;
 insert into table {db_name}{db_suffix}.{table_name} SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col FROM {db_name}.{table_name} where id % 4 = 3;
@@ -1438,30 +1708,6 @@ LOAD DATA LOCAL INPATH '{impala_home}/testdata/TblWithRaggedColumns/data.csv' OV
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
-nullinsert
----- CREATE
--- Must not be external
-CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
-  str_col1 string,
-  str_col2 string,
-  str_col3 string,
-  str_col4 string,
-  int_cal int
-)
-row format delimited fields terminated by ','  escaped by '\\'
-stored as {file_format}
-LOCATION '{hdfs_location}';
-DROP TABLE IF EXISTS {db_name}{db_suffix}.{table_name}_alt;
-CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}_alt(
-  whole_row string
-)
-row format delimited fields terminated by '|'
-stored as {file_format}
-LOCATION '{hdfs_location}';
-====
----- DATASET
-functional
----- BASE_TABLE_NAME
 zipcode_incomes
 ---- COLUMNS
 id STRING
@@ -1493,37 +1739,22 @@ partition by range(id)
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
-unsupported_types
----- CREATE_HIVE
--- Create a table that mixes supported and unsupported scalar types.
--- We should be able to read the column values of supported types and
--- fail queries that reference  columns of unsupported types.
-CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
-  int_col INT,
-  dec_col DECIMAL,
-  date_col DATE,
-  str_col STRING,
-  bin_col BINARY,
-  bigint_col BIGINT)
-ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
-STORED AS {file_format}
-LOCATION '{hdfs_location}';
----- DEPENDENT_LOAD
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}.{table_name};
----- LOAD
-LOAD DATA LOCAL INPATH '{impala_home}/testdata/UnsupportedTypes/data.csv' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
-====
----- DATASET
-functional
----- BASE_TABLE_NAME
-unsupported_partition_types
+unsupported_timestamp_partition
 ---- CREATE_HIVE
 -- Create a table that is partitioned on an unsupported partition-column type
 CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
   int_col INT)
 PARTITIONED BY (t TIMESTAMP);
----- DEPENDENT_LOAD
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+unsupported_binary_partition
+---- CREATE_HIVE
+-- Create a table that is partitioned on an unsupported partition-column type
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
+  int_col INT)
+PARTITIONED BY (t BINARY);
 ====
 ---- DATASET
 functional
@@ -1534,17 +1765,6 @@ key INT
 value STRING
 ---- DEPENDENT_LOAD_HIVE
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/oldrcfile.rc'
-OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
-====
----- DATASET
-functional
----- BASE_TABLE_NAME
-bad_text_lzo
----- COLUMNS
-field STRING
----- DEPENDENT_LOAD_HIVE
--- Error recovery test data for LZO compression.
-LOAD DATA LOCAL INPATH '{impala_home}/testdata/bad_text_lzo/bad_text.lzo'
 OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
@@ -1636,28 +1856,74 @@ OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- IMPALA-694: uses data file produced by parquet-mr version 1.2.5-cdh4.5.0
--- (can't use LOAD DATA LOCAL with Impala so copied in create-load-data.sh)
 functional
 ---- BASE_TABLE_NAME
 bad_parquet
 ---- COLUMNS
 field STRING
+---- DEPENDENT_LOAD_HIVE
+-- IMPALA-694: data file produced by parquet-mr version 1.2.5-cdh4.5.0
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/bad_parquet_data.parquet'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+-- Data file produced by parquet-mr with repeated values (produces 0 bit width dictionary)
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/repeated_values.parquet'
+INTO TABLE {db_name}{db_suffix}.{table_name};
+-- IMPALA-720: data file produced by parquet-mr with multiple row groups
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/multiple_rowgroups.parquet'
+INTO TABLE {db_name}{db_suffix}.{table_name};
+-- IMPALA-1401: data file produced by Hive 13 containing page statistics with long min/max
+-- string values
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/long_page_header.parquet'
+INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
--- Can't use LOAD DATA LOCAL with Impala so copied in create-load-data.sh.
 functional
 ---- BASE_TABLE_NAME
 bad_parquet_strings_negative_len
 ---- COLUMNS
 s STRING
+---- DEPENDENT_LOAD_HIVE
+-- IMPALA-3732: parquet files with corrupt strings
+LOAD DATA LOCAL INPATH
+'{impala_home}/testdata/bad_parquet_data/dict-encoded-negative-len.parq'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+LOAD DATA LOCAL INPATH
+'{impala_home}/testdata/bad_parquet_data/plain-encoded-negative-len.parq'
+INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
--- Can't use LOAD DATA LOCAL with Impala so copied in create-load-data.sh.
 functional
 ---- BASE_TABLE_NAME
 bad_parquet_strings_out_of_bounds
 ---- COLUMNS
 s STRING
+---- DEPENDENT_LOAD_HIVE
+-- IMPALA-3732: parquet files with corrupt strings
+LOAD DATA LOCAL INPATH
+'{impala_home}/testdata/bad_parquet_data/dict-encoded-out-of-bounds.parq'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+LOAD DATA LOCAL INPATH
+'{impala_home}/testdata/bad_parquet_data/plain-encoded-out-of-bounds.parq'
+INTO TABLE {db_name}{db_suffix}.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+bad_parquet_decimals
+---- COLUMNS
+d1 DECIMAL(4, 2)
+d2 DECIMAL(4, 2)
+d3 DECIMAL(4, 2)
+d4 DECIMAL(4, 2)
+d5 DECIMAL(4, 2)
+d6 DECIMAL(4, 2)
+d7 DECIMAL(4, 2)
+d8 DECIMAL(4, 2)
+---- DEPENDENT_LOAD_HIVE
+-- IMPALA-10808: parquet files with illegal decimal schemas
+LOAD DATA LOCAL INPATH
+'{impala_home}/testdata/bad_parquet_data/illegal_decimals.parq'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- IMPALA-2130: Wrong verification of parquet file version
@@ -1666,10 +1932,9 @@ functional
 bad_magic_number
 ---- COLUMNS
 field STRING
----- LOAD
-`hadoop fs -mkdir -p /test-warehouse/bad_magic_number_parquet && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/bad_magic_number.parquet \
-/test-warehouse/bad_magic_number_parquet/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/bad_magic_number.parquet'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- IMPALA-1658: Timestamps written by Hive are local-to-UTC adjusted.
@@ -1691,10 +1956,9 @@ timestamp_col timestamp
 year int
 month int
 day int
----- LOAD
-`hadoop fs -mkdir -p /test-warehouse/alltypesagg_hive_13_1_parquet && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/alltypesagg_hive_13_1.parquet \
-/test-warehouse/alltypesagg_hive_13_1_parquet/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/alltypesagg_hive_13_1.parquet'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- Parquet file with invalid metadata size in the file footer.
@@ -1703,10 +1967,9 @@ functional
 bad_metadata_len
 ---- COLUMNS
 field TINYINT
----- LOAD
-`hadoop fs -mkdir -p /test-warehouse/bad_metadata_len_parquet && hadoop fs -put -f \
-${IMPALA_HOME}/testdata/data/bad_metadata_len.parquet \
-/test-warehouse/bad_metadata_len_parquet/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/bad_metadata_len.parquet'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- Parquet file with invalid column dict_page_offset.
@@ -1715,10 +1978,9 @@ functional
 bad_dict_page_offset
 ---- COLUMNS
 field TINYINT
----- LOAD
-`hadoop fs -mkdir -p /test-warehouse/bad_dict_page_offset_parquet && hadoop fs -put -f \
-${IMPALA_HOME}/testdata/data/bad_dict_page_offset.parquet \
-/test-warehouse/bad_dict_page_offset_parquet/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/bad_dict_page_offset.parquet'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- Parquet file with invalid column total_compressed_size.
@@ -1727,10 +1989,9 @@ functional
 bad_compressed_size
 ---- COLUMNS
 field TINYINT
----- LOAD
-`hadoop fs -mkdir -p /test-warehouse/bad_compressed_size_parquet && hadoop fs -put -f \
-${IMPALA_HOME}/testdata/data/bad_compressed_size.parquet \
-/test-warehouse/bad_compressed_size_parquet/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/bad_compressed_size.parquet'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- Parquet file with required columns written by Kite. Hive and Impala always write files
@@ -1749,10 +2010,9 @@ opt_int_2 bigint
 opt_int_3 bigint
 req_int_2 bigint
 req_int_3 bigint
----- LOAD
-`hadoop fs -mkdir -p /test-warehouse/kite_required_fields_parquet && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/kite_required_fields.parquet \
-/test-warehouse/kite_required_fields_parquet/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/kite_required_fields.parquet'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- Parquet file with incorrect column metadata in multiple row groups
@@ -1762,10 +2022,9 @@ bad_column_metadata
 ---- COLUMNS
 id bigint
 int_array array<int>
----- LOAD
-`hadoop fs -mkdir -p /test-warehouse/bad_column_metadata_parquet && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/bad_column_metadata.parquet \
-/test-warehouse/bad_column_metadata_parquet
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/bad_column_metadata.parquet'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2031,8 +2290,8 @@ LOCATION '/test-warehouse/{table_name}';
 ---- ROW_FORMAT
 delimited fields terminated by '',''
 ---- LOAD
-`hadoop fs -mkdir -p /test-warehouse/parent_table && hadoop fs -put -f \
-${IMPALA_HOME}/testdata/data/parent_table.txt /test-warehouse/parent_table/
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/parent_table.txt'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2046,8 +2305,8 @@ LOCATION '/test-warehouse/{table_name}';
 ---- ROW_FORMAT
 delimited fields terminated by ','
 ---- LOAD
-`hadoop fs -mkdir -p /test-warehouse/parent_table_2 && hadoop fs -put -f \
-${IMPALA_HOME}/testdata/data/parent_table_2.txt /test-warehouse/parent_table_2/
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/parent_table_2.txt'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2064,8 +2323,8 @@ LOCATION '/test-warehouse/{table_name}';
 ---- ROW_FORMAT
 delimited fields terminated by ','
 ---- LOAD
-`hadoop fs -mkdir -p /test-warehouse/child_table && hadoop fs -put -f \
-${IMPALA_HOME}/testdata/data/child_table.txt /test-warehouse/child_table/
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/child_table.txt'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2078,8 +2337,8 @@ vc VARCHAR(32)
 ---- ROW_FORMAT
 delimited fields terminated by ','
 ---- LOAD
-`hadoop fs -mkdir -p /test-warehouse/chars_tiny && hadoop fs -put -f \
-${IMPALA_HOME}/testdata/data/chars-tiny.txt /test-warehouse/chars_tiny/
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/chars-tiny.txt'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ---- DEPENDENT_LOAD
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
 select * from functional.{table_name};
@@ -2125,6 +2384,17 @@ INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
 select * from functional.{table_name};
 ---- LOAD
 `${IMPALA_HOME}/testdata/common/widetable.py --create_data -n 1000 -o /tmp/widetable_data.csv
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+widetable_2000_cols_partitioned
+---- PARTITION_COLUMNS
+p int
+---- COLUMNS
+`${IMPALA_HOME}/testdata/common/widetable.py --get_columns -n 2000
+---- ROW_FORMAT
+delimited fields terminated by ',' escaped by '\\'
 ====
 ---- DATASET
 functional
@@ -2175,8 +2445,8 @@ id INT, col_1 BOOLEAN, col_2 DOUBLE, col_3 TIMESTAMP)
 row format delimited fields terminated by ','
 LOCATION '/test-warehouse/{table_name}';
 ---- LOAD
-`hadoop fs -mkdir -p /test-warehouse/table_no_newline && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/table_no_newline.csv /test-warehouse/table_no_newline
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_no_newline.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2191,11 +2461,10 @@ LOCATION '/test-warehouse/{table_name}';
 ALTER TABLE {db_name}{db_suffix}.{table_name} ADD IF NOT EXISTS PARTITION (year=2015, month=3);
 ALTER TABLE {db_name}{db_suffix}.{table_name} ADD IF NOT EXISTS PARTITION (year=2010, month=3);
 ---- LOAD
-`hadoop fs -mkdir -p /test-warehouse/table_no_newline_part && \
-hadoop fs -mkdir -p /test-warehouse/table_no_newline_part/year=2010/month=3 && \
-hadoop fs -mkdir -p /test-warehouse/table_no_newline_part/year=2015/month=3 && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/table_no_newline.csv /test-warehouse/table_no_newline_part/year=2010/month=3 && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/table_missing_columns.csv /test-warehouse/table_no_newline_part/year=2015/month=3
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_no_newline.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(year=2010, month=3);
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_missing_columns.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(year=2015, month=3);
 ====
 ---- DATASET
 functional
@@ -2226,16 +2495,6 @@ CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
   col1 int)
 STORED AS ORC
 TBLPROPERTIES('transactional'='true');
-====
----- DATASET
-functional
----- BASE_TABLE_NAME
-materialized_view
----- HIVE_MAJOR_VERSION
-3
----- CREATE_HIVE
-CREATE MATERIALIZED VIEW IF NOT EXISTS {db_name}{db_suffix}.{table_name}
-  AS SELECT * FROM {db_name}{db_suffix}.insert_only_transactional_table;
 ====
 ---- DATASET
 functional
@@ -2280,6 +2539,42 @@ SELECT * from functional.{table_name};
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
+materialized_view
+---- HIVE_MAJOR_VERSION
+3
+---- CREATE_HIVE
+-- The create materialized view command is moved down so that the database's
+-- managed directory has been created. Otherwise the command would fail. This
+-- is a bug in Hive.
+CREATE MATERIALIZED VIEW IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+  AS SELECT * FROM {db_name}{db_suffix}.insert_only_transactional_table;
+=====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+uncomp_src_alltypes
+---- CREATE_HIVE
+CREATE TABLE {db_name}{db_suffix}.{table_name} LIKE functional.alltypes STORED AS ORC;
+---- DEPENDENT_LOAD_HIVE
+SET orc.compress=NONE;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (year, month)
+SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+FROM functional.alltypes;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+uncomp_src_decimal_tbl
+---- CREATE_HIVE
+CREATE TABLE {db_name}{db_suffix}.{table_name} LIKE functional.decimal_tbl STORED AS ORC;
+---- DEPENDENT_LOAD_HIVE
+SET orc.compress=NONE;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (d6)
+SELECT d1, d2, d3, d4, d5, d6 FROM functional.decimal_tbl;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
 testescape_16_lf
 ---- CREATE
 CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
@@ -2287,9 +2582,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
 row format delimited fields terminated by ','  escaped by '\\'
 LOCATION '/test-warehouse/{table_name}';
 ---- LOAD
-`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_16_lf' --file_len 16 --only_newline && \
-hadoop fs -mkdir -p /test-warehouse/testescape_16_lf && \
-hadoop fs -put -f /tmp/testescape_16_lf/* /test-warehouse/testescape_16_lf/
+`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_16_lf' --file_len 16 --only_newline
 ====
 ---- DATASET
 functional
@@ -2301,9 +2594,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
 row format delimited fields terminated by ','  escaped by '\\'
 LOCATION '/test-warehouse/{table_name}';
 ---- LOAD
-`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_16_crlf' --file_len 16 && \
-hadoop fs -mkdir -p /test-warehouse/testescape_16_crlf && \
-hadoop fs -put -f /tmp/testescape_16_crlf/* /test-warehouse/testescape_16_crlf/
+`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_16_crlf' --file_len 16
 ====
 ---- DATASET
 functional
@@ -2315,9 +2606,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
 row format delimited fields terminated by ','  escaped by '\\'
 LOCATION '/test-warehouse/{table_name}';
 ---- LOAD
-`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_17_lf' --file_len 17 --only_newline && \
-hadoop fs -mkdir -p /test-warehouse/testescape_17_lf && \
-hadoop fs -put -f /tmp/testescape_17_lf/* /test-warehouse/testescape_17_lf/
+`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_17_lf' --file_len 17 --only_newline
 ====
 ---- DATASET
 functional
@@ -2329,9 +2618,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
 row format delimited fields terminated by ','  escaped by '\\'
 LOCATION '/test-warehouse/{table_name}';
 ---- LOAD
-`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_17_crlf' --file_len 17 && \
-hadoop fs -mkdir -p /test-warehouse/testescape_17_crlf && \
-hadoop fs -put -f /tmp/testescape_17_crlf/* /test-warehouse/testescape_17_crlf/
+`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_17_crlf' --file_len 17
 ====
 ---- DATASET
 functional
@@ -2343,9 +2630,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
 row format delimited fields terminated by ','  escaped by '\\'
 LOCATION '/test-warehouse/{table_name}';
 ---- LOAD
-`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_32_lf' --file_len 32 --only_newline && \
-hadoop fs -mkdir -p /test-warehouse/testescape_32_lf && \
-hadoop fs -put -f /tmp/testescape_32_lf/* /test-warehouse/testescape_32_lf/
+`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_32_lf' --file_len 32 --only_newline
 ====
 ---- DATASET
 functional
@@ -2357,9 +2642,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
 row format delimited fields terminated by ','  escaped by '\\'
 LOCATION '/test-warehouse/{table_name}';
 ---- LOAD
-`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_32_crlf' --file_len 32 && \
-hadoop fs -mkdir -p /test-warehouse/testescape_32_crlf && \
-hadoop fs -put -f /tmp/testescape_32_crlf/* /test-warehouse/testescape_32_crlf/
+`${IMPALA_HOME}/testdata/common/text_delims_table.py --table_dir '/tmp/testescape_32_crlf' --file_len 32
 ====
 ---- DATASET
 functional
@@ -2371,18 +2654,18 @@ timezone STRING, utctime TIMESTAMP, localtime TIMESTAMP)
 row format delimited fields terminated by ','
 LOCATION '/test-warehouse/{table_name}';
 ---- LOAD
-`hadoop fs -mkdir -p /test-warehouse/alltimezones && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/timezoneverification.csv /test-warehouse/alltimezones
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/timezoneverification.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
 avro_unicode_nulls
 ---- CREATE_HIVE
-create external table if not exists {db_name}{db_suffix}.{table_name} like {db_name}{db_suffix}.liketbl stored as avro LOCATION '/test-warehouse/avro_null_char';
----- LOAD
-`hdfs dfs -mkdir -p /test-warehouse/avro_null_char && \
-hdfs dfs -put -f ${IMPALA_HOME}/testdata/avro_null_char/000000_0 /test-warehouse/avro_null_char/
+create external table if not exists {db_name}{db_suffix}.{table_name} like {db_name}{db_suffix}.liketbl stored as avro LOCATION '{hdfs_location}';
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/avro_null_char/000000_0'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- IMPALA-1881: Maximize data locality when scanning Parquet files with multiple row groups.
@@ -2454,6 +2737,29 @@ L_SHIPMODE STRING
 L_COMMENT STRING
 ====
 ---- DATASET
+-- IMPALA-11350: Implementing virtual column FILE__POSITION
+functional
+---- BASE_TABLE_NAME
+lineitem_multiblock_variable_num_rows
+---- COLUMNS
+L_ORDERKEY BIGINT
+L_PARTKEY BIGINT
+L_SUPPKEY BIGINT
+L_LINENUMBER INT
+L_QUANTITY DECIMAL(12,2)
+L_EXTENDEDPRICE DECIMAL(12,2)
+L_DISCOUNT DECIMAL(12,2)
+L_TAX DECIMAL(12,2)
+L_RETURNFLAG STRING
+L_LINESTATUS STRING
+L_SHIPDATE STRING
+L_COMMITDATE STRING
+L_RECEIPTDATE STRING
+L_SHIPINSTRUCT STRING
+L_SHIPMODE STRING
+L_COMMENT STRING
+====
+---- DATASET
 -- IMPALA-4933: tests nested collections stored in multiple row-groups.
 ---- BASE_TABLE_NAME
 customer_multiblock
@@ -2467,10 +2773,9 @@ C_ACCTBAL DECIMAL(12, 2)
 C_MKTSEGMENT STRING
 C_COMMENT STRING
 C_ORDERS ARRAY<STRUCT<O_ORDERKEY: BIGINT, O_ORDERSTATUS: STRING, O_TOTALPRICE: DECIMAL(12, 2), O_ORDERDATE: STRING, O_ORDERPRIORITY: STRING, O_CLERK: STRING, O_SHIPPRIORITY: INT, O_COMMENT: STRING, O_LINEITEMS: ARRAY<STRUCT<L_PARTKEY: BIGINT, L_SUPPKEY: BIGINT, L_LINENUMBER: INT, L_QUANTITY: DECIMAL(12, 2), L_EXTENDEDPRICE: DECIMAL(12, 2), L_DISCOUNT: DECIMAL(12, 2), L_TAX: DECIMAL(12, 2), L_RETURNFLAG: STRING, L_LINESTATUS: STRING, L_SHIPDATE: STRING, L_COMMITDATE: STRING, L_RECEIPTDATE: STRING, L_SHIPINSTRUCT: STRING, L_SHIPMODE: STRING, L_COMMENT: STRING>>>>
----- DEPENDENT_LOAD
-`hadoop fs -mkdir -p /test-warehouse/customer_multiblock_parquet && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/CustomerMultiBlock/customer_multiblock.parquet \
-/test-warehouse/customer_multiblock_parquet/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/CustomerMultiBlock/customer_multiblock.parquet'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2478,9 +2783,9 @@ functional
 bzip2_tbl
 ---- COLUMNS
 col string
----- DEPENDENT_LOAD
-`hadoop fs -mkdir -p /test-warehouse/bzip2_tbl_text_bzip/ && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/data-bzip2.bz2 /test-warehouse/bzip2_tbl_text_bzip/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/data-bzip2.bz2'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2488,9 +2793,9 @@ functional
 large_bzip2_tbl
 ---- COLUMNS
 col string
----- DEPENDENT_LOAD
-`hadoop fs -mkdir -p /test-warehouse/large_bzip2_tbl_text_bzip/ && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/large_bzip2.bz2 /test-warehouse/large_bzip2_tbl_text_bzip/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/large_bzip2.bz2'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2498,9 +2803,9 @@ functional
 multistream_bzip2_tbl
 ---- COLUMNS
 col string
----- DEPENDENT_LOAD
-`hadoop fs -mkdir -p /test-warehouse/multistream_bzip2_tbl_text_bzip/ && \
-hadoop fs -put -f ${IMPALA_HOME}/testdata/data/data-pbzip2.bz2 /test-warehouse/multistream_bzip2_tbl_text_bzip/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/data-pbzip2.bz2'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2508,9 +2813,9 @@ functional
 large_multistream_bzip2_tbl
 ---- COLUMNS
 col string
----- DEPENDENT_LOAD
-`hdfs dfs -mkdir -p /test-warehouse/large_multistream_bzip2_tbl_text_bzip/ && \
-hdfs dfs -put -f ${IMPALA_HOME}/testdata/data/large_pbzip2.bz2 /test-warehouse/large_multistream_bzip2_tbl_text_bzip/
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/large_pbzip2.bz2'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2584,6 +2889,20 @@ PARTITION BY HASH (s) PARTITIONS 3 STORED AS KUDU;
 INSERT into TABLE {db_name}{db_suffix}.{table_name}
 SELECT s, i
 FROM {db_name}.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+part_strings_with_quotes
+---- COLUMNS
+i int
+---- PARTITION_COLUMNS
+p string
+---- LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (p="\"") VALUES (1);
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (p='\'') VALUES (2);
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (p="\\\"") VALUES (3);
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (p='\\\'') VALUES (4);
 ====
 ---- DATASET
 functional
@@ -2667,6 +2986,19 @@ LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/date_tbl/0003.txt' OVERWRITE
 ---- DEPENDENT_LOAD
 insert overwrite table {db_name}{db_suffix}.{table_name} partition(date_part)
 select id_col, date_col, date_part from functional.{table_name};
+---- CREATE_KUDU
+-- Can't create partitions with date_part since Kudu don't support "partition by"
+-- with non key column.
+DROP TABLE IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE TABLE {db_name}{db_suffix}.{table_name} (
+  id_col INT PRIMARY KEY,
+  date_col DATE NULL,
+  date_part DATE NOT NULL
+)
+PARTITION BY HASH (id_col) PARTITIONS 3 STORED AS KUDU;
+---- DEPENDENT_LOAD_KUDU
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name}
+SELECT id_col, date_col, date_part FROM {db_name}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2726,4 +3058,1148 @@ date_part DATE
 ---- COLUMNS
 id_col INT
 date_col DATE
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+hudi_partitioned
+---- CREATE
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+LIKE PARQUET '/test-warehouse/hudi_parquet/year=2015/month=03/day=16/5f541af5-ca07-4329-ad8c-40fa9b353f35-0_2-103-391_20200210090618.parquet'
+PARTITIONED BY (year int, month int, day int)
+STORED AS HUDIPARQUET
+LOCATION '/test-warehouse/hudi_parquet';
+ALTER TABLE {db_name}{db_suffix}.{table_name} RECOVER PARTITIONS;
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/hudi_parquet && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/hudi_parquet /test-warehouse/
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+hudi_non_partitioned
+---- CREATE
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+LIKE PARQUET '/test-warehouse/hudi_parquet/year=2015/month=03/day=16/5f541af5-ca07-4329-ad8c-40fa9b353f35-0_2-103-391_20200210090618.parquet'
+STORED AS HUDIPARQUET
+LOCATION '/test-warehouse/hudi_parquet';
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+hudi_as_parquet
+---- CREATE
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+LIKE PARQUET '/test-warehouse/hudi_parquet/year=2015/month=03/day=16/5f541af5-ca07-4329-ad8c-40fa9b353f35-0_2-103-391_20200210090618.parquet'
+STORED AS PARQUET
+LOCATION '/test-warehouse/hudi_parquet';
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypes_date_partition
+---- PARTITION_COLUMNS
+date_col date
+---- COLUMNS
+id int COMMENT 'Add a comment'
+bool_col boolean
+tinyint_col tinyint
+smallint_col smallint
+int_col int
+bigint_col bigint
+float_col float
+double_col double
+string_col string
+timestamp_col timestamp
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (date_col)
+SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col,
+float_col, double_col, string_col, timestamp_col,
+case when id % 2 = 0 then cast(timestamp_col as date)
+else cast(cast(timestamp_col as date) + interval 5 days as date) end date_col
+FROM {db_name}{db_suffix}.alltypes where id < 500;
+---- LOAD
+SET hive.exec.dynamic.partition.mode=nonstrict;
+SET hive.exec.dynamic.partition=true;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (date_col)
+SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col,
+float_col, double_col, string_col, timestamp_col,
+case when id % 2 = 0 then cast(timestamp_col as date)
+else cast(cast(timestamp_col as date) + interval 5 days as date) end date_col
+FROM {db_name}{db_suffix}.alltypes where id < 500;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_partitioned
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+LOCATION '/test-warehouse/iceberg_test/iceberg_partitioned'
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.tables');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/iceberg_partitioned /test-warehouse/iceberg_test/
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_non_partitioned
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+LOCATION '/test-warehouse/iceberg_test/iceberg_non_partitioned'
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.tables');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/iceberg_non_partitioned /test-warehouse/iceberg_test/
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+hadoop_catalog_test_external
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.catalog',
+'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog/hadoop_catalog_test',
+'iceberg.table_identifier'='functional_parquet.hadoop_catalog_test');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/hadoop_catalog_test /test-warehouse/iceberg_test/hadoop_catalog/
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_partitioned_orc_external
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='orc',
+'iceberg.catalog'='hadoop.catalog',
+'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog/iceberg_partitioned_orc',
+'iceberg.table_identifier'='functional_parquet.iceberg_partitioned_orc');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/iceberg_partitioned_orc /test-warehouse/iceberg_test/hadoop_catalog/
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypestbl_iceberg_orc
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='orc', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.complextypestbl_iceberg_orc');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/complextypestbl_iceberg_orc /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_alltypes_part
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_alltypes_part');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_alltypes_part /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_alltypes_part_orc
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='orc', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_alltypes_part_orc');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_alltypes_part_orc /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_legacy_partition_schema_evolution
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_legacy_partition_schema_evolution');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_legacy_partition_schema_evolution /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_legacy_partition_schema_evolution_orc
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='orc', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_legacy_partition_schema_evolution_orc');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_legacy_partition_schema_evolution_orc /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_partition_evolution
+---- CREATE
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+(id int, int_col int, string_col string, date_string_col string, year int, month int)
+PARTITIONED BY SPEC (year, truncate(4, date_string_col))
+STORED AS ICEBERG;
+---- DEPENDENT_LOAD
+# We can use 'date_string_col' as it is once IMPALA-11954 is done.
+INSERT INTO {db_name}{db_suffix}.iceberg_partition_evolution
+    SELECT id, int_col, string_col, regexp_replace(date_string_col, '/', ''), year, month
+    FROM {db_name}{db_suffix}.alltypes;
+ALTER TABLE {db_name}{db_suffix}.iceberg_partition_evolution
+    SET PARTITION SPEC (year, truncate(4, date_string_col), month);
+INSERT INTO {db_name}{db_suffix}.iceberg_partition_evolution
+    SELECT
+        cast(id + 7300 as int),
+        int_col,
+        string_col,
+        regexp_replace(date_string_col, '/', ''),
+        year,
+        month
+    FROM {db_name}{db_suffix}.alltypes;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+airports_orc
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='orc', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.airports_orc');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/airports_orc /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+airports_parquet
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.airports_parquet');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/airports_parquet /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_resolution_test_external
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.catalog',
+'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog/iceberg_resolution_test',
+'iceberg.table_identifier'='functional_parquet.iceberg_resolution_test');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/iceberg_resolution_test /test-warehouse/iceberg_test/hadoop_catalog/
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_int_partitioned
+---- CREATE
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (i INT, j INT, k INT)
+PARTITIONED BY SPEC (i, j)
+STORED AS ICEBERG;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_partition_transforms_zorder
+---- CREATE
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+(ts timestamp, s string, i int, j int)
+PARTITIONED BY SPEC (year(ts), bucket(5, s))
+SORT BY ZORDER (i, j)
+STORED AS ICEBERG;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_timestamp_part
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_timestamp_part');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_timestamp_part /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_timestamptz_part
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_timestamptz_part');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_timestamptz_part /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_uppercase_col
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_uppercase_col');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_uppercase_col /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypes_date_partition_2
+---- PARTITION_COLUMNS
+date_col date
+---- COLUMNS
+id int COMMENT 'Add a comment'
+bool_col boolean
+tinyint_col tinyint
+smallint_col smallint
+int_col int
+bigint_col bigint
+float_col float
+double_col double
+string_col string
+timestamp_col timestamp
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (date_col)
+SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col,
+float_col, double_col, string_col, timestamp_col,
+cast(timestamp_col as date) date_col
+FROM {db_name}{db_suffix}.alltypes where id < 500;
+---- LOAD
+SET hive.exec.dynamic.partition.mode=nonstrict;
+SET hive.exec.dynamic.partition=true;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (date_col)
+SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col,
+float_col, double_col, string_col, timestamp_col,
+cast(timestamp_col as date) date_col
+FROM {db_name}{db_suffix}.alltypes where id < 500;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypes_dp_2_view_1
+---- CREATE
+DROP VIEW IF EXISTS {db_name}{db_suffix}.{table_name};
+-- view which references a WHERE clause with hint
+CREATE VIEW {db_name}{db_suffix}.{table_name}
+AS SELECT * FROM {db_name}{db_suffix}.alltypes_date_partition_2 where [always_true] date_col = cast(timestamp_col as date);
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypes_dp_2_view_2
+---- CREATE
+DROP VIEW IF EXISTS {db_name}{db_suffix}.{table_name};
+-- view which references a table with hint and a WHERE clause with hint.
+-- WHERE clause has a compound predicate.
+CREATE VIEW {db_name}{db_suffix}.{table_name}
+AS SELECT * FROM {db_name}{db_suffix}.alltypes_date_partition_2 [convert_limit_to_sample(5)]
+where [always_true] date_col = cast(timestamp_col as date) and int_col in (select int_col from {db_name}{db_suffix}.alltypessmall);
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+utf8_str_tiny
+---- COLUMNS
+id int
+name string
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+SELECT id, name FROM {db_name}.{table_name};
+---- LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} VALUES
+  (1, "张三"), (2, "李四"), (3, "王五"), (4, "李小龙"), (5, "Alice"),
+  (6, "陈Bob"), (7, "Бopиc"), (8, "Jörg"), (9, "ひなた"), (10, "서연");
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypes_arrays_only_view
+---- CREATE
+DROP VIEW IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE VIEW {db_name}{db_suffix}.{table_name}
+AS SELECT id, int_array, int_array_array FROM {db_name}{db_suffix}.complextypestbl;
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypes_maps_view
+---- CREATE
+DROP VIEW IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE VIEW {db_name}{db_suffix}.{table_name}
+AS SELECT id, int_map, int_map_array FROM {db_name}{db_suffix}.complextypestbl;
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_delete_positional
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_delete_positional',
+              'format-version'='2', 'write.update.mode'='merge-on-read');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_delete_positional /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_delete_equality
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_delete_equality',
+              'format-version'='2', 'write.update.mode'='merge-on-read');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_delete_equality /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_multiple_storage_locations
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('write.format.default'='parquet', 'iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_multiple_storage_locations');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_multiple_storage_locations /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_multiple_storage_locations_data /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_multiple_storage_locations_data01 /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_multiple_storage_locations_data02 /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_no_deletes
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_no_deletes',
+              'format-version'='2');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_no_deletes /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_no_deletes_orc
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_no_deletes_orc',
+              'format-version'='2', 'write.format.default'='orc');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_no_deletes_orc /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_positional_delete_all_rows
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_positional_delete_all_rows',
+              'format-version'='2');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_positional_delete_all_rows /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_positional_delete_all_rows_orc
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_positional_delete_all_rows_orc',
+              'format-version'='2', 'write.format.default'='orc');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_positional_delete_all_rows_orc /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_positional_not_all_data_files_have_delete_files
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_positional_not_all_data_files_have_delete_files',
+              'format-version'='2');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_positional_not_all_data_files_have_delete_files /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_positional_not_all_data_files_have_delete_files_orc
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_positional_not_all_data_files_have_delete_files_orc',
+              'format-version'='2', 'write.format.default'='orc');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_positional_not_all_data_files_have_delete_files_orc /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_positional_update_all_rows
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_positional_update_all_rows',
+              'format-version'='2');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_positional_update_all_rows /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_partitioned_position_deletes
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_partitioned_position_deletes',
+              'format-version'='2');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_partitioned_position_deletes /test-warehouse/iceberg_test/hadoop_catalog/ice
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_v2_partitioned_position_deletes_orc
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS ICEBERG
+TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
+              'iceberg.catalog_location'='/test-warehouse/iceberg_test/hadoop_catalog',
+              'iceberg.table_identifier'='ice.iceberg_v2_partitioned_position_deletes_orc',
+              'format-version'='2', 'write.format.default'='orc');
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/iceberg_test/hadoop_catalog/ice && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/iceberg_test/hadoop_catalog/ice/iceberg_v2_partitioned_position_deletes_orc /test-warehouse/iceberg_test/hadoop_catalog/ice
+
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_avro_format
+---- CREATE_HIVE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
+  int_col int,
+  string_col string,
+  double_col double,
+  bool_col boolean
+)
+STORED BY ICEBERG STORED AS AVRO
+LOCATION '/test-warehouse/iceberg_test/hadoop_catalog/ice/iceberg_avro_format';
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} values(1, 'A', 0.5, true),(2, 'B', 1.5, true),(3, 'C', 2.5, false);
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+iceberg_mixed_file_format
+---- CREATE_HIVE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
+  int_col int,
+  string_col string,
+  double_col double,
+  bool_col boolean
+)
+STORED BY ICEBERG
+LOCATION '/test-warehouse/iceberg_test/hadoop_catalog/ice/iceberg_mixed_file_format';
+---- DEPENDENT_LOAD_HIVE
+-- This INSERT must run in Hive, because Impala doesn't support inserting into tables
+-- with avro and orc file formats.
+ALTER TABLE {db_name}{db_suffix}.{table_name} SET TBLPROPERTIES('write.format.default'='avro');
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} values(1, 'avro', 0.5, true);
+ALTER TABLE {db_name}{db_suffix}.{table_name} SET TBLPROPERTIES('write.format.default'='orc');
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} values(2, 'orc', 1.5, false);
+ALTER TABLE {db_name}{db_suffix}.{table_name} SET TBLPROPERTIES('write.format.default'='parquet');
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} values(3, 'parquet', 2.5, false);
+
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+mv1_alltypes_jointbl
+---- HIVE_MAJOR_VERSION
+3
+---- CREATE_HIVE
+CREATE MATERIALIZED VIEW IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS {file_format} AS SELECT t1.smallint_col c1, t1.bool_col c2,
+t2.test_id c3, min(t1.bigint_col) min_bigint, min(t2.test_zip) min_zip
+FROM {db_name}{db_suffix}.alltypes t1
+JOIN {db_name}{db_suffix}.jointbl t2 ON (t1.id=t2.alltypes_id)
+group by t1.smallint_col, t1.bool_col, t2.test_id;
+---- DEPENDENT_LOAD_HIVE
+ALTER MATERIALIZED VIEW {db_name}{db_suffix}.{table_name} REBUILD;
+-- do a count to confirm if the rebuild populated rows in the MV
+select count(*) as mv_count from {db_name}{db_suffix}.{table_name};
+=====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+mv2_alltypes_jointbl
+---- HIVE_MAJOR_VERSION
+3
+---- CREATE_HIVE
+-- Create a duplicate materialized view because we want to test
+-- computing stats, dropping stats on this MV without affecting
+-- planner tests for which we use the other MV mv1_alltypes_jointbl
+CREATE MATERIALIZED VIEW IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+STORED AS {file_format} AS SELECT t1.smallint_col c1, t1.bool_col c2,
+t2.test_id c3, max(t1.bigint_col) max_bigint, max(t2.test_zip) max_zip
+FROM {db_name}{db_suffix}.alltypes t1
+JOIN {db_name}{db_suffix}.jointbl t2 ON (t1.id=t2.alltypes_id)
+group by t1.smallint_col, t1.bool_col, t2.test_id;
+---- DEPENDENT_LOAD_HIVE
+ALTER MATERIALIZED VIEW {db_name}{db_suffix}.{table_name} REBUILD;
+-- do a count to confirm if the rebuild populated rows in the MV
+select count(*) as mv_count from {db_name}{db_suffix}.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+collection_tbl
+---- COLUMNS
+id INT
+arr_int_1d ARRAY<INT>
+arr_int_2d ARRAY<ARRAY<INT>>
+arr_int_3d ARRAY<ARRAY<ARRAY<INT>>>
+arr_string_1d ARRAY<STRING>
+arr_string_2d ARRAY<ARRAY<STRING>>
+arr_string_3d ARRAY<ARRAY<ARRAY<STRING>>>
+map_1d MAP<INT, STRING>
+map_2d MAP<INT,MAP<INT,STRING>>
+map_3d MAP<INT,MAP<INT,MAP<INT,STRING>>>
+map_map_array MAP<INT,MAP<INT,ARRAY<INT>>>
+map_bool_key MAP<BOOLEAN, STRING>
+map_tinyint_key MAP<TINYINT, STRING>
+map_smallint_key MAP<SMALLINT, STRING>
+map_bigint_key MAP<BIGINT, STRING>
+map_float_key MAP<FLOAT, STRING>
+map_double_key MAP<DOUBLE, STRING>
+map_decimal_key MAP<DECIMAL(2,1), STRING>
+map_string_key MAP<STRING, INT>
+map_char_key MAP<CHAR(3), INT>
+map_varchar_key MAP<VARCHAR(3), STRING>
+map_timestamp_key MAP<TIMESTAMP, STRING>
+map_date_key MAP<DATE, STRING>
+---- DEPENDENT_LOAD_HIVE
+-- It would be nice to insert NULLs, but I couldn't find a way in Hive.
+INSERT OVERWRITE {db_name}{db_suffix}.{table_name} VALUES
+  (1,
+   array(1, 2, NULL),
+   array(array(1, 2, NULL), array(3)),
+   array(array(array(1, 2, NULL), array(3)), array(array(4))),
+   array("1", "2", NULL),
+   array(array("1", "2", NULL), array("3")),
+   array(array(array("1", "2", NULL), array("3")), array(array("4"))),
+   map(1, "first", 2, "second"),
+   map(1, map(10, "ten", 20, "twenty"), 2, map(30, "thirty", 40, "forty")),
+   map(
+       1, map(10, map(100, "hundred", 200, "two hundred"), 20, map(300, "three hundred", 400, "four hundred")),
+       2, map(30, map(500, "five hundred", 600, "six hundred"), 40, map(700, "seven hundred", 800, "eight hundred"))
+   ),
+   map(
+       1, map(10, array(100, 200), 20, array(300, 400)),
+       2, map(30, array(500, 600), 40, array(700, 800))
+   ),
+   map(true, "true", false, "false"),
+   map(-1Y, "a", 0Y, "b", 1Y, "c"),
+   map(-1S, "a", 0S, "b", 1S, "c"),
+   map(-1L, "a", 0L, "b", 1L, "c"),
+   map(cast(-1.5 as FLOAT), "a", cast(0.25 as FLOAT), "b", cast(1.75 as FLOAT), "c"),
+   map(cast(-1.5 as DOUBLE), "a", cast(0.25 as DOUBLE), "b", cast(1.75 as DOUBLE), "c"),
+   map(-1.8, "a", 0.2, "b", 1.2, "c"),
+   map("one", 1, "two", 2, "three", 3),
+   map(cast("Mon" as CHAR(3)), 1,
+       cast("Tue" as CHAR(3)), 2,
+       cast("Wed" as CHAR(3)), 3,
+       cast("Thu" as CHAR(3)), 4,
+       cast("Fri" as CHAR(3)), 5,
+       cast("Sat" as CHAR(3)), 6,
+       cast("Sun" as CHAR(3)), 7
+      ),
+   map(cast("a" as VARCHAR(3)), "A", cast("ab" as VARCHAR(3)), "AB", cast("abc" as VARCHAR(3)), "ABC"),
+   map(to_utc_timestamp("2022-12-10 08:15:12", "UTC"), "Saturday morning",
+       to_utc_timestamp("2022-12-09 18:15:12", "UTC"), "Friday evening"),
+   map(to_date("2022-12-10"), "Saturday", to_date("2022-12-09"), "Friday")
+  );
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+map_null_keys
+---- COLUMNS
+id INT
+map_bool_key MAP<BOOLEAN, STRING>
+map_tinyint_key MAP<TINYINT, STRING>
+map_smallint_key MAP<SMALLINT, STRING>
+map_bigint_key MAP<BIGINT, STRING>
+map_float_key MAP<FLOAT, STRING>
+map_double_key MAP<DOUBLE, STRING>
+map_decimal_key MAP<DECIMAL(2,1), STRING>
+map_string_key MAP<STRING, INT>
+map_char_key MAP<CHAR(3), INT>
+map_varchar_key MAP<VARCHAR(3), STRING>
+map_timestamp_key MAP<TIMESTAMP, STRING>
+map_date_key MAP<DATE, STRING>
+struct_contains_map STRUCT<m: MAP<INT, STRING>, s: STRING>
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE {db_name}{db_suffix}.{table_name} VALUES
+  (1,
+   map(true, "true", if(false, false, NULL), "null"),
+   map(-1Y, "one", if(false, 1Y, NULL), "null"),
+   map(-1S, "one", if(false, 1S, NULL), "null"),
+   map(-1L, "one", if(false, 1L, NULL), "null"),
+   map(cast(-1.75 as FLOAT), "a", if(false, cast(1.5 as FLOAT), NULL), "null"),
+   map(cast(-1.75 as DOUBLE), "a", if(false, cast(1.5 as DOUBLE), NULL), "null"),
+   map(-1.8, "a",if(false, 1.5, NULL), "null"),
+   map("one", 1, if(false, "", NULL), NULL),
+   map(cast("Mon" as CHAR(3)), 1,
+       if(false, cast("NUL" as CHAR(3)), NULL), NULL),
+   map(cast("a" as VARCHAR(3)), "A", if(false, cast("" as VARCHAR(3)), NULL), NULL),
+   map(to_utc_timestamp("2022-12-10 08:15:12", "UTC"), "Saturday morning",
+       if(false, to_utc_timestamp("2022-12-10 08:15:12", "UTC"), NULL), "null"),
+   map(to_date("2022-12-10"), "Saturday", if(false, to_date("2022-12-10"), NULL), "null"),
+   named_struct("m", map(1, "one", if(false, 1, NULL), "null"), "s", "some_string")
+  );
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+map_non_varlen
+---- COLUMNS
+id INT
+map_int_int MAP<INT,INT>
+map_char3_char5 MAP<CHAR(3),CHAR(5)>
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE {db_name}{db_suffix}.{table_name} VALUES
+  (1, map(10, 100, 11, 110, 12, 120), map(cast("aaa" as char(3)), cast("aaaaa" as char(5)))),
+  (2, map(20, 200, 21, 210, 22, 220), map(cast("aab" as char(3)), cast("aaaab" as char(5)))),
+  (3, map(30, 300, 31, 310, 32, 320), map(cast("aac" as char(3)), cast("aaaac" as char(5)))),
+  (4, map(40, 400, 41, 410, 42, 420), map(cast("aad" as char(3)), cast("aaaad" as char(5)))),
+  (5, map(50, 500, 51, 510, 52, 520), map(cast("aae" as char(3)), cast("aaaae" as char(5)))),
+  (6, map(60, 600, 61, 610, 62, 620), map(cast("aaf" as char(3)), cast("aaaaf" as char(5)))),
+  (7, map(70, 700, 71, 710, 72, 720), map(cast("aag" as char(3)), cast("aaaag" as char(5)))),
+  (8, map(80, 800, 81, 810, 82, 820), map(cast("aah" as char(3)), cast("aaaah" as char(5)))),
+  (9, map(90, 900, 91, 910, 92, 920), map(cast("aai" as char(3)), cast("aaaai" as char(5)))),
+  (10, map(100, 1000, 101, 1010, 102, 1020), map(cast("aaj" as char(3)), cast("aaaaj" as char(5))));
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+collection_struct_mix
+---- COLUMNS
+id INT
+struct_contains_arr STRUCT<arr: ARRAY<INT>>
+struct_contains_map STRUCT<m: MAP<INT, STRING>>
+arr_contains_struct ARRAY<STRUCT<i: BIGINT>>
+arr_contains_nested_struct ARRAY<STRUCT<inner_struct: STRUCT<str: STRING, l: INT>, small: SMALLINT>>
+struct_contains_nested_arr STRUCT<arr: ARRAY<ARRAY<DATE>>, i: INT>
+all_mix MAP<INT, STRUCT<big: STRUCT<arr: ARRAY<STRUCT<inner_arr: ARRAY<ARRAY<INT>>, m: TIMESTAMP>>, n: INT>, small: STRUCT<str: STRING, i: INT>>>
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE {db_name}{db_suffix}.{table_name} VALUES
+  (
+    1,
+    named_struct("arr", array(1, 2, 3, 4, NULL, NULL, 5)),
+    named_struct("m", map(1, "one", 2, "two", 0, NULL)),
+    array(named_struct("i", 1L), named_struct("i", 2L), named_struct("i", 3L),
+          named_struct("i", 4L), NULL, named_struct("i", 5L), named_struct("i", NULL)),
+    array(named_struct("inner_struct", named_struct("str", "", "l", 0), "small", 2S), NULL,
+          named_struct("inner_struct", named_struct("str", "some_string", "l", 5), "small", 20S)),
+    named_struct("arr", array(array(to_date("2022-12-05"), to_date("2022-12-06"), NULL, to_date("2022-12-07")),
+                              array(to_date("2022-12-08"), to_date("2022-12-09"), NULL)), "i", 2),
+    map(
+      10,
+      named_struct(
+        "big", named_struct(
+          "arr", array(
+            named_struct(
+              "inner_arr", array(array(0, NULL, -1, -5, NULL, 8), array(20, NULL)),
+              "m", to_utc_timestamp("2022-12-05 14:30:00", "UTC")
+            ),
+            named_struct(
+              "inner_arr", array(array(12, 1024, NULL), array(NULL, NULL, 84), array(NULL, 15, NULL)),
+              "m", to_utc_timestamp("2022-12-06 16:20:52", "UTC")
+            )
+          ),
+          "n", 98
+        ),
+        "small", named_struct(
+          "str", "somestring",
+          "i", 100
+        )
+      )
+    )
+  ),
+  (
+    2,
+    named_struct("arr", if(false, array(1), NULL)),
+    named_struct("m", if(false, map(1, "one"), NULL)),
+    array(named_struct("i", 100L), named_struct("i", 8L), named_struct("i", 35L),
+          named_struct("i", 45L), NULL, named_struct("i", 193L), named_struct("i", NULL)),
+    array(named_struct("inner_struct", if(false, named_struct("str", "", "l", 0), NULL), "small", 104S),
+          named_struct("inner_struct", named_struct("str", "aaa", "l", 28), "small", 105S), NULL),
+    named_struct("arr", array(array(to_date("2022-12-10"), to_date("2022-12-11"), NULL, to_date("2022-12-12")),
+                              if(false, array(to_date("2022-12-12")), NULL)), "i", 2754),
+    map(
+      20,
+      named_struct(
+        "big", named_struct(
+          "arr", array(
+            if(false, named_struct(
+              "inner_arr", array(array(0)),
+              "m", to_utc_timestamp("2022-12-10 08:01:05", "UTC")
+            ), NULL),
+            named_struct(
+              "inner_arr", array(array(12, 1024, NULL), array(NULL, NULL, 84), array(NULL, 15, NULL)),
+              "m", to_utc_timestamp("2022-12-10 08:15:12", "UTC")
+            )
+          ),
+          "n", 95
+        ),
+        "small", named_struct(
+          "str", "otherstring",
+          "i", 2048
+        )
+      ),
+      21,
+      named_struct(
+        "big", named_struct(
+          "arr", if(false, array(
+            named_struct(
+              "inner_arr", array(array(0, NULL, -1, -5, NULL, 8), array(20, NULL)),
+              "m", to_utc_timestamp("2022-12-15 05:46:24", "UTC")
+            )
+          ), NULL),
+          "n", 8
+        ),
+        "small", named_struct(
+          "str", "textstring",
+          "i", 0
+        )
+      ),
+      22,
+      named_struct(
+        "big", if(false, named_struct(
+          "arr", array(
+            named_struct(
+              "inner_arr", array(array(0)),
+              "m", if(false, to_utc_timestamp("2022-12-15 05:46:24", "UTC"), NULL)
+            )
+          ),
+          "n", 93
+        ), NULL),
+        "small", named_struct(
+          "str", "nextstring",
+          "i", 128
+        )
+      ),
+      23,
+      NULL
+    )
+  );
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+collection_struct_mix_view
+---- CREATE
+DROP VIEW IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE VIEW {db_name}{db_suffix}.{table_name}
+AS SELECT id, arr_contains_struct, arr_contains_nested_struct, struct_contains_nested_arr FROM {db_name}{db_suffix}.collection_struct_mix;
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+simple_arrays_big
+---- COLUMNS
+int_col INT
+string_col STRING
+int_array ARRAY<INT>
+double_array ARRAY<DOUBLE>
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/simple_arrays_big_parquet && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/simple_arrays_big.parq \
+/test-warehouse/simple_arrays_big_parquet/
+---- DEPENDENT_LOAD_ACID
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM functional_parquet.simple_arrays_big;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+binary_tbl
+---- COLUMNS
+id INT
+string_col STRING
+binary_col BINARY
+---- ROW_FORMAT
+delimited fields terminated by ','
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/binary_tbl/000000_0.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD
+insert overwrite table {db_name}{db_suffix}.{table_name}
+select id, string_col, binary_col from functional.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+binary_tbl_big
+---- PARTITION_COLUMNS
+year INT
+month INT
+---- COLUMNS
+id INT
+int_col INT
+binary_col BINARY
+binary_col_with_nulls BINARY
+---- LOAD
+SET hive.exec.dynamic.partition.mode=nonstrict;
+SET hive.exec.dynamic.partition=true;
+insert overwrite table {db_name}{db_suffix}.{table_name} partition(year, month)
+select id, int_col, cast(string_col as binary),
+       cast(case when id % 2 = 0 then date_string_col else NULL end as binary),
+       year, month
+    from functional.alltypes;
+---- DEPENDENT_LOAD
+insert overwrite table {db_name}{db_suffix}.{table_name} partition(year, month)
+select id, int_col, cast(string_col as binary),
+       cast(case when id % 2 = 0 then date_string_col else NULL end as binary),
+       year, month
+    from functional.alltypes;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+binary_in_complex_types
+---- COLUMNS
+binary_item_col array<binary>
+binary_key_col map<binary, int>
+binary_value_col map<int, binary>
+binary_member_col struct<i:int, b:binary>
+---- DEPENDENT_LOAD_HIVE
+insert overwrite table {db_name}{db_suffix}.{table_name}
+values (
+  array(cast("item1" as binary), cast("item2" as binary)),
+  map(cast("key1" as binary), 1, cast("key2" as binary), 2),
+  map(1, cast("value1" as binary), 2, cast("value2" as binary)),
+  named_struct("i", 0, "b", cast("member" as binary))
+  );
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+insert_only_minor_compacted
+---- COLUMNS
+id bigint
+---- DEPENDENT_LOAD_HIVE
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (1);
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (2);
+ALTER TABLE {db_name}{db_suffix}.{table_name} compact 'minor' AND WAIT;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (3);
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (4);
+---- TABLE_PROPERTIES
+transactional=true
+transactional_properties=insert_only
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+insert_only_major_and_minor_compacted
+---- COLUMNS
+id bigint
+---- DEPENDENT_LOAD_HIVE
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (1);
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (2);
+ALTER TABLE {db_name}{db_suffix}.{table_name} compact 'major' AND WAIT;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (3);
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (4);
+ALTER TABLE {db_name}{db_suffix}.{table_name} compact 'minor' AND WAIT;
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (5);
+INSERT INTO TABLE {db_name}{db_suffix}.{table_name} VALUES (6);
+---- TABLE_PROPERTIES
+transactional=true
+transactional_properties=insert_only
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypesagg_parquet_v2_uncompressed
+---- PARTITION_COLUMNS
+year int
+month int
+day int
+---- COLUMNS
+id int
+bool_col boolean
+tinyint_col tinyint
+smallint_col smallint
+int_col int
+bigint_col bigint
+float_col float
+double_col double
+date_string_col string
+string_col string
+timestamp_col timestamp
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE {db_name}{db_suffix}.{table_name} select * from functional.alltypesagg;
+---- TABLE_PROPERTIES
+parquet.writer.version=v2
+parquet.compression=UNCOMPRESSED
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+alltypesagg_parquet_v2_snappy
+---- PARTITION_COLUMNS
+year int
+month int
+day int
+---- COLUMNS
+id int
+bool_col boolean
+tinyint_col tinyint
+smallint_col smallint
+int_col int
+bigint_col bigint
+float_col float
+double_col double
+date_string_col string
+string_col string
+timestamp_col timestamp
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE {db_name}{db_suffix}.{table_name} select * from functional.alltypesagg;
+---- TABLE_PROPERTIES
+parquet.writer.version=v2
+parquet.compression=SNAPPY
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypestbl_parquet_v2_uncompressed
+---- COLUMNS
+id bigint
+int_array array<int>
+int_array_array array<array<int>>
+int_map map<string, int>
+int_map_array array<map<string, int>>
+nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: int, f: string>>>>, g: map<string, struct<h: struct<i: array<double>>>>>
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE {db_name}{db_suffix}.{table_name} select * from functional_parquet.complextypestbl;
+---- TABLE_PROPERTIES
+parquet.writer.version=v2
+parquet.compression=UNCOMPRESSED
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypestbl_parquet_v2_snappy
+---- COLUMNS
+id bigint
+int_array array<int>
+int_array_array array<array<int>>
+int_map map<string, int>
+int_map_array array<map<string, int>>
+nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: int, f: string>>>>, g: map<string, struct<h: struct<i: array<double>>>>>
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE {db_name}{db_suffix}.{table_name} select * from functional_parquet.complextypestbl;
+---- TABLE_PROPERTIES
+parquet.writer.version=v2
+parquet.compression=SNAPPY
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+empty_parquet_page_source_impala10186
+---- COLUMNS
+id bigint
+---- ROW_FORMAT
+delimited
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/empty_parquet_page_source_impala10186/data.csv' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====

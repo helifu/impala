@@ -17,10 +17,12 @@
 
 # Targeted Impala insert tests
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range, round
 import os
 
 from collections import namedtuple
-from datetime import (datetime, date)
+from datetime import datetime, date
 from decimal import Decimal
 from subprocess import check_call
 from parquet.ttypes import ColumnOrder, SortingColumn, TypeDefinedOrder, ConvertedType
@@ -28,16 +30,16 @@ from parquet.ttypes import ColumnOrder, SortingColumn, TypeDefinedOrder, Convert
 from tests.common.environ import impalad_basedir
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import (SkipIfEC, SkipIfIsilon, SkipIfLocal, SkipIfS3, SkipIfABFS,
-    SkipIfADLS)
+from tests.common.skip import SkipIfEC, SkipIfFS, SkipIfLocal
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_result_verifier import verify_query_result_is_equal
 from tests.common.test_vector import ImpalaTestDimension
-from tests.util.filesystem_utils import get_fs_path
+from tests.util.filesystem_utils import get_fs_path, WAREHOUSE
 from tests.util.get_parquet_metadata import (decode_stats_value,
     get_parquet_metadata_from_hdfs_folder)
 
 PARQUET_CODECS = ['none', 'snappy', 'gzip', 'zstd', 'lz4']
+IMPALA_HOME = os.environ['IMPALA_HOME']
 
 
 class RoundFloat():
@@ -51,6 +53,9 @@ class RoundFloat():
   def __eq__(self, numeral):
     """Compares this objects's value to a numeral after rounding it."""
     return round(self.value, self.num_digits) == round(numeral, self.num_digits)
+
+  def __hash__(self):
+    return hash(round(self.value, self.num_digits))
 
 
 class TimeStamp():
@@ -66,6 +71,9 @@ class TimeStamp():
     """Compares this objects's value to another timetuple."""
     return self.timetuple == other_timetuple
 
+  def __hash__(self):
+    return hash(self.timetuple)
+
 
 class Date():
   """Class to compare dates specified as year-month-day to dates specified as days since
@@ -76,6 +84,9 @@ class Date():
 
   def __eq__(self, other_days_since_eopch):
     return self.days_since_epoch == other_days_since_eopch
+
+  def __hash__(self):
+    return hash(self.days_since_epoch)
 
 
 ColumnStats = namedtuple('ColumnStats', ['name', 'min', 'max', 'null_count'])
@@ -114,9 +125,7 @@ class TestInsertParquetQueries(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').compression_codec == 'none')
 
-  @SkipIfEC.oom
   @SkipIfLocal.multiple_impalad
-  @SkipIfS3.eventually_consistent
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_insert_parquet(self, vector, unique_database):
     vector.get_value('exec_option')['PARQUET_FILE_SIZE'] = \
@@ -176,11 +185,8 @@ class TestInsertParquetInvalidCodec(ImpalaTestSuite):
         lambda v: v.get_value('table_format').compression_codec == 'none')
 
   @SkipIfLocal.multiple_impalad
-  def test_insert_parquet_invalid_codec(self, vector):
-    vector.get_value('exec_option')['COMPRESSION_CODEC'] = \
-        vector.get_value('compression_codec')
-    self.run_test_case('QueryTest/insert_parquet_invalid_codec', vector,
-                       multiple_impalad=True)
+  def test_insert_parquet_invalid_codec(self, vector, unique_database):
+    self.run_test_case('QueryTest/insert_parquet_invalid_codec', vector, unique_database)
 
 
 class TestInsertParquetVerifySize(ImpalaTestSuite):
@@ -203,7 +209,7 @@ class TestInsertParquetVerifySize(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension("compression_codec", *PARQUET_CODECS))
 
-  @SkipIfIsilon.hdfs_block_size
+  @SkipIfFS.hdfs_block_size
   @SkipIfLocal.hdfs_client
   def test_insert_parquet_verify_size(self, vector, unique_database):
     # Test to verify that the result file size is close to what we expect.
@@ -265,7 +271,8 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
       for f in files:
         if not f.endswith('parq'):
           continue
-        check_call([os.path.join(impalad_basedir, 'util/parquet-reader'), '--file',
+        check_call([os.path.join(IMPALA_HOME, "bin/run-binary.sh"),
+                    os.path.join(impalad_basedir, 'util/parquet-reader'), '--file',
                     os.path.join(tmpdir.strpath, str(f))])
 
   def test_sorting_columns(self, vector, unique_database, tmpdir):
@@ -331,8 +338,8 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
     to have columns with different signed integer logical types. The test verifies
     that parquet file written by the hdfs parquet table writer using the generated
     file has the same column type metadata as the generated one."""
-    hdfs_path = (os.environ['DEFAULT_FS'] + "/test-warehouse/{0}.db/"
-                 "signed_integer_logical_types.parquet").format(unique_database)
+    hdfs_path = "{1}/{0}.db/signed_integer_logical_types.parquet".\
+        format(unique_database, WAREHOUSE)
     self.filesystem_client.copy_from_local(os.environ['IMPALA_HOME'] +
         '/testdata/data/signed_integer_logical_types.parquet', hdfs_path)
     # Create table with signed integer logical types
@@ -427,7 +434,7 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
   def _check_only_one_member_var_is_set(obj, var_name):
     """Checks that 'var_name' is the only member of 'obj' that is not None. Useful to
     check Thrift unions."""
-    keys = [k for k, v in vars(obj).iteritems() if v is not None]
+    keys = [k for k, v in vars(obj).items() if v is not None]
     assert keys == [var_name]
 
   def _check_no_logical_type(self, schemas, column_name):
@@ -532,12 +539,27 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
     self._ctas_and_check_int64_timestamps(vector, unique_database, tmpdir, "micros")
     self._ctas_and_check_int64_timestamps(vector, unique_database, tmpdir, "nanos")
 
+  # Skip test for non-HDFS environment as it uses Hive statement.
+  # Hive statement is being used as Impala's result are converted
+  # by python to string. In both HS2 and beewax, it only handles float
+  # precision uptil 16 decimal digits and test needs 17.
+  # IMPALA-9365 describes why HS2 is not started on non-HDFS test env.
+  @SkipIfFS.hive
+  def test_double_precision(self, vector, unique_database):
+    # IMPALA-10654: Test inserting double into Parquet table retains the precision.
+    src_tbl = "{0}.{1}".format(unique_database, "i10654_parquet")
+    create_tbl_stmt = """create table {0} (dbl1 double)
+        stored as parquet""".format(src_tbl)
+    self.execute_query_expect_success(self.client, create_tbl_stmt)
+    insert_tbl_stmt = """insert into table {0}
+        values (-0.43149576573887316)""".format(src_tbl)
+    self.execute_query_expect_success(self.client, insert_tbl_stmt)
+    select_stmt = """select * from {0}""".format(src_tbl)
+    result = self.run_stmt_in_hive(select_stmt)
+    assert result.split('\n')[1] == '-0.43149576573887316'
 
-@SkipIfIsilon.hive
-@SkipIfLocal.hive
-@SkipIfS3.hive
-@SkipIfABFS.hive
-@SkipIfADLS.hive
+
+@SkipIfFS.hive
 # TODO: Should we move this to test_parquet_stats.py?
 class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
 
@@ -621,7 +643,8 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     num_columns = len(table_stats)
     assert num_columns == len(expected_values)
 
-    for col_idx, stats, expected in zip(range(num_columns), table_stats, expected_values):
+    for col_idx, stats, expected in zip(list(range(num_columns)),
+                                        table_stats, expected_values):
       if col_idx in skip_col_idxs:
         continue
       if not expected:
@@ -919,7 +942,7 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     """Test that writing a Parquet table with too many columns results in an error."""
     num_cols = 12000
     query = "create table %s.wide stored as parquet as select \n" % unique_database
-    query += ", ".join(map(str, xrange(num_cols)))
+    query += ", ".join(map(str, range(num_cols)))
     query += ";\n"
     result = self.execute_query_expect_failure(self.client, query)
     assert "Minimum required block size must be less than 2GB" in str(result)

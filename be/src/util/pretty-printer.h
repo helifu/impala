@@ -18,11 +18,12 @@
 #ifndef IMPALA_UTIL_PRETTY_PRINTER_H
 #define IMPALA_UTIL_PRETTY_PRINTER_H
 
-#include <boost/algorithm/string.hpp>
 #include <cmath>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+
+#include <boost/algorithm/string/join.hpp>
 
 #include "gen-cpp/RuntimeProfile_types.h"
 #include "util/cpu-info.h"
@@ -132,7 +133,7 @@ class PrettyPrinter {
 
       case TUnit::DOUBLE_VALUE: {
         double output = *reinterpret_cast<double*>(&value);
-        ss << std::setprecision(PRECISION) << output << " ";
+        ss << std::setprecision(PRECISION) << output;
         break;
       }
 

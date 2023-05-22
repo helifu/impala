@@ -24,6 +24,7 @@
 #include <vector>
 #include <boost/scoped_ptr.hpp>
 
+#include "codegen/codegen-fn-ptr.h"
 #include "common/global-types.h"
 #include "common/status.h"
 #include "exprs/expr.h"
@@ -55,7 +56,9 @@ using impala_udf::StringVal;
 using impala_udf::DecimalVal;
 using impala_udf::DateVal;
 using impala_udf::CollectionVal;
+using impala_udf::StructVal;
 
+class FragmentState;
 struct LibCacheEntry;
 class LlvmCodeGen;
 class MemTracker;
@@ -69,6 +72,27 @@ class TExpr;
 class TExprNode;
 class Tuple;
 class TupleRow;
+
+/// Describes the memory efficient layout for storing the results of evaluating a list
+/// of scalar expressions.
+/// The constructor computes a memory efficient layout for storing the results of
+/// evaluating 'exprs'. The results are assumed to be void* slot types (vs AnyVal types).
+/// Varlen data is not included (e.g. there will be space for a StringValue, but not the
+/// data referenced by it). Variable length types are guaranteed to be at the end.
+struct ScalarExprsResultsRowLayout {
+  ScalarExprsResultsRowLayout() = delete;
+  ScalarExprsResultsRowLayout(const vector<ScalarExpr*>& exprs);
+
+  /// The number of bytes necessary to store all the results.
+  int expr_values_bytes_per_row;
+
+  /// Maps from expression index to the byte offset into the row of expression values.
+  std::vector<int> expr_values_offsets;
+
+  /// Byte offset from where the variable length results for a row begins. If -1, there
+  /// are no variable length slots.
+  int var_results_begin_offset;
+};
 
 /// --- ScalarExpr overview
 ///
@@ -98,11 +122,9 @@ class TupleRow;
 /// ScalarExpr's compute functions are codegend to replace calls to the generic compute
 /// function of child expressions with the exact compute functions based on the return
 /// types of the child expressions known at runtime. Subclasses should override
-/// GetCodegendComputeFnImpl() to either generate custom IR compute functions using
-/// IRBuilder, which inlines calls to child expressions' compute functions, or simply call
-/// GetCodegendComputeFnWrapper() to generate a wrapper function to call the interpreted
-/// compute function. Note that we do not need a separate GetCodegendComputeFn() for each
-/// type.
+/// GetCodegendComputeFnImpl() to generate custom IR compute functions using IRBuilder,
+/// which inlines calls to child expressions' compute functions. Note that we do not need
+/// a separate GetCodegendComputeFn() for each type.
 ///
 /// The two main usage patterns for ScalarExpr are:
 /// * The codegen'd expressions are called from other codegen'd functions, e.g. from a
@@ -115,9 +137,6 @@ class TupleRow;
 /// (e.g. by ScalarExprEvaluator::GetConstValue()) but may fail back to a slower
 /// interpreted implementation.
 ///
-/// TODO: remove GetCodegendComputeFnWrapper(), which is a hack to enable "codegen"
-/// by generating LLVM functions that actually call into the interpreted path.
-///
 class ScalarExpr : public Expr {
  public:
   /// Create a new ScalarExpr based on thrift Expr 'texpr'. The newly created ScalarExpr
@@ -125,22 +144,22 @@ class ScalarExpr : public Expr {
   /// tuple row descriptor of the input tuple row. On failure, 'expr' is set to NULL and
   /// the expr tree (if created) will be closed. Error status will be returned too.
   static Status Create(const TExpr& texpr, const RowDescriptor& row_desc,
-      RuntimeState* state, ObjectPool* pool, ScalarExpr** expr) WARN_UNUSED_RESULT;
+      FragmentState* state, ObjectPool* pool, ScalarExpr** expr) WARN_UNUSED_RESULT;
 
   /// Create a new ScalarExpr based on thrift Expr 'texpr'. The newly created ScalarExpr
   /// is stored in ObjectPool 'state->obj_pool()' and returned in 'expr'. 'row_desc' is
   /// the tuple row descriptor of the input tuple row. Returns error status on failure.
   static Status Create(const TExpr& texpr, const RowDescriptor& row_desc,
-      RuntimeState* state, ScalarExpr** expr) WARN_UNUSED_RESULT;
+      FragmentState* state, ScalarExpr** expr) WARN_UNUSED_RESULT;
 
   /// Convenience functions creating multiple ScalarExpr.
   static Status Create(const std::vector<TExpr>& texprs, const RowDescriptor& row_desc,
-      RuntimeState* state, ObjectPool* pool, std::vector<ScalarExpr*>* exprs)
-      WARN_UNUSED_RESULT;
+      FragmentState* state, ObjectPool* pool,
+      std::vector<ScalarExpr*>* exprs) WARN_UNUSED_RESULT;
 
   /// Convenience functions creating multiple ScalarExpr.
   static Status Create(const std::vector<TExpr>& texprs, const RowDescriptor& row_desc,
-      RuntimeState* state, std::vector<ScalarExpr*>* exprs) WARN_UNUSED_RESULT;
+      FragmentState* state, std::vector<ScalarExpr*>* exprs) WARN_UNUSED_RESULT;
 
   /// Returns true if this expression is a SlotRef. Overridden by SlotRef.
   virtual bool IsSlotRef() const { return false; }
@@ -182,20 +201,6 @@ class ScalarExpr : public Expr {
   static std::string DebugString(const std::vector<ScalarExpr*>& exprs);
   std::string DebugString(const std::string& expr_name) const;
 
-  /// Computes a memory efficient layout for storing the results of evaluating 'exprs'.
-  /// The results are assumed to be void* slot types (vs AnyVal types). Varlen data is
-  /// not included (e.g. there will be space for a StringValue, but not the data
-  /// referenced by it).
-  ///
-  /// Returns the number of bytes necessary to store all the results and offsets
-  /// where the result for each expr should be stored.
-  ///
-  /// Variable length types are guaranteed to be at the end and 'var_result_begin'
-  /// will be set the beginning byte offset where variable length results begin.
-  /// 'var_result_begin' will be set to -1 if there are no variable len types.
-  static int ComputeResultsLayout(const vector<ScalarExpr*>& exprs, vector<int>* offsets,
-      int* var_result_begin);
-
   /// Releases cache entries to libCache for all nodes in the ScalarExpr tree.
   virtual void Close();
 
@@ -228,6 +233,10 @@ class ScalarExpr : public Expr {
   friend class Predicate;
   friend class ScalarExprEvaluator;
   friend class ScalarFnCall;
+  friend class SlotRef;
+
+  // The ORC scanner builds search arguments based on the values it gets from Literal.
+  friend class HdfsOrcScanner;
 
   /// For BE tests
   friend class ExprTest;
@@ -238,7 +247,7 @@ class ScalarExpr : public Expr {
   /// nodes which need FunctionContext in the tree. 'next_fn_ctx_idx' is the index
   /// of the next available entry in the vector. It's updated as this function is
   /// called recursively down the tree.
-  void AssignFnCtxIdx(int* next_fn_ctx_idx);
+  virtual void AssignFnCtxIdx(int* next_fn_ctx_idx);
 
   int fn_ctx_idx() const { return fn_ctx_idx_; }
 
@@ -247,7 +256,7 @@ class ScalarExpr : public Expr {
   static Status CreateNode(const TExprNode& texpr_node, ObjectPool* pool,
       ScalarExpr** expr) WARN_UNUSED_RESULT;
 
-  ScalarExpr(const ColumnType& type, bool is_constant);
+  ScalarExpr(const ColumnType& type, bool is_constant, bool is_codegen_disabled = false);
   ScalarExpr(const TExprNode& node);
 
   /// Implementation of GetCodegendComputeFn() to be overridden by each subclass of
@@ -268,6 +277,7 @@ class ScalarExpr : public Expr {
   DoubleVal GetDoubleVal(ScalarExprEvaluator*, const TupleRow*) const;
   StringVal GetStringVal(ScalarExprEvaluator*, const TupleRow*) const;
   CollectionVal GetCollectionVal(ScalarExprEvaluator*, const TupleRow*) const;
+  StructVal GetStructVal(ScalarExprEvaluator*, const TupleRow*) const;
   TimestampVal GetTimestampVal(ScalarExprEvaluator*, const TupleRow*) const;
   DecimalVal GetDecimalVal(ScalarExprEvaluator*, const TupleRow*) const;
   DateVal GetDateVal(ScalarExprEvaluator*, const TupleRow*) const;
@@ -289,6 +299,8 @@ class ScalarExpr : public Expr {
   virtual StringVal GetStringValInterpreted(ScalarExprEvaluator*, const TupleRow*) const;
   virtual CollectionVal GetCollectionValInterpreted(
       ScalarExprEvaluator*, const TupleRow*) const;
+  virtual StructVal GetStructValInterpreted(
+      ScalarExprEvaluator*, const TupleRow*) const;
   virtual TimestampVal GetTimestampValInterpreted(
       ScalarExprEvaluator*, const TupleRow*) const;
   virtual DecimalVal GetDecimalValInterpreted(
@@ -301,7 +313,7 @@ class ScalarExpr : public Expr {
   /// point into the codegen'd code. Currently we assume all roots of ScalarExpr subtrees
   /// exprs are potential entry points.
   virtual Status Init(const RowDescriptor& row_desc, bool is_entry_point,
-      RuntimeState* state) WARN_UNUSED_RESULT;
+      FragmentState* state) WARN_UNUSED_RESULT;
 
   /// Initializes 'eval' for execution. If scope if FRAGMENT_LOCAL, both
   /// fragment-local and thread-local states should be initialized. If scope is
@@ -335,29 +347,11 @@ class ScalarExpr : public Expr {
   /// tree.
   llvm::Function* CreateIrFunctionPrototype(const std::string& name, LlvmCodeGen* codegen,
       llvm::Value* (*args)[2]);
-
-  /// Generates an IR compute function that calls the interpreted compute function.
-  /// It doesn't provide any performance benefit over the interpreted path. This is
-  /// useful for builtins (e.g. && and || operators) and UDF which don't generate
-  /// custom IR code but are part of a larger expr tree. The IR compute function of
-  /// the larger expr tree may still benefit from custom IR and inlining of other
-  /// sub-expressions.
-  ///
-  /// TODO: this should be removed in the long run and replaced with cross-compilation
-  /// together with constant propagation and loop unrolling.
-  Status GetCodegendComputeFnWrapper(LlvmCodeGen* codegen, llvm::Function** fn)
-      WARN_UNUSED_RESULT;
-
-  /// Helper function for GetCodegendComputeFnWrapper(). Returns the cross-compiled IR
-  /// function of the static Get*Val wrapper function for return type 'type'. Must not
-  /// be called for a type that doesn't have a wrapper function in the built-in
-  /// IR module. Never returns NULL.
-  llvm::Function* GetStaticGetValWrapper(ColumnType type, LlvmCodeGen* codegen);
-
  protected:
+
   /// Return true if we should codegen this expression node, based on query options
   /// and the properties of this ScalarExpr node.
-  bool ShouldCodegen(const RuntimeState* state) const;
+  bool ShouldCodegen(const FragmentState* state) const;
 
   /// Return true if it is possible to evaluate this expression node without codegen.
   /// The vast majority of exprs support interpretation, so default to true. Scalars
@@ -390,7 +384,9 @@ class ScalarExpr : public Expr {
   /// Non-NULL if this expr is codegen'd and the constructor of this Expr requested
   /// that this expr should be an entry point from interpreted to codegen'd code.
   /// (see class comment for explanation of usage patterns and motivation).
-  void* codegend_compute_fn_ = nullptr;
+  /// The actual types of the functions differ so we use void* and reinterpret cast before
+  /// calling the functions.
+  CodegenFnPtr<void*> codegend_compute_fn_;
 
   /// True if 'codegend_compute_fn_' is registered with LlvmCodeGen as an entry point
   /// to codegen to fill in . If this is true, then 'codegend_compute_fn_' will be set
@@ -398,15 +394,13 @@ class ScalarExpr : public Expr {
   /// Set in GetCodegendComputeFn().
   bool added_to_jit_ = false;
 
+  /// True if codegen should be disabled for this scalar expression. Typical use case
+  /// is const expressions in VALUES clause, which are evaluated only once.
+  const bool is_codegen_disabled_;
+
   /// Static wrappers which call the compute function of the given ScalarExpr, passing
-  /// it the ScalarExprEvaluator and TupleRow. These are cross-compiled and called by
-  /// the IR wrapper functions generated by GetCodegendComputeFnWrapper(). The wrapper
-  /// functions avoid the need for codegen'd callers to do a virtual function call on
-  /// the ScalarExpr.
-  /// Note: the ScalarExpr subclass is known at codegen time, so codegen *could* replace
-  /// the virtual function call with a direct function call. However, it would be better
-  /// to focus on removing GetCodegendComputeFnWrapper() instead of micro-optimising this
-  /// inefficient mechanism.
+  /// it the ScalarExprEvaluator and TupleRow. These are cross-compiled and used by
+  /// GetStaticGetValWrapper.
   static BooleanVal GetBooleanValInterpreted(
       ScalarExpr*, ScalarExprEvaluator*, const TupleRow*);
   static TinyIntVal GetTinyIntValInterpreted(

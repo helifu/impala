@@ -15,33 +15,33 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM ubuntu:16.04
+# This uses an invalid BASE_IMAGE, because this needs to be overridden.
+ARG BASE_IMAGE=REPLACED_WITH_BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# If set to "--install-debug-tools", then extra utilities will be installed.
+ARG INSTALL_OS_PACKAGES_ARGS=""
 
 # Install minimal dependencies required for Impala services to run.
-# liblzo2-2 may be needed by the Impala-lzo plugin, which is used in tests.
-# We install it in the base image for convenience.
-RUN apt-get update && \
-  apt-get install -y openjdk-8-jre-headless \
-  libsasl2-2 libsasl2-modules libsasl2-modules-gssapi-mit \
-  sudo netcat-openbsd less curl iproute2 vim iputils-ping \
-  tzdata liblzo2-2 krb5-user && \
-  apt-get clean && \
-  rm -rf /var/lib/apt/lists/*
+ADD helper/install_os_packages.sh /root
+RUN /root/install_os_packages.sh ${INSTALL_OS_PACKAGES_ARGS}
 
 # Use a non-privileged impala user to run the daemons in the container.
 # That user should own everything in the /opt/impala subdirectory.
-RUN groupadd -r impala && useradd --no-log-init -r -g impala impala && \
+RUN groupadd -r impala -g 1000 && useradd --no-log-init -r -u 1000 -g 1000 impala && \
     mkdir -p /opt/impala && chown impala /opt/impala && \
     chmod ugo+w /etc/passwd
 USER impala
 
-# Copy build artifacts required for the daemon processes.
+# Copy build artifacts required for the daemon processes. The daemon images are
+# responsible for copying in the required jar files, as each daemon has a different
+# set of jar dependencies.
 # Need to have multiple copy commands to preserve directory structure.
-COPY --chown=impala lib /opt/impala/lib
 COPY --chown=impala www /opt/impala/www
 COPY --chown=impala bin /opt/impala/bin
 # Symlink here instead of in setup_build_context to avoid duplicate binaries.
 RUN cd /opt/impala/bin && ln -s impalad statestored && ln -s impalad catalogd && \
+    ln -s impalad admissiond && \
 # Create conf directory for later config injection.
     mkdir /opt/impala/conf && \
 # Create logs directory to collect container logs.
@@ -50,3 +50,13 @@ RUN cd /opt/impala/bin && ln -s impalad statestored && ln -s impalad catalogd &&
     mkdir /opt/impala/rangercache
 
 WORKDIR /opt/impala/
+
+LABEL name="Apache Impala Daemon Base Image" \
+      description="Common base image for Apache Impala daemons." \
+      # Common labels.
+      org.label-schema.maintainer=$MAINTAINER \
+      org.label-schema.url=$URL \
+      org.label-schema.vcs-ref=$VCS_REF \
+      org.label-schema.vcs-type=$VCS_TYPE \
+      org.label-schema.vcs-url=$VCS_URL \
+      org.label-schema.version=$VERSION

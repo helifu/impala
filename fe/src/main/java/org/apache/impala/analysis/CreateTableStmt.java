@@ -25,21 +25,29 @@ import org.apache.avro.Schema;
 import org.apache.avro.SchemaParseException;
 import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
 import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
+import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.mr.Catalogs;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.KuduTable;
+import org.apache.impala.catalog.IcebergTable;
 import org.apache.impala.catalog.RowFormat;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.service.BackendConfig;
+import org.apache.impala.thrift.TBucketInfo;
 import org.apache.impala.thrift.TCreateTableParams;
 import org.apache.impala.thrift.THdfsFileFormat;
+import org.apache.impala.thrift.TIcebergCatalog;
+import org.apache.impala.thrift.TIcebergFileFormat;
+import org.apache.impala.thrift.TIcebergPartitionTransformType;
 import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.AvroSchemaConverter;
 import org.apache.impala.util.AvroSchemaParser;
 import org.apache.impala.util.AvroSchemaUtils;
+import org.apache.impala.util.IcebergUtil;
 import org.apache.impala.util.KuduUtil;
 import org.apache.impala.util.MetaStoreUtil;
 
@@ -47,6 +55,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.primitives.Ints;
 
@@ -82,7 +91,7 @@ public class CreateTableStmt extends StatementBase {
   /**
    * Copy c'tor.
    */
-  CreateTableStmt(CreateTableStmt other) {
+  public CreateTableStmt(CreateTableStmt other) {
     this(other.tableDef_);
     owner_ = other.owner_;
   }
@@ -107,6 +116,7 @@ public class CreateTableStmt extends StatementBase {
   public List<ColumnDef> getPrimaryKeyColumnDefs() {
     return tableDef_.getPrimaryKeyColumnDefs();
   }
+  public boolean isPrimaryKeyUnique() { return tableDef_.isPrimaryKeyUnique(); }
   public List<SQLPrimaryKey> getPrimaryKeys() { return tableDef_.getSqlPrimaryKeys(); }
   public List<SQLForeignKey> getForeignKeys() { return tableDef_.getSqlForeignKeys(); }
   public boolean isExternal() { return tableDef_.isExternal(); }
@@ -119,24 +129,29 @@ public class CreateTableStmt extends StatementBase {
   public List<String> getSortColumns() { return tableDef_.getSortColumns(); }
   public TSortingOrder getSortingOrder() { return tableDef_.getSortingOrder(); }
   public String getComment() { return tableDef_.getComment(); }
-  Map<String, String> getTblProperties() { return tableDef_.getTblProperties(); }
+  public Map<String, String> getTblProperties() { return tableDef_.getTblProperties(); }
   private HdfsCachingOp getCachingOp() { return tableDef_.getCachingOp(); }
   public HdfsUri getLocation() { return tableDef_.getLocation(); }
   Map<String, String> getSerdeProperties() { return tableDef_.getSerdeProperties(); }
   public THdfsFileFormat getFileFormat() { return tableDef_.getFileFormat(); }
   RowFormat getRowFormat() { return tableDef_.getRowFormat(); }
-  private void putGeneratedKuduProperty(String key, String value) {
-    tableDef_.putGeneratedKuduProperty(key, value);
+  private void putGeneratedProperty(String key, String value) {
+    tableDef_.putGeneratedProperty(key, value);
   }
   public Map<String, String> getGeneratedKuduProperties() {
-    return tableDef_.getGeneratedKuduProperties();
+    return tableDef_.getGeneratedProperties();
   }
+  public TBucketInfo geTBucketInfo() { return tableDef_.geTBucketInfo(); }
 
   // Only exposed for ToSqlUtils. Returns the list of primary keys declared by the user
   // at the table level. Note that primary keys may also be declared in column
   // definitions, those are not included here (they are stored in the ColumnDefs).
   List<String> getTblPrimaryKeyColumnNames() {
     return tableDef_.getPrimaryKeyColumnNames();
+  }
+
+  public List<IcebergPartitionSpec> getIcebergPartitionSpecs() {
+    return tableDef_.getIcebergPartitionSpecs();
   }
 
   /**
@@ -200,11 +215,13 @@ public class CreateTableStmt extends StatementBase {
     if (getRowFormat() != null) params.setRow_format(getRowFormat().toThrift());
     params.setFile_format(getFileFormat());
     params.setIf_not_exists(getIfNotExists());
+    if (geTBucketInfo() != null) params.setBucket_info(geTBucketInfo());
     params.setSort_columns(getSortColumns());
     params.setSorting_order(getSortingOrder());
     params.setTable_properties(Maps.newHashMap(getTblProperties()));
     params.getTable_properties().putAll(Maps.newHashMap(getGeneratedKuduProperties()));
     params.setSerde_properties(getSerdeProperties());
+    params.setIs_primary_key_unique(isPrimaryKeyUnique());
     for (KuduPartitionParam d: getKuduPartitionParams()) {
       params.addToPartition_by(d.toThrift());
     }
@@ -218,6 +235,13 @@ public class CreateTableStmt extends StatementBase {
       params.addToForeign_keys(fk);
     }
     params.setServer_name(serverName_);
+
+    // Create table stmt only have one PartitionSpec
+    if (!getIcebergPartitionSpecs().isEmpty()) {
+      Preconditions.checkState(getIcebergPartitionSpecs().size() == 1);
+      params.setPartition_spec(getIcebergPartitionSpecs().get(0).toThrift());
+    }
+
     return params;
   }
 
@@ -243,8 +267,29 @@ public class CreateTableStmt extends StatementBase {
     // Avro tables can have empty column defs because they can infer them from the Avro
     // schema. Likewise for external Kudu tables, the schema can be read from Kudu.
     if (getColumnDefs().isEmpty() && getFileFormat() != THdfsFileFormat.AVRO
-        && getFileFormat() != THdfsFileFormat.KUDU) {
+        && getFileFormat() != THdfsFileFormat.KUDU && getFileFormat() !=
+        THdfsFileFormat.ICEBERG) {
       throw new AnalysisException("Table requires at least 1 column");
+    }
+    if (getRowFormat() != null) {
+      String fieldDelimiter = getRowFormat().getFieldDelimiter();
+      String lineDelimiter = getRowFormat().getLineDelimiter();
+      String escapeChar = getRowFormat().getEscapeChar();
+      if (getFileFormat() != THdfsFileFormat.TEXT
+          && getFileFormat() != THdfsFileFormat.SEQUENCE_FILE) {
+        if (fieldDelimiter != null) {
+          analyzer.addWarning("'ROW FORMAT DELIMITED FIELDS TERMINATED BY '"
+              + fieldDelimiter + "'' is ignored.");
+        }
+        if (lineDelimiter != null) {
+          analyzer.addWarning("'ROW FORMAT DELIMITED LINES TERMINATED BY '"
+              + lineDelimiter + "'' is ignored.");
+        }
+        if (escapeChar != null) {
+          analyzer.addWarning(
+              "'ROW FORMAT DELIMITED ESCAPED BY '" + escapeChar + "'' is ignored.");
+        }
+      }
     }
     if (getFileFormat() == THdfsFileFormat.AVRO) {
       setColumnDefs(analyzeAvroSchema(analyzer));
@@ -253,6 +298,17 @@ public class CreateTableStmt extends StatementBase {
             "An Avro table requires column definitions or an Avro schema.");
       }
       AvroSchemaUtils.setFromSerdeComment(getColumnDefs());
+    }
+
+    if (getFileFormat() == THdfsFileFormat.ICEBERG) {
+      analyzeIcebergColumns();
+      analyzeIcebergFormat(analyzer);
+    } else {
+      List<IcebergPartitionSpec> iceSpec = tableDef_.getIcebergPartitionSpecs();
+      if (iceSpec != null && !iceSpec.isEmpty()) {
+        throw new AnalysisException(
+            "PARTITIONED BY SPEC is only valid for Iceberg tables.");
+      }
     }
 
     // If lineage logging is enabled, compute minimal lineage graph.
@@ -287,8 +343,7 @@ public class CreateTableStmt extends StatementBase {
     }
 
     analyzeKuduTableProperties(analyzer);
-    if (isExternal() && !Boolean.parseBoolean(getTblProperties().get(
-        Table.TBL_PROP_EXTERNAL_TABLE_PURGE))) {
+    if (isExternalWithNoPurge()) {
       // this is an external table
       analyzeExternalKuduTableParams(analyzer);
     } else {
@@ -303,16 +358,33 @@ public class CreateTableStmt extends StatementBase {
    * Kudu tables.
    */
   private void analyzeKuduTableProperties(Analyzer analyzer) throws AnalysisException {
+    String kuduMasters = getKuduMasters(analyzer);
+    if (kuduMasters.isEmpty()) {
+      throw new AnalysisException(String.format(
+          "Table property '%s' is required when the impalad startup flag " +
+          "-kudu_master_hosts is not used.", KuduTable.KEY_MASTER_HOSTS));
+    }
+    putGeneratedProperty(KuduTable.KEY_MASTER_HOSTS, kuduMasters);
+
     AuthorizationConfig authzConfig = analyzer.getAuthzConfig();
     if (authzConfig.isEnabled()) {
-      // Today there is no comprehensive way of enforcing a Sentry authorization policy
-      // against tables stored in Kudu. This is why only users with ALL privileges on
-      // SERVER may create external Kudu tables or set the master addresses.
-      // See IMPALA-4000 for details.
       boolean isExternal = tableDef_.isExternal() ||
           MetaStoreUtil.findTblPropKeyCaseInsensitive(
               getTblProperties(), "EXTERNAL") != null;
-      if (getTblProperties().containsKey(KuduTable.KEY_MASTER_HOSTS) || isExternal) {
+      if (isExternal) {
+        String externalTableName = getTblProperties().get(KuduTable.KEY_TABLE_NAME);
+        AnalysisUtils.throwIfNull(externalTableName,
+            String.format("Table property %s must be specified when creating " +
+                "an external Kudu table.", KuduTable.KEY_TABLE_NAME));
+        List<String> storageUris = getUrisForAuthz(kuduMasters, externalTableName);
+        for (String storageUri : storageUris) {
+          analyzer.registerPrivReq(builder -> builder
+                  .onStorageHandlerUri("kudu", storageUri)
+                  .rwstorage().build());
+        }
+      }
+
+      if (getTblProperties().containsKey(KuduTable.KEY_MASTER_HOSTS)) {
         String authzServer = authzConfig.getServerName();
         Preconditions.checkNotNull(authzServer);
         analyzer.registerPrivReq(builder -> builder.onServer(authzServer).all().build());
@@ -325,16 +397,8 @@ public class CreateTableStmt extends StatementBase {
       throw new AnalysisException("Invalid storage handler specified for Kudu table: " +
           handler);
     }
-    putGeneratedKuduProperty(KuduTable.KEY_STORAGE_HANDLER,
+    putGeneratedProperty(KuduTable.KEY_STORAGE_HANDLER,
         KuduTable.KUDU_STORAGE_HANDLER);
-
-    String kuduMasters = getKuduMasters(analyzer);
-    if (kuduMasters.isEmpty()) {
-      throw new AnalysisException(String.format(
-          "Table property '%s' is required when the impalad startup flag " +
-          "-kudu_master_hosts is not used.", KuduTable.KEY_MASTER_HOSTS));
-    }
-    putGeneratedKuduProperty(KuduTable.KEY_MASTER_HOSTS, kuduMasters);
 
     // TODO: Find out what is creating a directory in HDFS and stop doing that. Kudu
     //       tables shouldn't have HDFS dirs: IMPALA-3570
@@ -347,6 +411,15 @@ public class CreateTableStmt extends StatementBase {
     AnalysisUtils.throwIfNotNull(getTblProperties().get(KuduTable.KEY_TABLE_ID),
         String.format("Table property %s should not be specified when creating a " +
             "Kudu table.", KuduTable.KEY_TABLE_ID));
+  }
+
+  private List<String> getUrisForAuthz(String kuduMasterAddresses, String kuduTableName) {
+    List<String> masterAddresses = Lists.newArrayList(kuduMasterAddresses.split(","));
+    List<String> uris = new ArrayList<>();
+    for (String masterAddress : masterAddresses) {
+      uris.add(masterAddress + "/" + kuduTableName);
+    }
+    return uris;
   }
 
   /**
@@ -450,7 +523,7 @@ public class CreateTableStmt extends StatementBase {
       throw new AnalysisException(String.format("Cannot analyze Kudu table '%s': %s",
           getTbl(), e.getMessage()));
     }
-    putGeneratedKuduProperty(KuduTable.KEY_TABLE_NAME,
+    putGeneratedProperty(KuduTable.KEY_TABLE_NAME,
         KuduUtil.getDefaultKuduTableName(getDb(), getTbl(), isHMSIntegrationEnabled));
   }
 
@@ -468,11 +541,6 @@ public class CreateTableStmt extends StatementBase {
     Map<String, ColumnDef> pkColDefsByName =
         ColumnDef.mapByColumnNames(getPrimaryKeyColumnDefs());
     for (KuduPartitionParam partitionParam: getKuduPartitionParams()) {
-      // If no column names were specified in this partitioning scheme, use all the
-      // primary key columns.
-      if (!partitionParam.hasColumnNames()) {
-        partitionParam.setColumnNames(pkColDefsByName.keySet());
-      }
       partitionParam.setPkColumnDefMap(pkColDefsByName);
       partitionParam.analyze(analyzer);
     }
@@ -541,5 +609,296 @@ public class CreateTableStmt extends StatementBase {
       propertyMap.put(kv.getKey(),
           new StringLiteral(kv.getValue()).getUnescapedValue());
     }
+  }
+
+  /**
+   * For iceberg file format, add related storage handler
+   */
+  private void analyzeIcebergFormat(Analyzer analyzer) throws AnalysisException {
+    // A managed table cannot have 'external.table.purge' property set
+    if (!isExternal() && Boolean.parseBoolean(
+        getTblProperties().get(IcebergTable.TBL_PROP_EXTERNAL_TABLE_PURGE))) {
+      throw new AnalysisException(String.format("Table property '%s' cannot be set to " +
+          "true with a managed Iceberg table.",
+          IcebergTable.TBL_PROP_EXTERNAL_TABLE_PURGE));
+    }
+
+    // Check for managed table
+    if (!isExternal() || Boolean.parseBoolean(getTblProperties().get(
+        Table.TBL_PROP_EXTERNAL_TABLE_PURGE))) {
+      if (getColumnDefs().isEmpty()) {
+        // External iceberg table can have empty column, but managed iceberg table
+        // requires at least one column.
+        throw new AnalysisException("Table requires at least 1 column for " +
+            "managed iceberg table.");
+      }
+
+      // Check partition columns for managed iceberg table
+      checkPartitionColumns(analyzer);
+    }
+
+    String handler = getTblProperties().get(IcebergTable.KEY_STORAGE_HANDLER);
+    if (handler != null && !IcebergTable.isIcebergStorageHandler(handler)) {
+      throw new AnalysisException("Invalid storage handler " +
+          "specified for Iceberg format: " + handler);
+    }
+    putGeneratedProperty(IcebergTable.KEY_STORAGE_HANDLER,
+        IcebergTable.ICEBERG_STORAGE_HANDLER);
+    putGeneratedProperty(TableProperties.ENGINE_HIVE_ENABLED, "true");
+    addMergeOnReadPropertiesIfNeeded();
+
+    String fileformat = getTblProperties().get(IcebergTable.ICEBERG_FILE_FORMAT);
+    TIcebergFileFormat icebergFileFormat = IcebergUtil.getIcebergFileFormat(fileformat);
+    if (fileformat != null && icebergFileFormat == null) {
+      throw new AnalysisException("Invalid fileformat for Iceberg table: " + fileformat);
+    }
+    if (fileformat == null || fileformat.isEmpty()) {
+      putGeneratedProperty(IcebergTable.ICEBERG_FILE_FORMAT, "parquet");
+    }
+
+    validateIcebergParquetCompressionCodec(icebergFileFormat);
+    validateIcebergParquetRowGroupSize(icebergFileFormat);
+    validateIcebergParquetPageSize(icebergFileFormat,
+        IcebergTable.PARQUET_PLAIN_PAGE_SIZE, "page size");
+    validateIcebergParquetPageSize(icebergFileFormat,
+        IcebergTable.PARQUET_DICT_PAGE_SIZE, "dictionary page size");
+
+    // Determine the Iceberg catalog being used. The default catalog is HiveCatalog.
+    String catalogStr = getTblProperties().get(IcebergTable.ICEBERG_CATALOG);
+    TIcebergCatalog catalog;
+    if (catalogStr == null || catalogStr.isEmpty()) {
+      catalog = TIcebergCatalog.HIVE_CATALOG;
+    } else {
+      catalog = IcebergUtil.getTIcebergCatalog(catalogStr);
+    }
+    validateIcebergTableProperties(catalog);
+  }
+
+  /**
+   * When creating an Iceberg table that supports row-level modifications
+   * (format-version >= 2) we set write modes to "merge-on-read" which is the write
+   * mode Impala will eventually support (IMPALA-11664).
+   */
+  private void addMergeOnReadPropertiesIfNeeded() {
+    Map<String, String> tblProps = getTblProperties();
+    String formatVersion = tblProps.get(TableProperties.FORMAT_VERSION);
+    if (formatVersion == null ||
+        Integer.valueOf(formatVersion) < IcebergTable.ICEBERG_FORMAT_V2) {
+      return;
+    }
+
+    // Only add "merge-on-read" if none of the write modes are specified.
+    final String MERGE_ON_READ = IcebergTable.MERGE_ON_READ;
+    if (!IcebergUtil.isAnyWriteModeSet(tblProps)) {
+      putGeneratedProperty(TableProperties.DELETE_MODE, MERGE_ON_READ);
+      putGeneratedProperty(TableProperties.UPDATE_MODE, MERGE_ON_READ);
+      putGeneratedProperty(TableProperties.MERGE_MODE, MERGE_ON_READ);
+    }
+  }
+
+  private void validateIcebergParquetCompressionCodec(
+      TIcebergFileFormat icebergFileFormat) throws AnalysisException {
+    if (icebergFileFormat != TIcebergFileFormat.PARQUET) {
+      if (getTblProperties().containsKey(IcebergTable.PARQUET_COMPRESSION_CODEC)) {
+          throw new AnalysisException(IcebergTable.PARQUET_COMPRESSION_CODEC +
+              " should be set only for parquet file format");
+      }
+      if (getTblProperties().containsKey(IcebergTable.PARQUET_COMPRESSION_LEVEL)) {
+          throw new AnalysisException(IcebergTable.PARQUET_COMPRESSION_LEVEL +
+              " should be set only for parquet file format");
+      }
+    } else {
+      StringBuilder errMsg = new StringBuilder();
+      if (IcebergUtil.parseParquetCompressionCodec(true, getTblProperties(), errMsg)
+          == null) {
+        throw new AnalysisException(errMsg.toString());
+      }
+    }
+  }
+
+  private void validateIcebergParquetRowGroupSize(TIcebergFileFormat icebergFileFormat)
+      throws AnalysisException {
+    if (getTblProperties().containsKey(IcebergTable.PARQUET_ROW_GROUP_SIZE)) {
+      if (icebergFileFormat != TIcebergFileFormat.PARQUET) {
+        throw new AnalysisException(IcebergTable.PARQUET_ROW_GROUP_SIZE +
+            " should be set only for parquet file format");
+      }
+    }
+
+    StringBuilder errMsg = new StringBuilder();
+    if (IcebergUtil.parseParquetRowGroupSize(getTblProperties(), errMsg) == null) {
+      throw new AnalysisException(errMsg.toString());
+    }
+  }
+
+  private void validateIcebergParquetPageSize(TIcebergFileFormat icebergFileFormat,
+      String pageSizeTblProp, String descr) throws AnalysisException {
+    if (getTblProperties().containsKey(pageSizeTblProp)) {
+      if (icebergFileFormat != TIcebergFileFormat.PARQUET) {
+        throw new AnalysisException(pageSizeTblProp +
+            " should be set only for parquet file format");
+      }
+    }
+
+    StringBuilder errMsg = new StringBuilder();
+    if (IcebergUtil.parseParquetPageSize(getTblProperties(), pageSizeTblProp, descr,
+        errMsg) == null) {
+      throw new AnalysisException(errMsg.toString());
+    }
+  }
+
+  private void validateIcebergTableProperties(TIcebergCatalog catalog)
+      throws AnalysisException {
+    // Metadata location is only used by HiveCatalog, but we shouldn't allow setting this
+    // for any catalogs to avoid confusion.
+    if (getTblProperties().get(IcebergTable.METADATA_LOCATION) != null) {
+      throw new AnalysisException(String.format("%s cannot be set for Iceberg tables",
+          IcebergTable.METADATA_LOCATION));
+    }
+    switch(catalog) {
+      case HIVE_CATALOG: validateTableInHiveCatalog();
+      break;
+      case HADOOP_CATALOG: validateTableInHadoopCatalog();
+      break;
+      case HADOOP_TABLES: validateTableInHadoopTables();
+      break;
+      case CATALOGS: validateTableInCatalogs();
+      break;
+      default: throw new AnalysisException(String.format(
+          "Unknown Iceberg catalog type: %s", catalog));
+    }
+    // HMS will override 'external.table.purge' to 'TRUE' When 'iceberg.catalog' is not
+    // the Hive Catalog for managed tables.
+    if (!isExternal() && !IcebergUtil.isHiveCatalog(getTblProperties())
+        && "false".equalsIgnoreCase(getTblProperties().get(
+            Table.TBL_PROP_EXTERNAL_TABLE_PURGE))) {
+      analyzer_.addWarning("The table property 'external.table.purge' will be set "
+          + "to 'TRUE' on newly created managed Iceberg tables.");
+    }
+  }
+
+  private void validateTableInHiveCatalog() throws AnalysisException {
+    if (getTblProperties().get(IcebergTable.ICEBERG_CATALOG_LOCATION) != null) {
+      throw new AnalysisException(String.format("%s cannot be set for Iceberg table " +
+          "stored in hive.catalog", IcebergTable.ICEBERG_CATALOG_LOCATION));
+    }
+    if (isExternalWithNoPurge()) {
+      String tableId = getTblProperties().get(IcebergTable.ICEBERG_TABLE_IDENTIFIER);
+      if (tableId == null || tableId.isEmpty()) {
+        tableId = getTblProperties().get(Catalogs.NAME);
+      }
+      if (tableId == null || tableId.isEmpty()) {
+        throw new AnalysisException(String.format("Table property '%s' is necessary " +
+            "for external Iceberg tables stored in hive.catalog. " +
+            "For creating a completely new Iceberg table, use 'CREATE TABLE' " +
+            "(no EXTERNAL keyword).",
+            IcebergTable.ICEBERG_TABLE_IDENTIFIER));
+      }
+    }
+  }
+
+  private void validateTableInHadoopCatalog() throws AnalysisException {
+    // Table location cannot be set in SQL when using 'hadoop.catalog'
+    if (getLocation() != null) {
+      throw new AnalysisException(String.format("Location cannot be set for Iceberg " +
+          "table with 'hadoop.catalog'."));
+    }
+    String catalogLoc = getTblProperties().get(IcebergTable.ICEBERG_CATALOG_LOCATION);
+    if (catalogLoc == null || catalogLoc.isEmpty()) {
+      throw new AnalysisException(String.format("Table property '%s' is necessary " +
+          "for Iceberg table with 'hadoop.catalog'.",
+          IcebergTable.ICEBERG_CATALOG_LOCATION));
+    }
+  }
+
+  private void validateTableInHadoopTables() throws AnalysisException {
+    if (getTblProperties().get(IcebergTable.ICEBERG_CATALOG_LOCATION) != null) {
+      throw new AnalysisException(String.format("%s cannot be set for Iceberg table " +
+          "stored in hadoop.tables", IcebergTable.ICEBERG_CATALOG_LOCATION));
+    }
+    if (isExternalWithNoPurge() && getLocation() == null) {
+      throw new AnalysisException("Set LOCATION for external Iceberg tables " +
+          "stored in hadoop.tables. For creating a completely new Iceberg table, use " +
+          "'CREATE TABLE' (no EXTERNAL keyword).");
+    }
+  }
+
+  private void validateTableInCatalogs() {
+    String tableId = getTblProperties().get(IcebergTable.ICEBERG_TABLE_IDENTIFIER);
+    if (tableId != null && !tableId.isEmpty()) {
+      putGeneratedProperty(Catalogs.NAME, tableId);
+    }
+  }
+
+  /**
+   * For iceberg table, partition column must be from source column
+   */
+  private void checkPartitionColumns(Analyzer analyzer) throws AnalysisException {
+    // This check is unnecessary for iceberg table without partition spec
+    List<IcebergPartitionSpec> specs = tableDef_.getIcebergPartitionSpecs();
+    if (specs == null || specs.isEmpty()) return;
+
+    // Iceberg table only has one partition spec now
+    IcebergPartitionSpec spec = specs.get(0);
+    // Analyzes the partition spec and the underlying partition fields.
+    spec.analyze(analyzer);
+
+    List<IcebergPartitionField> fields = spec.getIcebergPartitionFields();
+    Preconditions.checkState(fields != null && !fields.isEmpty());
+    for (IcebergPartitionField field : fields) {
+      String fieldName = field.getFieldName();
+      boolean containFlag = false;
+      for (ColumnDef columnDef : tableDef_.getColumnDefs()) {
+        if (columnDef.getColName().equalsIgnoreCase(fieldName)) {
+          containFlag = true;
+          break;
+        }
+      }
+      if (!containFlag) {
+        throw new AnalysisException("Cannot find source column: " + fieldName);
+      }
+    }
+  }
+
+  /**
+   * Set column's nullable as true for default situation, so we can create optional
+   * Iceberg field
+   */
+  private void analyzeIcebergColumns() {
+    if (!getPartitionColumnDefs().isEmpty()) {
+      createIcebergPartitionSpecFromPartitionColumns();
+    }
+    for (ColumnDef def : getColumnDefs()) {
+      if (!def.isNullabilitySet()) {
+        def.setNullable(true);
+      }
+    }
+  }
+
+  /**
+   * Creates Iceberg partition spec from partition columns. Needed to support old-style
+   * CREATE TABLE .. PARTITIONED BY (<cols>) syntax. In this case the column list in
+   * 'cols' is appended to the table-level columns, but also Iceberg-level IDENTITY
+   * partitions are created from this list.
+   */
+  private void createIcebergPartitionSpecFromPartitionColumns() {
+    Preconditions.checkState(!getPartitionColumnDefs().isEmpty());
+    Preconditions.checkState(getIcebergPartitionSpecs().isEmpty());
+    List<IcebergPartitionField> partFields = new ArrayList<>();
+    for (ColumnDef colDef : getPartitionColumnDefs()) {
+      partFields.add(new IcebergPartitionField(colDef.getColName(),
+          new IcebergPartitionTransform(TIcebergPartitionTransformType.IDENTITY)));
+    }
+    getIcebergPartitionSpecs().add(new IcebergPartitionSpec(partFields));
+    getColumnDefs().addAll(getPartitionColumnDefs());
+    getPartitionColumnDefs().clear();
+  }
+
+  /**
+   * @return true for external tables that don't have "external.table.purge" set to true.
+   */
+  private boolean isExternalWithNoPurge() {
+    return isExternal() && !Boolean.parseBoolean(getTblProperties().get(
+      Table.TBL_PROP_EXTERNAL_TABLE_PURGE));
   }
 }

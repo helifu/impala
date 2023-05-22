@@ -38,6 +38,7 @@ class PlanNode;
 class CodegenAnyVal;
 class DescriptorTbl;
 class ExecNode;
+class FragmentState;
 class LlvmBuilder;
 class LlvmCodeGen;
 class MemPool;
@@ -58,11 +59,20 @@ class TupleRow;
 /// structure. It serves as an input for creating instances of the Aggregator class.
 class AggregatorConfig {
  public:
+  /// 'agg_idx' is the index of 'TAggregator' in the parent TAggregationNode.
   AggregatorConfig(
-      const TAggregator& taggregator, RuntimeState* state, PlanNode* pnode);
+      const TAggregator& taggregator, FragmentState* state, PlanNode* pnode, int agg_idx);
   virtual Status Init(
-      const TAggregator& taggregator, RuntimeState* state, PlanNode* pnode);
+      const TAggregator& taggregator, FragmentState* state, PlanNode* pnode);
+  /// Closes the expressions created in Init();
+  virtual void Close();
+  virtual void Codegen(FragmentState* state) = 0;
   virtual ~AggregatorConfig() {}
+
+  /// The index of this Aggregator within the AggregationNode which is also equivalent to
+  /// its corresponding TAggregator in the parent TAggregationNode. When returning output,
+  /// this Aggregator should only write tuples at 'agg_idx_' within the row.
+  const int agg_idx_;
 
   /// Tuple into which Update()/Merge()/Serialize() results are stored.
   TupleId intermediate_tuple_id_;
@@ -86,11 +96,34 @@ class AggregatorConfig {
 
   std::vector<ScalarExpr*> conjuncts_;
 
-  /// Exprs used to evaluate input rows
-  std::vector<ScalarExpr*> grouping_exprs_;
-
   /// The list of all aggregate operations for this aggregator.
   std::vector<AggFn*> aggregate_functions_;
+
+  /// A message that will eventually be added to the aggregator's (spawned using this
+  /// config) runtime profile to convey codegen related information. Populated in
+  /// Codegen().
+  std::string codegen_status_msg_;
+
+  virtual int GetNumGroupingExprs() const = 0;
+
+ protected:
+  /// Codegen for updating aggregate expressions aggregate_functions_[agg_fn_idx]
+  /// and returns the IR function in 'fn'. Returns non-OK status if codegen
+  /// is unsuccessful.
+  Status CodegenUpdateSlot(LlvmCodeGen* codegen, int agg_fn_idx,
+      SlotDescriptor* slot_desc, llvm::Function** fn) WARN_UNUSED_RESULT;
+
+  /// Codegen a call to a function implementing the UDA interface with input values
+  /// from 'input_vals'. 'dst_val' should contain the previous value of the aggregate
+  /// function, and 'updated_dst_val' is set to the new value after the Update or Merge
+  /// operation is applied. The instruction sequence for the UDA call is inserted at
+  /// the insert position of 'builder'.
+  Status CodegenCallUda(LlvmCodeGen* codegen, LlvmBuilder* builder, AggFn* agg_fn,
+      llvm::Value* agg_fn_ctx_arg, const std::vector<CodegenAnyVal>& input_vals,
+      const CodegenAnyVal& dst_val, CodegenAnyVal* updated_dst_val) WARN_UNUSED_RESULT;
+
+  /// Codegen Aggregator::UpdateTuple(). Returns non-OK status if codegen is unsuccessful.
+  Status CodegenUpdateTuple(LlvmCodeGen* codegen, llvm::Function** fn) WARN_UNUSED_RESULT;
 };
 
 /// Base class for aggregating rows. Used in the AggregationNode and
@@ -100,15 +133,13 @@ class AggregatorConfig {
 /// be called and the results can be fetched with GetNext().
 class Aggregator {
  public:
-  /// 'agg_idx' is the index of 'taggregator' in the parent TAggregationNode.
   Aggregator(ExecNode* exec_node, ObjectPool* pool, const AggregatorConfig& config,
-      const std::string& name, int agg_idx);
+      const std::string& name);
   virtual ~Aggregator();
 
   /// Aggregators follow the same lifecycle as ExecNodes, except that after Open() and
   /// before GetNext() rows should be added with AddBatch(), followed by InputDone()[
   virtual Status Prepare(RuntimeState* state) WARN_UNUSED_RESULT;
-  virtual void Codegen(RuntimeState* state) = 0;
   virtual Status Open(RuntimeState* state) WARN_UNUSED_RESULT;
   virtual Status GetNext(
       RuntimeState* state, RowBatch* row_batch, bool* eos) WARN_UNUSED_RESULT = 0;
@@ -141,10 +172,16 @@ class Aggregator {
 
   static const char* LLVM_CLASS_NAME;
 
+  // The number of unique values that have been aggregated
+  virtual int64_t GetNumKeys() const = 0;
+
  protected:
   /// The id of the ExecNode this Aggregator corresponds to.
   const int id_;
   ExecNode* exec_node_;
+
+  /// Reference to the config object used to generate this instance.
+  const AggregatorConfig& config_;
 
   /// The index of this Aggregator within the AggregationNode. When returning output, this
   /// Aggregator should only write tuples at 'agg_idx_' within the row.
@@ -190,7 +227,7 @@ class Aggregator {
   const bool needs_finalize_;
 
   /// The list of all aggregate operations for this aggregator.
-  std::vector<AggFn*> agg_fns_;
+  const std::vector<AggFn*>& agg_fns_;
 
   /// Evaluators for each aggregate function. If this is a grouping aggregation, these
   /// evaluators are only used to create cloned per-partition evaluators. The cloned
@@ -204,7 +241,7 @@ class Aggregator {
   /// Conjuncts and their evaluators in this aggregator. 'conjuncts_' live in the
   /// query-state's object pool while the evaluators live in this aggregator's
   /// object pool.
-  std::vector<ScalarExpr*> conjuncts_;
+  const std::vector<ScalarExpr*>& conjuncts_;
   std::vector<ScalarExprEvaluator*> conjunct_evals_;
 
   /// Runtime profile for this aggregator. Owned by 'pool_'.
@@ -229,7 +266,8 @@ class Aggregator {
   /// is_merge() == true.
   /// This function is replaced by codegen (which is why we don't use a vector argument
   /// for agg_fn_evals).. Any var-len data is allocated from the FunctionContexts.
-  /// TODO: Fix the arguments order. Need to update CodegenUpdateTuple() too.
+  /// TODO: Fix the arguments order. Need to update AggregatorConfig::CodegenUpdateTuple()
+  /// too.
   void UpdateTuple(AggFnEvaluator** agg_fn_evals, Tuple* tuple, TupleRow* row,
       bool is_merge = false) noexcept;
 
@@ -250,24 +288,6 @@ class Aggregator {
   /// should not be called outside the main execution thread.
   /// TODO: IMPALA-2399: replace QueryMaintenance() - see JIRA for more details.
   Status QueryMaintenance(RuntimeState* state) WARN_UNUSED_RESULT;
-
-  /// Codegen for updating aggregate expressions agg_fns_[agg_fn_idx]
-  /// and returns the IR function in 'fn'. Returns non-OK status if codegen
-  /// is unsuccessful.
-  Status CodegenUpdateSlot(LlvmCodeGen* codegen, int agg_fn_idx,
-      SlotDescriptor* slot_desc, llvm::Function** fn) WARN_UNUSED_RESULT;
-
-  /// Codegen a call to a function implementing the UDA interface with input values
-  /// from 'input_vals'. 'dst_val' should contain the previous value of the aggregate
-  /// function, and 'updated_dst_val' is set to the new value after the Update or Merge
-  /// operation is applied. The instruction sequence for the UDA call is inserted at
-  /// the insert position of 'builder'.
-  Status CodegenCallUda(LlvmCodeGen* codegen, LlvmBuilder* builder, AggFn* agg_fn,
-      llvm::Value* agg_fn_ctx_arg, const std::vector<CodegenAnyVal>& input_vals,
-      const CodegenAnyVal& dst_val, CodegenAnyVal* updated_dst_val) WARN_UNUSED_RESULT;
-
-  /// Codegen UpdateTuple(). Returns non-OK status if codegen is unsuccessful.
-  Status CodegenUpdateTuple(LlvmCodeGen* codegen, llvm::Function** fn) WARN_UNUSED_RESULT;
 };
 } // namespace impala
 

@@ -145,6 +145,35 @@ public class AggregateFunction extends Function {
     return fn;
   }
 
+  public static AggregateFunction createUnsupportedBuiltin(Db db, String name,
+      List<Type> argTypes, Type retType, Type intermediateType) {
+    AggregateFunction fn = new AggregateFunction(new FunctionName(db.getName(), name),
+        argTypes, retType, intermediateType, null, null, null, null, null, null, null,
+        null);
+    fn.setBinaryType(TFunctionBinaryType.BUILTIN);
+    fn.isAggregateFn_ = true;
+    fn.setUnsupported();
+    return fn;
+  }
+
+  /**
+   * Create a builtin with no concrete implementation that will be rewritten during
+   * analysis, e.g. grouping() and grouping_id().
+   */
+  public static AggregateFunction createRewrittenBuiltin(Db db, String name,
+      List<Type> argTypes, Type retType, boolean ignoresDistinct,
+      boolean isAnalyticFn, boolean returnsNonNullOnEmpty) {
+    AggregateFunction fn = new AggregateFunction(new FunctionName(db.getName(), name),
+        argTypes, retType, false);
+    fn.setBinaryType(TFunctionBinaryType.BUILTIN);
+    fn.ignoresDistinct_ = ignoresDistinct;
+    fn.isAnalyticFn_ = isAnalyticFn;
+    fn.isAggregateFn_ = true;
+    fn.returnsNonNullOnEmpty_ = returnsNonNullOnEmpty;
+    fn.setIsPersistent(true);
+    return fn;
+  }
+
   public static AggregateFunction createAnalyticBuiltin(Db db, String name,
       List<Type> argTypes, Type retType, Type intermediateType) {
     return createAnalyticBuiltin(db, name, argTypes, retType, intermediateType, null,
@@ -182,6 +211,8 @@ public class AggregateFunction extends Function {
   public String getSerializeFnSymbol() { return serializeFnSymbol_; }
   public String getMergeFnSymbol() { return mergeFnSymbol_; }
   public String getFinalizeFnSymbol() { return finalizeFnSymbol_; }
+  public String getRemoveFnSymbol() { return removeFnSymbol_; }
+  public String getValueFnSymbol() { return getValueFnSymbol_; }
   public boolean ignoresDistinct() { return ignoresDistinct_; }
   public boolean isAnalyticFn() { return isAnalyticFn_; }
   public boolean isAggregateFn() { return isAggregateFn_; }

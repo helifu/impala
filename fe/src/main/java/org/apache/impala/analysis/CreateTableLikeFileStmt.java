@@ -26,6 +26,7 @@ import org.apache.impala.catalog.HdfsCompression;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.THdfsFileFormat;
 
 
@@ -53,10 +54,11 @@ public class CreateTableLikeFileStmt extends CreateTableStmt {
         schemaLocation_.toString());
     String s = ToSqlUtils.getCreateTableSql(getDb(),
         getTbl() + " __LIKE_FILEFORMAT__ ",  getComment(), colsSql, partitionColsSql,
-        null, null, null, new Pair<>(getSortColumns(), getSortingOrder()),
+        /* isPrimaryKeyUnique */true, /* primaryKeysSql */null, /* foreignKeysSql */null,
+        /* kuduPartitionByParams */null, new Pair<>(getSortColumns(), getSortingOrder()),
         getTblProperties(), getSerdeProperties(), isExternal(), getIfNotExists(),
         getRowFormat(), HdfsFileFormat.fromThrift(getFileFormat()), compression, null,
-        getLocation());
+        getLocation(), null, null);
     s = s.replace("__LIKE_FILEFORMAT__", String.format("LIKE %s '%s'",
         schemaFileFormat_, schemaLocation_.toString()));
     return s;
@@ -71,11 +73,18 @@ public class CreateTableLikeFileStmt extends CreateTableStmt {
     schemaLocation_.analyze(analyzer, Privilege.ALL, FsAction.READ);
     switch (schemaFileFormat_) {
       case PARQUET:
-        getColumnDefs().addAll(ParquetHelper.extractParquetSchema(schemaLocation_));
+        getColumnDefs().addAll(ParquetSchemaExtractor.extract(schemaLocation_));
+        break;
+      case ORC:
+        if (MetastoreShim.getMajorVersion() < 3) {
+          throw new AnalysisException("Creating table like ORC file is unsupported for " +
+              "Hive with version < 3");
+        }
+        getColumnDefs().addAll(OrcSchemaExtractor.extract(schemaLocation_));
         break;
       default:
-        throw new AnalysisException("Unsupported file type for schema inference: "
-            + schemaFileFormat_);
+        throw new AnalysisException("Unsupported file type for schema inference: " +
+            schemaFileFormat_);
     }
     super.analyze(analyzer);
   }

@@ -34,12 +34,12 @@
 #include "exec/empty-set-node.h"
 #include "exec/exchange-node.h"
 #include "exec/exec-node-util.h"
-#include "exec/hbase-scan-node.h"
+#include "exec/hbase/hbase-scan-node.h"
 #include "exec/hdfs-scan-node-mt.h"
 #include "exec/hdfs-scan-node.h"
-#include "exec/kudu-scan-node-mt.h"
-#include "exec/kudu-scan-node.h"
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-scan-node-mt.h"
+#include "exec/kudu/kudu-scan-node.h"
+#include "exec/kudu/kudu-util.h"
 #include "exec/nested-loop-join-node.h"
 #include "exec/partial-sort-node.h"
 #include "exec/partitioned-hash-join-node.h"
@@ -57,21 +57,23 @@
 #include "gutil/strings/substitute.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec-env.h"
+#include "runtime/fragment-state.h"
 #include "runtime/initial-reservations.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
-#include "runtime/query-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "util/debug-util.h"
 #include "util/runtime-profile-counters.h"
+#include "util/string-parser.h"
+#include "util/uid-util.h"
 
 #include "common/names.h"
 
 using strings::Substitute;
 
 namespace impala {
-Status PlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+Status PlanNode::Init(const TPlanNode& tnode, FragmentState* state) {
   tnode_ = &tnode;
   row_descriptor_ = state->obj_pool()->Add(
       new RowDescriptor(state->desc_tbl(), tnode_->row_tuples, tnode_->nullable_tuples));
@@ -81,17 +83,37 @@ Status PlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
     RETURN_IF_ERROR(
         ScalarExpr::Create(tnode_->conjuncts, *row_descriptor_, state, &conjuncts_));
   }
+
+  if (state->query_options().compute_processing_cost) {
+    DCHECK_GT(state->fragment().effective_instance_count, 0);
+    is_mt_fragment_ = true;
+    num_instances_per_node_ = state->fragment().effective_instance_count;
+  } else if (state->query_options().mt_dop > 0) {
+    is_mt_fragment_ = true;
+    num_instances_per_node_ = state->query_options().mt_dop;
+  } else {
+    is_mt_fragment_ = false;
+    num_instances_per_node_ = 1;
+  }
   return Status::OK();
 }
 
-Status PlanNode::CreateTree(
-      RuntimeState* state, const TPlan& plan, PlanNode** root) {
+void PlanNode::Close() {
+  ScalarExpr::Close(conjuncts_);
+  ScalarExpr::Close(runtime_filter_exprs_);
+  for (auto& child : children_) {
+    child->Close();
+  }
+}
+
+Status PlanNode::CreateTree(FragmentState* state, const TPlan& plan, PlanNode** root) {
   if (plan.nodes.size() == 0) {
     *root = NULL;
     return Status::OK();
   }
   int node_idx = 0;
-  Status status = CreateTreeHelper(state, plan.nodes, NULL, &node_idx, root);
+  Status status =
+      CreateTreeHelper(state, plan.nodes, NULL, &node_idx, root);
   if (status.ok() && node_idx + 1 != plan.nodes.size()) {
     status = Status(
         "Plan tree only partially reconstructed. Not all thrift nodes were used.");
@@ -103,9 +125,9 @@ Status PlanNode::CreateTree(
   return status;
 }
 
-Status PlanNode::CreateTreeHelper(RuntimeState* state,
-      const std::vector<TPlanNode>& tnodes, PlanNode* parent, int* node_idx,
-      PlanNode** root) {
+Status PlanNode::CreateTreeHelper(FragmentState* state,
+    const std::vector<TPlanNode>& tnodes, PlanNode* parent, int* node_idx,
+    PlanNode** root) {
   // propagate error case
   if (*node_idx >= tnodes.size()) {
     return Status("Failed to reconstruct plan tree from thrift.");
@@ -114,7 +136,7 @@ Status PlanNode::CreateTreeHelper(RuntimeState* state,
 
   int num_children = tnode.num_children;
   PlanNode* node = NULL;
-  RETURN_IF_ERROR(CreatePlanNode(state->obj_pool(), tnode, &node, state));
+  RETURN_IF_ERROR(CreatePlanNode(state->obj_pool(), tnode, &node));
   if (parent != NULL) {
     parent->children_.push_back(node);
   } else {
@@ -122,7 +144,8 @@ Status PlanNode::CreateTreeHelper(RuntimeState* state,
   }
   for (int i = 0; i < num_children; ++i) {
     ++*node_idx;
-    RETURN_IF_ERROR(CreateTreeHelper(state, tnodes, node, node_idx, NULL));
+    RETURN_IF_ERROR(
+        CreateTreeHelper(state, tnodes, node, node_idx, nullptr));
     // we are expecting a child, but have used all nodes
     // this means we have been given a bad tree and must fail
     if (*node_idx >= tnodes.size()) {
@@ -135,8 +158,14 @@ Status PlanNode::CreateTreeHelper(RuntimeState* state,
   return Status::OK();
 }
 
-Status PlanNode::CreatePlanNode(ObjectPool* pool, const TPlanNode& tnode, PlanNode** node,
-      RuntimeState* state) {
+void PlanNode::AddCodegenStatus(
+    const Status& codegen_status, const std::string& extra_label) {
+  codegen_status_msgs_.emplace_back(FragmentState::GenerateCodegenMsg(
+      codegen_status.ok(), codegen_status, extra_label));
+}
+
+Status PlanNode::CreatePlanNode(
+    ObjectPool* pool, const TPlanNode& tnode, PlanNode** node) {
   switch (tnode.node_type) {
     case TPlanNodeType::HDFS_SCAN_NODE:
       *node = pool->Add(new HdfsScanPlanNode());
@@ -167,7 +196,8 @@ Status PlanNode::CreatePlanNode(ObjectPool* pool, const TPlanNode& tnode, PlanNo
     case TPlanNodeType::SORT_NODE:
       if (tnode.sort_node.type == TSortType::PARTIAL) {
         *node = pool->Add(new PartialSortPlanNode());
-      } else if (tnode.sort_node.type == TSortType::TOPN) {
+      } else if (tnode.sort_node.type == TSortType::TOPN ||
+          tnode.sort_node.type == TSortType::PARTITIONED_TOPN) {
         *node = pool->Add(new TopNPlanNode());
       } else {
         DCHECK(tnode.sort_node.type == TSortType::TOTAL);
@@ -206,6 +236,14 @@ Status PlanNode::CreatePlanNode(ObjectPool* pool, const TPlanNode& tnode, PlanNo
   return Status::OK();
 }
 
+void PlanNode::Codegen(FragmentState* state) {
+  DCHECK(state->ShouldCodegen());
+  DCHECK(state->codegen() != nullptr);
+  for (PlanNode* child : children_) {
+    child->Codegen(state);
+  }
+}
+
 const string ExecNode::ROW_THROUGHPUT_COUNTER = "RowsReturnedRate";
 
 ExecNode::ExecNode(ObjectPool* pool, const PlanNode& pnode, const DescriptorTbl& descs)
@@ -218,11 +256,10 @@ ExecNode::ExecNode(ObjectPool* pool, const PlanNode& pnode, const DescriptorTbl&
     resource_profile_(pnode.tnode_->resource_profile),
     limit_(pnode.tnode_->limit),
     runtime_profile_(RuntimeProfile::Create(
-        pool_, Substitute("$0 (id=$1)", PrintThriftEnum(type_), id_))),
+        pool_, Substitute("$0 (id=$1)", PrintValue(type_), id_))),
     rows_returned_counter_(nullptr),
     rows_returned_rate_(nullptr),
     containing_subplan_(nullptr),
-    disable_codegen_(pnode.tnode_->disable_codegen),
     num_rows_returned_(0),
     is_closed_(false) {
   runtime_profile_->SetPlanNodeId(id_);
@@ -252,7 +289,7 @@ Status ExecNode::Prepare(RuntimeState* state) {
     RETURN_IF_ERROR(children_[i]->Prepare(state));
   }
   reservation_manager_.Init(
-      Substitute("$0 id=$1 ptr=$2", PrintThriftEnum(type_), id_, this), runtime_profile_,
+      Substitute("$0 id=$1 ptr=$2", PrintValue(type_), id_, this), runtime_profile_,
       state->instance_buffer_reservation(), mem_tracker_.get(), resource_profile_,
       debug_options_);
   if (!IsInSubplan()) {
@@ -260,14 +297,6 @@ Status ExecNode::Prepare(RuntimeState* state) {
     events_->Start(state->query_state()->fragment_events_start_time());
   }
   return Status::OK();
-}
-
-void ExecNode::Codegen(RuntimeState* state) {
-  DCHECK(state->ShouldCodegen());
-  DCHECK(state->codegen() != NULL);
-  for (int i = 0; i < children_.size(); ++i) {
-    children_[i]->Codegen(state);
-  }
 }
 
 Status ExecNode::Open(RuntimeState* state) {
@@ -296,7 +325,6 @@ void ExecNode::Close(RuntimeState* state) {
   }
 
   ScalarExprEvaluator::Close(conjunct_evals_, state);
-  ScalarExpr::Close(conjuncts_);
   if (expr_perm_pool() != nullptr) expr_perm_pool_->FreeAll();
   if (expr_results_pool() != nullptr) expr_results_pool_->FreeAll();
   reservation_manager_.Close(state);
@@ -311,6 +339,11 @@ void ExecNode::Close(RuntimeState* state) {
     }
     mem_tracker_->Close();
   }
+
+  for (const string& codegen_msg : plan_node_.codegen_status_msgs_) {
+    runtime_profile_->AppendExecOption(codegen_msg);
+  }
+
   if (events_ != nullptr) events_->MarkEvent("Closed");
 }
 
@@ -412,8 +445,19 @@ Status ExecNode::ExecDebugActionImpl(TExecNodePhase::type phase, RuntimeState* s
     }
   } else {
     DCHECK_EQ(debug_options_.action, TDebugAction::DELAY);
-    VLOG(1) << "DEBUG_ACTION: Sleeping";
-    SleepForMs(100);
+    int64_t sleep_duration_ms = 100;
+    if (!debug_options_.action_param.empty()) {
+      const string& param = debug_options_.action_param;
+      StringParser::ParseResult result;
+      sleep_duration_ms =
+          StringParser::StringToInt<int64_t>(param.c_str(), param.length(), &result);
+      if (result != StringParser::PARSE_SUCCESS || sleep_duration_ms < 0) {
+        return Status(Substitute("Invalid sleep duration: '$0'. "
+              "Only non-negative numbers are allowed.", param));
+      }
+    }
+    VLOG(1) << "DEBUG_ACTION: Sleeping for " << sleep_duration_ms << "ms";
+    SleepForMs(sleep_duration_ms);
   }
   return Status::OK();
 }
@@ -449,21 +493,9 @@ bool ExecNode::CheckLimitAndTruncateRowBatchIfNeededShared(
   return reached_limit;
 }
 
-bool ExecNode::EvalConjuncts(
-    ScalarExprEvaluator* const* evals, int num_conjuncts, TupleRow* row) {
-  for (int i = 0; i < num_conjuncts; ++i) {
-    if (!EvalPredicate(evals[i], row)) return false;
-  }
-  return true;
-}
-
 Status ExecNode::QueryMaintenance(RuntimeState* state) {
   expr_results_pool_->Clear();
   return state->CheckQueryState();
-}
-
-bool ExecNode::IsNodeCodegenDisabled() const {
-  return disable_codegen_;
 }
 
 // Codegen for EvalConjuncts.  The generated signature is the same as EvalConjuncts().

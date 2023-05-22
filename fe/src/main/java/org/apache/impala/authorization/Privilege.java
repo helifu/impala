@@ -35,6 +35,7 @@ public enum Privilege {
   DROP,
   CREATE,
   ALL,
+  RWSTORAGE,
   OWNER,
   // Privileges required to view metadata on a server object.
   VIEW_METADATA(true),
@@ -51,6 +52,7 @@ public enum Privilege {
     INSERT.implied_ = EnumSet.of(INSERT);
     SELECT.implied_ = EnumSet.of(SELECT);
     REFRESH.implied_ = EnumSet.of(REFRESH);
+    RWSTORAGE.implied_ = EnumSet.of(RWSTORAGE);
     VIEW_METADATA.implied_ = EnumSet.of(INSERT, SELECT, REFRESH);
     ANY.implied_ = EnumSet.of(ALL, OWNER, ALTER, DROP, CREATE, INSERT, SELECT,
         REFRESH);
@@ -85,4 +87,12 @@ public enum Privilege {
    * Gets list of implied privileges for this privilege.
    */
   public EnumSet<Privilege> getImpliedPrivileges() { return implied_; }
+
+  /**
+   * Returns true if this implies modification on data or metadata.
+   */
+  public boolean impliesUpdate() {
+    return this == ALTER || this == DROP || this == CREATE || this == INSERT
+        || this == REFRESH || this == ALL;
+  }
 }

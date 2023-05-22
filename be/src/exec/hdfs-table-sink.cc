@@ -23,6 +23,7 @@
 #include "exprs/scalar-expr-evaluator.h"
 #include "exprs/scalar-expr.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
+#include "gutil/stringprintf.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
@@ -53,42 +54,60 @@ using namespace strings;
 
 namespace impala {
 
-HdfsTableSink::HdfsTableSink(TDataSinkId sink_id, const RowDescriptor* row_desc,
-    const TDataSink& tsink, RuntimeState* state)
-  : DataSink(sink_id, row_desc, "HdfsTableSink", state),
-    table_desc_(nullptr),
-    prototype_partition_(nullptr),
-    table_id_(tsink.table_sink.target_table_id),
-    skip_header_line_count_(
-        tsink.table_sink.hdfs_table_sink.__isset.skip_header_line_count ?
-            tsink.table_sink.hdfs_table_sink.skip_header_line_count :
-            0),
-    overwrite_(tsink.table_sink.hdfs_table_sink.overwrite),
-    input_is_clustered_(tsink.table_sink.hdfs_table_sink.input_is_clustered),
-    sort_columns_(tsink.table_sink.hdfs_table_sink.sort_columns),
-    current_clustered_partition_(nullptr) {
-  DCHECK(tsink.__isset.table_sink);
-  if (tsink.table_sink.hdfs_table_sink.__isset.write_id) {
-    write_id_ = tsink.table_sink.hdfs_table_sink.write_id;
-    DCHECK_GT(write_id_, 0);
-  }
+Status HdfsTableSinkConfig::Init(
+    const TDataSink& tsink, const RowDescriptor* input_row_desc, FragmentState* state) {
+  RETURN_IF_ERROR(DataSinkConfig::Init(tsink, input_row_desc, state));
+  DCHECK(tsink_->__isset.table_sink);
+  DCHECK(tsink_->table_sink.__isset.hdfs_table_sink);
+  RETURN_IF_ERROR(
+      ScalarExpr::Create(tsink_->table_sink.hdfs_table_sink.partition_key_exprs,
+          *input_row_desc_, state, &partition_key_exprs_));
+  return Status::OK();
 }
 
-OutputPartition::OutputPartition()
-  : hdfs_connection(nullptr),
-    tmp_hdfs_file(nullptr),
-    num_rows(0),
-    num_files(0),
-    partition_descriptor(nullptr),
-    block_size(0) {}
+DataSink* HdfsTableSinkConfig::CreateSink(RuntimeState* state) const {
+  TDataSinkId sink_id = state->fragment().idx;
+  return state->obj_pool()->Add(
+      new HdfsTableSink(sink_id, *this, this->tsink_->table_sink.hdfs_table_sink, state));
+}
 
-Status HdfsTableSink::Init(const vector<TExpr>& thrift_output_exprs,
-    const TDataSink& tsink, RuntimeState* state) {
-  RETURN_IF_ERROR(DataSink::Init(thrift_output_exprs, tsink, state));
-  DCHECK(tsink.__isset.table_sink);
-  RETURN_IF_ERROR(ScalarExpr::Create(tsink.table_sink.hdfs_table_sink.partition_key_exprs,
-      *row_desc_, state, &partition_key_exprs_));
-  return Status::OK();
+void HdfsTableSinkConfig::Close() {
+  ScalarExpr::Close(partition_key_exprs_);
+  DataSinkConfig::Close();
+}
+
+HdfsTableSink::HdfsTableSink(TDataSinkId sink_id, const HdfsTableSinkConfig& sink_config,
+    const THdfsTableSink& hdfs_sink, RuntimeState* state)
+  : DataSink(sink_id, sink_config, "HdfsTableSink", state),
+    table_desc_(nullptr),
+    prototype_partition_(nullptr),
+    table_id_(sink_config.tsink_->table_sink.target_table_id),
+    skip_header_line_count_(
+        hdfs_sink.__isset.skip_header_line_count ? hdfs_sink.skip_header_line_count : 0),
+    overwrite_(hdfs_sink.overwrite),
+    input_is_clustered_(hdfs_sink.input_is_clustered),
+    sort_columns_(hdfs_sink.sort_columns),
+    sorting_order_((TSortingOrder::type)hdfs_sink.sorting_order),
+    current_clustered_partition_(nullptr),
+    partition_key_exprs_(sink_config.partition_key_exprs_),
+    is_result_sink_(hdfs_sink.is_result_sink) {
+  if (hdfs_sink.__isset.write_id) {
+    write_id_ = hdfs_sink.write_id;
+    DCHECK_GT(write_id_, 0);
+  }
+
+  // Optional output path provided by an external FE
+  if (hdfs_sink.__isset.external_output_dir) {
+    external_output_dir_ = hdfs_sink.external_output_dir;
+  }
+
+  if (hdfs_sink.__isset.external_output_partition_depth) {
+    external_output_partition_depth_ = hdfs_sink.external_output_partition_depth;
+  }
+
+  if (hdfs_sink.__isset.parquet_bloom_filter_col_info) {
+    parquet_bloom_filter_columns_ = hdfs_sink.parquet_bloom_filter_col_info;
+  }
 }
 
 Status HdfsTableSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
@@ -120,10 +139,12 @@ Status HdfsTableSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracke
     }
   }
   // Sanity check.
-  DCHECK_LE(partition_key_expr_evals_.size(), table_desc_->num_cols())
-      << DebugString();
-  DCHECK_EQ(partition_key_expr_evals_.size(), table_desc_->num_clustering_cols())
-      << DebugString();
+  if (!IsIceberg()) {
+    DCHECK_LE(partition_key_expr_evals_.size(), table_desc_->num_cols())
+        << DebugString();
+    DCHECK_EQ(partition_key_expr_evals_.size(), table_desc_->num_clustering_cols())
+        << DebugString();
+  }
   DCHECK_GE(output_expr_evals_.size(),
       table_desc_->num_cols() - table_desc_->num_clustering_cols()) << DebugString();
 
@@ -138,14 +159,7 @@ Status HdfsTableSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracke
   return Status::OK();
 }
 
-Status HdfsTableSink::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(DataSink::Open(state));
-  DCHECK_EQ(partition_key_exprs_.size(), partition_key_expr_evals_.size());
-  RETURN_IF_ERROR(ScalarExprEvaluator::Open(partition_key_expr_evals_, state));
-
-  // Build a map from partition key values to partition descriptor for multiple output
-  // format support. The map is keyed on the concatenation of the non-constant keys of
-  // the PARTITION clause of the INSERT statement.
+void HdfsTableSink::BuildPartitionDescMap() {
   for (const HdfsTableDescriptor::PartitionIdToDescriptorMap::value_type& id_to_desc:
        table_desc_->partition_descriptors()) {
     // Build a map whose key is computed from the value of dynamic partition keys for a
@@ -203,13 +217,20 @@ Status HdfsTableSink::Open(RuntimeState* state) {
       partition_descriptor_map_[key] = partition;
     }
   }
+}
+
+Status HdfsTableSink::Open(RuntimeState* state) {
+  RETURN_IF_ERROR(DataSink::Open(state));
+  DCHECK_EQ(partition_key_exprs_.size(), partition_key_expr_evals_.size());
+  RETURN_IF_ERROR(ScalarExprEvaluator::Open(partition_key_expr_evals_, state));
+  if (!IsIceberg()) BuildPartitionDescMap();
   prototype_partition_ = CHECK_NOTNULL(table_desc_->prototype_partition_descriptor());
   return Status::OK();
 }
 
 void HdfsTableSink::BuildHdfsFileNames(
     const HdfsPartitionDescriptor& partition_descriptor,
-    OutputPartition* output_partition) {
+    OutputPartition* output_partition, const string &external_partition_name) {
 
   // Create final_hdfs_file_name_prefix and tmp_hdfs_file_name_prefix.
   // Path: <hdfs_base_dir>/<partition_values>/<unique_id_str>
@@ -232,12 +253,18 @@ void HdfsTableSink::BuildHdfsFileNames(
 
   output_partition->tmp_hdfs_dir_name =
       Substitute("$0/.$1_$2_dir/", staging_dir_, unique_id_str_, rand());
-  output_partition->tmp_hdfs_file_name_prefix = Substitute("$0$1$2",
+  output_partition->tmp_hdfs_file_name_prefix = Substitute("$0$1/$2",
       output_partition->tmp_hdfs_dir_name, output_partition->partition_name,
       query_suffix);
 
-  if (partition_descriptor.location().empty()) {
-    output_partition->final_hdfs_file_name_prefix = Substitute("$0/$1",
+  if (HasExternalOutputDir()) {
+    // When an external FE has provided a staging directory we use that directly.
+    // We are trusting that the external frontend implementation has done appropriate
+    // authorization checks on the external output directory.
+    output_partition->final_hdfs_file_name_prefix = Substitute("$0/$1/",
+        external_output_dir_, external_partition_name);
+  } else if (partition_descriptor.location().empty()) {
+    output_partition->final_hdfs_file_name_prefix = Substitute("$0/$1/",
         table_desc_->hdfs_base_dir(), output_partition->partition_name);
   } else {
     // If the partition descriptor has a location (as set by alter table add partition
@@ -246,9 +273,35 @@ void HdfsTableSink::BuildHdfsFileNames(
     output_partition->final_hdfs_file_name_prefix =
         Substitute("$0/", partition_descriptor.location());
   }
-  if (IsTransactional()) {
-    string acid_dir = Substitute(overwrite_ ? "/base_$0/" : "/delta_$0_$0/", write_id_);
-    output_partition->final_hdfs_file_name_prefix += acid_dir;
+  if (IsHiveAcid()) {
+    if (HasExternalOutputDir()) {
+      // The 0 padding on base and delta is to match the behavior of Hive since various
+      // systems will expect a certain format for dynamic partition creation. Additionally
+      // include an 0 statement id for delta directory so various Hive AcidUtils detect
+      // the directory (such as AcidUtils.baseOrDeltaSubdir()). Multiple statements in a
+      // single transaction is not supported.
+      if (overwrite_) {
+        output_partition->final_hdfs_file_name_prefix += StringPrintf("/base_%07ld/",
+            write_id_);
+      } else {
+        output_partition->final_hdfs_file_name_prefix += StringPrintf(
+            "/delta_%07ld_%07ld_0000/", write_id_, write_id_);
+      }
+    } else {
+      string acid_dir = Substitute(overwrite_ ? "/base_$0/" : "/delta_$0_$0/", write_id_);
+      output_partition->final_hdfs_file_name_prefix += acid_dir;
+    }
+  }
+  if (IsIceberg()) {
+    //TODO: implement LocationProviders.
+    if (output_partition->partition_name.empty()) {
+      output_partition->final_hdfs_file_name_prefix =
+          Substitute("$0/data/", table_desc_->IcebergTableLocation());
+    } else {
+      output_partition->final_hdfs_file_name_prefix =
+          Substitute("$0/data/$1/", table_desc_->IcebergTableLocation(),
+              output_partition->partition_name);
+    }
   }
   output_partition->final_hdfs_file_name_prefix += query_suffix;
 
@@ -264,8 +317,18 @@ Status HdfsTableSink::WriteRowsToPartition(
   bool new_file;
   while (true) {
     OutputPartition* output_partition = partition_pair->first.get();
-    RETURN_IF_ERROR(
-        output_partition->writer->AppendRows(batch, partition_pair->second, &new_file));
+    Status status =
+        output_partition->writer->AppendRows(batch, partition_pair->second, &new_file);
+    if (!status.ok()) {
+      // IMPALA-10607: Deletes partition file if staging is skipped when appending rows
+      // fails. Otherwise, it leaves the file in un-finalized state.
+      if (ShouldSkipStaging(state, output_partition)) {
+        status.MergeStatus(ClosePartitionFile(state, output_partition));
+        hdfsDelete(output_partition->hdfs_connection,
+            output_partition->current_file_name.c_str(), 0);
+      }
+      return status;
+    }
     if (!new_file) break;
     RETURN_IF_ERROR(FinalizePartitionFile(state, output_partition));
     RETURN_IF_ERROR(CreateNewTmpFile(state, output_partition));
@@ -352,10 +415,13 @@ Status HdfsTableSink::CreateNewTmpFile(RuntimeState* state,
   // location.
   if (ShouldSkipStaging(state, output_partition)) {
     output_partition->current_file_name = final_location;
+    output_partition->current_file_final_name = "";
   } else {
     output_partition->current_file_name = Substitute(file_name_pattern,
-      output_partition->tmp_hdfs_file_name_prefix, output_partition->num_files,
-      output_partition->writer->file_extension());
+        output_partition->tmp_hdfs_file_name_prefix, output_partition->num_files,
+        output_partition->writer->file_extension());
+    // Save the ultimate destination for this file (it will be moved by the coordinator).
+    output_partition->current_file_final_name = final_location;
   }
   // Check if tmp_hdfs_file_name exists.
   const char* tmp_hdfs_file_name_cstr =
@@ -390,13 +456,20 @@ Status HdfsTableSink::CreateNewTmpFile(RuntimeState* state,
         output_partition->current_file_name));
   }
 
-  if (IsS3APath(output_partition->current_file_name.c_str()) ||
-      IsABFSPath(output_partition->current_file_name.c_str()) ||
-      IsADLSPath(output_partition->current_file_name.c_str())) {
+  if (IsS3APath(tmp_hdfs_file_name_cstr) ||
+      IsABFSPath(tmp_hdfs_file_name_cstr) ||
+      IsADLSPath(tmp_hdfs_file_name_cstr) ||
+      IsOSSPath(tmp_hdfs_file_name_cstr) ||
+      IsGcsPath(tmp_hdfs_file_name_cstr) ||
+      IsCosPath(tmp_hdfs_file_name_cstr) ||
+      IsSFSPath(tmp_hdfs_file_name_cstr) ||
+      IsOzonePath(tmp_hdfs_file_name_cstr)) {
     // On S3A, the file cannot be stat'ed until after it's closed, and even so, the block
     // size reported will be just the filesystem default. Similarly, the block size
     // reported for ADLS will be the filesystem default. So, remember the requested block
     // size.
+    // TODO: IMPALA-9437: Ozone does not support stat'ing a file until after it's closed,
+    // so for now skip the call to hdfsGetPathInfo.
     output_partition->block_size = block_size;
   } else {
     // HDFS may choose to override the block size that we've recommended, so for non-S3
@@ -414,14 +487,8 @@ Status HdfsTableSink::CreateNewTmpFile(RuntimeState* state,
   ImpaladMetrics::NUM_FILES_OPEN_FOR_INSERT->Increment(1);
   COUNTER_ADD(files_created_counter_, 1);
 
-  if (!ShouldSkipStaging(state, output_partition)) {
-    // Save the ultimate destination for this file (it will be moved by the coordinator).
-    state->dml_exec_state()->AddFileToMove(
-        output_partition->current_file_name, final_location);
-  }
-
   ++output_partition->num_files;
-  output_partition->num_rows = 0;
+  output_partition->current_file_rows = 0;
   Status status = output_partition->writer->InitNewFile();
   if (!status.ok()) {
     status.MergeStatus(ClosePartitionFile(state, output_partition));
@@ -431,21 +498,45 @@ Status HdfsTableSink::CreateNewTmpFile(RuntimeState* state,
   return status;
 }
 
-Status HdfsTableSink::InitOutputPartition(RuntimeState* state,
-    const HdfsPartitionDescriptor& partition_descriptor, const TupleRow* row,
-    OutputPartition* output_partition, bool empty_partition) {
-  // Build the unique name for this partition from the partition keys, e.g. "j=1/f=foo/"
-  // etc.
-  stringstream partition_name_ss;
-  for (int j = 0; j < partition_key_expr_evals_.size(); ++j) {
-    partition_name_ss << table_desc_->col_descs()[j].name() << "=";
-    void* value = partition_key_expr_evals_[j]->GetValue(row);
-    // nullptr partition keys get a special value to be compatible with Hive.
+string HdfsTableSink::GetPartitionName(int i) {
+  if (IsIceberg()) {
+    DCHECK_LT(i, partition_key_expr_evals_.size());
+    return table_desc_->IcebergNonVoidPartitionNames()[i];
+  } else {
+    DCHECK_LT(i, table_desc_->num_clustering_cols());
+    return table_desc_->col_descs()[i].name();
+  }
+}
+
+void HdfsTableSink::ConstructPartitionNames(
+    const TupleRow* row,
+    string* url_encoded_partition_name,
+    vector<string>* raw_partition_names,
+    string* external_partition_name) {
+  DCHECK(url_encoded_partition_name != nullptr);
+  DCHECK(external_partition_name != nullptr);
+  DCHECK(raw_partition_names != nullptr);
+  DCHECK(raw_partition_names->empty());
+
+  stringstream url_encoded_partition_name_ss;
+  stringstream external_partition_name_ss;
+  for (int i = 0; i < partition_key_expr_evals_.size(); ++i) {
+    stringstream raw_partition_key_value_ss;
+    stringstream encoded_partition_key_value_ss;
+
+    raw_partition_key_value_ss << GetPartitionName(i) << "=";
+    encoded_partition_key_value_ss << GetPartitionName(i) << "=";
+
+    void* value = partition_key_expr_evals_[i]->GetValue(row);
     if (value == nullptr) {
-      partition_name_ss << table_desc_->null_partition_key_value();
+      raw_partition_key_value_ss << table_desc_->null_partition_key_value();
+      encoded_partition_key_value_ss << table_desc_->null_partition_key_value();
     } else {
       string value_str;
-      partition_key_expr_evals_[j]->PrintValue(value, &value_str);
+      partition_key_expr_evals_[i]->PrintValue(value, &value_str);
+
+      raw_partition_key_value_ss << value_str;
+
       // Directory names containing partition-key values need to be UrlEncoded, in
       // particular to avoid problems when '/' is part of the key value (which might
       // occur, for example, with date strings). Hive will URL decode the value
@@ -456,16 +547,35 @@ Status HdfsTableSink::InitOutputPartition(RuntimeState* state,
       // decoded partition key value.
       string encoded_str;
       UrlEncode(value_str, &encoded_str, true);
+      string part_key_value = (encoded_str.empty() ?
+                              table_desc_->null_partition_key_value() : encoded_str);
       // If the string is empty, map it to nullptr (mimicking Hive's behaviour)
-      partition_name_ss << (encoded_str.empty() ?
-                        table_desc_->null_partition_key_value() : encoded_str);
+      encoded_partition_key_value_ss << part_key_value;
     }
-    partition_name_ss << "/";
+    if (i < partition_key_expr_evals_.size() - 1) encoded_partition_key_value_ss << "/";
+
+    url_encoded_partition_name_ss << encoded_partition_key_value_ss.str();
+    if (HasExternalOutputDir() && i >= external_output_partition_depth_) {
+      external_partition_name_ss << encoded_partition_key_value_ss.str();
+    }
+
+    raw_partition_names->push_back(raw_partition_key_value_ss.str());
   }
 
-  // partition_name_ss now holds the unique descriptor for this partition,
-  output_partition->partition_name = partition_name_ss.str();
-  BuildHdfsFileNames(partition_descriptor, output_partition);
+  *url_encoded_partition_name = url_encoded_partition_name_ss.str();
+  *external_partition_name = external_partition_name_ss.str();
+}
+
+Status HdfsTableSink::InitOutputPartition(RuntimeState* state,
+    const HdfsPartitionDescriptor& partition_descriptor, const TupleRow* row,
+    OutputPartition* output_partition, bool empty_partition) {
+  // Build the unique name for this partition from the partition keys, e.g. "j=1/f=foo/"
+  // etc.
+  string external_partition_name;
+  ConstructPartitionNames(row, &output_partition->partition_name,
+      &output_partition->raw_partition_names, &external_partition_name);
+
+  BuildHdfsFileNames(partition_descriptor, output_partition, external_partition_name);
 
   if (ShouldSkipStaging(state, output_partition)) {
     // We will be writing to the final file if we're skipping staging, so get a connection
@@ -545,6 +655,15 @@ void HdfsTableSink::GetHashTblKey(const TupleRow* row,
   *key = hash_table_key.str();
 }
 
+inline const HdfsPartitionDescriptor* HdfsTableSink::GetPartitionDescriptor(
+    const string& key) {
+  if (IsIceberg()) return table_desc_->partition_descriptors().begin()->second;
+  const HdfsPartitionDescriptor* ret = prototype_partition_;
+  PartitionDescriptorMap::const_iterator it = partition_descriptor_map_.find(key);
+  if (it != partition_descriptor_map_.end()) ret = it->second;
+  return ret;
+}
+
 inline Status HdfsTableSink::GetOutputPartition(RuntimeState* state, const TupleRow* row,
     const string& key, PartitionPair** partition_pair, bool no_more_rows) {
   DCHECK(row != nullptr || key == ROOT_PARTITION_KEY);
@@ -552,12 +671,7 @@ inline Status HdfsTableSink::GetOutputPartition(RuntimeState* state, const Tuple
   existing_partition = partition_keys_to_output_partitions_.find(key);
   if (existing_partition == partition_keys_to_output_partitions_.end()) {
     // Create a new OutputPartition, and add it to partition_keys_to_output_partitions.
-    const HdfsPartitionDescriptor* partition_descriptor = prototype_partition_;
-    PartitionDescriptorMap::const_iterator it = partition_descriptor_map_.find(key);
-    if (it != partition_descriptor_map_.end()) {
-      partition_descriptor = it->second;
-    }
-
+    const HdfsPartitionDescriptor* partition_descriptor = GetPartitionDescriptor(key);
     std::unique_ptr<OutputPartition> partition(new OutputPartition());
     Status status =
         InitOutputPartition(state, *partition_descriptor, row, partition.get(),
@@ -570,16 +684,16 @@ inline Status HdfsTableSink::GetOutputPartition(RuntimeState* state, const Tuple
       return status;
     }
 
+    // Indicate that temporary directory is to be deleted after execution.
+    bool clean_up_staging_dir =
+        !no_more_rows && !ShouldSkipStaging(state, partition.get());
+
     // Save the partition name so that the coordinator can create the partition
     // directory structure if needed.
     state->dml_exec_state()->AddPartition(
         partition->partition_name, partition_descriptor->id(),
-        &table_desc_->hdfs_base_dir());
-
-    if (!no_more_rows && !ShouldSkipStaging(state, partition.get())) {
-      // Indicate that temporary directory is to be deleted after execution.
-      state->dml_exec_state()->AddFileToMove(partition->tmp_hdfs_dir_name, "");
-    }
+        &table_desc_->hdfs_base_dir(),
+        clean_up_staging_dir ? &partition->tmp_hdfs_dir_name : nullptr);
 
     partition_keys_to_output_partitions_[key].first = std::move(partition);
     *partition_pair = &partition_keys_to_output_partitions_[key];
@@ -636,7 +750,10 @@ Status HdfsTableSink::FinalizePartitionFile(
   if (partition->writer.get() != nullptr) {
     RETURN_IF_ERROR(partition->writer->Finalize());
     state->dml_exec_state()->UpdatePartition(
-        partition->partition_name, partition->num_rows, &partition->writer->stats());
+        partition->partition_name, partition->current_file_rows,
+        &partition->writer->stats());
+    state->dml_exec_state()->AddCreatedFile(*partition, IsIceberg(),
+        partition->writer->iceberg_file_stats());
   }
 
   RETURN_IF_ERROR(ClosePartitionFile(state, partition));
@@ -695,13 +812,13 @@ void HdfsTableSink::Close(RuntimeState* state) {
   }
   partition_keys_to_output_partitions_.clear();
   ScalarExprEvaluator::Close(partition_key_expr_evals_, state);
-  ScalarExpr::Close(partition_key_exprs_);
   DataSink::Close(state);
   closed_ = true;
 }
 
 bool HdfsTableSink::ShouldSkipStaging(RuntimeState* state, OutputPartition* partition) {
-  if (IsTransactional()) return true;
+  if (IsTransactional() || HasExternalOutputDir() || is_result_sink_) return true;
+  // We skip staging if we are writing query results
   return (IsS3APath(partition->final_hdfs_file_name_prefix.c_str()) && !overwrite_ &&
       state->query_options().s3_skip_insert_staging);
 }

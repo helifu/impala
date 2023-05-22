@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import os
 import pytest
 import requests
@@ -37,7 +39,7 @@ from random import choice, sample
 from string import ascii_lowercase, digits
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.test_dimensions import create_uncompressed_text_dimension
+from tests.common.test_dimensions import create_kudu_dimension
 
 DEFAULT_KUDU_MASTER_WEBUI_PORT = os.getenv('KUDU_MASTER_WEBUI_PORT', '8051')
 
@@ -75,9 +77,6 @@ class KuduTestSuite(ImpalaTestSuite):
 
   @classmethod
   def setup_class(cls):
-    if os.environ["KUDU_IS_SUPPORTED"] == "false":
-      pytest.skip("Kudu is not supported")
-
     super(KuduTestSuite, cls).setup_class()
 
   @classmethod
@@ -88,7 +87,7 @@ class KuduTestSuite(ImpalaTestSuite):
   def add_test_dimensions(cls):
     super(KuduTestSuite, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_dimension(
-        create_uncompressed_text_dimension(cls.get_workload()))
+        create_kudu_dimension(cls.get_workload()))
 
   @classmethod
   def auto_create_db(cls):
@@ -112,7 +111,7 @@ class KuduTestSuite(ImpalaTestSuite):
 
   @classmethod
   def random_table_name(cls):
-    return "".join(choice(string.lowercase) for _ in xrange(10))
+    return "".join(choice(string.ascii_lowercase) for _ in range(10))
 
   @classmethod
   def to_kudu_table_name(cls, db_name, tbl_name):
@@ -130,12 +129,13 @@ class KuduTestSuite(ImpalaTestSuite):
 
   @contextmanager
   def temp_kudu_table(self, kudu, col_types, name=None, num_key_cols=1, col_names=None,
-      prepend_db_name=True, db_name=None):
+      prepend_db_name=True, db_name=None, num_partitions=2):
     """Create and return a table. This function should be used in a "with" context.
        'kudu' must be a kudu.client.Client. If a table name is not provided, a random
        name will be used. If 'prepend_db_name' is True, the table name will be prepended
        with (get_db_name() + "."). If column names are not provided, the letters
-       "a", "b", "c", ... will be used.
+       "a", "b", "c", ... will be used. The number of partitions can be set using
+       'num_partitions'.
 
        Example:
          with self.temp_kudu_table(kudu, [INT32]) as kudu_table:
@@ -145,7 +145,7 @@ class KuduTestSuite(ImpalaTestSuite):
     if not col_names:
       if len(col_types) > 26:
         raise Exception("Too many columns for default naming")
-      col_names = [chr(97 + i) for i in xrange(len(col_types))]
+      col_names = [chr(97 + i) for i in range(len(col_types))]
     schema_builder = SchemaBuilder()
     for i, t in enumerate(col_types):
       column_spec = schema_builder.add_column(col_names[i], type_=t)
@@ -157,7 +157,8 @@ class KuduTestSuite(ImpalaTestSuite):
     if prepend_db_name:
       name = (db_name or self.get_db_name().lower()) + "." + name
     kudu.create_table(name, schema,
-        partitioning=Partitioning().add_hash_partitions(col_names[:num_key_cols], 2))
+        partitioning=Partitioning().add_hash_partitions(col_names[:num_key_cols],
+            num_partitions))
     try:
       yield kudu.table(name)
     finally:

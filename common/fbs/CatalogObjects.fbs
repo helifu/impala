@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+include "IcebergObjects.fbs";
+
 namespace org.apache.impala.fb;
 
 // Supported compression algorithms. This needs to match the values in
@@ -50,8 +52,8 @@ table FbFileBlock {
   replica_host_idxs: [ushort] (id: 2);
 
   // The list of disk ids for the file block. May not be set if disk ids are not
-  // supported.
-  disk_ids: [ushort] (id: 3);
+  // supported. Set to -1 for unknown disk id.
+  disk_ids: [short] (id: 3);
 }
 
 table FbFileDesc {
@@ -77,4 +79,17 @@ table FbFileDesc {
 
   // Whether this file is erasure-coded
   is_ec: bool = false (id: 5);
+
+  // The absolute path of the file, it's used only when data files are outside of
+  // the Iceberg table location (IMPALA-11507).
+  absolute_path: string (id: 6);
+
+  // Whether this file is encrypted
+  is_encrypted: bool = false (id: 7);
+}
+
+// Additional file-related metadata
+table FbFileMetadata {
+  // Iceberg-related metadata about the data file
+  iceberg_metadata : FbIcebergMetadata;
 }

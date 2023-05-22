@@ -20,11 +20,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include "gen-cpp/StatestoreService_types.h"
 #include "gen-cpp/Types_types.h"
+#include "gen-cpp/statestore_service.pb.h"
 #include "scheduling/hash-ring.h"
 #include "util/container-util.h"
 #include "util/network-util.h"
+#include "util/unique-id-hash.h"
 
 namespace impala {
 
@@ -46,11 +47,16 @@ class ExecutorGroup {
  public:
   explicit ExecutorGroup(std::string name);
   explicit ExecutorGroup(std::string name, int64_t min_size);
-  explicit ExecutorGroup(const TExecutorGroupDesc& desc);
+  explicit ExecutorGroup(const ExecutorGroupDescPB& desc);
   ExecutorGroup(const ExecutorGroup& other) = default;
 
+  /// Get an ExecutorGroup with the executors from the given ExecutorGroup, excluding
+  /// the executors with address in the given set of blacklisted executor addresses.
+  static ExecutorGroup* GetFilteredExecutorGroup(const ExecutorGroup* group,
+      const std::unordered_set<NetworkAddressPB>& blacklisted_executor_addresses);
+
   /// List of backends, in this case they're all executors.
-  typedef std::vector<TBackendDescriptor> Executors;
+  typedef std::vector<BackendDescriptorPB> Executors;
   typedef std::vector<IpAddr> IpAddrs;
 
   /// Returns the list of executors on a particular host. The caller must make sure that
@@ -67,14 +73,14 @@ class ExecutorGroup {
   /// Adds an executor to the group. If it already exists, it is ignored. Backend
   /// descriptors are identified by their IP address and port. Backends that fail the
   /// consistency check (CheckConsistencyOrWarn()) are ignored. Note that executors can be
-  /// added to an executor group even if they don't have a matching TExecutorGroupDesc in
+  /// added to an executor group even if they don't have a matching ExecutorGroupDescPB in
   /// their 'executor_groups' list. This is required when building the coordinator-only
   /// group during scheduling.
-  void AddExecutor(const TBackendDescriptor& be_desc);
+  void AddExecutor(const BackendDescriptorPB& be_desc);
 
   /// Removes an executor from the group if it exists. Otherwise does nothing. Backend
   /// descriptors are identified by their IP address and port.
-  void RemoveExecutor(const TBackendDescriptor& be_desc);
+  void RemoveExecutor(const BackendDescriptorPB& be_desc);
 
   /// Look up the IP address of 'hostname' in the internal executor maps and return
   /// whether the lookup was successful. If 'hostname' itself is a valid IP address and is
@@ -88,7 +94,7 @@ class ExecutorGroup {
   /// nullptr if it's not found. The returned descriptor should not be retained beyond the
   /// lifetime of this ExecutorGroup and the caller must make sure that the group does not
   /// change while it holds the pointer.
-  const TBackendDescriptor* LookUpBackendDesc(const TNetworkAddress& host) const;
+  const BackendDescriptorPB* LookUpBackendDesc(const NetworkAddressPB& host) const;
 
   /// Returns the hash ring associated with this executor group. It's owned by the group
   /// and the caller must not hold a reference beyond the groups lifetime.
@@ -106,6 +112,11 @@ class ExecutorGroup {
   /// Returns false otherwise.
   bool IsHealthy() const;
 
+  /// Return effective memory limit for admission for executors in this group.
+  int64_t GetPerExecutorMemLimitForAdmission() const {
+      return per_executor_admit_mem_limit_;
+  }
+
   const string& name() const { return name_; }
   int64_t min_size() const { return min_size_; }
 
@@ -113,7 +124,10 @@ class ExecutorGroup {
   /// Finds the first executor group in 'be_desc.executor_groups' and validates its target
   /// size. Returns true if a group is found and its min size matches, or if no group is
   /// found. Returns false and logs a warning otherwise.
-  bool CheckConsistencyOrWarn(const TBackendDescriptor& be_desc) const;
+  bool CheckConsistencyOrWarn(const BackendDescriptorPB& be_desc) const;
+
+  /// Calculates minimum memory limit for admission across all backends.
+  void CalculatePerExecutorMemLimitForAdmission();
 
   const std::string name_;
 
@@ -134,6 +148,10 @@ class ExecutorGroup {
   /// All executors are kept in a hash ring to allow a consistent mapping from filenames
   /// to executors.
   HashRing executor_ip_hash_ring_;
+
+  /// The minimum memory limit in bytes for admission across all backends. Used by
+  /// admission controller to bound the per backend memory limit for a given query.
+  int64_t per_executor_admit_mem_limit_;
 };
 
 }  // end ns impala

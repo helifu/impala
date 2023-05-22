@@ -18,6 +18,11 @@
 package org.apache.impala.customcluster;
 
 import java.io.IOException;
+import java.util.Map;
+import java.util.HashMap;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.log4j.Logger;
 
 /**
  * Runs an Impala cluster with custom flags.
@@ -27,18 +32,79 @@ import java.io.IOException;
  * not be used outside of this package.
  */
 class CustomClusterRunner {
+  private static final Logger LOG = Logger.getLogger(CustomClusterRunner.class);
+
   public static int StartImpalaCluster() throws IOException, InterruptedException {
     return StartImpalaCluster("");
   }
 
-  /**
-   * Starts Impala and passes 'args' to the impalads, catalogd, and statestored.
-   */
   public static int StartImpalaCluster(String args)
       throws IOException, InterruptedException {
-    Process p = Runtime.getRuntime().exec(new String[] {"start-impala-cluster.py",
-        "--impalad_args", args, "--catalogd_args", args, "--state_store_args", args});
+    return StartImpalaCluster(args, new HashMap<String, String>());
+  }
+
+  public static int StartImpalaCluster(String args, Map<String, String> env)
+      throws IOException, InterruptedException {
+    return StartImpalaCluster(args, env, "");
+  }
+
+  /**
+   * Starts Impala, setting environment variables in 'env', and passing 'args' to the
+   * impalads, catalogd, and statestored, and 'startArgs' to start-impala-cluster.py.
+   */
+  public static int StartImpalaCluster(String args, Map<String, String> env,
+      String startArgs) throws IOException, InterruptedException {
+    return StartImpalaCluster(args, args, args, "", env, startArgs);
+  }
+
+  public static int StartImpalaCluster(String impaladArgs, String catalogdArgs,
+      String statestoredArgs) throws IOException, InterruptedException {
+    return StartImpalaCluster(
+        impaladArgs, catalogdArgs, statestoredArgs, "", new HashMap<String, String>(),
+        "");
+  }
+
+  public static int StartImpalaCluster(String impaladArgs, String catalogdArgs,
+      String statestoredArgs, String startArgs) throws IOException, InterruptedException {
+    return StartImpalaCluster(impaladArgs, catalogdArgs, statestoredArgs, "",
+        new HashMap<String, String>(), startArgs);
+  }
+
+  public static int StartImpalaCluster(String impaladArgs, String catalogdArgs,
+      String statestoredArgs, Map<String, String> env, String startArgs)
+      throws IOException, InterruptedException {
+    return StartImpalaCluster(impaladArgs, catalogdArgs, statestoredArgs, "",
+        env, startArgs);
+  }
+
+  /**
+   * Starts Impala, setting environment variables in 'env', and passing 'impalad_args',
+   * 'catalogd_args', 'statestored_args', 'admissiond_args' and 'startArgs' to
+   * start-impala-cluster.py.
+   */
+  public static int StartImpalaCluster(String impaladArgs, String catalogdArgs,
+      String statestoredArgs, String admissiondArgs, Map<String, String> env,
+      String startArgs)
+      throws IOException, InterruptedException {
+    ProcessBuilder pb;
+    if (!admissiondArgs.isEmpty()) {
+      pb = new ProcessBuilder(new String[] {"start-impala-cluster.py",
+          "--impalad_args", impaladArgs, "--catalogd_args", catalogdArgs,
+          "--state_store_args", statestoredArgs, "--enable_admission_service", "true",
+          "--admissiond_args", admissiondArgs, startArgs});
+    } else {
+      pb = new ProcessBuilder(new String[] {"start-impala-cluster.py",
+          "--impalad_args", impaladArgs, "--catalogd_args", catalogdArgs,
+          "--state_store_args", statestoredArgs, startArgs});
+    }
+    pb.redirectErrorStream(true);
+    Map<String, String> origEnv = pb.environment();
+    origEnv.putAll(env);
+    Process p = pb.start();
     p.waitFor();
+    // Print out the output of the process, for debugging. We only need to print stdout,
+    // as stderr is redirected to it above.
+    LOG.info(IOUtils.toString(p.getInputStream()));
     return p.exitValue();
   }
 }

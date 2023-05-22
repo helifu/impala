@@ -8,14 +8,14 @@ where int_col > 1 and int_col * rand() > 50 and int_col is null
 and int_col > tinyint_col;
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=42.00MB mem-reservation=16.00KB thread-reservation=2
+|  Per-Host Resources: mem-estimate=32.10MB mem-reservation=16.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: count(*)
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  mem-estimate=10.00MB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=100.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=8B cardinality=1
 |  in pipelines: 01(GETNEXT), 00(OPEN)
 |
@@ -24,7 +24,7 @@ PLAN-ROOT SINK
    predicates: int_col IS NULL, int_col > CAST(1 AS INT), int_col > CAST(tinyint_col AS INT), CAST(int_col AS DOUBLE) * rand() > CAST(50 AS DOUBLE)
    stored statistics:
      table: rows=unavailable size=unavailable
-     partitions: 0/24 rows=unavailable
+     partitions: 0/24 rows=12.84K
      columns: unavailable
    extrapolated-rows=disabled max-scan-range-rows=unavailable
    parquet statistics predicates: int_col > CAST(1 AS INT)
@@ -39,14 +39,14 @@ where int_col > 1 and int_col * rand() > 50 and int_col is null
 and int_col > tinyint_col;
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=138.00MB mem-reservation=32.00KB thread-reservation=2
+|  Per-Host Resources: mem-estimate=128.10MB mem-reservation=32.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: count(*)
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  mem-estimate=10.00MB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=100.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=8B cardinality=1
 |  in pipelines: 01(GETNEXT), 00(OPEN)
 |
@@ -72,14 +72,14 @@ and timestamp_cmp(timestamp_col, '2016-11-20 00:00:00') = 1
 and year > 2000 and month < 12;
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=138.00MB mem-reservation=88.00KB thread-reservation=2
+|  Per-Host Resources: mem-estimate=128.10MB mem-reservation=88.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: count(*)
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  mem-estimate=10.00MB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=100.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=8B cardinality=1
 |  in pipelines: 01(GETNEXT), 00(OPEN)
 |
@@ -89,7 +89,7 @@ PLAN-ROOT SINK
    predicates: bool_col, bigint_col < CAST(5000 AS BIGINT), double_col > CAST(100.00 AS DOUBLE), float_col > CAST(50.00 AS FLOAT), id = CAST(1 AS INT), tinyint_col < CAST(50 AS TINYINT), int_col % CAST(2 AS INT) = CAST(1 AS INT), string_col IN ('aaaa', 'bbbb', 'cccc'), smallint_col IN (CAST(1 AS SMALLINT), CAST(2 AS SMALLINT), CAST(3 AS SMALLINT), CAST(4 AS SMALLINT), CAST(5 AS SMALLINT)), timestamp_cmp(timestamp_col, TIMESTAMP '2016-11-20 00:00:00') = CAST(1 AS INT), date_string_col > '1993-10-01'
    stored statistics:
      table: rows=unavailable size=unavailable
-     partitions: 0/22 rows=unavailable
+     partitions: 0/22 rows=11.74K
      columns missing stats: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col
    extrapolated-rows=disabled max-scan-range-rows=unavailable
    parquet statistics predicates: bigint_col < CAST(5000 AS BIGINT), double_col > CAST(100.00 AS DOUBLE), float_col > CAST(50.00 AS FLOAT), id = CAST(1 AS INT), tinyint_col < CAST(50 AS TINYINT), string_col IN ('aaaa', 'bbbb', 'cccc'), smallint_col IN (CAST(1 AS SMALLINT), CAST(2 AS SMALLINT), CAST(3 AS SMALLINT), CAST(4 AS SMALLINT), CAST(5 AS SMALLINT)), date_string_col > '1993-10-01'
@@ -108,14 +108,14 @@ and timestamp_cmp(timestamp_col, '2016-11-20 00:00:00') = 1
 and year > 2000 and month < 12;
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=138.00MB mem-reservation=32.00KB thread-reservation=2
+|  Per-Host Resources: mem-estimate=128.10MB mem-reservation=32.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: count(*)
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  mem-estimate=10.00MB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=100.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=8B cardinality=1
 |  in pipelines: 01(GETNEXT), 00(OPEN)
 |
@@ -143,14 +143,14 @@ and mod(int_col,50) IN (0,1)
 and id IN (int_col);
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=58.00MB mem-reservation=24.00KB thread-reservation=2
+|  Per-Host Resources: mem-estimate=48.10MB mem-reservation=24.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: count(*)
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  mem-estimate=10.00MB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=100.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=8B cardinality=1
 |  in pipelines: 01(GETNEXT), 00(OPEN)
 |
@@ -159,7 +159,7 @@ PLAN-ROOT SINK
    predicates: id IN (int_col), id NOT IN (CAST(0 AS INT), CAST(1 AS INT), CAST(2 AS INT)), int_col % CAST(50 AS INT) IN (CAST(0 AS INT), CAST(1 AS INT)), string_col IN ('aaaa', 'bbbb', 'cccc', NULL)
    stored statistics:
      table: rows=unavailable size=unavailable
-     partitions: 0/24 rows=unavailable
+     partitions: 0/24 rows=12.84K
      columns: unavailable
    extrapolated-rows=disabled max-scan-range-rows=unavailable
    parquet dictionary predicates: id NOT IN (CAST(0 AS INT), CAST(1 AS INT), CAST(2 AS INT)), int_col % CAST(50 AS INT) IN (CAST(0 AS INT), CAST(1 AS INT)), string_col IN ('aaaa', 'bbbb', 'cccc', NULL)
@@ -177,7 +177,7 @@ F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=48.00MB mem-reservation=24.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=15.11MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SUBPLAN
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
@@ -250,7 +250,7 @@ F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=48.00MB mem-reservation=24.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SUBPLAN
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
@@ -319,7 +319,7 @@ F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=48.00MB mem-reservation=24.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: id
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SUBPLAN
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
@@ -384,7 +384,7 @@ F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=264.00MB mem-reservation=16.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: c_custkey
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=68.66MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SUBPLAN
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
@@ -455,14 +455,14 @@ select count(*) from functional_parquet.complextypestbl c left outer join
 (select * from c.int_array where item > 10) v;
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=26.00MB mem-reservation=8.00KB thread-reservation=2
+|  Per-Host Resources: mem-estimate=16.10MB mem-reservation=8.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: count(*)
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 05:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  mem-estimate=10.00MB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=100.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=3 row-size=8B cardinality=1
 |  in pipelines: 05(GETNEXT), 00(OPEN)
 |
@@ -490,7 +490,7 @@ PLAN-ROOT SINK
 |
 00:SCAN HDFS [functional_parquet.complextypestbl c]
    HDFS partitions=1/1 files=2 size=6.92KB
-   predicates on int_array: item > CAST(10 AS INT)
+   predicates on c.int_array: item > CAST(10 AS INT)
    stored statistics:
      table: rows=unavailable size=unavailable
      columns: unavailable
@@ -511,7 +511,7 @@ F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=616.00MB mem-reservation=32.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: c_name, o.o_clerk
-|  mem-estimate=0B mem-reservation=0B thread-reservation=0
+|  mem-estimate=100.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 01:SUBPLAN
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
@@ -583,14 +583,14 @@ and timestamp_cmp(timestamp_col, '2016-11-20 00:00:00') = 1
 and year > 2000 and month < 12;
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=138.00MB mem-reservation=88.00KB thread-reservation=2
+|  Per-Host Resources: mem-estimate=128.10MB mem-reservation=88.00KB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: count(*)
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  mem-estimate=10.00MB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=100.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=8B cardinality=1
 |  in pipelines: 01(GETNEXT), 00(OPEN)
 |
@@ -600,7 +600,7 @@ PLAN-ROOT SINK
    predicates: bool_col, bigint_col < CAST(5000 AS BIGINT), double_col > CAST(100.00 AS DOUBLE), float_col > CAST(50.00 AS FLOAT), id = CAST(1 AS INT), tinyint_col < CAST(50 AS TINYINT), int_col % CAST(2 AS INT) = CAST(1 AS INT), string_col IN ('aaaa', 'bbbb', 'cccc'), smallint_col IN (CAST(1 AS SMALLINT), CAST(2 AS SMALLINT), CAST(3 AS SMALLINT), CAST(4 AS SMALLINT), CAST(5 AS SMALLINT)), timestamp_cmp(timestamp_col, TIMESTAMP '2016-11-20 00:00:00') = CAST(1 AS INT), date_string_col > '1993-10-01'
    stored statistics:
      table: rows=unavailable size=unavailable
-     partitions: 0/4 rows=unavailable
+     partitions: 0/4 rows=2.55K
      columns missing stats: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col
    extrapolated-rows=disabled max-scan-range-rows=unavailable
    parquet statistics predicates: bigint_col < CAST(5000 AS BIGINT), double_col > CAST(100.00 AS DOUBLE), float_col > CAST(50.00 AS FLOAT), id = CAST(1 AS INT), tinyint_col < CAST(50 AS TINYINT), string_col IN ('aaaa', 'bbbb', 'cccc'), smallint_col IN (CAST(1 AS SMALLINT), CAST(2 AS SMALLINT), CAST(3 AS SMALLINT), CAST(4 AS SMALLINT), CAST(5 AS SMALLINT)), date_string_col > '1993-10-01'
@@ -620,14 +620,14 @@ and timestamp_cmp(timestamp_col, '2016-11-20 00:00:00') = 1
 and year != 2009 and month != 4;
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=10.00MB mem-reservation=0B thread-reservation=1
+|  Per-Host Resources: mem-estimate=100.00KB mem-reservation=0B thread-reservation=1
 PLAN-ROOT SINK
 |  output exprs: count(*)
 |  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 01:AGGREGATE [FINALIZE]
 |  output: count(*)
-|  mem-estimate=10.00MB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=100.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
 |  tuple-ids=1 row-size=8B cardinality=1
 |  in pipelines: 01(GETNEXT), 00(OPEN)
 |
@@ -637,7 +637,7 @@ PLAN-ROOT SINK
    predicates: bool_col, bigint_col < CAST(5000 AS BIGINT), double_col > CAST(100.00 AS DOUBLE), float_col > CAST(50.00 AS FLOAT), id = CAST(1 AS INT), tinyint_col < CAST(50 AS TINYINT), int_col % CAST(2 AS INT) = CAST(1 AS INT), string_col IN ('aaaa', 'bbbb', 'cccc'), smallint_col IN (CAST(1 AS SMALLINT), CAST(2 AS SMALLINT), CAST(3 AS SMALLINT), CAST(4 AS SMALLINT), CAST(5 AS SMALLINT)), timestamp_cmp(timestamp_col, TIMESTAMP '2016-11-20 00:00:00') = CAST(1 AS INT), date_string_col > '1993-10-01'
    stored statistics:
      table: rows=unavailable size=unavailable
-     partitions: 0/0 rows=unavailable
+     partitions: 0/0 rows=0
      columns missing stats: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col
    extrapolated-rows=disabled max-scan-range-rows=0
    mem-estimate=0B mem-reservation=0B thread-reservation=0

@@ -17,14 +17,22 @@
 #
 # Client tests for Impala's HiveServer2 interface
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from getpass import getuser
 from contextlib import contextmanager
 import json
 import logging
 import pytest
+import random
+import threading
 import time
+import uuid
 
-from urllib2 import urlopen
+try:
+  from urllib.request import urlopen
+except ImportError:
+  from urllib2 import urlopen
 
 from ImpalaService import ImpalaHiveServer2Service
 from tests.common.environ import ImpalaTestClusterProperties
@@ -70,6 +78,12 @@ class TestHS2(HS2TestSuite):
       TestHS2.check_response(session)
       for k, v in configuration.items():
         assert session.configuration[k] == v
+    # simulate hive jdbc's action, see IMPALA-11992
+    hiveconfs = dict([("set:hiveconf:" + k, v) for k, v in configuration.items()])
+    with ScopedSession(self.hs2_client, configuration=hiveconfs) as sessions:
+      TestHS2.check_response(sessions)
+      for k, v in configuration.items():
+        assert sessions.configuration[k] == v
 
   def get_session_options(self, setCmd):
     """Returns dictionary of query options."""
@@ -141,6 +155,22 @@ class TestHS2(HS2TestSuite):
     assert levels["DEBUG_ACTION"] == "DEVELOPMENT"
     # Removed options are returned by "SET ALL" for the benefit of impala-shell.
     assert levels["MAX_IO_BUFFERS"] == "REMOVED"
+
+  @needs_session()
+  def test_session_option_levels_via_unset_all(self):
+    self.execute_statement("SET COMPRESSION_CODEC=gzip")
+    self.execute_statement("SET SYNC_DDL=1")
+    vals, levels = self.get_session_options("SET")
+    assert vals["COMPRESSION_CODEC"] == "GZIP"
+    assert vals["SYNC_DDL"] == "1"
+
+    # Unset all query options
+    self.execute_statement("UNSET ALL")
+    vals2, levels = self.get_session_options("SET")
+
+    # Reset to default value
+    assert vals2["COMPRESSION_CODEC"] == ""
+    assert vals2["SYNC_DDL"] == "0"
 
   @SkipIfDockerizedCluster.internal_hostname
   def test_open_session_http_addr(self):
@@ -314,7 +344,8 @@ class TestHS2(HS2TestSuite):
 
     get_operation_status_resp = \
         self.get_operation_status(execute_statement_resp.operationHandle)
-    # GetOperationState should return 'Invalid query handle' if the query has been closed.
+    # GetOperationState should return 'Invalid or unknown query handle' if the query has
+    # been closed.
     TestHS2.check_response(get_operation_status_resp, \
         TCLIService.TStatusCode.ERROR_STATUS)
 
@@ -368,7 +399,7 @@ class TestHS2(HS2TestSuite):
     TestHS2.check_response(get_operation_status_resp, \
         TCLIService.TStatusCode.ERROR_STATUS)
 
-    err_msg = "Invalid query handle: efcdab8967452301:3031323334353637"
+    err_msg = "Invalid or unknown query handle: efcdab8967452301:3031323334353637"
     assert err_msg in get_operation_status_resp.status.errorMessage
 
     get_result_set_metadata_req = TCLIService.TGetResultSetMetadataReq()
@@ -378,7 +409,7 @@ class TestHS2(HS2TestSuite):
     TestHS2.check_response(get_result_set_metadata_resp, \
         TCLIService.TStatusCode.ERROR_STATUS)
 
-    err_msg = "Invalid query handle: efcdab8967452301:3031323334353637"
+    err_msg = "Invalid or unknown query handle: efcdab8967452301:3031323334353637"
     assert err_msg in get_result_set_metadata_resp.status.errorMessage
 
   @pytest.mark.execute_serially
@@ -387,7 +418,7 @@ class TestHS2(HS2TestSuite):
     num_sessions = self.impalad_test_service.get_metric_value(
         "impala-server.num-open-hiveserver2-sessions")
     session_ids = []
-    for _ in xrange(5):
+    for _ in range(5):
       open_session_req = TCLIService.TOpenSessionReq()
       resp = self.hs2_client.OpenSession(open_session_req)
       TestHS2.check_response(resp)
@@ -443,43 +474,64 @@ class TestHS2(HS2TestSuite):
     """Basic test for the GetTables() HS2 method. Needs to execute serially because
     the test depends on controlling whether a table is loaded or not and other
     concurrent tests loading or invalidating tables could interfere with it."""
-    table = "__hs2_column_comments_test"
+    table = "__hs2_table_comment_test"
+    view = "__hs2_view_comment_test"
     self.execute_query("use {0}".format(unique_database))
     self.execute_query("drop table if exists {0}".format(table))
+    self.execute_query("drop view if exists {0}".format(view))
     self.execute_query("""
         create table {0} (a int comment 'column comment')
         comment 'table comment'""".format(table))
+    self.execute_query("""
+        create view {0} comment 'view comment' as select * from {1}
+        """.format(view, table))
     try:
       req = TCLIService.TGetTablesReq()
       req.sessionHandle = self.session_handle
       req.schemaName = unique_database
-      req.tableName = table
 
-      # Execute the request twice, the first time with the table unloaded and the second
-      # with it loaded.
+      # Execute the request twice, the first time with the table/view unloaded and the
+      # second with them loaded.
       self.execute_query("invalidate metadata {0}".format(table))
+      self.execute_query("invalidate metadata {0}".format(view))
       for i in range(2):
         get_tables_resp = self.hs2_client.GetTables(req)
         TestHS2.check_response(get_tables_resp)
 
         fetch_results_resp = self._fetch_results(get_tables_resp.operationHandle, 100)
         results = fetch_results_resp.results
-        table_cat = results.columns[0].stringVal.values[0]
-        table_schema = results.columns[1].stringVal.values[0]
-        table_name = results.columns[2].stringVal.values[0]
-        table_type = results.columns[3].stringVal.values[0]
-        table_remarks = results.columns[4].stringVal.values[0]
-        assert table_cat == ''
-        assert table_schema == unique_database
-        assert table_name == table
-        assert table_type == "TABLE"
-        if i == 0:
-          assert table_remarks == ""
-        else:
-          if not cluster_properties.is_catalog_v2_cluster():
-            assert table_remarks == "table comment"
-        # Ensure the table is loaded for the second iteration.
+        # The returned results should only contain metadata for the table and the view.
+        # Note that results are in columnar format so we get #rows by the length of the
+        # first column.
+        assert len(results.columns[0].stringVal.values) == 2
+        for row_idx in range(2):
+          table_cat = results.columns[0].stringVal.values[row_idx]
+          table_schema = results.columns[1].stringVal.values[row_idx]
+          table_name = results.columns[2].stringVal.values[row_idx]
+          table_type = results.columns[3].stringVal.values[row_idx]
+          table_remarks = results.columns[4].stringVal.values[row_idx]
+          assert table_cat == ''
+          assert table_schema == unique_database
+          if i == 0:
+            # In the first iteration the table and view are unloaded, so their types are
+            # in the default value (TABLE) and their comments are empty.
+            assert table_name in (table, view)
+            assert table_type == "TABLE"
+            assert table_remarks == ""
+          else:
+            # In the second iteration the table and view are loaded. They should be shown
+            # with correct types and comments. Verify types and comments based on table
+            # names so we don't care the order in which the table/view are returned.
+            if table_name == table:
+              assert table_type == "TABLE"
+              assert table_remarks == "table comment"
+            else:
+              assert table_name == view
+              assert table_type == "VIEW"
+              assert table_remarks == "view comment"
+        # Ensure the table and view are loaded for the second iteration.
         self.execute_query("describe {0}".format(table))
+        self.execute_query("describe {0}".format(view))
 
       # Test that session secret is validated by this API.
       invalid_req = TCLIService.TGetTablesReq()
@@ -491,139 +543,115 @@ class TestHS2(HS2TestSuite):
     finally:
       self.execute_query("drop table {0}".format(table))
 
-  @needs_session_cluster_properties()
-  def test_get_primary_keys(self, cluster_properties, unique_database):
-    table = "pk"
-    self.execute_query("use {0}".format(unique_database))
-    self.execute_query("drop table if exists {0}".format(table))
-    self.execute_query("""
-        create table {0} (id int, year string, primary key(id, year))""".format(
-        table))
-    pks = ["id", "year"]
-    try:
-      req = TCLIService.TGetPrimaryKeysReq()
-      req.sessionHandle = self.session_handle
-      req.schemaName = unique_database
-      req.tableName = table
+  @needs_session()
+  def test_get_primary_keys(self):
+    req = TCLIService.TGetPrimaryKeysReq()
+    req.sessionHandle = self.session_handle
+    req.schemaName = 'functional'
+    req.tableName = 'parent_table'
 
-      get_primary_keys_resp = self.hs2_client.GetPrimaryKeys(req)
-      TestHS2.check_response(get_primary_keys_resp)
+    get_primary_keys_resp = self.hs2_client.GetPrimaryKeys(req)
+    TestHS2.check_response(get_primary_keys_resp)
 
-      fetch_results_resp = self._fetch_results(
-          get_primary_keys_resp.operationHandle, 100)
+    fetch_results_resp = self._fetch_results(
+        get_primary_keys_resp.operationHandle, 100)
 
-      if not cluster_properties.is_catalog_v2_cluster():
-        for i in range(len(pks)):
-          results = fetch_results_resp.results
-          table_cat = results.columns[0].stringVal.values[i]
-          table_schema = results.columns[1].stringVal.values[i]
-          table_name = results.columns[2].stringVal.values[i]
-          pk_col_name = results.columns[3].stringVal.values[i]
-          pk_name = results.columns[5].stringVal.values[i]
-          assert table_cat == ''
-          assert table_schema == unique_database
-          assert table_name == table
-          assert pk_col_name in pks
-          assert len(pk_name) > 0
+    results = fetch_results_resp.results
+    for i in range(2):
+      table_cat = results.columns[0].stringVal.values[i]
+      table_schema = results.columns[1].stringVal.values[i]
+      table_name = results.columns[2].stringVal.values[i]
+      pk_name = results.columns[5].stringVal.values[i]
+      assert table_cat == ''
+      assert table_schema == 'functional'
+      assert table_name == 'parent_table'
+      assert len(pk_name) > 0
 
-    finally:
-      self.execute_query("drop table {0}".format(table))
+    # Assert PK column names.
+    assert results.columns[3].stringVal.values[0] == 'id'
+    assert results.columns[3].stringVal.values[1] == 'year'
 
-  @needs_session_cluster_properties()
-  def test_get_cross_reference(self, cluster_properties, unique_database):
-    parent_table_1 = "pk_1"
-    parent_table_2 = "pk_2"
-    fk_table = "fk"
-    self.execute_query("use {0}".format(unique_database))
-    self.execute_query("drop table if exists {0}".format(parent_table_1))
-    self.execute_query("""
-        create table {0} (id int, year string, primary key(id, year))""".format(
-        parent_table_1))
-    self.execute_query("drop table if exists {0}".format(parent_table_2))
-    self.execute_query("""
-        create table {0} (a int, b string, primary key(a))""".format(
-        parent_table_2))
-    self.execute_query("drop table if exists {0}".format(fk_table))
-    self.execute_query("""
-        create table {0} (seq int, id int, year string, a int, primary key(seq)
-        , foreign key(id, year) references {1}(id, year), foreign key(a)
-        references {2}(a))
-        """.format(fk_table, parent_table_1, parent_table_2))
-    pk_column_names = ["id", "year", "a"]
-    try:
-      req = TCLIService.TGetCrossReferenceReq()
-      req.sessionHandle = self.session_handle
-      req.parentSchemaName = unique_database
-      req.foreignSchemaName = unique_database
-      req.parentTableName = parent_table_1
-      req.foreignTableName = fk_table
+  @needs_session()
+  def test_get_cross_reference(self):
+    req = TCLIService.TGetCrossReferenceReq()
+    req.sessionHandle = self.session_handle
+    req.parentSchemaName = "functional"
+    req.foreignSchemaName = "functional"
+    req.parentTableName = "parent_table"
+    req.foreignTableName = "child_table"
 
-      get_foreign_keys_resp = self.hs2_client.GetCrossReference(req)
-      TestHS2.check_response(get_foreign_keys_resp)
+    get_foreign_keys_resp = self.hs2_client.GetCrossReference(req)
+    TestHS2.check_response(get_foreign_keys_resp)
 
-      fetch_results_resp = self._fetch_results(
-          get_foreign_keys_resp.operationHandle, 100)
+    fetch_results_resp = self._fetch_results(
+        get_foreign_keys_resp.operationHandle, 100)
 
-      results = fetch_results_resp.results
+    results = fetch_results_resp.results
 
-      if not cluster_properties.is_catalog_v2_cluster():
-        for i in range(2):
-          parent_table_cat = results.columns[0].stringVal.values[i]
-          parent_table_schema = results.columns[1].stringVal.values[i]
-          parent_table_name = results.columns[2].stringVal.values[i]
-          parent_col_name = results.columns[3].stringVal.values[i]
-          foreign_table_cat = results.columns[4].stringVal.values[i]
-          foreign_table_schema = results.columns[5].stringVal.values[i]
-          foreign_table_name = results.columns[6].stringVal.values[i]
-          foreign_col_name = results.columns[7].stringVal.values[i]
+    for i in range(2):
+      parent_table_cat = results.columns[0].stringVal.values[i]
+      parent_table_schema = results.columns[1].stringVal.values[i]
+      parent_table_name = results.columns[2].stringVal.values[i]
+      foreign_table_cat = results.columns[4].stringVal.values[i]
+      foreign_table_schema = results.columns[5].stringVal.values[i]
+      foreign_table_name = results.columns[6].stringVal.values[i]
+      assert parent_table_cat == ''
+      assert parent_table_schema == 'functional'
+      assert parent_table_name == 'parent_table'
+      assert foreign_table_cat == ''
+      assert foreign_table_schema == 'functional'
+      assert foreign_table_name == 'child_table'
 
-          assert parent_table_cat == ''
-          assert parent_table_schema == unique_database
-          assert parent_table_name == parent_table_1
-          assert parent_col_name in pk_column_names
-          assert foreign_table_cat == ''
-          assert foreign_table_schema == unique_database
-          assert foreign_table_name == fk_table
-          assert foreign_col_name in pk_column_names
+    # Assert PK column names.
+    assert results.columns[3].stringVal.values[0] == 'id'
+    assert results.columns[3].stringVal.values[1] == 'year'
 
-        # Get all foreign keys from the FK side by not setting pkTableSchema
-        # and pkTable name in the request.
-        req = TCLIService.TGetCrossReferenceReq()
-        req.sessionHandle = self.session_handle
-        req.foreignSchemaName = unique_database
-        req.foreignTableName = fk_table
+    # Assert FK column names.
+    assert results.columns[7].stringVal.values[0] == 'id'
+    assert results.columns[7].stringVal.values[1] == 'year'
 
-        get_foreign_keys_resp = self.hs2_client.GetCrossReference(req)
-        TestHS2.check_response(get_foreign_keys_resp)
+    # Get all foreign keys from the FK side by not setting pkTableSchema
+    # and pkTable name in the request.
+    req = TCLIService.TGetCrossReferenceReq()
+    req.sessionHandle = self.session_handle
+    req.foreignSchemaName = 'functional'
+    req.foreignTableName = 'child_table'
 
-        fetch_results_resp = self._fetch_results(
-            get_foreign_keys_resp.operationHandle, 100)
+    get_foreign_keys_resp = self.hs2_client.GetCrossReference(req)
+    TestHS2.check_response(get_foreign_keys_resp)
 
-        results = fetch_results_resp.results
+    fetch_results_resp = self._fetch_results(
+        get_foreign_keys_resp.operationHandle, 100)
 
-        pk_table_names = [parent_table_1, parent_table_2]
-        for i in range(len(pk_column_names)):
-          parent_table_cat = results.columns[0].stringVal.values[i]
-          parent_table_schema = results.columns[1].stringVal.values[i]
-          parent_table_name = results.columns[2].stringVal.values[i]
-          parent_col_name = results.columns[3].stringVal.values[i]
-          foreign_table_cat = results.columns[4].stringVal.values[i]
-          foreign_table_schema = results.columns[5].stringVal.values[i]
-          foreign_table_name = results.columns[6].stringVal.values[i]
-          foreign_col_name = results.columns[7].stringVal.values[i]
-          assert parent_table_cat == ''
-          assert parent_table_schema == unique_database
-          assert parent_table_name in pk_table_names
-          assert parent_col_name in pk_column_names
-          assert foreign_table_cat == ''
-          assert foreign_table_schema == unique_database
-          assert foreign_table_name == fk_table
-          assert foreign_col_name in pk_column_names
+    results = fetch_results_resp.results
 
-    finally:
-      self.execute_query("drop table {0}".format(parent_table_1))
-      self.execute_query("drop table {0}".format(parent_table_2))
-      self.execute_query("drop table {0}".format(fk_table))
+    for i in range(3):
+      parent_table_cat = results.columns[0].stringVal.values[i]
+      parent_table_schema = results.columns[1].stringVal.values[i]
+      foreign_table_cat = results.columns[4].stringVal.values[i]
+      foreign_table_schema = results.columns[5].stringVal.values[i]
+      foreign_table_name = results.columns[6].stringVal.values[i]
+      assert parent_table_cat == ''
+      assert parent_table_schema == 'functional'
+      assert foreign_table_cat == ''
+      assert foreign_table_schema == 'functional'
+      assert foreign_table_name == 'child_table'
+
+    # First two FKs have 'parent_table' as PK table.
+    pk_table_names = ['parent_table', 'parent_table', 'parent_table_2']
+    for i in range(len(pk_table_names)):
+      parent_table_name = results.columns[2].stringVal.values[i]
+      parent_table_name == pk_table_names[i]
+
+      # Assert PK column names.
+    assert results.columns[3].stringVal.values[0] == 'id'
+    assert results.columns[3].stringVal.values[1] == 'year'
+    assert results.columns[3].stringVal.values[2] == 'a'
+
+    # Assert FK column names.
+    assert results.columns[7].stringVal.values[0] == 'id'
+    assert results.columns[7].stringVal.values[1] == 'year'
+    assert results.columns[7].stringVal.values[2] == 'a'
 
   @needs_session(conf_overlay={"idle_session_timeout": "5"})
   def test_get_operation_status_session_timeout(self):
@@ -731,6 +759,29 @@ class TestHS2(HS2TestSuite):
     assert len(exec_summary_resp.summary.nodes) > 0
 
   @needs_session()
+  def test_get_backend_config(self):
+    get_backend_config_req = ImpalaHiveServer2Service.TGetBackendConfigReq()
+    get_backend_config_req.sessionHandle = self.session_handle
+    get_backend_config_resp = self.hs2_client.GetBackendConfig(get_backend_config_req)
+    TestHS2.check_response(get_backend_config_resp,
+        TCLIService.TStatusCode.ERROR_STATUS, "Unsupported operation")
+
+  @needs_session()
+  def test_get_executor_membership(self):
+    get_executor_membership_req = ImpalaHiveServer2Service.TGetExecutorMembershipReq()
+    get_executor_membership_req.sessionHandle = self.session_handle
+    get_executor_membership_resp = self.hs2_client.GetExecutorMembership(
+      get_executor_membership_req)
+    TestHS2.check_response(get_executor_membership_resp,
+        TCLIService.TStatusCode.ERROR_STATUS, "Unsupported operation")
+
+  @needs_session()
+  def test_init_query_context(self):
+    init_query_context_resp = self.hs2_client.InitQueryContext()
+    TestHS2.check_response(init_query_context_resp,
+        TCLIService.TStatusCode.ERROR_STATUS, "Unsupported operation")
+
+  @needs_session()
   def test_get_profile(self):
     statement = "SELECT COUNT(2) FROM functional.alltypes"
     execute_statement_resp = self.execute_statement(statement)
@@ -813,6 +864,99 @@ class TestHS2(HS2TestSuite):
           "JSON content is invalid. Content: {0}".format(get_profile_resp.profile)
         break
 
+  @needs_session()
+  def test_concurrent_unregister(self):
+    """Test that concurrently unregistering a query from multiple clients is safe and
+    that the profile can be fetched during the process."""
+    # Attach a UUID to the query text to make it easy to identify in web UI.
+    query_uuid = str(uuid.uuid4())
+    statement = "/*{0}*/ SELECT COUNT(2) FROM functional.alltypes".format(query_uuid)
+    execute_statement_resp = self.execute_statement(statement)
+    op_handle = execute_statement_resp.operationHandle
+
+    fetch_results_req = TCLIService.TFetchResultsReq()
+    fetch_results_req.operationHandle = op_handle
+    fetch_results_req.maxRows = 100
+    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
+    TestHS2.check_response(fetch_results_resp)
+
+    # Create a profile fetch thread and multiple unregister threads.
+    NUM_UNREGISTER_THREADS = 10
+    threads = []
+    profile_fetch_exception = [None]
+    unreg_exceptions = [None] * NUM_UNREGISTER_THREADS
+    sockets = []
+    try:
+      # Start a profile fetch thread first that will fetch the profile
+      # as the query is unregistered.
+      threads.append(threading.Thread(target=self._fetch_profile_loop,
+        args=(profile_fetch_exception, query_uuid, op_handle)))
+
+      # Start threads that will race to unregister the query.
+      for i in range(NUM_UNREGISTER_THREADS):
+        socket, client = self._open_hs2_connection()
+        sockets.append(socket)
+        threads.append(threading.Thread(target=self._unregister_query,
+            args=(i, unreg_exceptions, client, op_handle)))
+      for thread in threads:
+        thread.start()
+      for thread in threads:
+        thread.join()
+    finally:
+      for socket in sockets:
+        socket.close()
+
+    if profile_fetch_exception[0] is not None:
+      raise profile_fetch_exception[0]
+
+    # Validate the exceptions and ensure only one thread successfully unregistered
+    # the query.
+    num_successful = 0
+    for exception in unreg_exceptions:
+      if exception is None:
+        num_successful += 1
+      elif "Invalid or unknown query handle" not in str(exception):
+        raise exception
+    assert num_successful == 1, "Only one client should have been able to unregister"
+
+  def _fetch_profile_loop(self, exception_array, query_uuid, op_handle):
+    try:
+      # This thread will keep fetching the profile to make sure that the
+      # ClientRequestState object can be continually accessed during unregistration.
+      get_profile_req = ImpalaHiveServer2Service.TGetRuntimeProfileReq()
+      get_profile_req.operationHandle = op_handle
+      get_profile_req.sessionHandle = self.session_handle
+
+      def find_query(array):
+        """Find the query for this test in a JSON array returned from web UI."""
+        return [q for q in array if query_uuid in q['stmt']]
+      # Loop until the query has been unregistered and moved out of in-flight
+      # queries.
+      registered = True
+      while registered:
+        get_profile_resp = self.hs2_client.GetRuntimeProfile(get_profile_req)
+        TestHS2.check_response(get_profile_resp)
+        if "Unregister query" in get_profile_resp.profile:
+          json = self.impalad_test_service.get_queries_json()
+          inflight_query = find_query(json['in_flight_queries'])
+          completed_query = find_query(json['completed_queries'])
+          # Query should only be in one list.
+          assert len(inflight_query) + len(completed_query) == 1
+          if completed_query:
+            registered = False
+    except BaseException as e:
+      exception_array[0] = e
+
+  def _unregister_query(self, thread_num, exceptions, client, op_handle):
+    # Add some delay/jitter so that unregisters come in at different times.
+    time.sleep(0.01 + 0.005 * random.random())
+    try:
+      close_operation_req = TCLIService.TCloseOperationReq()
+      close_operation_req.operationHandle = op_handle
+      TestHS2.check_response(client.CloseOperation(close_operation_req))
+    except BaseException as e:
+      exceptions[thread_num] = e
+
   @needs_session(conf_overlay={"use:database": "functional"})
   def test_change_default_database(self):
     statement = "SELECT 1 FROM alltypes LIMIT 1"
@@ -847,7 +991,7 @@ class TestHS2(HS2TestSuite):
     results = fetch_results_resp.results
     types = ['BOOLEAN', 'TINYINT', 'SMALLINT', 'INT', 'BIGINT', 'FLOAT', 'DOUBLE', 'DATE',
              'TIMESTAMP', 'STRING', 'VARCHAR', 'DECIMAL', 'CHAR', 'ARRAY', 'MAP',
-             'STRUCT']
+             'STRUCT', 'BINARY']
     assert self.get_num_rows(results) == len(types)
     # Validate that each type description (result row) has the required 18 fields as
     # described in the DatabaseMetaData.getTypeInfo() documentation.

@@ -15,9 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-
-cmake_minimum_required(VERSION 2.6)
-
 set(BE_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/be/generated-sources)
 set(FE_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/fe/generated-sources/gen-java/org/apache/impala/)
 
@@ -26,10 +23,23 @@ set(CODE_GEN_OUTPUT
   ${FE_OUTPUT_DIR}/builtins/ScalarBuiltins.java
 )
 
+set(GEOSPATIAL_CODE_GEN_OUTPUT
+  ${FE_OUTPUT_DIR}/builtins/ST_ConvexHull_Wrapper.java
+  ${FE_OUTPUT_DIR}/builtins/ST_LineString_Wrapper.java
+  ${FE_OUTPUT_DIR}/builtins/ST_MultiPoint_Wrapper.java
+  ${FE_OUTPUT_DIR}/builtins/ST_Polygon_Wrapper.java
+  ${FE_OUTPUT_DIR}/builtins/ST_Union_Wrapper.java
+)
+
 # Source python files
 set(FUNCTION_REGISTRY_INPUT
   gen_builtins_catalog.py
   impala_functions.py
+)
+
+set(GEOSPATIAL_WRAPPER_INPUT
+  gen_builtins_catalog.py
+  gen_geospatial_udf_wrappers.py
 )
 
 # Run the python scripts
@@ -41,5 +51,20 @@ add_custom_command(
   VERBATIM
 )
 
+add_custom_command(
+  OUTPUT ${GEOSPATIAL_CODE_GEN_OUTPUT}
+  COMMAND ./gen_geospatial_udf_wrappers.py
+  DEPENDS ${GEOSPATIAL_WRAPPER_INPUT}
+  COMMENT "Generating UDF wrappers for geospatial builtins."
+  VERBATIM
+)
+
 add_custom_target(function-registry ALL DEPENDS ${CODE_GEN_OUTPUT})
 
+if( $ENV{USE_APACHE_HIVE} STREQUAL "false")
+  add_custom_target(geospatial-udf-wrappers ALL DEPENDS ${GEOSPATIAL_CODE_GEN_OUTPUT})
+  add_dependencies(geospatial-udf-wrappers function-registry)
+else()
+  # Empty target to skip wrapper generation
+  add_custom_target(geospatial-udf-wrappers)
+endif()

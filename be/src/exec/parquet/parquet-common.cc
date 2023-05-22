@@ -80,6 +80,21 @@ void GetRowRangeForPage(const parquet::RowGroup& row_group,
   }
 }
 
+void GetRowRangeForPageRange(const parquet::RowGroup& row_group,
+    const parquet::OffsetIndex& offset_index, const PageRange& page_range,
+    RowRange* row_range) {
+  const auto& page_locations = offset_index.page_locations;
+  DCHECK_GE(page_range.first, 0);
+  DCHECK_LE(page_range.first, page_range.last);
+  DCHECK_LT(page_range.last, page_locations.size());
+  row_range->first = page_locations[page_range.first].first_row_index;
+  if (page_range.last == page_locations.size() - 1) {
+    row_range->last = row_group.num_rows - 1;
+  } else {
+    row_range->last = page_locations[page_range.last + 1].first_row_index - 1;
+  }
+}
+
 static bool ValidateRowRangesData(const vector<RowRange>& skip_ranges,
     const int64_t num_rows) {
   for (auto& range : skip_ranges) {
@@ -120,15 +135,23 @@ bool ComputeCandidateRanges(const int64_t num_rows, vector<RowRange>* skip_range
 
 static bool ValidatePageLocations(const vector<parquet::PageLocation>& page_locations,
     const int64_t num_rows) {
+  int last_valid_idx = -1;
   for (int i = 0; i < page_locations.size(); ++i) {
     auto& page_loc = page_locations[i];
-    if (page_loc.first_row_index < 0 || page_loc.first_row_index >= num_rows) {
-      return false;
+    if (!IsValidPageLocation(page_loc, num_rows)) {
+      // Skip page locations for empty pages.
+      if (page_loc.compressed_page_size == 0) {
+        continue;
+      } else {
+        return false;
+      }
     }
-    if (i + 1 < page_locations.size()) {
-      auto& next_page_loc = page_locations[i+1];
-      if (page_loc.first_row_index >= next_page_loc.first_row_index) return false;
+    if (last_valid_idx != -1) {
+      auto& last_valid_page = page_locations[last_valid_idx];
+      // 'first_row_index' must have progressed in a non-empty page.
+      if (page_loc.first_row_index <= last_valid_page.first_row_index) return false;
     }
+    last_valid_idx = i;
   }
   return true;
 }
@@ -147,11 +170,21 @@ bool ComputeCandidatePages(
   if (!ValidatePageLocations(page_locations, num_rows)) return false;
 
   int range_idx = 0;
-  for (int i = 0; i < page_locations.size(); ++i) {
-    auto& page_location = page_locations[i];
+  int page_idx = 0;
+  while (page_idx < page_locations.size()) {
+    auto& page_location = page_locations[page_idx];
+    if (page_location.compressed_page_size == 0) {
+      ++page_idx;
+      continue;
+    }
+    int next_page_idx = page_idx + 1;
+    while (next_page_idx < page_locations.size() &&
+           page_locations[next_page_idx].compressed_page_size == 0) {
+      ++next_page_idx;
+    }
     int64_t page_start = page_location.first_row_index;
-    int64_t page_end = i != page_locations.size() - 1 ?
-                       page_locations[i + 1].first_row_index - 1 :
+    int64_t page_end = next_page_idx < page_locations.size() ?
+                       page_locations[next_page_idx].first_row_index - 1 :
                        num_rows - 1;
     while (range_idx < candidate_ranges.size() &&
         candidate_ranges[range_idx].last < page_start) {
@@ -159,8 +192,9 @@ bool ComputeCandidatePages(
     }
     if (range_idx >= candidate_ranges.size()) break;
     if (RangesIntersect(candidate_ranges[range_idx], {page_start, page_end})) {
-      candidate_pages->push_back(i);
+      candidate_pages->push_back(page_idx);
     }
+    page_idx = next_page_idx;
   }
   // When there are candidate ranges, then we should have at least one candidate page.
   if (!candidate_ranges.empty() && candidate_pages->empty()) return false;

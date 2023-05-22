@@ -18,6 +18,8 @@
 #include "runtime/coordinator.h"
 
 #include <cerrno>
+#include <iomanip>
+#include <sstream>
 #include <unordered_set>
 
 #include <thrift/protocol/TDebugProtocol.h>
@@ -29,32 +31,44 @@
 #include <gutil/strings/substitute.h>
 
 #include "common/hdfs.h"
+#include "exec/buffered-plan-root-sink.h"
 #include "exec/data-sink.h"
 #include "exec/plan-root-sink.h"
-#include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
+#include "gen-cpp/admission_control_service.pb.h"
+#include "kudu/rpc/rpc_context.h"
+#include "kudu/rpc/rpc_sidecar.h"
+#include "runtime/coordinator-backend-state.h"
+#include "runtime/coordinator-filter-state.h"
+#include "runtime/debug-options.h"
 #include "runtime/exec-env.h"
 #include "runtime/fragment-instance-state.h"
 #include "runtime/hdfs-fs-cache.h"
+#include "runtime/query-driver.h"
 #include "runtime/query-exec-mgr.h"
-#include "runtime/coordinator-filter-state.h"
-#include "runtime/coordinator-backend-state.h"
-#include "runtime/debug-options.h"
 #include "runtime/query-state.h"
-#include "scheduling/admission-controller.h"
+#include "runtime/raw-value.h"
+#include "scheduling/admission-control-client.h"
 #include "scheduling/scheduler.h"
-#include "scheduling/query-schedule.h"
 #include "service/client-request-state.h"
+#include "service/frontend.h"
+#include "util/bit-util.h"
 #include "util/bloom-filter.h"
 #include "util/hdfs-bulk-ops.h"
 #include "util/hdfs-util.h"
 #include "util/histogram-metric.h"
+#include "util/kudu-status-util.h"
+#include "util/in-list-filter.h"
 #include "util/min-max-filter.h"
 #include "util/pretty-printer.h"
 #include "util/table-printer.h"
+#include "util/uid-util.h"
 
 #include "common/names.h"
 
+using kudu::rpc::RpcContext;
+using kudu::rpc::RpcController;
+using kudu::rpc::RpcSidecar;
 using namespace apache::thrift;
 using namespace rapidjson;
 using boost::algorithm::iequals;
@@ -64,6 +78,7 @@ using boost::algorithm::token_compress_on;
 using boost::algorithm::split;
 using boost::filesystem::path;
 
+DECLARE_bool(gen_experimental_profile);
 DECLARE_string(hostname);
 
 using namespace impala;
@@ -107,15 +122,16 @@ PROFILE_DEFINE_TIMER(FinalizationTimer, STABLE_LOW,
 // Maximum number of fragment instances that can publish each broadcast filter.
 static const int MAX_BROADCAST_FILTER_PRODUCERS = 3;
 
-Coordinator::Coordinator(ClientRequestState* parent, const QuerySchedule& schedule,
-    RuntimeProfile::EventSequence* events)
-  : parent_request_state_(parent),
-    schedule_(schedule),
-    filter_mode_(schedule.query_options().runtime_filter_mode),
+Coordinator::Coordinator(ClientRequestState* parent, const TExecRequest& exec_request,
+    const QuerySchedulePB& query_schedule, RuntimeProfile::EventSequence* events)
+  : parent_query_driver_(parent->parent_driver()),
+    parent_request_state_(parent),
+    exec_params_(exec_request, query_schedule),
+    filter_mode_(exec_params_.query_options().runtime_filter_mode),
     obj_pool_(new ObjectPool()),
     query_events_(events),
-    exec_rpcs_complete_barrier_(schedule_.per_backend_exec_params().size()),
-    backend_released_barrier_(schedule_.per_backend_exec_params().size()),
+    exec_rpcs_status_barrier_(query_schedule.backend_exec_params().size()),
+    backend_released_barrier_(query_schedule.backend_exec_params().size()),
     filter_routing_table_(new FilterRoutingTable) {}
 
 Coordinator::~Coordinator() {
@@ -129,29 +145,29 @@ Coordinator::~Coordinator() {
 }
 
 Status Coordinator::Exec() {
-  const TQueryExecRequest& request = schedule_.request();
+  const TQueryExecRequest& request = exec_params_.query_exec_request();
   DCHECK(request.plan_exec_info.size() > 0);
 
   VLOG_QUERY << "Exec() query_id=" << PrintId(query_id())
              << " stmt=" << request.query_ctx.client_request.stmt;
   stmt_type_ = request.stmt_type;
 
-  query_profile_ =
-      RuntimeProfile::Create(obj_pool(), "Execution Profile " + PrintId(query_id()));
+  query_profile_ = RuntimeProfile::Create(
+      obj_pool(), "Execution Profile " + PrintId(query_id()), false);
   finalization_timer_ = PROFILE_FinalizationTimer.Instantiate(query_profile_);
   filter_updates_received_ = PROFILE_FiltersReceived.Instantiate(query_profile_);
 
-  host_profiles_ = RuntimeProfile::Create(obj_pool(), "Per Node Profiles");
+  host_profiles_ = RuntimeProfile::Create(obj_pool(), "Per Node Profiles", false);
   query_profile_->AddChild(host_profiles_);
 
   SCOPED_TIMER(query_profile_->total_time_counter());
 
   // initialize progress updater
   const string& str = Substitute("Query $0", PrintId(query_id()));
-  progress_.Init(str, schedule_.num_scan_ranges());
+  progress_.Init(str, exec_params_.query_schedule().num_scan_ranges());
 
   query_state_ = ExecEnv::GetInstance()->query_exec_mgr()->CreateQueryState(
-      query_ctx(), schedule_.coord_backend_mem_limit());
+      query_ctx(), exec_params_.query_schedule().coord_backend_mem_limit());
   filter_mem_tracker_ = query_state_->obj_pool()->Add(new MemTracker(
       -1, "Runtime Filter (Coordinator)", query_state_->query_mem_tracker(), false));
 
@@ -159,10 +175,9 @@ Status Coordinator::Exec() {
   // create BackendStates and per-instance state, including profiles, and install
   // the latter in the FragmentStats' root profile
   InitBackendStates();
-  exec_summary_.Init(schedule_);
+  exec_summary_.Init(exec_params_);
 
   if (filter_mode_ != TRuntimeFilterMode::OFF) {
-    DCHECK_EQ(request.plan_exec_info.size(), 1);
     // Populate the runtime filter routing table. This should happen before starting the
     // fragment instances. This code anticipates the indices of the instance states
     // created later on in ExecRemoteFragment()
@@ -177,7 +192,7 @@ Status Coordinator::Exec() {
   RETURN_IF_ERROR(FinishBackendStartup());
 
   // set coord_instance_ and coord_sink_
-  if (schedule_.GetCoordFragment() != nullptr) {
+  if (exec_params_.GetCoordFragment() != nullptr) {
     // this blocks until all fragment instances have finished their Prepare phase
     Status query_status = query_state_->GetFInstanceState(query_id(), &coord_instance_);
     if (!query_status.ok()) return UpdateExecState(query_status, nullptr, FLAGS_hostname);
@@ -192,37 +207,40 @@ Status Coordinator::Exec() {
 }
 
 void Coordinator::InitFragmentStats() {
-  vector<const TPlanFragment*> fragments;
-  schedule_.GetTPlanFragments(&fragments);
-  const TPlanFragment* coord_fragment = schedule_.GetCoordFragment();
+  const TPlanFragment* coord_fragment = exec_params_.GetCoordFragment();
   int64_t total_num_finstances = 0;
 
-  for (const TPlanFragment* fragment: fragments) {
+  DCHECK_GT(exec_params_.num_fragments(), 0);
+  for (const TPlanFragment* fragment : exec_params_.GetFragments()) {
     string root_profile_name =
         Substitute(
           fragment == coord_fragment ? "Coordinator Fragment $0" : "Fragment $0",
           fragment->display_name);
-    string avg_profile_name =
+    const string& agg_profile_name = FLAGS_gen_experimental_profile ?
+        root_profile_name :
         Substitute("Averaged Fragment $0", fragment->display_name);
-    int num_instances =
-        schedule_.GetFragmentExecParams(fragment->idx).instance_exec_params.size();
+    int num_instances = exec_params_.query_schedule()
+                            .fragment_exec_params(fragment->idx)
+                            .instances_size();
     total_num_finstances += num_instances;
     // TODO: special-case the coordinator fragment?
-    FragmentStats* fragment_stats = obj_pool()->Add(
-        new FragmentStats(
-          avg_profile_name, root_profile_name, num_instances, obj_pool()));
+    FragmentStats* fragment_stats = obj_pool()->Add(new FragmentStats(
+        agg_profile_name, root_profile_name, num_instances, obj_pool()));
     fragment_stats_.push_back(fragment_stats);
-    query_profile_->AddChild(fragment_stats->avg_profile(), true);
-    query_profile_->AddChild(fragment_stats->root_profile());
+    query_profile_->AddChild(fragment_stats->agg_profile(), true);
+    if (!FLAGS_gen_experimental_profile) {
+      // Per-instance profiles are not included in the profile tree in profile V2.
+      query_profile_->AddChild(fragment_stats->root_profile());
+    }
   }
   COUNTER_SET(PROFILE_NumFragments.Instantiate(query_profile_),
-      static_cast<int64_t>(fragments.size()));
+      static_cast<int64_t>(exec_params_.num_fragments()));
   COUNTER_SET(PROFILE_NumFragmentInstances.Instantiate(query_profile_),
       total_num_finstances);
 }
 
 void Coordinator::InitBackendStates() {
-  int num_backends = schedule_.per_backend_exec_params().size();
+  int num_backends = exec_params_.query_schedule().backend_exec_params().size();
   DCHECK_GT(num_backends, 0);
 
   lock_guard<SpinLock> l(backend_states_init_lock_);
@@ -232,9 +250,10 @@ void Coordinator::InitBackendStates() {
 
   // create BackendStates
   int backend_idx = 0;
-  for (const auto& entry : schedule_.per_backend_exec_params()) {
-    BackendState* backend_state = obj_pool()->Add(new BackendState(
-        schedule_, query_ctx(), backend_idx, filter_mode_, entry.second));
+  for (const BackendExecParamsPB& backend_exec_params :
+      exec_params_.query_schedule().backend_exec_params()) {
+    BackendState* backend_state = obj_pool()->Add(
+        new BackendState(exec_params_, backend_idx, filter_mode_, backend_exec_params));
     backend_state->Init(fragment_stats_, host_profiles_, obj_pool());
     backend_states_[backend_idx++] = backend_state;
     // was_inserted is true if the pair was successfully inserted into the map, false
@@ -247,13 +266,12 @@ void Coordinator::InitBackendStates() {
                     << " associated with multiple BackendStates";
     }
   }
-  backend_resource_state_ =
-      obj_pool()->Add(new BackendResourceState(backend_states_, schedule_));
+  backend_resource_state_ = obj_pool()->Add(new BackendResourceState(backend_states_));
   num_completed_backends_ = PROFILE_NumCompletedBackends.Instantiate(query_profile_);
 }
 
-void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
-  const TQueryExecRequest& request = schedule.request();
+void Coordinator::ExecSummary::Init(const QueryExecParams& exec_params) {
+  const TQueryExecRequest& request = exec_params.query_exec_request();
   // init exec_summary_.{nodes, exch_to_sender_map}
   thrift_exec_summary.__isset.nodes = true;
   DCHECK(thrift_exec_summary.nodes.empty());
@@ -267,14 +285,10 @@ void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
       const TPlan& plan = fragment.plan;
       const TDataSink& output_sink = fragment.output_sink;
       // Count the number of hosts and instances.
-      const vector<FInstanceExecParams>& instance_params =
-          schedule.GetFragmentExecParams(fragment.idx).instance_exec_params;
-      unordered_set<TNetworkAddress> host_set;
-      for (const FInstanceExecParams& instance: instance_params) {
-        host_set.insert(instance.host);
-      }
-      int num_hosts = host_set.size();
-      int num_instances = instance_params.size();
+      const FragmentExecParamsPB& fragment_exec_param =
+          exec_params.query_schedule().fragment_exec_params(fragment.idx);
+      int num_hosts = fragment_exec_param.num_hosts();
+      int num_instances = fragment_exec_param.instances_size();
 
       // Add the data sink at the root of the fragment.
       data_sink_id_to_idx_map[fragment.idx] = thrift_exec_summary.nodes.size();
@@ -315,15 +329,23 @@ void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
         node_summary.exec_stats.resize(num_instances);
       }
 
-      if (fragment.__isset.output_sink
-          && fragment.output_sink.type == TDataSinkType::DATA_STREAM_SINK) {
-        const TDataStreamSink& sink = fragment.output_sink.stream_sink;
-        int exch_idx = node_id_to_idx_map[sink.dest_node_id];
-        if (sink.output_partition.type == TPartitionType::UNPARTITIONED) {
-          thrift_exec_summary.nodes[exch_idx].__set_is_broadcast(true);
+      if (fragment.__isset.output_sink &&
+          (fragment.output_sink.type == TDataSinkType::DATA_STREAM_SINK
+           || IsJoinBuildSink(fragment.output_sink.type))) {
+        int dst_node_idx;
+        if (fragment.output_sink.type == TDataSinkType::DATA_STREAM_SINK) {
+          const TDataStreamSink& sink = fragment.output_sink.stream_sink;
+          dst_node_idx = node_id_to_idx_map[sink.dest_node_id];
+          if (sink.output_partition.type == TPartitionType::UNPARTITIONED) {
+            thrift_exec_summary.nodes[dst_node_idx].__set_is_broadcast(true);
+          }
+        } else {
+          DCHECK(IsJoinBuildSink(fragment.output_sink.type));
+          const TJoinBuildSink& sink = fragment.output_sink.join_build_sink;
+          dst_node_idx = node_id_to_idx_map[sink.dest_node_id];
         }
         thrift_exec_summary.__isset.exch_to_sender_map = true;
-        thrift_exec_summary.exch_to_sender_map[exch_idx] = root_node_idx;
+        thrift_exec_summary.exch_to_sender_map[dst_node_idx] = root_node_idx;
       }
     }
   }
@@ -336,54 +358,44 @@ void Coordinator::InitFilterRoutingTable() {
       << "InitFilterRoutingTable() called after table marked as complete";
 
   lock_guard<shared_mutex> lock(filter_routing_table_->lock); // Exclusive lock.
-  for (const FragmentExecParams& fragment_params: schedule_.fragment_exec_params()) {
-    int num_instances = fragment_params.instance_exec_params.size();
+  for (const FragmentExecParamsPB& fragment_params :
+      exec_params_.query_schedule().fragment_exec_params()) {
+    int num_instances = fragment_params.instances_size();
     DCHECK_GT(num_instances, 0);
+    int num_backends = fragment_params.num_hosts();
+    DCHECK_GT(num_backends, 0);
 
-    for (const TPlanNode& plan_node: fragment_params.fragment.plan.nodes) {
+    const TPlanFragment* fragment =
+        exec_params_.GetFragments()[fragment_params.fragment_idx()];
+    // Hash join build sinks can produce filters in mt_dop > 0 plans.
+    if (fragment->output_sink.__isset.join_build_sink) {
+      const TJoinBuildSink& join_sink = fragment->output_sink.join_build_sink;
+      for (const TRuntimeFilterDesc& filter: join_sink.runtime_filters) {
+        // The join node ID is used to identify the join that produces the filter, even
+        // though the builder is separate from the actual node.
+        DCHECK_EQ(filter.src_node_id, join_sink.dest_node_id);
+        AddFilterSource(
+            fragment_params, num_instances, num_backends, filter, filter.src_node_id);
+      }
+    }
+    for (const TPlanNode& plan_node : fragment->plan.nodes) {
       if (!plan_node.__isset.runtime_filters) continue;
       for (const TRuntimeFilterDesc& filter: plan_node.runtime_filters) {
         DCHECK(filter_mode_ == TRuntimeFilterMode::GLOBAL || filter.has_local_targets);
-        auto i = filter_routing_table_->id_to_filter.emplace(
-            filter.filter_id, FilterState(filter, plan_node.node_id)).first;
-        FilterState* f = &(i->second);
-
-        // source plan node of filter
-        if (plan_node.__isset.hash_join_node) {
-          // Set the 'pending_count_' to zero to indicate that for a filter with
-          // local-only targets the coordinator does not expect to receive any filter
-          // updates.
-          int pending_count = filter.is_broadcast_join
-              ? (filter.has_remote_targets ? 1 : 0) : num_instances;
-          f->set_pending_count(pending_count);
-
-          // determine source instances
-          // TODO: store this in FInstanceExecParams, not in FilterState
-          vector<int> src_idxs = fragment_params.GetInstanceIdxs();
-
-          // If this is a broadcast join with only non-local targets, build and publish it
-          // on MAX_BROADCAST_FILTER_PRODUCERS instances. If this is not a broadcast join
-          // or it is a broadcast join with local targets, it should be generated
-          // everywhere the join is executed.
-          if (filter.is_broadcast_join && !filter.has_local_targets
-              && num_instances > MAX_BROADCAST_FILTER_PRODUCERS) {
-            random_shuffle(src_idxs.begin(), src_idxs.end());
-            src_idxs.resize(MAX_BROADCAST_FILTER_PRODUCERS);
-          }
-          for (int src_idx : src_idxs) {
-            TRuntimeFilterSource filter_src;
-            filter_src.src_node_id = plan_node.node_id;
-            filter_src.filter_id = filter.filter_id;
-            filter_routing_table_->finstance_filters_produced[src_idx].emplace_back(
-                filter_src);
-          }
-          f->set_num_producers(src_idxs.size());
+        // Currently either hash or nested loop joins are the only filter sources.
+        // Otherwise it must be a filter consumer.
+        if (plan_node.__isset.join_node
+            && (plan_node.join_node.__isset.hash_join_node
+                || plan_node.join_node.__isset.nested_loop_join_node)) {
+          AddFilterSource(
+              fragment_params, num_instances, num_backends, filter, plan_node.node_id);
         } else if (plan_node.__isset.hdfs_scan_node || plan_node.__isset.kudu_scan_node) {
+          FilterState* f = filter_routing_table_->GetOrCreateFilterState(filter);
           auto it = filter.planid_to_target_ndx.find(plan_node.node_id);
           DCHECK(it != filter.planid_to_target_ndx.end());
           const TRuntimeFilterTargetDesc& t_target = filter.targets[it->second];
           DCHECK(filter_mode_ == TRuntimeFilterMode::GLOBAL || t_target.is_local_target);
-          f->targets()->emplace_back(t_target, fragment_params.fragment.idx);
+          f->targets()->emplace_back(t_target, fragment->idx);
         } else {
           DCHECK(false) << "Unexpected plan node with runtime filters: "
               << ThriftDebugString(plan_node);
@@ -399,18 +411,74 @@ void Coordinator::InitFilterRoutingTable() {
   filter_routing_table_->is_complete = true;
 }
 
+void Coordinator::AddFilterSource(const FragmentExecParamsPB& src_fragment_params,
+    int num_instances, int num_backends, const TRuntimeFilterDesc& filter,
+    int join_node_id) {
+  FilterState* f = filter_routing_table_->GetOrCreateFilterState(filter);
+  // Set the 'pending_count_' to zero to indicate that for a filter with
+  // local-only targets the coordinator does not expect to receive any filter
+  // updates. We expect to receive a single aggregated filter from each backend
+  // for partitioned joins.
+  int pending_count = filter.is_broadcast_join
+      ? (filter.has_remote_targets ? 1 : 0) : num_backends;
+  f->set_pending_count(pending_count);
+
+  // Determine which instances will produce the filters.
+  // TODO: IMPALA-9333: having a shared RuntimeFilterBank between all fragments on
+  // a backend allows further optimizations to reduce the number of broadcast join
+  // filters sent over the network, by considering cross-fragment filters on
+  // the same backend as local filters:
+  // 1. Produce a local filter on any backend with a destination fragment.
+  // 2. Only produce one local filter per backend (although, this would be made
+  //    redundant by IMPALA-4224 - sharing broadcast join hash tables).
+  // 3. Don't produce a global filter if all targets can be satisfied with
+  //    local producers.
+  // This work was deferred from the IMPALA-4400 change because it provides only
+  // incremental performance benefits.
+  vector<int> src_idxs;
+  for (const UniqueIdPB& instance_id : src_fragment_params.instances()) {
+    src_idxs.push_back(GetInstanceIdx(instance_id));
+  }
+
+  // If this is a broadcast join with only non-local targets, build and publish it
+  // on MAX_BROADCAST_FILTER_PRODUCERS instances. If this is not a broadcast join
+  // or it is a broadcast join with local targets, it should be generated
+  // everywhere the join is executed.
+  if (filter.is_broadcast_join && !filter.has_local_targets
+      && num_instances > MAX_BROADCAST_FILTER_PRODUCERS) {
+    random_shuffle(src_idxs.begin(), src_idxs.end());
+    src_idxs.resize(MAX_BROADCAST_FILTER_PRODUCERS);
+  }
+  for (int src_idx : src_idxs) {
+    TRuntimeFilterSource filter_src;
+    filter_src.src_node_id = join_node_id;
+    filter_src.filter_id = filter.filter_id;
+    filter_routing_table_->finstance_filters_produced[src_idx].emplace_back(
+        filter_src);
+  }
+  f->set_num_producers(src_idxs.size());
+}
+
+void Coordinator::WaitOnExecRpcs() {
+  if (exec_rpcs_complete_.Load()) return;
+  for (BackendState* backend_state : backend_states_) {
+    backend_state->WaitOnExecRpc();
+  }
+  exec_rpcs_complete_.Store(true);
+}
+
 Status Coordinator::StartBackendExec() {
   int num_backends = backend_states_.size();
   backend_exec_complete_barrier_.reset(new CountingBarrier(num_backends));
 
-  DebugOptions debug_options(schedule_.query_options());
+  DebugOptions debug_options(exec_params_.query_options());
 
   VLOG_QUERY << "starting execution on " << num_backends << " backends for query_id="
              << PrintId(query_id());
   query_events_->MarkEvent(Substitute("Ready to start on $0 backends", num_backends));
 
   // Serialize the TQueryCtx once and pass it to each backend. The serialized buffer must
-  // stay valid until exec_rpcs_complete_barrier_ has been signalled.
+  // stay valid until WaitOnExecRpcs() has returned.
   ThriftSerializer serializer(true);
   uint8_t* serialized_buf = nullptr;
   uint32_t serialized_len = 0;
@@ -422,30 +490,58 @@ Status Coordinator::StartBackendExec() {
   kudu::Slice query_ctx_slice(serialized_buf, serialized_len);
 
   for (BackendState* backend_state: backend_states_) {
-    ExecEnv::GetInstance()->exec_rpc_thread_pool()->Offer(
-        [backend_state, this, &debug_options, &query_ctx_slice]() {
-          DebugActionNoFail(schedule_.query_options(), "COORD_BEFORE_EXEC_RPC");
-          // Safe for Exec() to read 'filter_routing_table_' because it is complete
-          // at this point and won't be destroyed while this function is executing,
-          // because it won't be torn down until 'exec_rpcs_complete_barrier_' is
-          // signalled.
-          DCHECK(filter_mode_ == TRuntimeFilterMode::OFF
-              || filter_routing_table_->is_complete);
-          backend_state->Exec(debug_options, *filter_routing_table_, query_ctx_slice,
-              &exec_rpcs_complete_barrier_);
-        });
+    if (exec_rpcs_status_barrier_.pending() <= 0) {
+      // One of the backends has already indicated an error with Exec().
+      break;
+    }
+    DebugActionNoFail(exec_params_.query_options(), "COORD_BEFORE_EXEC_RPC");
+    // Safe for ExecAsync() to read 'filter_routing_table_' because it is complete
+    // at this point and won't be destroyed while this function is executing,
+    // because it won't be torn down until WaitOnExecRpcs() has returned.
+    DCHECK(filter_mode_ == TRuntimeFilterMode::OFF || filter_routing_table_->is_complete);
+    backend_state->ExecAsync(debug_options, *filter_routing_table_, query_ctx_slice,
+        &exec_rpcs_status_barrier_);
   }
-  exec_rpcs_complete_barrier_.Wait();
+  Status exec_rpc_status = exec_rpcs_status_barrier_.Wait();
+  if (!exec_rpc_status.ok()) {
+    // One of the backends failed to startup, so we cancel the other ones.
+    CancelBackends(/*fire_and_forget=*/ true);
+    WaitOnExecRpcs();
+    vector<BackendState*> failed_backend_states;
+    for (BackendState* backend_state : backend_states_) {
+      // If Exec() rpc failed for a reason besides being aborted, blacklist the executor
+      // and retry the query.
+      if (!backend_state->exec_rpc_status().ok()
+          && !backend_state->exec_rpc_status().IsAborted()) {
+        failed_backend_states.push_back(backend_state);
+        LOG(INFO) << "Blacklisting " << backend_state->impalad_address()
+                  << " because an Exec() rpc to it failed.";
+        const UniqueIdPB& backend_id = backend_state->exec_params().backend_id();
+        ExecEnv::GetInstance()->cluster_membership_mgr()->BlacklistExecutor(backend_id,
+            FromKuduStatus(backend_state->exec_rpc_status(), "Exec() rpc failed"));
+        parent_request_state_->AddBlacklistedExecutorAddress(
+            backend_state->exec_params().address());
+      }
+    }
+    if (!failed_backend_states.empty()) {
+      HandleFailedExecRpcs(failed_backend_states);
+    }
+    VLOG_QUERY << "query startup cancelled due to a failed Exec() rpc: "
+               << exec_rpc_status;
+    return UpdateExecState(exec_rpc_status, nullptr, FLAGS_hostname);
+  }
 
+  WaitOnExecRpcs();
   VLOG_QUERY << "started execution on " << num_backends << " backends for query_id="
              << PrintId(query_id());
   query_events_->MarkEvent(
       Substitute("All $0 execution backends ($1 fragment instances) started",
-        num_backends, schedule_.GetNumFragmentInstances()));
+          num_backends, exec_params_.GetNumFragmentInstances()));
   return Status::OK();
 }
 
 Status Coordinator::FinishBackendStartup() {
+  DCHECK(exec_rpcs_complete_.Load());
   const TMetricDef& def =
       MakeTMetricDef("backend-startup-latencies", TMetricKind::HISTOGRAM, TUnit::TIME_MS);
   // Capture up to 30 minutes of start-up times, in ms, with 4 s.f. accuracy.
@@ -455,25 +551,19 @@ Status Coordinator::FinishBackendStartup() {
   string max_latency_host;
   int max_latency = 0;
   for (BackendState* backend_state: backend_states_) {
+    // All of the Exec() rpcs must have completed successfully.
+    DCHECK(backend_state->exec_rpc_status().ok());
     // preserve the first non-OK, if there is one
     Status backend_status = backend_state->GetStatus();
     if (!backend_status.ok() && status.ok()) {
       status = backend_status;
-      error_hostname = backend_state->impalad_address().hostname;
-    }
-    if (!backend_state->exec_rpc_status().ok()) {
-      // The Exec() rpc failed, so blacklist the executor.
-      LOG(INFO) << "Blacklisting "
-                << TNetworkAddressToString(backend_state->impalad_address())
-                << " because an Exec() rpc to it failed.";
-      const TBackendDescriptor& be_desc = backend_state->exec_params()->be_desc;
-      ExecEnv::GetInstance()->cluster_membership_mgr()->BlacklistExecutor(be_desc);
+      error_hostname = backend_state->impalad_address().hostname();
     }
     if (backend_state->rpc_latency() > max_latency) {
       // Find the backend that takes the most time to acknowledge to
       // the ExecQueryFInstances() RPC.
       max_latency = backend_state->rpc_latency();
-      max_latency_host = TNetworkAddressToString(backend_state->impalad_address());
+      max_latency_host = NetworkAddressPBToString(backend_state->impalad_address());
     }
     latencies.Update(backend_state->rpc_latency());
     // Mark backend complete if no fragment instances were assigned to it.
@@ -502,11 +592,18 @@ string Coordinator::FilterDebugString() {
     table_printer.AddColumn("Completed", false);
   }
   table_printer.AddColumn("Enabled", false);
+  table_printer.AddColumn("Bloom Size", false);
+  table_printer.AddColumn("Est fpp", false);
+  table_printer.AddColumn("Min value", false);
+  table_printer.AddColumn("Max value", false);
+  table_printer.AddColumn("In-list size", false);
+  ObjectPool temp_object_pool;
+  MemTracker temp_mem_tracker;
   for (auto& v: filter_routing_table_->id_to_filter) {
     vector<string> row;
     const FilterState& state = v.second;
     row.push_back(lexical_cast<string>(v.first));
-    row.push_back(lexical_cast<string>(state.src()));
+    row.push_back(lexical_cast<string>(state.desc().src_node_id));
     vector<string> target_ids;
     vector<string> target_types;
     vector<string> partition_filter;
@@ -534,9 +631,81 @@ string Coordinator::FilterDebugString() {
       }
     }
 
-    row.push_back(!state.disabled() ? "true" : "false");
+    // In case of remote filter, we might intentionally disable the filter upon
+    // completion to prevent further update. In such case, we should check if all filter
+    // updates have been successfully received.
+    row.push_back(state.enabled() || state.received_all_updates() ? "true" : "false");
+
+    // Add size and fpp for bloom filters.
+    if (state.is_bloom_filter()) {
+      int64_t filter_size = state.desc().filter_size_bytes;
+      row.push_back(PrettyPrinter::Print(filter_size, TUnit::BYTES));
+      double fpp = BloomFilter::FalsePositiveProb(
+          state.desc().ndv_estimate, BitUtil::Log2Ceiling64(filter_size));
+      stringstream ss;
+      ss << setprecision(3) << fpp;
+      row.push_back(ss.str());
+      // The following 3 fields belong to MinMax/IN-list filters.
+      for (int i = 0; i < 3; ++i) row.push_back("");
+    } else if (state.is_min_max_filter()) {
+      // Add the filter type for minmax filters.
+      row.push_back(PrintValue(state.desc().type));
+      row.push_back("");
+
+      // Also add the min/max value for the accumulated filter as follows.
+      //  'PartialUpdates' - The min and the max are partially updated;
+      //  'AlwaysTrue'     - One received filter is AlwaysTrue;
+      //  'AlwaysFalse'    - No filter is received or all received filters are empty;
+      //  'Real values'    - The final accumulated min/max from all filters received.
+      const MinMaxFilterPB& minmax_filterPB =
+          const_cast<FilterState*>(&state)->min_max_filter();
+
+      if (state.AlwaysTrueFilterReceived()) {
+        DCHECK(MinMaxFilter::AlwaysTrue(minmax_filterPB));
+        row.push_back("AlwaysTrue");
+        row.push_back("AlwaysTrue");
+      } else {
+        // AlwaysTrue, if set, is due to the disabling of the state by the coordinator,
+        // which can be safely ignored.
+        if (state.received_all_updates()) {
+          if (state.AlwaysFalseFlippedToFalse()
+              || MinMaxFilter::AlwaysFalse(minmax_filterPB)) {
+            row.push_back("AlwaysFalse");
+            row.push_back("AlwaysFalse");
+          } else {
+            row.push_back(MinMaxFilter::DebugString(minmax_filterPB.min(),
+                ColumnType::FromThrift(state.desc().src_expr.nodes[0].type)));
+            row.push_back(MinMaxFilter::DebugString(minmax_filterPB.max(),
+                ColumnType::FromThrift(state.desc().src_expr.nodes[0].type)));
+          }
+        } else {
+          row.push_back("PartialUpdates");
+          row.push_back("PartialUpdates");
+        }
+      }
+      row.push_back("");
+    } else if (state.is_in_list_filter()) {
+      row.push_back(PrintValue(state.desc().type));
+      // Skip 3 fields belong to Bloom/MinMax filters.
+      for (int i = 0; i < 3; ++i) row.push_back("");
+      const InListFilterPB& in_list_filterPB =
+          const_cast<FilterState*>(&state)->in_list_filter();
+      if (state.AlwaysTrueFilterReceived()) {
+        row.push_back("AlwaysTrue");
+      } else if (state.received_all_updates()) {
+        if (state.AlwaysFalseFlippedToFalse()
+            || InListFilter::AlwaysFalse(in_list_filterPB)) {
+          row.push_back("AlwaysFalse");
+        } else {
+          row.push_back(std::to_string(in_list_filterPB.value().size()));
+        }
+      } else {
+        row.push_back("PartialUpdates");
+      }
+    }
     table_printer.AddRow(row);
   }
+  temp_mem_tracker.Close();
   // Add a line break, as in all contexts this is called we need to start a new line to
   // print it correctly.
   return Substitute("\n$0", table_printer.ToString());
@@ -630,7 +799,7 @@ void Coordinator::HandleExecStateTransition(
   // Can't transition until the exec RPCs are no longer in progress. Otherwise, a
   // cancel RPC could be missed, and resources freed before a backend has had a chance
   // to take a resource reference.
-  DCHECK_LE(exec_rpcs_complete_barrier_.pending(), 0) << "exec rpcs not completed";
+  DCHECK(exec_rpcs_complete_.Load()) << "exec rpcs not completed";
 
   query_events_->MarkEvent(exec_state_to_event.at(new_state));
   // This thread won the race to transitioning into a terminal state - terminate
@@ -640,30 +809,57 @@ void Coordinator::HandleExecStateTransition(
     // TODO: IMPALA-6984: cancel all backends in this case too.
     WaitForBackends();
   } else {
-    CancelBackends();
+    CancelBackends(/*fire_and_forget=*/ true);
   }
   ReleaseQueryAdmissionControlResources();
   // Once the query has released its admission control resources, update its end time.
-  parent_request_state_->UpdateEndTime();
+  // However, for non Query statement like DML statement, we still need to update HMS
+  // after the query finishes. So the end time of non Query statement is not set here.
+  // Instead, we set it in ClientRequestState::Wait().
+  if (stmt_type_ == TStmtType::QUERY) parent_request_state_->UpdateEndTime();
   // Can compute summary only after we stop accepting reports from the backends. Both
   // WaitForBackends() and CancelBackends() ensures that.
   // TODO: should move this off of the query execution path?
   ComputeQuerySummary();
+  finalized_.Set(true);
+}
+
+Status Coordinator::FinalizeResultSink() {
+  // All instances must have reported their final statuses before finalization, which is a
+  // post-condition of Wait. Result sink file clean up is the responsibility of the
+  // external frontend implementation.
+  DCHECK(has_called_wait_.Load());
+  VLOG_QUERY << "Finalizing result sink: " << PrintId(query_id());
+  SCOPED_TIMER(finalization_timer_);
+  RETURN_IF_ERROR(UpdateExecState(Status::OK(), nullptr, FLAGS_hostname));
+
+  HdfsTableDescriptor* hdfs_table;
+  DCHECK(query_ctx().__isset.desc_tbl_serialized);
+  // When a query has a result sink, it is explicitly assumed that the table descriptor
+  // for id = 0 is a pseudo-table describing the location in which to write results.
+  const TableId result_sink_table_id = 0;
+  RETURN_IF_ERROR(DescriptorTbl::CreateHdfsTblDescriptor(query_ctx().desc_tbl_serialized,
+        result_sink_table_id, obj_pool(), &hdfs_table));
+  DCHECK(hdfs_table != nullptr)
+    << "Result Sink target table not known in descriptor table";
+  hdfs_table->ReleaseResources();
+  return Status::OK();
 }
 
 Status Coordinator::FinalizeHdfsDml() {
   // All instances must have reported their final statuses before finalization, which is a
   // post-condition of Wait. If the query was not successful, still try to clean up the
   // staging directory.
-  DCHECK(has_called_wait_);
+  DCHECK(has_called_wait_.Load());
   DCHECK(finalize_params() != nullptr);
-  bool is_transactional = finalize_params()->__isset.write_id;
+  bool is_hive_acid = finalize_params()->__isset.write_id;
+  bool is_iceberg_table = finalize_params()->__isset.spec_id;
 
   VLOG_QUERY << "Finalizing query: " << PrintId(query_id());
   SCOPED_TIMER(finalization_timer_);
   Status return_status = UpdateExecState(Status::OK(), nullptr, FLAGS_hostname);
+  HdfsTableDescriptor* hdfs_table = nullptr;
   if (return_status.ok()) {
-    HdfsTableDescriptor* hdfs_table;
     DCHECK(query_ctx().__isset.desc_tbl_serialized);
     RETURN_IF_ERROR(DescriptorTbl::CreateHdfsTblDescriptor(
             query_ctx().desc_tbl_serialized, finalize_params()->table_id, obj_pool(),
@@ -671,8 +867,12 @@ Status Coordinator::FinalizeHdfsDml() {
     DCHECK(hdfs_table != nullptr)
         << "INSERT target table not known in descriptor table: "
         << finalize_params()->table_id;
-    // There is no need for finalization for transactional inserts.
-    if (!is_transactional) {
+    if (is_iceberg_table) {
+      // No-op. The data files are written by the table sink operators to their final
+      // places. We append them to the table in UpdateCatalog().
+    }
+    // There is no need for finalization for Hive ACID transactional inserts.
+    else if (!is_hive_acid) {
       // 'write_id' is NOT set, therefore we need to do some finalization, e.g. moving
       // files or delete old files in case of INSERT OVERWRITE.
       return_status = dml_exec_state_.FinalizeHdfsInsert(*finalize_params(),
@@ -680,10 +880,19 @@ Status Coordinator::FinalizeHdfsDml() {
           hdfs_table, query_profile_);
     }
     hdfs_table->ReleaseResources();
-  } else if (is_transactional) {
+  } else if (is_hive_acid) {
     parent_request_state_->AbortTransaction();
   }
+  // Cleanup after DML operation.
+  if (is_hive_acid || is_iceberg_table) {
+    DCHECK(!finalize_params()->__isset.staging_dir);
+  } else {
+    RETURN_IF_ERROR(DeleteQueryLevelStagingDir());
+  }
+  return return_status;
+}
 
+Status Coordinator::DeleteQueryLevelStagingDir() {
   stringstream staging_dir;
   DCHECK(finalize_params()->__isset.staging_dir);
   staging_dir << finalize_params()->staging_dir << "/" << PrintId(query_id(),"_") << "/";
@@ -692,8 +901,7 @@ Status Coordinator::FinalizeHdfsDml() {
   RETURN_IF_ERROR(HdfsFsCache::instance()->GetConnection(staging_dir.str(), &hdfs_conn));
   VLOG_QUERY << "Removing staging directory: " << staging_dir.str();
   hdfsDelete(hdfs_conn, staging_dir.str().c_str(), 1);
-
-  return return_status;
+  return Status::OK();
 }
 
 void Coordinator::WaitForBackends() {
@@ -706,25 +914,43 @@ void Coordinator::WaitForBackends() {
 }
 
 Status Coordinator::Wait() {
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first";
   lock_guard<SpinLock> l(wait_lock_);
   SCOPED_TIMER(query_profile_->total_time_counter());
-  if (has_called_wait_) return Status::OK();
-  has_called_wait_ = true;
+  if (has_called_wait_.Load()) return Status::OK();
+  has_called_wait_.Store(true);
 
-  if (stmt_type_ == TStmtType::QUERY) {
+  if (stmt_type_ == TStmtType::QUERY && !exec_params_.HasResultSink()) {
     DCHECK(coord_instance_ != nullptr);
-    return UpdateExecState(coord_instance_->WaitForOpen(),
-        &coord_instance_->runtime_state()->fragment_instance_id(), FLAGS_hostname);
+    RETURN_IF_ERROR(UpdateExecState(coord_instance_->WaitForOpen(),
+        &coord_instance_->runtime_state()->fragment_instance_id(), FLAGS_hostname));
+    if (query_state_->query_options().retry_failed_queries
+        && query_state_->query_options().spool_query_results
+        && query_state_->query_options().spool_all_results_for_retries) {
+      // Wait until the BufferedPlanRootSink spooled all results or any errors stopping
+      // it, e.g. batch queue full, cancellation or failures.
+      auto sink = static_cast<BufferedPlanRootSink*>(coord_sink_);
+      if (sink->WaitForAllResultsSpooled()) {
+        VLOG_QUERY << "Cannot spool all results in the allocated result spooling space."
+            " Query retry will be skipped if any results have been returned.";
+      }
+    }
+    return Status::OK();
   }
-  DCHECK_EQ(stmt_type_, TStmtType::DML);
+  DCHECK(stmt_type_ == TStmtType::DML ||
+      (stmt_type_ == TStmtType::QUERY && exec_params_.HasResultSink()));
   // DML finalization can only happen when all backends have completed all side-effects
-  // and reported relevant state.
+  // and reported relevant state. We also wait for backends to complete if we are writing
+  // results to a filesystem.
   WaitForBackends();
+
   if (finalize_params() != nullptr) {
-    RETURN_IF_ERROR(UpdateExecState(
-            FinalizeHdfsDml(), nullptr, FLAGS_hostname));
+    RETURN_IF_ERROR(UpdateExecState(FinalizeHdfsDml(), nullptr, FLAGS_hostname));
+  } else if (exec_params_.HasResultSink()) {
+    RETURN_IF_ERROR(UpdateExecState(FinalizeResultSink(), nullptr, FLAGS_hostname));
   }
-  // DML requests are finished at this point.
+
+  // DML queries are finished at this point.
   RETURN_IF_ERROR(SetNonErrorTerminalState(ExecState::RETURNED_RESULTS));
   query_profile_->AddInfoString(
       "DML Stats", dml_exec_state_.OutputPartitionStats("\n"));
@@ -734,7 +960,7 @@ Status Coordinator::Wait() {
 Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos,
     int64_t block_on_wait_time_us) {
   VLOG_ROW << "GetNext() query_id=" << PrintId(query_id());
-  DCHECK(has_called_wait_);
+  DCHECK(has_called_wait_.Load());
   SCOPED_TIMER(query_profile_->total_time_counter());
 
   if (ReturnedAllResults()) {
@@ -772,28 +998,31 @@ Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos,
   return Status::OK();
 }
 
-void Coordinator::Cancel() {
+void Coordinator::Cancel(bool wait_until_finalized) {
   // Illegal to call Cancel() before Exec() returns, so there's no danger of the cancel
   // RPC passing the exec RPC.
-  DCHECK_LE(exec_rpcs_complete_barrier_.pending(), 0) << "Exec() must be called first";
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first";
   discard_result(SetNonErrorTerminalState(ExecState::CANCELLED));
-  // CancelBackends() is called for all transitions into a terminal state except
-  // for RETURNED_RESULTS. We need to call it now because after Cancel() is called
-  // the coordinator is not guaranteed to get UpdateBackendExecStatus() calls, and
-  // so we need to unblock the backend_exec_complete_barrier_.
-  // TODO: Remove this once IMPALA-6984 is fixed. It won't be necessary since
-  // CancelBackends() will be called when transitioning to RETURNED_RESULTS.
-  if (ReturnedAllResults()) CancelBackends();
+  // CancelBackends() is called for all transitions into a terminal state.
+  // RETURNED_RESULTS, however, calls it with fire_and_forget=false and may be blocked
+  // waiting for cancellation. In that case, we want explicit cancellation to unblock
+  // backend_exec_complete_barrier_, which we do by forcing cancellation.
+  if (ReturnedAllResults()) CancelBackends(/*fire_and_forget=*/ true);
+
+  // IMPALA-5756: Wait until finalized, in case a different thread was handling the
+  // transition to the terminal state.
+  if (wait_until_finalized) finalized_.Get();
 }
 
-void Coordinator::CancelBackends() {
+void Coordinator::CancelBackends(bool fire_and_forget) {
   int num_cancelled = 0;
   for (BackendState* backend_state: backend_states_) {
     DCHECK(backend_state != nullptr);
-    if (backend_state->Cancel()) ++num_cancelled;
+    BackendState::CancelResult cr = backend_state->Cancel(fire_and_forget);
+    if (cr.cancel_attempted) ++num_cancelled;
+    if (!fire_and_forget && cr.became_done) backend_exec_complete_barrier_->Notify();
   }
-  backend_exec_complete_barrier_->NotifyRemaining();
-
+  if (fire_and_forget) backend_exec_complete_barrier_->NotifyRemaining();
   VLOG_QUERY << Substitute(
       "CancelBackends() query_id=$0, tried to cancel $1 backends",
       PrintId(query_id()), num_cancelled);
@@ -816,15 +1045,19 @@ Status Coordinator::UpdateBackendExecStatus(const ReportExecStatusRequestPB& req
     backend_state->UpdateHostProfile(thrift_profiles.host_profile);
   }
 
+  // Set by ApplyExecStatusReport, contains all the AuxErrorInfoPB objects in
+  // ReportExecStatusRequestPB.
+  vector<AuxErrorInfoPB> aux_error_info;
+
   if (backend_state->ApplyExecStatusReport(request, thrift_profiles, &exec_summary_,
-          &progress_, &dml_exec_state_)) {
+          &progress_, &dml_exec_state_, &aux_error_info, fragment_stats_)) {
     // This backend execution has completed.
     if (VLOG_QUERY_IS_ON) {
       // Don't log backend completion if the query has already been cancelled.
       int pending_backends = backend_exec_complete_barrier_->pending();
       if (pending_backends >= 1) {
         VLOG_QUERY << "Backend completed:"
-                   << " host=" << TNetworkAddressToString(backend_state->impalad_address())
+                   << " host=" << backend_state->impalad_address()
                    << " remaining=" << pending_backends
                    << " query_id=" << PrintId(query_id());
         BackendState::LogFirstInProgress(backend_states_);
@@ -833,21 +1066,47 @@ Status Coordinator::UpdateBackendExecStatus(const ReportExecStatusRequestPB& req
     bool is_fragment_failure;
     TUniqueId failed_instance_id;
     Status status = backend_state->GetStatus(&is_fragment_failure, &failed_instance_id);
+
+    // Iterate through all AuxErrorInfoPB objects, and use each one to possibly blacklist
+    // any "faulty" nodes.
+    Status retryable_status = UpdateBlacklistWithAuxErrorInfo(
+        &aux_error_info, status, backend_state);
+    // Check if the backend node should be blacklisted based on the reported backend
+    // error. Note that only blacklist one node per report.
+    if (!status.ok() && retryable_status.ok()) {
+      retryable_status = UpdateBlacklistWithBackendState(status, backend_state);
+    }
+
+    // If any nodes were blacklisted, retry the query. This needs to be done before
+    // UpdateExecState is called with the error status to avoid exposing the error to any
+    // clients. If a retry is attempted, the ClientRequestState::query_status_ will be
+    // set by TryQueryRetry, which prevents the error status from being exposed to any
+    // clients.
+    if (!retryable_status.ok()) {
+      parent_query_driver_->TryQueryRetry(parent_request_state_, &retryable_status);
+    }
+
     if (!status.ok()) {
       // We may start receiving status reports before all exec rpcs are complete.
       // Can't apply state transition until no more exec rpcs will be sent.
-      exec_rpcs_complete_barrier_.Wait();
-
-      // Iterate through all instance exec statuses, and use each fragment's AuxErrorInfo
-      // to possibly blacklist any "faulty" nodes.
-      UpdateBlacklistWithAuxErrorInfo(request);
+      // We should stop issuing ExecQueryFInstance rpcs and cancel any inflight
+      // when this happens.
+      if (!exec_rpcs_complete_.Load()) {
+        if (!status.IsCancelled()) exec_rpcs_status_barrier_.NotifyRemaining(status);
+        WaitOnExecRpcs();
+      }
 
       // Transition the status if we're not already in a terminal state. This won't block
       // because either this transitions to an ERROR state or the query is already in
       // a terminal state.
-      discard_result(UpdateExecState(status,
-              is_fragment_failure ? &failed_instance_id : nullptr,
-              TNetworkAddressToString(backend_state->impalad_address())));
+      // If both 'retryable_status' and 'status' are errors, prefer 'retryable_status' as
+      // it includes 'status' as well as additional error log information from
+      // UpdateBlacklistWithAuxErrorInfo.
+      const Status& update_exec_state_status =
+          !retryable_status.ok() ? retryable_status : status;
+      discard_result(UpdateExecState(update_exec_state_status,
+          is_fragment_failure ? &failed_instance_id : nullptr,
+          NetworkAddressPBToString(backend_state->impalad_address())));
     }
     // We've applied all changes from the final status report - notify waiting threads.
     discard_result(backend_exec_complete_barrier_->Notify());
@@ -864,29 +1123,43 @@ Status Coordinator::UpdateBackendExecStatus(const ReportExecStatusRequestPB& req
       }
     }
     num_completed_backends_->Add(1);
+  } else {
+    // Iterate through all AuxErrorInfoPB objects, and use each one to possibly blacklist
+    // any "faulty" nodes.
+    Status retryable_status = UpdateBlacklistWithAuxErrorInfo(
+        &aux_error_info, Status::OK(), backend_state);
+
+    // If any nodes were blacklisted, retry the query.
+    if (!retryable_status.ok()) {
+      parent_query_driver_->TryQueryRetry(parent_request_state_, &retryable_status);
+    }
   }
+
   // If query execution has terminated, return a cancelled status to force the fragment
   // instance to stop executing.
-  return IsExecuting() ? Status::OK() : Status::CANCELLED;
+  // After cancelling backend_state, it's possible that current exec_state is still
+  // EXECUTING but the backend status is not OK since execution status report is not
+  // applied to update the overall status. In such case, we should return a cancelled
+  // status to backend.
+  return (IsExecuting() && backend_state->GetStatus().ok()) ? Status::OK() :
+                                                              Status::CANCELLED;
 }
 
-void Coordinator::UpdateBlacklistWithAuxErrorInfo(
-    const ReportExecStatusRequestPB& request) {
+Status Coordinator::UpdateBlacklistWithAuxErrorInfo(
+    vector<AuxErrorInfoPB>* aux_error_info, const Status& status,
+    BackendState* backend_state) {
   // If the Backend failed due to a RPC failure, blacklist the destination node of
   // the failed RPC. Only blacklist one node per ReportExecStatusRequestPB to avoid
   // blacklisting nodes too aggressively. Currently, only blacklist the first node
   // that contains a valid RPCErrorInfoPB object.
-  for (auto instance_exec_status : request.instance_exec_status()) {
-    if (instance_exec_status.has_aux_error_info()
-        && instance_exec_status.aux_error_info().has_rpc_error_info()) {
-      RPCErrorInfoPB rpc_error_info =
-          instance_exec_status.aux_error_info().rpc_error_info();
+  for (auto aux_error : *aux_error_info) {
+    if (aux_error.has_rpc_error_info()) {
+      RPCErrorInfoPB rpc_error_info = aux_error.rpc_error_info();
       DCHECK(rpc_error_info.has_dest_node());
       DCHECK(rpc_error_info.has_posix_error_code());
       const NetworkAddressPB& dest_node = rpc_error_info.dest_node();
 
-      auto dest_node_and_be_state =
-          addr_to_backend_state_.find(FromNetworkAddressPB(dest_node));
+      auto dest_node_and_be_state = addr_to_backend_state_.find(dest_node);
 
       // If the target address of the RPC is not known to the Coordinator, it cannot
       // be blacklisted.
@@ -899,11 +1172,11 @@ void Coordinator::UpdateBlacklistWithAuxErrorInfo(
       }
 
       // The execution parameters of the destination node for the failed RPC.
-      const BackendExecParams* dest_node_exec_params =
+      const BackendExecParamsPB& dest_node_exec_params =
           dest_node_and_be_state->second->exec_params();
 
       // The Coordinator for the query should never be blacklisted.
-      if (dest_node_exec_params->is_coord_backend) {
+      if (dest_node_exec_params.is_coord_backend()) {
         VLOG_QUERY << "Query failed due to a failed RPC to the Coordinator";
         continue;
       }
@@ -911,29 +1184,81 @@ void Coordinator::UpdateBlacklistWithAuxErrorInfo(
       // A set of RPC related posix error codes that should cause the target node
       // of the failed RPC to be blacklisted.
       static const set<int32_t> blacklistable_rpc_error_codes = {
+          ECONNRESET, // 104: Connection reset by peer
           ENOTCONN, // 107: Transport endpoint is not connected
           ESHUTDOWN, // 108: Cannot send after transport endpoint shutdown
-          ECONNREFUSED  // 111: Connection refused
+          ECONNREFUSED // 111: Connection refused
       };
 
+      // If the RPC error code matches any of the 'blacklistable' errors codes, blacklist
+      // the target executor of the RPC and return.
       if (blacklistable_rpc_error_codes.find(rpc_error_info.posix_error_code())
           != blacklistable_rpc_error_codes.end()) {
-        LOG(INFO) << "Blacklisting " << NetworkAddressPBToString(dest_node)
-                  << " because a RPC to it failed.";
+        string src_node_addr =
+            NetworkAddressPBToString(backend_state->krpc_impalad_address());
+        string dest_node_addr = NetworkAddressPBToString(dest_node);
+        VLOG_QUERY << Substitute(
+            "Blacklisting $0 because a RPC to it failed, query_id=$1", dest_node_addr,
+            PrintId(query_id()));
+
+        Status retryable_status = Status::Expected(
+            Substitute("RPC from $0 to $1 failed", src_node_addr, dest_node_addr));
+        retryable_status.MergeStatus(status);
+
         ExecEnv::GetInstance()->cluster_membership_mgr()->BlacklistExecutor(
-            dest_node_exec_params->be_desc);
-        break;
+            dest_node_exec_params.backend_id(), retryable_status);
+        parent_request_state_->AddBlacklistedExecutorAddress(
+            dest_node_exec_params.address());
+
+        // Only blacklist one node per report.
+        return retryable_status;
       }
     }
   }
+  return Status::OK();
 }
 
-int64_t Coordinator::GetMaxBackendStateLagMs(TNetworkAddress* address) {
-  if (exec_rpcs_complete_barrier_.pending() > 0) {
-    // Exec() hadn't completed for all the backends, so we can't rely on
-    // 'last_report_time_ms_' being set yet.
-    return 0;
+Status Coordinator::UpdateBlacklistWithBackendState(
+    const Status& status, BackendState* backend_state) {
+  DCHECK(!status.ok());
+  // If the Backend failed due to its local faulty disk, blacklist the backend node.
+  if (backend_state->IsLocalDiskFaulty()) {
+    Status retryable_status(TErrorCode::LOCAL_DISK_FAULTY,
+        NetworkAddressPBToString(backend_state->impalad_address()));
+    retryable_status.MergeStatus(status);
+
+    ExecEnv::GetInstance()->cluster_membership_mgr()->BlacklistExecutor(
+        backend_state->exec_params().backend_id(), retryable_status);
+    parent_request_state_->AddBlacklistedExecutorAddress(
+        backend_state->krpc_impalad_address());
+
+    return retryable_status;
   }
+  return Status::OK();
+}
+
+void Coordinator::HandleFailedExecRpcs(vector<BackendState*> failed_backend_states) {
+  DCHECK(!failed_backend_states.empty());
+
+  // Create an error based on the Exec RPC failure Status
+  vector<string> backend_addresses;
+  for (BackendState* backend_state : failed_backend_states) {
+    backend_addresses.push_back(
+        NetworkAddressPBToString(backend_state->krpc_impalad_address()));
+  }
+  Status retryable_status = Status::Expected(
+      Substitute("ExecFInstances RPC to $0 failed", join(backend_addresses, ",")));
+  for (BackendState* backend_state : failed_backend_states) {
+    retryable_status.MergeStatus(
+        FromKuduStatus(backend_state->exec_rpc_status(), "Exec() rpc failed"));
+  }
+
+  // Retry the query
+  parent_query_driver_->TryQueryRetry(parent_request_state_, &retryable_status);
+}
+
+int64_t Coordinator::GetMaxBackendStateLagMs(NetworkAddressPB* address) {
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first.";
   DCHECK_GT(backend_states_.size(), 0);
   int64_t current_time = BackendState::GenerateReportTimestamp();
   int64_t min_last_report_time_ms = current_time;
@@ -954,15 +1279,16 @@ int64_t Coordinator::GetMaxBackendStateLagMs(TNetworkAddress* address) {
 
 // TODO: add histogram/percentile
 void Coordinator::ComputeQuerySummary() {
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first";
   // In this case, the query did not even get to start all fragment instances.
   // Some of the state that is used below might be uninitialized.  In this case,
   // the query has made so little progress, reporting a summary is not very useful.
-  if (!has_called_wait_) return;
+  if (!has_called_wait_.Load()) return;
 
   if (backend_states_.empty()) return;
   // make sure fragment_stats_ are up-to-date
   for (BackendState* backend_state: backend_states_) {
-    backend_state->UpdateExecStats(fragment_stats_);
+    backend_state->UpdateExecStats(fragment_stats_, /*finalize=*/true);
   }
 
   for (FragmentStats* fragment_stats: fragment_stats_) {
@@ -974,10 +1300,9 @@ void Coordinator::ComputeQuerySummary() {
   stringstream mem_info, cpu_user_info, cpu_system_info, bytes_read_info;
   ResourceUtilization total_utilization;
   for (BackendState* backend_state: backend_states_) {
-    ResourceUtilization utilization = backend_state->ComputeResourceUtilization();
+    ResourceUtilization utilization = backend_state->GetResourceUtilization();
     total_utilization.Merge(utilization);
-    string network_address = TNetworkAddressToString(
-        backend_state->impalad_address());
+    string network_address = NetworkAddressPBToString(backend_state->impalad_address());
     mem_info << network_address << "("
              << PrettyPrinter::Print(utilization.peak_per_host_mem_consumption,
                  TUnit::BYTES) << ") ";
@@ -1018,6 +1343,12 @@ void Coordinator::ComputeQuerySummary() {
   COUNTER_SET(PROFILE_InnerNodeSelectivityRatio.Instantiate(query_profile_),
       inner_node_ratio);
 
+  double skew_threshold = query_state_->query_options().report_skew_limit;
+  if (skew_threshold >= 0) {
+    // Add skews info (if any)
+    query_profile_->AddSkewInfo(query_profile_, skew_threshold);
+  }
+
   // TODO(IMPALA-8126): Move to host profiles
   query_profile_->AddInfoString("Per Node Peak Memory Usage", mem_info.str());
   query_profile_->AddInfoString("Per Node Bytes Read", bytes_read_info.str());
@@ -1026,6 +1357,7 @@ void Coordinator::ComputeQuerySummary() {
 }
 
 string Coordinator::GetErrorLog() {
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first";
   ErrorLogMap merged;
   {
     lock_guard<SpinLock> l(backend_states_init_lock_);
@@ -1041,9 +1373,12 @@ void Coordinator::ReleaseExecResources() {
   }
 
   for (auto& filter : filter_routing_table_->id_to_filter) {
-    FilterState* state = &filter.second;
-    state->Disable(filter_mem_tracker_);
+    unique_lock<SpinLock> l(filter.second.lock());
+    filter.second.WaitForPublishFilter();
+    filter.second.DisableAndRelease(
+        filter_mem_tracker_, filter.second.received_all_updates());
   }
+
   // This may be NULL while executing UDFs.
   if (filter_mem_tracker_ != nullptr) filter_mem_tracker_->Close();
   // At this point some tracked memory may still be used in the coordinator for result
@@ -1051,6 +1386,7 @@ void Coordinator::ReleaseExecResources() {
 }
 
 void Coordinator::ReleaseQueryAdmissionControlResources() {
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first";
   vector<BackendState*> unreleased_backends =
       backend_resource_state_->CloseAndGetUnreleasedBackends();
   if (!unreleased_backends.empty()) {
@@ -1064,39 +1400,41 @@ void Coordinator::ReleaseQueryAdmissionControlResources() {
   // AdmissionController::ReleaseQuery.
   backend_released_barrier_.Wait();
   LOG(INFO) << "Release admission control resources for query_id=" << PrintId(query_id());
-  AdmissionController* admission_controller =
-      ExecEnv::GetInstance()->admission_controller();
-  DCHECK(admission_controller != nullptr);
-  admission_controller->ReleaseQuery(
-      schedule_, ComputeQueryResourceUtilization().peak_per_host_mem_consumption);
+  AdmissionControlClient* admission_control_client =
+      parent_request_state_->admission_control_client();
+  DCHECK(admission_control_client != nullptr);
+  admission_control_client->ReleaseQuery(
+      ComputeQueryResourceUtilization().peak_per_host_mem_consumption);
   query_events_->MarkEvent("Released admission control resources");
 }
 
 void Coordinator::ReleaseBackendAdmissionControlResources(
     const vector<BackendState*>& backend_states) {
-  AdmissionController* admission_controller =
-      ExecEnv::GetInstance()->admission_controller();
-  DCHECK(admission_controller != nullptr);
-  vector<TNetworkAddress> host_addrs;
+  AdmissionControlClient* admission_control_client =
+      parent_request_state_->admission_control_client();
+  DCHECK(admission_control_client != nullptr);
+  vector<NetworkAddressPB> host_addrs;
   for (auto backend_state : backend_states) {
     host_addrs.push_back(backend_state->impalad_address());
   }
-  admission_controller->ReleaseQueryBackends(schedule_, host_addrs);
+  admission_control_client->ReleaseQueryBackends(host_addrs);
 }
 
 Coordinator::ResourceUtilization Coordinator::ComputeQueryResourceUtilization() {
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first";
   ResourceUtilization query_resource_utilization;
   for (BackendState* backend_state: backend_states_) {
-    query_resource_utilization.Merge(backend_state->ComputeResourceUtilization());
+    query_resource_utilization.Merge(backend_state->GetResourceUtilization());
   }
   return query_resource_utilization;
 }
 
-vector<TNetworkAddress> Coordinator::GetActiveBackends(
-    const vector<TNetworkAddress>& candidates) {
+vector<NetworkAddressPB> Coordinator::GetActiveBackends(
+    const vector<NetworkAddressPB>& candidates) {
   // Build set from vector so that runtime of this function is O(backend_states.size()).
-  unordered_set<TNetworkAddress> candidate_set(candidates.begin(), candidates.end());
-  vector<TNetworkAddress> result;
+  std::unordered_set<NetworkAddressPB> candidate_set(
+      candidates.begin(), candidates.end());
+  vector<NetworkAddressPB> result;
   lock_guard<SpinLock> l(backend_states_init_lock_);
   for (BackendState* backend_state : backend_states_) {
     if (candidate_set.find(backend_state->impalad_address()) != candidate_set.end()
@@ -1107,37 +1445,40 @@ vector<TNetworkAddress> Coordinator::GetActiveBackends(
   return result;
 }
 
-void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
+void Coordinator::UpdateFilter(const UpdateFilterParamsPB& params, RpcContext* context) {
+  VLOG(2) << "Coordinator::UpdateFilter(filter_id=" << params.filter_id() << ")";
   shared_lock<shared_mutex> lock(filter_routing_table_->lock);
   DCHECK_NE(filter_mode_, TRuntimeFilterMode::OFF)
       << "UpdateFilter() called although runtime filters are disabled";
   DCHECK(backend_exec_complete_barrier_.get() != nullptr)
       << "Filters received before fragments started!";
 
-  exec_rpcs_complete_barrier_.Wait();
+  WaitOnExecRpcs();
   DCHECK(filter_routing_table_->is_complete)
       << "Filter received before routing table complete";
 
-  TPublishFilterParams rpc_params;
-  unordered_set<int> target_fragment_idxs;
+  PublishFilterParamsPB rpc_params;
+  std::unordered_set<int> target_fragment_idxs;
+  if (!IsExecuting()) {
+    LOG(INFO) << "Filter update received for non-executing query with id: "
+        << query_id();
+    return;
+  }
+  auto it = filter_routing_table_->id_to_filter.find(params.filter_id());
+  if (it == filter_routing_table_.get()->id_to_filter.end()) {
+    // This should not be possible since 'id_to_filter' is never changed after
+    // InitFilterRoutingTable().
+    DCHECK(false);
+    LOG(INFO) << "Could not find filter with id: " << rpc_params.filter_id();
+    return;
+  }
+  FilterState* state = &it->second;
   {
-    lock_guard<SpinLock> l(filter_routing_table_->update_lock);
-    if (!IsExecuting()) {
-      LOG(INFO) << "Filter update received for non-executing query with id: "
-                << query_id();
-      return;
-    }
-    auto it = filter_routing_table_->id_to_filter.find(params.filter_id);
-    if (it == filter_routing_table_->id_to_filter.end()) {
-      LOG(INFO) << "Could not find filter with id: " << params.filter_id;
-      return;
-    }
-    FilterState* state = &it->second;
-
+    lock_guard<SpinLock> l(state->lock());
     DCHECK(state->desc().has_remote_targets)
-          << "Coordinator received filter that has only local targets";
+        << "Coordinator received filter that has only local targets";
 
-    // Check if the filter has already been sent, which could happen in four cases:
+    // Check if the filter has already been sent, which could happen in five cases:
     //   * if one local filter had always_true set - no point waiting for other local
     //     filters that can't affect the aggregated global filter
     //   * if this is a broadcast join, and another local filter was already received
@@ -1145,6 +1486,7 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
     //     immediately.
     //   * query execution finished and resources were released: filters do not need
     //     to be processed.
+    //   * if the inbound sidecar for Bloom filter cannot be successfully retrieved.
     if (state->disabled()) return;
 
     if (filter_updates_received_->value() == 0) {
@@ -1152,14 +1494,14 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
     }
     filter_updates_received_->Add(1);
 
-    state->ApplyUpdate(params, this);
+    state->ApplyUpdate(params, this, context);
 
-    if (state->pending_count() > 0 && !state->disabled()) return;
+    if (state->pending_count() > 0 && state->enabled()) return;
     // At this point, we either disabled this filter or aggregation is complete.
 
     // No more updates are pending on this filter ID. Create a distribution payload and
     // offer it to the queue.
-    for (const FilterTarget& target: *state->targets()) {
+    for (const FilterTarget& target : *state->targets()) {
       // Don't publish the filter to targets that are in the same fragment as the join
       // that produced it.
       if (target.is_local) continue;
@@ -1167,48 +1509,50 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
     }
 
     if (state->is_bloom_filter()) {
-      // Assign outgoing bloom filter.
-      TBloomFilter& aggregated_filter = state->bloom_filter();
+      // Assign an outgoing bloom filter.
+      *rpc_params.mutable_bloom_filter() = state->bloom_filter();
 
-      swap(rpc_params.bloom_filter, aggregated_filter);
-      DCHECK(rpc_params.bloom_filter.always_false || rpc_params.bloom_filter.always_true
-          || !rpc_params.bloom_filter.directory.empty());
-      DCHECK(aggregated_filter.directory.empty());
-      rpc_params.__isset.bloom_filter = true;
+      DCHECK(rpc_params.bloom_filter().always_false()
+          || rpc_params.bloom_filter().always_true()
+          || !state->bloom_filter_directory().empty());
+
+    } else if (state->is_min_max_filter()) {
+      MinMaxFilter::Copy(state->min_max_filter(), rpc_params.mutable_min_max_filter());
     } else {
-      DCHECK(state->is_min_max_filter());
-      MinMaxFilter::Copy(state->min_max_filter(), &rpc_params.min_max_filter);
-      rpc_params.__isset.min_max_filter = true;
+      DCHECK(state->is_in_list_filter());
+      *rpc_params.mutable_in_list_filter() = state->in_list_filter();
     }
 
-    // Filter is complete, and can be released.
-    state->Disable(filter_mem_tracker_);
-  }
+    // Filter is complete. We disable it so future UpdateFilter rpcs will be ignored,
+    // e.g., if it was a broadcast join. If filter is still enabled at this point, it
+    // means all filter updates have been successfully received and applied.
+    state->Disable(state->enabled());
 
-  rpc_params.__set_dst_query_id(query_id());
-  rpc_params.__set_filter_id(params.filter_id);
+    TUniqueIdToUniqueIdPB(query_id(), rpc_params.mutable_dst_query_id());
+    rpc_params.set_filter_id(params.filter_id());
 
-  // Waited for exec_rpcs_complete_barrier_ so backend_states_ is valid.
-  for (BackendState* bs: backend_states_) {
-    for (int fragment_idx: target_fragment_idxs) {
-      if (!IsExecuting()) goto cleanup;
-      rpc_params.__set_dst_fragment_idx(fragment_idx);
-      bs->PublishFilter(rpc_params);
+    // Called WaitForExecRpcs() so backend_states_ is valid.
+    for (BackendState* bs : backend_states_) {
+      if (!IsExecuting()) break;
+
+      if (bs->HasFragmentIdx(target_fragment_idxs)) {
+        rpc_params.set_filter_id(params.filter_id());
+        RpcController* controller = obj_pool()->Add(new RpcController);
+        PublishFilterResultPB* res = obj_pool()->Add(new PublishFilterResultPB);
+        if (rpc_params.has_bloom_filter() && !rpc_params.bloom_filter().always_false()
+            && !rpc_params.bloom_filter().always_true()) {
+          BloomFilter::AddDirectorySidecar(rpc_params.mutable_bloom_filter(), controller,
+              state->bloom_filter_directory());
+        }
+        bs->PublishFilter(state, filter_mem_tracker_, rpc_params, *controller, *res);
+      }
     }
-  }
-
-cleanup:
-  // For bloom filters, the memory used in the filter_routing_table_ is transfered to
-  // rpc_params. Hence the Release() function on the filter_mem_tracker_ is called
-  // here to ensure that the MemTracker is updated after the memory is actually freed.
-  if (rpc_params.__isset.bloom_filter) {
-    filter_mem_tracker_->Release(rpc_params.bloom_filter.directory.size());
   }
 }
 
-void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
-    Coordinator* coord) {
-  DCHECK(!disabled());
+void Coordinator::FilterState::ApplyUpdate(
+    const UpdateFilterParamsPB& params, Coordinator* coord, RpcContext* context) {
+  DCHECK(enabled());
   DCHECK_GT(pending_count_, 0);
   DCHECK_EQ(completion_time_, 0L);
   if (first_arrival_time_ == 0L) {
@@ -1217,40 +1561,77 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
 
   --pending_count_;
   if (is_bloom_filter()) {
-    DCHECK(params.__isset.bloom_filter);
-    if (params.bloom_filter.always_true) {
-      Disable(coord->filter_mem_tracker_);
-    } else if (bloom_filter_.always_false) {
-      int64_t heap_space = params.bloom_filter.directory.size();
-      if (!coord->filter_mem_tracker_->TryConsume(heap_space)) {
-        VLOG_QUERY << "Not enough memory to allocate filter: "
-                   << PrettyPrinter::Print(heap_space, TUnit::BYTES)
-                   << " (query_id=" << PrintId(coord->query_id()) << ")";
-        // Disable, as one missing update means a correct filter cannot be produced.
-        Disable(coord->filter_mem_tracker_);
-      } else {
-        // Workaround for fact that parameters are const& for Thrift RPCs - yet we want to
-        // move the payload from the request rather than copy it and take double the
-        // memory cost. After this point, params.bloom_filter is an empty filter and
-        // should not be read.
-        TBloomFilter* non_const_filter = &const_cast<TBloomFilter&>(params.bloom_filter);
-        swap(bloom_filter_, *non_const_filter);
-        DCHECK_EQ(non_const_filter->directory.size(), 0);
+    DCHECK(params.has_bloom_filter());
+    if (params.bloom_filter().always_true()) {
+      // An always_true filter is received. We don't need to wait for other pending
+      // backends.
+      always_true_filter_received_ = true;
+      DisableAndRelease(coord->filter_mem_tracker_, true);
+    } else if (params.bloom_filter().always_false()) {
+      if (!bloom_filter_.has_log_bufferpool_space()) {
+        bloom_filter_ = BloomFilterPB(params.bloom_filter());
       }
     } else {
-      BloomFilter::Or(params.bloom_filter, &bloom_filter_);
+      // If the incoming Bloom filter is neither an always true filter nor an
+      // always false filter, then it must be the case that a non-empty sidecar slice
+      // has been received. Refer to BloomFilter::ToProtobuf() for further details.
+      DCHECK(params.bloom_filter().has_directory_sidecar_idx());
+      kudu::Slice sidecar_slice;
+      kudu::Status status = context->GetInboundSidecar(
+          params.bloom_filter().directory_sidecar_idx(), &sidecar_slice);
+      if (!status.ok()) {
+        LOG(ERROR) << "Cannot get inbound sidecar: " << status.message().ToString();
+        DisableAndRelease(coord->filter_mem_tracker_, false);
+      } else if (bloom_filter_.always_false()) {
+        int64_t heap_space = sidecar_slice.size();
+        if (!coord->filter_mem_tracker_->TryConsume(heap_space)) {
+          VLOG_QUERY << "Not enough memory to allocate filter: "
+                     << PrettyPrinter::Print(heap_space, TUnit::BYTES)
+                     << " (query_id=" << PrintId(coord->query_id()) << ")";
+          // Disable, as one missing update means a correct filter cannot be produced.
+          DisableAndRelease(coord->filter_mem_tracker_, false);
+        } else {
+          bloom_filter_ = params.bloom_filter();
+          bloom_filter_directory_ = sidecar_slice.ToString();
+        }
+      } else {
+        DCHECK_EQ(bloom_filter_directory_.size(), sidecar_slice.size());
+        BloomFilter::Or(params.bloom_filter(), sidecar_slice.data(), &bloom_filter_,
+            reinterpret_cast<uint8_t*>(const_cast<char*>(bloom_filter_directory_.data())),
+            sidecar_slice.size());
+      }
     }
-  } else {
-    DCHECK(is_min_max_filter());
-    DCHECK(params.__isset.min_max_filter);
-    if (params.min_max_filter.always_true) {
-      Disable(coord->filter_mem_tracker_);
-    } else if (min_max_filter_.always_false) {
-      MinMaxFilter::Copy(params.min_max_filter, &min_max_filter_);
+  } else if (is_min_max_filter()) {
+    DCHECK(params.has_min_max_filter());
+    ColumnType col_type = ColumnType::FromThrift(desc_.src_expr.nodes[0].type);
+    VLOG(3) << "Coordinator::FilterState::ApplyUpdate() on minmax."
+            << " Current accumulated filter=" << DebugString()
+            << ". Incoming min/max param:"
+            << " has_filter_id()=" << params.has_filter_id()
+            << ", filter_id=" << params.filter_id() << ", details="
+            << MinMaxFilter::DebugString(params.min_max_filter(), col_type);
+    if (params.min_max_filter().always_true()) {
+      // An always_true filter is received. We don't need to wait for other pending
+      // backends.
+      always_true_filter_received_ = true;
+      DisableAndRelease(coord->filter_mem_tracker_, true);
+    } else if (params.min_max_filter().always_false()) {
+      // An always_true filter is received. Do nothing.
+    } else if (min_max_filter_.always_false()) {
+      MinMaxFilter::Copy(params.min_max_filter(), &min_max_filter_);
     } else {
-      MinMaxFilter::Or(params.min_max_filter, &min_max_filter_,
-          ColumnType::FromThrift(desc_.src_expr.nodes[0].type));
+      MinMaxFilter::Or(params.min_max_filter(), &min_max_filter_, col_type);
     }
+    VLOG(3) << " Updated accumulated filter=" << DebugString();
+  } else {
+    DCHECK(is_in_list_filter());
+    DCHECK(params.has_in_list_filter());
+    VLOG(3) << "Update IN-list filter " << params.filter_id() << ", "
+            << InListFilter::DebugString(params.in_list_filter());
+    DCHECK(!in_list_filter_.always_true());
+    DCHECK_EQ(in_list_filter_.value_size(), 0);
+    DCHECK(!in_list_filter_.contains_null());
+    in_list_filter_ = params.in_list_filter();
   }
 
   if (pending_count_ == 0 || disabled()) {
@@ -1258,18 +1639,63 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
   }
 }
 
-void Coordinator::FilterState::Disable(MemTracker* tracker) {
+void Coordinator::FilterState::DisableAndRelease(
+    MemTracker* tracker, const bool all_updates_received) {
+  Disable(all_updates_received);
+  Release(tracker);
+}
+
+void Coordinator::FilterState::Disable(bool all_updates_received) {
+  all_updates_received_ = all_updates_received;
   if (is_bloom_filter()) {
-    bloom_filter_.always_true = true;
-    bloom_filter_.always_false = false;
-    tracker->Release(bloom_filter_.directory.size());
-    bloom_filter_.directory.clear();
-    bloom_filter_.directory.shrink_to_fit();
+    bloom_filter_.set_always_true(true);
+    if (bloom_filter_.has_always_false() && bloom_filter_.always_false()) {
+      always_false_flipped_to_false_ = true;
+    }
+    bloom_filter_.set_always_false(false);
+  } else if (is_min_max_filter()) {
+    min_max_filter_.set_always_true(true);
+    if (MinMaxFilter::AlwaysFalse(min_max_filter_)) {
+      always_false_flipped_to_false_ = true;
+    }
+    min_max_filter_.set_always_false(false);
   } else {
-    DCHECK(is_min_max_filter());
-    min_max_filter_.always_true = true;
-    min_max_filter_.always_false = false;
+    DCHECK(is_in_list_filter());
+    if (InListFilter::AlwaysFalse(in_list_filter_)) {
+      always_false_flipped_to_false_ = true;
+    }
+    in_list_filter_.set_always_true(true);
   }
+}
+
+void Coordinator::FilterState::Release(MemTracker* tracker) {
+  DCHECK(disabled());
+  DCHECK(num_inflight_publish_filter_rpcs_ == 0);
+  if (is_bloom_filter()) {
+    tracker->Release(bloom_filter_directory_.size());
+    bloom_filter_directory_.clear();
+    bloom_filter_directory_.shrink_to_fit();
+  }
+}
+
+void Coordinator::FilterState::WaitForPublishFilter() {
+  while (num_inflight_publish_filter_rpcs_ > 0) {
+    publish_filter_done_cv_.wait(lock_);
+  }
+}
+
+string Coordinator::FilterState::DebugString() const {
+  std::stringstream ss;
+  if (is_min_max_filter()) {
+    ColumnType col_type = ColumnType::FromThrift(desc_.src_expr.nodes[0].type);
+    ss << "Coordinator::FilterState: "
+       << "filter_id=" << desc_.filter_id
+       << ", all_updates_received_=" << all_updates_received_
+       << ", enabled=" << enabled()
+       << ", pending_count()=" << pending_count()
+       << ", " << MinMaxFilter::DebugString(min_max_filter_, col_type);
+  }
+  return ss.str();
 }
 
 void Coordinator::GetTExecSummary(TExecSummary* exec_summary) {
@@ -1282,6 +1708,7 @@ MemTracker* Coordinator::query_mem_tracker() const {
 }
 
 void Coordinator::BackendsToJson(Document* doc) {
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first";
   Value states(kArrayType);
   {
     lock_guard<SpinLock> l(backend_states_init_lock_);
@@ -1295,6 +1722,7 @@ void Coordinator::BackendsToJson(Document* doc) {
 }
 
 void Coordinator::FInstanceStatsToJson(Document* doc) {
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first";
   Value states(kArrayType);
   {
     lock_guard<SpinLock> l(backend_states_init_lock_);
@@ -1308,7 +1736,7 @@ void Coordinator::FInstanceStatsToJson(Document* doc) {
 }
 
 const TQueryCtx& Coordinator::query_ctx() const {
-  return schedule_.request().query_ctx;
+  return exec_params_.query_exec_request().query_ctx;
 }
 
 const TUniqueId& Coordinator::query_id() const {
@@ -1316,8 +1744,9 @@ const TUniqueId& Coordinator::query_id() const {
 }
 
 const TFinalizeParams* Coordinator::finalize_params() const {
-  return schedule_.request().__isset.finalize_params
-      ? &schedule_.request().finalize_params : nullptr;
+  return exec_params_.query_exec_request().__isset.finalize_params ?
+      &exec_params_.query_exec_request().finalize_params :
+      nullptr;
 }
 
 bool Coordinator::IsExecuting() {

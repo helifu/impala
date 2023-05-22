@@ -17,13 +17,13 @@
 
 #include "rpc/impala-service-pool.h"
 
-#include <boost/thread/mutex.hpp>
-#include <glog/logging.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
+#include <glog/logging.h>
 
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "gutil/strings/numbers.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
@@ -39,15 +39,15 @@
 #include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
 #include "util/pretty-printer.h"
+#include "util/thread.h"
 
 #include "common/names.h"
 #include "common/status.h"
 
-METRIC_DEFINE_histogram(server, impala_incoming_queue_time,
-    "RPC Queue Time",
+METRIC_DEFINE_histogram(server, impala_incoming_queue_time, "RPC Queue Time",
     kudu::MetricUnit::kMicroseconds,
     "Number of microseconds incoming RPC requests spend in the worker queue",
-    60000000LU, 3);
+    kudu::MetricLevel::kInfo, 60000000LU, 3);
 
 using namespace rapidjson;
 
@@ -59,18 +59,19 @@ const char * ImpalaServicePool::RPC_QUEUE_OVERFLOW_METRIC_KEY =
 
 ImpalaServicePool::ImpalaServicePool(const scoped_refptr<kudu::MetricEntity>& entity,
     int service_queue_length, kudu::rpc::GeneratedServiceIf* service,
-    MemTracker* service_mem_tracker, const TNetworkAddress& address)
+    MemTracker* service_mem_tracker, const NetworkAddressPB& address,
+    MetricGroup* rpc_metrics)
   : service_mem_tracker_(service_mem_tracker),
     service_(service),
     service_queue_(service_queue_length),
     incoming_queue_time_(METRIC_impala_incoming_queue_time.Instantiate(entity)),
-    hostname_(address.hostname),
-    port_(SimpleItoa(address.port)) {
+    hostname_(address.hostname()),
+    port_(SimpleItoa(address.port())) {
   DCHECK(service_mem_tracker_ != nullptr);
   const TMetricDef& overflow_metric_def =
       MetricDefs::Get(RPC_QUEUE_OVERFLOW_METRIC_KEY, service_->service_name());
-  rpcs_queue_overflow_ = ExecEnv::GetInstance()->rpc_metrics()->RegisterMetric(
-      new IntCounter(overflow_metric_def, 0L));
+  rpcs_queue_overflow_ =
+      rpc_metrics->RegisterMetric(new IntCounter(overflow_metric_def, 0L));
   // Initialize additional histograms for each method of the service.
   // TODO: Retrieve these from KRPC once KUDU-2313 has been implemented.
   for (const auto& method : service_->methods_by_name()) {
@@ -96,16 +97,24 @@ Status ImpalaServicePool::Init(int num_threads) {
   return Status::OK();
 }
 
+void ImpalaServicePool::Join() {
+  VLOG_QUERY << "join Impala Service pool\n";
+  std::lock_guard<std::mutex> l(close_lock_);
+  if (is_joined_) return;
+  // TODO (from KRPC): Use a proper thread pool implementation.
+  for (std::unique_ptr<Thread>& thread : threads_) {
+    thread->Join();
+  }
+  is_joined_ = true;
+}
+
 void ImpalaServicePool::Shutdown() {
   service_queue_.Shutdown();
 
   lock_guard<mutex> lock(shutdown_lock_);
   if (closing_) return;
   closing_ = true;
-  // TODO (from KRPC): Use a proper thread pool implementation.
-  for (std::unique_ptr<Thread>& thread : threads_) {
-    thread->Join();
-  }
+  Join();
 
   // Now we must drain the service queue.
   kudu::Status status = kudu::Status::ServiceUnavailable("Service is shutting down");
@@ -149,7 +158,7 @@ kudu::rpc::RpcMethodInfo* ImpalaServicePool::LookupMethod(
 }
 
 kudu::Status ImpalaServicePool::QueueInboundCall(
-    gscoped_ptr<kudu::rpc::InboundCall> call) {
+    std::unique_ptr<kudu::rpc::InboundCall> call) {
   kudu::rpc::InboundCall* c = call.release();
 
   vector<uint32_t> unsupported_features;

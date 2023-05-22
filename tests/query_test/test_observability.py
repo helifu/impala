@@ -15,14 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from collections import defaultdict
 from datetime import datetime
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon,
-                               SkipIfLocal, SkipIfNotHdfsMinicluster)
-from tests.util.filesystem_utils import IS_EC
-from time import sleep
+from tests.common.skip import SkipIfFS, SkipIfLocal, SkipIfNotHdfsMinicluster
+from tests.util.filesystem_utils import IS_EC, WAREHOUSE
+from tests.util.parse_util import get_duration_us_from_str
+from time import sleep, time
 from RuntimeProfile.ttypes import TRuntimeProfileFormat
 import pytest
 import re
@@ -91,11 +92,7 @@ class TestObservability(ImpalaTestSuite):
     assert num_validated > 0
     self.hs2_client.close_query(handle)
 
-  @SkipIfS3.hbase
-  @SkipIfLocal.hbase
-  @SkipIfIsilon.hbase
-  @SkipIfABFS.hbase
-  @SkipIfADLS.hbase
+  @SkipIfFS.hbase
   def test_scan_summary(self):
     """IMPALA-4499: Checks that the exec summary for scans show the table name."""
     # HDFS table
@@ -183,20 +180,19 @@ class TestObservability(ImpalaTestSuite):
     expected_str = ("Query Options (set by configuration and planner): "
         "MEM_LIMIT=8589934592,"
         "NUM_NODES=1,NUM_SCANNER_THREADS=1,"
-        "RUNTIME_FILTER_MODE=0,MT_DOP=0,{erasure_coding}TIMEZONE={timezone},"
+        "RUNTIME_FILTER_MODE=OFF,MT_DOP=0,TIMEZONE={timezone},"
         "CLIENT_IDENTIFIER="
-        "query_test/test_observability.py::TestObservability::()::test_query_options"
+        "query_test/test_observability.py::TestObservability::()::test_query_options,"
+        "SPOOL_QUERY_RESULTS=0"
         "\n")
-    expected_str = expected_str.format(
-        erasure_coding="ALLOW_ERASURE_CODED_FILES=1," if IS_EC else "",
-        timezone=server_timezone)
+    expected_str = expected_str.format(timezone=server_timezone)
     assert expected_str in profile, profile
 
   def test_exec_summary(self):
     """Test that the exec summary is populated correctly in every query state"""
     query = "select count(*) from functional.alltypes"
     handle = self.execute_query_async(query,
-        {"debug_action": "CRS_BEFORE_ADMISSION:SLEEP@1000"})
+        {"debug_action": "AC_BEFORE_ADMISSION:SLEEP@1000"})
     # If ExecuteStatement() has completed and the query is paused in the admission control
     # phase, then the coordinator has not started yet and exec_summary should be empty.
     exec_summary = self.client.get_exec_summary(handle)
@@ -218,7 +214,7 @@ class TestObservability(ImpalaTestSuite):
     query state"""
     query = "select count(*) from functional.alltypes"
     handle = self.execute_query_async(query,
-        {"debug_action": "CRS_BEFORE_ADMISSION:SLEEP@1000"})
+        {"debug_action": "AC_BEFORE_ADMISSION:SLEEP@1000"})
 
     # If ExecuteStatement() has completed and the query is paused in the admission control
     # phase, then the coordinator has not started yet and exec_summary should be empty.
@@ -241,10 +237,12 @@ class TestObservability(ImpalaTestSuite):
     """IMPALA-6081: Test that the expected number of fragment instances and their exec
     nodes appear in the runtime profile, even when fragments may be quickly cancelled when
     all results are already returned."""
+    query_opts = {'report_skew_limit': -1}
     results = self.execute_query("""
         with l as (select * from tpch.lineitem UNION ALL select * from tpch.lineitem)
         select STRAIGHT_JOIN count(*) from (select * from tpch.lineitem a LIMIT 1) a
-        join (select * from l LIMIT 2000000) b on a.l_orderkey = -b.l_orderkey;""")
+        join (select * from l LIMIT 2000000) b on a.l_orderkey = -b.l_orderkey;""",
+        query_opts)
     # There are 3 scan nodes and each appears in the profile n+1 times (for n fragment
     # instances + the averaged fragment). n depends on how data is loaded and scheduler's
     # decision.
@@ -290,6 +288,7 @@ class TestObservability(ImpalaTestSuite):
     else:
       load_event_regexes = [
         r'Frontend:',
+        r'Referenced Tables:',
         r'CatalogFetch.ColumnStats.Hits',
         r'CatalogFetch.ColumnStats.Misses',
         r'CatalogFetch.ColumnStats.Requests',
@@ -314,10 +313,10 @@ class TestObservability(ImpalaTestSuite):
         r'CatalogFetch.RPCs.Requests',
         r'CatalogFetch.RPCs.Time',
         r'CatalogFetch.StorageLoad.Time',
-        r'CatalogFetch.TableNames.Hits',
-        r'CatalogFetch.TableNames.Misses',
-        r'CatalogFetch.TableNames.Requests',
-        r'CatalogFetch.TableNames.Time',
+        r'CatalogFetch.TableList.Hits',
+        r'CatalogFetch.TableList.Misses',
+        r'CatalogFetch.TableList.Requests',
+        r'CatalogFetch.TableList.Time',
         r'CatalogFetch.Tables.Hits',
         r'CatalogFetch.Tables.Misses',
         r'CatalogFetch.Tables.Requests',
@@ -351,6 +350,8 @@ class TestObservability(ImpalaTestSuite):
         r'Distributed plan created:',
         r'Lineage info computed:',
         r'Planning finished:']
+    # Disable auto-scaling as it can produce multiple event sequences in event_regexes
+    self.execute_query_expect_success(self.client, "set enable_replan=0")
     query = "select * from functional.alltypes"
     runtime_profile = self.execute_query(query).runtime_profile
     self.__verify_profile_event_sequence(event_regexes, runtime_profile)
@@ -404,7 +405,6 @@ class TestObservability(ImpalaTestSuite):
   def __verify_profile_event_sequence(self, event_regexes, runtime_profile):
     """Check that 'event_regexes' appear in a consecutive series of lines in
        'runtime_profile'"""
-    lines = runtime_profile.splitlines()
     event_regex_index = 0
 
     # Check that the strings appear in the above order with no gaps in the profile.
@@ -425,7 +425,7 @@ class TestObservability(ImpalaTestSuite):
   def test_query_profile_contains_all_events(self, unique_database):
     """Test that the expected events show up in a query profile for various queries"""
     # make a data file to load data from
-    path = "test-warehouse/{0}.db/data_file".format(unique_database)
+    path = "{1}/{0}.db/data_file".format(unique_database, WAREHOUSE)
     self.filesystem_client.create_file(path, "1")
     use_query = "use {0}".format(unique_database)
     self.execute_query(use_query)
@@ -442,7 +442,7 @@ class TestObservability(ImpalaTestSuite):
       'explain select * from impala_6568',
       'describe impala_6568',
       'alter table impala_6568 set tblproperties(\'numRows\'=\'10\')',
-      "load data inpath '/{0}' into table impala_6568".format(path)
+      "load data inpath '{0}' into table impala_6568".format(path)
     ]
     # run each query...
     for query in queries:
@@ -501,9 +501,13 @@ class TestObservability(ImpalaTestSuite):
         if key in line:
           # Match byte count within parentheses
           m = re.search("\(([0-9]+)\)", line)
-          assert m, "Cannot match pattern for key %s in line '%s'" % (key, line)
-          # Only keep first (query-level) counter
-          if counters[key] == 0:
+
+          # If a match was not found, then the value of the key should be 0
+          if not m:
+            assert key + ": 0" in line, "Invalid format for key %s" % key
+            assert counters[key] != 0, "Query level counter for key %s cannot be 0" % key
+          elif counters[key] == 0:
+            # Only keep first (query-level) counter
             counters[key] = int(m.group(1))
 
     # All counters have values
@@ -605,7 +609,7 @@ class TestObservability(ImpalaTestSuite):
     assert len(start_time_sub_sec_str) == 9, start_time
 
   @pytest.mark.execute_serially
-  def test_end_time(self):
+  def test_query_end_time(self):
     """ Test that verifies that the end time of a query with a coordinator is set once
     the coordinator releases its admission control resources. This ensures that the
     duration of the query will be determined by the time taken to do real work rather
@@ -640,6 +644,41 @@ class TestObservability(ImpalaTestSuite):
     end_time = tree.nodes[1].info_strings["End Time"]
     assert end_time is not None
 
+  def test_dml_end_time(self, unique_database):
+    """Same as the above test but verifies the end time of DML is set only after the work
+    in catalogd is done."""
+    stmt = "create table %s.alltypestiny like functional.alltypestiny" % unique_database
+    self.execute_query(stmt)
+    # Warm up the table
+    self.execute_query("describe %s.alltypestiny" % unique_database)
+    stmt = "insert overwrite %s.alltypestiny partition(year, month)" \
+           " select * from functional.alltypestiny" % unique_database
+    # Use debug_action to inject a delay in catalogd. The INSERT usually finishes in
+    # 300ms without the delay.
+    delay_s = 5
+    self.hs2_client.set_configuration_option(
+        "debug_action", "catalogd_insert_finish_delay:SLEEP@%d" % (delay_s * 1000))
+    start_ts = time()
+    handle = self.hs2_client.execute_async(stmt)
+    self.hs2_client.clear_configuration()
+    end_time_str = ""
+    duration_str = ""
+    while len(end_time_str) == 0:
+      sleep(1)
+      tree = self.hs2_client.get_runtime_profile(handle, TRuntimeProfileFormat.THRIFT)
+      end_time_str = tree.nodes[1].info_strings["End Time"]
+      duration_str = tree.nodes[1].info_strings["Duration"]
+      # End time should not show up earlier than the delay.
+      if time() - start_ts < delay_s:
+        assert len(end_time_str) == 0, "End time show up too early: {end_str}. " \
+                                       "{delay_s} second delay expected since " \
+                                       "{start_str} ({start_ts:.6f})".format(
+          end_str=end_time_str, delay_s=delay_s, start_ts=start_ts,
+          start_str=datetime.utcfromtimestamp(start_ts).strftime('%Y-%m-%d %H:%M:%S.%f'))
+    self.hs2_client.close_query(handle)
+    duration_us = get_duration_us_from_str(duration_str)
+    assert duration_us > delay_s * 1000000
+
   def test_query_profile_contains_number_of_fragment_instance(self):
     """Test that the expected section for number of fragment instance in
     a query profile."""
@@ -665,11 +704,7 @@ class TestObservability(ImpalaTestSuite):
     self.__check_query_profile_storage_load_time(unique_database, table_name,
         cluster_properties)
 
-  @SkipIfS3.hbase
-  @SkipIfLocal.hbase
-  @SkipIfIsilon.hbase
-  @SkipIfABFS.hbase
-  @SkipIfADLS.hbase
+  @SkipIfFS.hbase
   @pytest.mark.execute_serially
   def test_query_profile_storage_load_time(self, cluster_properties):
     """Test that when a query needs load metadata for table(s), the
@@ -727,6 +762,45 @@ class TestObservability(ImpalaTestSuite):
     assert result.success
     self.__verify_hashtable_stats_profile(result.runtime_profile)
 
+  @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+  def test_skew_reporting_in_runtime_profile(self):
+    """Test that the skew summary and skew details are reported in runtime profile
+    correctly"""
+    query = """select ca_state, count(*) from tpcds_parquet.store_sales,
+            tpcds_parquet.customer, tpcds_parquet.customer_address
+            where ss_customer_sk = c_customer_sk and
+            c_current_addr_sk = ca_address_sk
+            group by ca_state
+            order by ca_state
+            """
+    "Set up the skew threshold to 0.0"
+    query_opts = {'report_skew_limit': 0.0}
+    results = self.execute_query(query, query_opts)
+    assert results.success
+
+    "When the skew summary is seen, look for the details"
+    skews_found = 'skew\(s\) found at:.*HASH_JOIN.*HASH_JOIN.*HDFS_SCAN_NODE'
+    if len(re.findall(skews_found, results.runtime_profile, re.M)) == 1:
+
+      "Expect to see skew details twice at the hash join nodes."
+      probe_rows_at_hj = 'HASH_JOIN_NODE.*\n.*Skew details: ProbeRows'
+      assert len(re.findall(probe_rows_at_hj, results.runtime_profile, re.M)) == 2
+
+      "Expect to see skew details once at the scan node."
+      probe_rows_at_hdfs_scan = 'HDFS_SCAN_NODE.*\n.*Skew details: RowsRead'
+      assert len(re.findall(probe_rows_at_hdfs_scan, results.runtime_profile, re.M)) == 1
+
+  def test_query_profile_contains_auto_scaling_events(self):
+    """Test that the info about two compilation events appears in the profile."""
+    query = "select * from functional.alltypes"
+    # Specifically turn on test_replan to impose a 2-executor group environment in FE.
+    query_opts = {'enable_replan': 1, 'test_replan': 1}
+    results = self.execute_query(query, query_opts)
+    assert results.success
+    runtime_profile = results.runtime_profile
+    assert len(re.findall('Analysis finished:', runtime_profile, re.M)) == 2
+    assert len(re.findall('Single node plan created:', runtime_profile, re.M)) == 2
+    assert len(re.findall('Distributed plan created:', runtime_profile, re.M)) == 2
 
 class TestQueryStates(ImpalaTestSuite):
   """Test that the 'Query State' and 'Impala Query State' are set correctly in the
@@ -740,7 +814,7 @@ class TestQueryStates(ImpalaTestSuite):
     """Tests that the query profile shows expected query states."""
     query = "select count(*) from functional.alltypes where bool_col = sleep(10)"
     handle = self.execute_query_async(query,
-        {"debug_action": "CRS_BEFORE_ADMISSION:SLEEP@1000"})
+        {"debug_action": "AC_BEFORE_ADMISSION:SLEEP@1000"})
     # If ExecuteStatement() has completed and the query is paused in the admission control
     # phase, then the query must be in COMPILED state.
     profile = self.client.get_runtime_profile(handle)
@@ -770,7 +844,7 @@ class TestQueryStates(ImpalaTestSuite):
       return self.__is_line_in_profile("Query State: FINISHED", profile) and \
              self.__is_line_in_profile("Impala Query State: FINISHED", profile)
 
-    self.assert_eventually(30, 1, assert_finished,
+    self.assert_eventually(300, 1, assert_finished,
       lambda: self.client.get_runtime_profile(handle))
 
     try:

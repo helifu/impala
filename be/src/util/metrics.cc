@@ -67,9 +67,9 @@ void ScalarMetric<T, metric_kind_t>::ToJson(Document* document, Value* val) {
   ToJsonValue(GetValue(), TUnit::NONE, document, &metric_value);
   container.AddMember("value", metric_value, document->GetAllocator());
 
-  Value type_value(PrintThriftEnum(kind()).c_str(), document->GetAllocator());
+  Value type_value(PrintValue(kind()).c_str(), document->GetAllocator());
   container.AddMember("kind", type_value, document->GetAllocator());
-  Value units(PrintThriftEnum(unit()).c_str(), document->GetAllocator());
+  Value units(PrintValue(unit()).c_str(), document->GetAllocator());
   container.AddMember("units", units, document->GetAllocator());
   *val = container;
 }
@@ -85,7 +85,7 @@ void ScalarMetric<T, metric_kind_t>::ToLegacyJson(Document* document) {
 template <typename T, TMetricKind::type metric_kind_t>
 TMetricKind::type ScalarMetric<T, metric_kind_t>::ToPrometheus(
     string name, stringstream* val, stringstream* metric_kind) {
-  string metric_type = PrintThriftEnum(kind()).c_str();
+  string metric_type = PrintValue(kind()).c_str();
   // prometheus doesn't support 'property', so ignore it
   if (!metric_type.compare("property")) {
     return TMetricKind::PROPERTY;
@@ -137,7 +137,7 @@ TMetricDef MetricDefs::Get(const string& key, const string& arg) {
 MetricGroup::MetricGroup(const string& name)
     : obj_pool_(new ObjectPool()), name_(name) { }
 
-Status MetricGroup::Init(Webserver* webserver) {
+Status MetricGroup::RegisterHttpHandlers(Webserver* webserver) {
   if (webserver != NULL) {
     Webserver::UrlCallback default_callback =
         bind<void>(mem_fn(&MetricGroup::CMCompatibleCallback), this, _1, _2);
@@ -172,20 +172,34 @@ void MetricGroup::CMCompatibleCallback(const Webserver::WebRequest& req,
     return;
   }
 
+  // Add all metrics in the metric_map_ to the given document.
+  for (const MetricMap::value_type& m : metric_map_) {
+    m.second->ToLegacyJson(document);
+  }
+
+
+  // Depth-first traversal of children to flatten all metrics, which is what was
+  // expected by CM before we introduced metric groups.
   stack<MetricGroup*> groups;
-  groups.push(this);
-  do {
-    // Depth-first traversal of children to flatten all metrics, which is what was
-    // expected by CM before we introduced metric groups.
+  for (const ChildGroupMap::value_type& child : children_) {
+    groups.push(child.second);
+  }
+
+  while (!groups.empty()) {
     MetricGroup* group = groups.top();
     groups.pop();
+
+    // children_ and metric_map_ are protected by lock_, so acquire group->lock_ before
+    // adding the metrics to the given document.
+    lock_guard<SpinLock> l(group->lock_);
     for (const ChildGroupMap::value_type& child: group->children_) {
       groups.push(child.second);
     }
+
     for (const MetricMap::value_type& m: group->metric_map_) {
       m.second->ToLegacyJson(document);
     }
-  } while (!groups.empty());
+  }
 }
 
 void MetricGroup::TemplateCallback(const Webserver::WebRequest& req,

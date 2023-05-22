@@ -22,15 +22,14 @@
 #include <boost/algorithm/string.hpp>
 #include <gflags/gflags.h>
 #include <gutil/strings/substitute.h>
-#include <kudu/client/client.h>
 
+#include "catalog/catalog-service-client-wrapper.h"
+#include "codegen/llvm-codegen-cache.h"
 #include "common/logging.h"
 #include "common/object-pool.h"
-#include "exec/kudu-util.h"
-#include "gen-cpp/ImpalaInternalService.h"
+#include "exec/kudu/kudu-util.h"
 #include "kudu/rpc/service_if.h"
 #include "rpc/rpc-mgr.h"
-#include "runtime/backend-client.h"
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/client-cache.h"
@@ -53,7 +52,6 @@
 #include "service/frontend.h"
 #include "service/impala-server.h"
 #include "statestore/statestore-subscriber.h"
-#include "util/cgroup-util.h"
 #include "util/cpu-info.h"
 #include "util/debug-util.h"
 #include "util/default-path-handlers.h"
@@ -70,6 +68,7 @@
 #include "util/system-state-info.h"
 #include "util/test-info.h"
 #include "util/thread-pool.h"
+#include "util/uid-util.h"
 #include "util/webserver.h"
 
 #include "common/names.h"
@@ -81,6 +80,9 @@ using namespace strings;
 DEFINE_string(catalog_service_host, "localhost",
     "hostname where CatalogService is running");
 DEFINE_bool(enable_webserver, true, "If true, debug webserver is enabled");
+DEFINE_bool(ping_expose_webserver_url, true,
+    "If true, debug webserver url is exposed via PingImpalaService/PingImpalaHS2Service "
+    "RPC calls");
 DEFINE_string(state_store_host, "localhost",
     "hostname where StatestoreService is running");
 DEFINE_int32(state_store_subscriber_port, 23000,
@@ -98,22 +100,25 @@ DEFINE_int32(admission_control_slots, 0,
     "this backend. The degree of parallelism of the query determines the number of slots "
     "that it needs. Defaults to number of cores / -num_cores for executors, and 8x that "
     "value for dedicated coordinators).");
+DEFINE_string(codegen_cache_capacity, "1GB",
+    "Specify the capacity of the codegen cache. If set to 0, codegen cache is disabled.");
 
-DEFINE_bool_hidden(use_local_catalog, false,
-    "Use experimental implementation of a local catalog. If this is set, "
-    "the catalog service is not used and does not need to be started.");
-DEFINE_int32_hidden(local_catalog_cache_mb, -1,
+DEFINE_bool(use_local_catalog, false,
+    "Use the on-demand metadata feature in coordinators. If this is set, coordinators "
+    "pull metadata as needed from catalogd and cache it locally. The cached metadata "
+    "gets evicted automatically under memory pressure or after an expiration time.");
+DEFINE_int32(local_catalog_cache_mb, -1,
     "If --use_local_catalog is enabled, configures the size of the catalog "
     "cache within each impalad. If this is set to -1, the cache is auto-"
     "configured to 60% of the configured Java heap size. Note that the Java "
     "heap size is distinct from and typically smaller than the overall "
     "Impala memory limit.");
-DEFINE_int32_hidden(local_catalog_cache_expiration_s, 60 * 60,
+DEFINE_int32(local_catalog_cache_expiration_s, 60 * 60,
     "If --use_local_catalog is enabled, configures the expiration time "
     "of the catalog cache within each impalad. Even if the configured "
     "cache capacity has not been reached, items are removed from the cache "
     "if they have not been accessed in this amount of time.");
-DEFINE_int32_hidden(local_catalog_max_fetch_retries, 40,
+DEFINE_int32(local_catalog_max_fetch_retries, 40,
     "If --use_local_catalog is enabled, configures the maximum number of times "
     "the frontend retries when fetching a metadata object from the impalad "
     "coordinator's local catalog cache.");
@@ -121,7 +126,6 @@ DEFINE_int32_hidden(local_catalog_max_fetch_retries, 40,
 DECLARE_int32(state_store_port);
 DECLARE_int32(num_threads_per_core);
 DECLARE_int32(num_cores);
-DECLARE_int32(be_port);
 DECLARE_int32(krpc_port);
 DECLARE_string(mem_limit);
 DECLARE_bool(mem_limit_includes_jvm);
@@ -133,10 +137,8 @@ DECLARE_bool(is_executor);
 DECLARE_string(webserver_interface);
 DECLARE_int32(webserver_port);
 DECLARE_int64(tcmalloc_max_total_thread_cache_bytes);
-
-// TODO-MT: rename or retire
-DEFINE_int32(coordinator_rpc_threads, 12, "(Advanced) Number of threads available to "
-    "start fragments on remote Impala daemons.");
+DECLARE_string(admission_service_host);
+DECLARE_int32(admission_service_port);
 
 DECLARE_string(ssl_client_ca_certificate);
 
@@ -156,7 +158,19 @@ DEFINE_int32(catalog_client_rpc_retry_interval_ms, 3000, "(Advanced) The time to
     "before retrying when the catalog RPC client fails to connect to catalogd or when "
     "RPCs to the catalogd fail.");
 
+DEFINE_int32(metrics_webserver_port, 0,
+    "If non-zero, the port to run the metrics webserver on, which exposes the /metrics, "
+    "/jsonmetrics, /metrics_prometheus, and /healthz endpoints without authentication "
+    "enabled.");
+
+DEFINE_string(metrics_webserver_interface, "",
+    "Interface to start metrics webserver on. If blank, webserver binds to 0.0.0.0");
+
 const static string DEFAULT_FS = "fs.defaultFS";
+
+// The max percentage that the codegen cache can take from the total process memory.
+// The value is set to 10%.
+const double MAX_CODEGEN_CACHE_MEM_PERCENT = 0.1;
 
 // The multiplier for how many queries a dedicated coordinator can run compared to an
 // executor. This is only effective when using non-default settings for executor groups
@@ -166,47 +180,14 @@ const static int COORDINATOR_CONCURRENCY_MULTIPLIER = 8;
 namespace {
 using namespace impala;
 /// Helper method to forward cluster membership updates to the frontend.
-///
-/// The frontend uses cluster membership information to determine whether it expects the
-/// scheduler to assign local or remote reads. It also uses the number of executors to
-/// determine the join type (partitioned vs broadcast). For the default executor group, we
-/// assume that local reads are preferred and will include the hostnames and IP addresses
-/// in the update to the frontend. For non-default executor groups, we assume that we will
-/// read data remotely and will only send the number of executors in the largest healthy
-/// group.
-void SendClusterMembershipToFrontend(
-    ClusterMembershipMgr::SnapshotPtr& snapshot, Frontend* frontend) {
+/// For additional details see comments for PopulateExecutorMembershipRequest()
+/// in cluster-membership-mgr.cc
+void SendClusterMembershipToFrontend(ClusterMembershipMgr::SnapshotPtr& snapshot,
+    const vector<TExecutorGroupSet>& expected_exec_group_sets, Frontend* frontend) {
   TUpdateExecutorMembershipRequest update_req;
-  const ExecutorGroup* group = nullptr;
-  bool is_default_group = false;
-  auto default_it =
-      snapshot->executor_groups.find(ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME);
-  if (default_it != snapshot->executor_groups.end()) {
-    is_default_group = true;
-    group = &(default_it->second);
-  } else {
-    int max_num_executors = 0;
-    // Find largest healthy group.
-    for (const auto& it : snapshot->executor_groups) {
-      if (!it.second.IsHealthy()) continue;
-      int num_executors = it.second.NumExecutors();
-      if (num_executors > max_num_executors) {
-        max_num_executors = num_executors;
-        group = &(it.second);
-      }
-    }
-  }
-  if (group) {
-    for (const auto& backend : group->GetAllExecutorDescriptors()) {
-      if (backend.is_executor) {
-        if (is_default_group) {
-          update_req.hostnames.insert(backend.address.hostname);
-          update_req.ip_addresses.insert(backend.ip_address);
-        }
-        update_req.num_executors++;
-      }
-    }
-  }
+
+  PopulateExecutorMembershipRequest(snapshot, expected_exec_group_sets, update_req);
+
   Status status = frontend->UpdateExecutorMembership(update_req);
   if (!status.ok()) {
     LOG(WARNING) << "Error updating frontend membership snapshot: " << status.GetDetail();
@@ -216,54 +197,45 @@ void SendClusterMembershipToFrontend(
 
 namespace impala {
 
-struct ExecEnv::KuduClientPtr {
-  kudu::client::sp::shared_ptr<kudu::client::KuduClient> kudu_client;
-};
-
 ExecEnv* ExecEnv::exec_env_ = nullptr;
 
-ExecEnv::ExecEnv()
-  : ExecEnv(FLAGS_be_port, FLAGS_krpc_port,
-        FLAGS_state_store_subscriber_port, FLAGS_webserver_port,
-        FLAGS_state_store_host, FLAGS_state_store_port) {}
+ExecEnv::ExecEnv(bool external_fe)
+  : ExecEnv(FLAGS_krpc_port, FLAGS_state_store_subscriber_port, FLAGS_webserver_port,
+        FLAGS_state_store_host, FLAGS_state_store_port, external_fe) {}
 
-ExecEnv::ExecEnv(int backend_port, int krpc_port,
-    int subscriber_port, int webserver_port, const string& statestore_host,
-    int statestore_port)
+ExecEnv::ExecEnv(int krpc_port, int subscriber_port, int webserver_port,
+    const string& statestore_host, int statestore_port, bool external_fe)
   : obj_pool_(new ObjectPool),
     metrics_(new MetricGroup("impala-metrics")),
-    impalad_client_cache_(
-        new ImpalaBackendClientCache(FLAGS_backend_client_connection_num_retries, 0,
-            FLAGS_backend_client_rpc_timeout_ms, FLAGS_backend_client_rpc_timeout_ms, "",
-            !FLAGS_ssl_client_ca_certificate.empty())),
     // Create the CatalogServiceClientCache with num_retries = 1 and wait_ms = 0.
     // Connections are still retried, but the retry mechanism is driven by
     // DoRpcWithRetry. Clients should always use DoRpcWithRetry rather than DoRpc to
     // ensure that both RPCs and connections are retried.
-    catalogd_client_cache_(
-        new CatalogServiceClientCache(1, 0,
-            FLAGS_catalog_client_rpc_timeout_ms, FLAGS_catalog_client_rpc_timeout_ms, "",
-            !FLAGS_ssl_client_ca_certificate.empty())),
+    catalogd_client_cache_(new CatalogServiceClientCache(1, 0,
+        FLAGS_catalog_client_rpc_timeout_ms, FLAGS_catalog_client_rpc_timeout_ms, "",
+        !FLAGS_ssl_client_ca_certificate.empty())),
     htable_factory_(new HBaseTableFactory()),
     disk_io_mgr_(new io::DiskIoMgr()),
     webserver_(new Webserver(FLAGS_webserver_interface, webserver_port, metrics_.get())),
     pool_mem_trackers_(new PoolMemTrackerRegistry),
     thread_mgr_(new ThreadResourceMgr),
     tmp_file_mgr_(new TmpFileMgr),
-    frontend_(new Frontend()),
+    frontend_(external_fe ? nullptr : new Frontend()),
     async_rpc_pool_(new CallableThreadPool("rpc-pool", "async-rpc-sender", 8, 10000)),
     query_exec_mgr_(new QueryExecMgr()),
     rpc_metrics_(metrics_->GetOrCreateChildGroup("rpc")),
     enable_webserver_(FLAGS_enable_webserver && webserver_port > 0),
-    configured_backend_address_(MakeNetworkAddress(FLAGS_hostname, backend_port)) {
+    external_fe_(external_fe),
+    configured_backend_address_(MakeNetworkAddress(FLAGS_hostname, krpc_port)) {
+  UUIDToUniqueIdPB(boost::uuids::random_generator()(), &backend_id_);
 
   // Resolve hostname to IP address.
   ABORT_IF_ERROR(HostnameToIpAddr(FLAGS_hostname, &ip_address_));
 
   // KRPC relies on resolved IP address.
-  krpc_address_.__set_hostname(ip_address_);
-  krpc_address_.__set_port(krpc_port);
   rpc_mgr_.reset(new RpcMgr(IsInternalTlsConfigured()));
+  krpc_address_ = MakeNetworkAddressPB(
+      ip_address_, krpc_port, backend_id_, rpc_mgr_->GetUdsAddressUniqueId());
   stream_mgr_.reset(new KrpcDataStreamMgr(metrics_.get()));
 
   request_pool_service_.reset(new RequestPoolService(metrics_.get()));
@@ -273,24 +245,34 @@ ExecEnv::ExecEnv(int backend_port, int krpc_port,
   TNetworkAddress statestore_address =
       MakeNetworkAddress(statestore_host, statestore_port);
 
+  // Set StatestoreSubscriber::subscriber_id as hostname + krpc_port.
   statestore_subscriber_.reset(new StatestoreSubscriber(
-      Substitute("impalad@$0", TNetworkAddressToString(configured_backend_address_)),
-      subscriber_address, statestore_address, metrics_.get()));
+      Substitute("impalad@$0:$1", FLAGS_hostname, FLAGS_krpc_port), subscriber_address,
+      statestore_address, metrics_.get()));
 
   if (FLAGS_is_coordinator) {
     hdfs_op_thread_pool_.reset(
         CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024));
-    exec_rpc_thread_pool_.reset(new CallableThreadPool("exec-rpc-pool", "worker",
-        FLAGS_coordinator_rpc_threads, numeric_limits<int32_t>::max()));
+  }
+  if (FLAGS_is_coordinator && !AdmissionServiceEnabled()) {
+    // We only need a Scheduler if we're performing admission control locally, i.e. if
+    // this is a coordinator and there isn't an admissiond.
     scheduler_.reset(new Scheduler(metrics_.get(), request_pool_service_.get()));
   }
 
   cluster_membership_mgr_.reset(new ClusterMembershipMgr(
-      statestore_subscriber_->id(), statestore_subscriber_.get(), metrics_.get()));
+      PrintId(backend_id_), statestore_subscriber_.get(), metrics_.get()));
 
-  admission_controller_.reset(
-      new AdmissionController(cluster_membership_mgr_.get(), statestore_subscriber_.get(),
-          request_pool_service_.get(), metrics_.get(), configured_backend_address_));
+  // TODO: Consider removing AdmissionController from executor only impalads.
+  admission_controller_.reset(new AdmissionController(cluster_membership_mgr_.get(),
+      statestore_subscriber_.get(), request_pool_service_.get(), metrics_.get(),
+      scheduler_.get(), pool_mem_trackers_.get(), configured_backend_address_));
+
+  if (FLAGS_metrics_webserver_port > 0) {
+    metrics_webserver_.reset(new Webserver(FLAGS_metrics_webserver_interface,
+        FLAGS_metrics_webserver_port, metrics_.get(), Webserver::AuthMode::NONE));
+  }
+
   exec_env_ = this;
 }
 
@@ -300,16 +282,16 @@ ExecEnv::~ExecEnv() {
   disk_io_mgr_.reset(); // Need to tear down before mem_tracker_.
 }
 
-Status ExecEnv::InitForFeTests() {
+Status ExecEnv::InitForFeSupport() {
   mem_tracker_.reset(new MemTracker(-1, "Process"));
   is_fe_tests_ = true;
   return Status::OK();
 }
 
 Status ExecEnv::Init() {
+  LOG(INFO) << "Initializing impalad with backend uuid: " << PrintId(backend_id_);
   // Initialize thread pools
   if (FLAGS_is_coordinator) {
-    RETURN_IF_ERROR(exec_rpc_thread_pool_->Init());
     RETURN_IF_ERROR(hdfs_op_thread_pool_->Init());
   }
   RETURN_IF_ERROR(async_rpc_pool_->Init());
@@ -331,15 +313,51 @@ Status ExecEnv::Init() {
     // The JVM max heap size is static and therefore known at this point. Other categories
     // of JVM memory consumption are much smaller and dynamic so it is simpler not to
     // include them here.
-    admit_mem_limit_ -= JvmMemoryMetric::HEAP_MAX_USAGE->GetValue();
+    int64_t jvm_max_heap_size = JvmMemoryMetric::HEAP_MAX_USAGE->GetValue();
+    admit_mem_limit_ -= jvm_max_heap_size;
+    if (admit_mem_limit_ <= 0) {
+      return Status(
+          Substitute("Invalid combination of --mem_limit_includes_jvm and JVM max heap "
+                     "size $0, which must be smaller than process memory limit $1",
+              jvm_max_heap_size, bytes_limit));
+    }
   }
 
-  bool is_percent;
+  bool is_percent = false;
+  int64_t codegen_cache_capacity =
+      ParseUtil::ParseMemSpec(FLAGS_codegen_cache_capacity, &is_percent, 0);
+  if (codegen_cache_capacity > 0) {
+    // If codegen_cache_capacity is larger than 0, the number should not be a percentage.
+    DCHECK(!is_percent);
+    int64_t codegen_cache_limit = admit_mem_limit_ * MAX_CODEGEN_CACHE_MEM_PERCENT;
+    DCHECK(codegen_cache_limit > 0);
+    if (codegen_cache_capacity > codegen_cache_limit) {
+      LOG(INFO) << "CodeGen Cache capacity changed from "
+                << PrettyPrinter::Print(codegen_cache_capacity, TUnit::BYTES) << " to "
+                << PrettyPrinter::Print(codegen_cache_limit, TUnit::BYTES)
+                << " due to reaching the limit.";
+      codegen_cache_capacity = codegen_cache_limit;
+    }
+    codegen_cache_.reset(new CodeGenCache(metrics_.get()));
+    RETURN_IF_ERROR(codegen_cache_->Init(codegen_cache_capacity));
+    LOG(INFO) << "CodeGen Cache initialized with capacity "
+              << PrettyPrinter::Print(codegen_cache_capacity, TUnit::BYTES);
+    // Preserve the memory for codegen cache.
+    admit_mem_limit_ -= codegen_cache_capacity;
+    DCHECK_GT(admit_mem_limit_, 0);
+  } else {
+    LOG(INFO) << "CodeGen Cache is disabled.";
+  }
+
+  LOG(INFO) << "Admit memory limit: "
+            << PrettyPrinter::Print(admit_mem_limit_, TUnit::BYTES);
+
   int64_t buffer_pool_limit = ParseUtil::ParseMemSpec(FLAGS_buffer_pool_limit,
       &is_percent, admit_mem_limit_);
   if (buffer_pool_limit <= 0) {
-    return Status(Substitute("Invalid --buffer_pool_limit value, must be a percentage or "
-          "positive bytes value or percentage: $0", FLAGS_buffer_pool_limit));
+    return Status(Substitute("Invalid --buffer_pool_limit value, must be a "
+                             "positive bytes value or percentage: $0",
+        FLAGS_buffer_pool_limit));
   }
   buffer_pool_limit = BitUtil::RoundDown(buffer_pool_limit, FLAGS_min_buffer_size);
   LOG(INFO) << "Buffer pool limit: "
@@ -349,7 +367,7 @@ Status ExecEnv::Init() {
       &is_percent, buffer_pool_limit);
   if (clean_pages_limit <= 0) {
     return Status(Substitute("Invalid --buffer_pool_clean_pages_limit value, must be a "
-        "percentage or positive bytes value or percentage: $0",
+                             "positive bytes value or percentage: $0",
         FLAGS_buffer_pool_clean_pages_limit));
   }
   InitBufferPool(FLAGS_min_buffer_size, buffer_pool_limit, clean_pages_limit);
@@ -371,8 +389,13 @@ Status ExecEnv::Init() {
 
   InitSystemStateInfo();
 
-  RETURN_IF_ERROR(metrics_->Init(enable_webserver_ ? webserver_.get() : nullptr));
-  impalad_client_cache_->InitMetrics(metrics_.get(), "impala-server.backends");
+  if (enable_webserver_) {
+    RETURN_IF_ERROR(metrics_->RegisterHttpHandlers(webserver_.get()));
+  }
+  if (FLAGS_metrics_webserver_port > 0) {
+    RETURN_IF_ERROR(metrics_->RegisterHttpHandlers(metrics_webserver_.get()));
+    RETURN_IF_ERROR(metrics_webserver_->Start());
+  }
   catalogd_client_cache_->InitMetrics(metrics_.get(), "catalog.server");
   RETURN_IF_ERROR(RegisterMemoryMetrics(
       metrics_.get(), true, buffer_reservation_.get(), buffer_pool_.get()));
@@ -391,6 +414,7 @@ Status ExecEnv::Init() {
   data_svc_.reset(new DataStreamService(rpc_metrics_));
   RETURN_IF_ERROR(data_svc_->Init());
   RETURN_IF_ERROR(stream_mgr_->Init(data_svc_->mem_tracker()));
+
   // Bump thread cache to 1GB to reduce contention for TCMalloc central
   // list's spinlock.
   if (FLAGS_tcmalloc_max_total_thread_cache_bytes == 0) {
@@ -434,89 +458,33 @@ Status ExecEnv::Init() {
   }
 
   RETURN_IF_ERROR(cluster_membership_mgr_->Init());
-  cluster_membership_mgr_->RegisterUpdateCallbackFn(
-      [this](ClusterMembershipMgr::SnapshotPtr snapshot) {
-        SendClusterMembershipToFrontend(snapshot, this->frontend());
-      });
-
-  RETURN_IF_ERROR(admission_controller_->Init());
-
-  // Get the fs.defaultFS value set in core-site.xml and assign it to configured_defaultFs
-  TGetHadoopConfigRequest config_request;
-  config_request.__set_name(DEFAULT_FS);
-  TGetHadoopConfigResponse config_response;
-  RETURN_IF_ERROR(frontend_->GetHadoopConfig(config_request, &config_response));
-  if (config_response.__isset.value) {
-    default_fs_ = config_response.value;
-  } else {
-    default_fs_ = "hdfs://";
+  if (FLAGS_is_coordinator && frontend_ != nullptr) {
+    cluster_membership_mgr_->RegisterUpdateCallbackFn(
+        [this](ClusterMembershipMgr::SnapshotPtr snapshot) {
+          SendClusterMembershipToFrontend(snapshot,
+              this->cluster_membership_mgr()->GetExpectedExecGroupSets(),
+              this->frontend());
+        });
   }
 
+  RETURN_IF_ERROR(admission_controller_->Init());
+  RETURN_IF_ERROR(InitHadoopConfig());
   return Status::OK();
 }
 
-Status ExecEnv::ChooseProcessMemLimit(int64_t* bytes_limit) {
-  // Depending on the system configuration, we detect the total amount of memory
-  // available to the system - either the available physical memory, or if overcommitting
-  // is turned off, we use the memory commit limit from /proc/meminfo (see IMPALA-1690).
-  // The 'memory' CGroup can also impose a lower limit on memory consumption,
-  // so we take the minimum of the system memory and the CGroup memory limit.
-  int64_t avail_mem = MemInfo::physical_mem();
-  bool use_commit_limit =
-      MemInfo::vm_overcommit() == 2 && MemInfo::commit_limit() < MemInfo::physical_mem();
-  if (use_commit_limit) {
-    avail_mem = MemInfo::commit_limit();
-    // There might be the case of misconfiguration, when on a system swap is disabled
-    // and overcommitting is turned off the actual usable memory is less than the
-    // available physical memory.
-    LOG(WARNING) << "This system shows a discrepancy between the available "
-                 << "memory and the memory commit limit allowed by the "
-                 << "operating system. ( Mem: " << MemInfo::physical_mem()
-                 << "<=> CommitLimit: " << MemInfo::commit_limit() << "). "
-                 << "Impala will adhere to the smaller value when setting the process "
-                 << "memory limit. Please verify the system configuration. Specifically, "
-                 << "/proc/sys/vm/overcommit_memory and "
-                 << "/proc/sys/vm/overcommit_ratio.";
-  }
-  LOG(INFO) << "System memory available: " << PrettyPrinter::PrintBytes(avail_mem)
-            << " (from " << (use_commit_limit ? "commit limit" : "physical mem") << ")";
-  int64_t cgroup_mem_limit;
-  Status cgroup_mem_status = CGroupUtil::FindCGroupMemLimit(&cgroup_mem_limit);
-  if (cgroup_mem_status.ok()) {
-    if (cgroup_mem_limit < avail_mem) {
-      avail_mem = cgroup_mem_limit;
-      LOG(INFO) << "CGroup memory limit for this process reduces physical memory "
-                << "available to: " << PrettyPrinter::PrintBytes(avail_mem);
+Status ExecEnv::InitHadoopConfig() {
+  if (frontend_ != nullptr) {
+    // Get the fs.defaultFS value set in core-site.xml and assign it to
+    // configured_defaultFs
+    TGetHadoopConfigRequest config_request;
+    config_request.__set_name(DEFAULT_FS);
+    TGetHadoopConfigResponse config_response;
+    RETURN_IF_ERROR(frontend_->GetHadoopConfig(config_request, &config_response));
+    if (config_response.__isset.value) {
+      default_fs_ = config_response.value;
+    } else {
+      default_fs_ = "hdfs://";
     }
-  } else {
-    LOG(WARNING) << "Could not detect CGroup memory limit, assuming unlimited: $0"
-                 << cgroup_mem_status.GetDetail();
-  }
-  bool is_percent;
-  *bytes_limit = ParseUtil::ParseMemSpec(FLAGS_mem_limit, &is_percent, avail_mem);
-  // ParseMemSpec() returns -1 for invalid input and 0 to mean unlimited. From Impala
-  // 2.11 onwards we do not support unlimited process memory limits.
-  if (*bytes_limit <= 0) {
-    return Status(Substitute("The process memory limit (--mem_limit) must be a positive "
-                             "bytes value or percentage: $0", FLAGS_mem_limit));
-  }
-  if (is_percent) {
-    LOG(INFO) << "Using process memory limit: " << PrettyPrinter::PrintBytes(*bytes_limit)
-              << " (--mem_limit=" << FLAGS_mem_limit << " of "
-              << PrettyPrinter::PrintBytes(avail_mem) << ")";
-  } else {
-    LOG(INFO) << "Using process memory limit: " << PrettyPrinter::PrintBytes(*bytes_limit)
-              << " (--mem_limit=" << FLAGS_mem_limit << ")";
-  }
-  if (*bytes_limit > MemInfo::physical_mem()) {
-    LOG(WARNING) << "Process memory limit " << PrettyPrinter::PrintBytes(*bytes_limit)
-                 << " exceeds physical memory of "
-                 << PrettyPrinter::PrintBytes(MemInfo::physical_mem());
-  }
-  if (cgroup_mem_status.ok() && *bytes_limit > cgroup_mem_limit) {
-    LOG(WARNING) << "Process Memory limit " << PrettyPrinter::PrintBytes(*bytes_limit)
-                 << " exceeds CGroup memory limit of "
-                 << PrettyPrinter::PrintBytes(cgroup_mem_limit);
   }
   return Status::OK();
 }
@@ -550,14 +518,27 @@ void ExecEnv::SetImpalaServer(ImpalaServer* server) {
   cluster_membership_mgr_->SetLocalBeDescFn([server]() {
     return server->GetLocalBackendDescriptor();
   });
-  cluster_membership_mgr_->RegisterUpdateCallbackFn(
-      [server](ClusterMembershipMgr::SnapshotPtr snapshot) {
-        std::unordered_set<TNetworkAddress> current_backend_set;
-        for (const auto& it : snapshot->current_backends) {
-          current_backend_set.insert(it.second.address);
-        }
-        server->CancelQueriesOnFailedBackends(current_backend_set);
-      });
+  if (FLAGS_is_coordinator) {
+    cluster_membership_mgr_->RegisterUpdateCallbackFn(
+        [server](ClusterMembershipMgr::SnapshotPtr snapshot) {
+          std::unordered_set<BackendIdPB> current_backend_set;
+          for (const auto& it : snapshot->current_backends) {
+            current_backend_set.insert(it.second.backend_id());
+          }
+          server->CancelQueriesOnFailedBackends(current_backend_set);
+        });
+  }
+  if (FLAGS_is_executor && !TestInfo::is_test()) {
+    cluster_membership_mgr_->RegisterUpdateCallbackFn(
+        [](ClusterMembershipMgr::SnapshotPtr snapshot) {
+          std::unordered_set<BackendIdPB> current_backend_set;
+          for (const auto& it : snapshot->current_backends) {
+            current_backend_set.insert(it.second.backend_id());
+          }
+          ExecEnv::GetInstance()->query_exec_mgr()->CancelQueriesForFailedCoordinators(
+              current_backend_set);
+        });
+  }
 }
 
 void ExecEnv::InitBufferPool(int64_t min_buffer_size, int64_t capacity,
@@ -623,25 +604,38 @@ void ExecEnv::InitSystemStateInfo() {
   });
 }
 
-TNetworkAddress ExecEnv::GetThriftBackendAddress() const {
-  DCHECK(impala_server_ != nullptr);
-  return impala_server_->GetThriftBackendAddress();
-}
-
-Status ExecEnv::GetKuduClient(
-    const vector<string>& master_addresses, kudu::client::KuduClient** client) {
+Status ExecEnv::GetKuduClient(const vector<string>& master_addresses,
+    kudu::client::sp::shared_ptr<kudu::client::KuduClient>* client) {
   string master_addr_concat = join(master_addresses, ",");
   lock_guard<SpinLock> l(kudu_client_map_lock_);
   auto kudu_client_map_it = kudu_client_map_.find(master_addr_concat);
   if (kudu_client_map_it == kudu_client_map_.end()) {
-    // KuduClient doesn't exist, create it
-    KuduClientPtr* kudu_client_ptr = new KuduClientPtr;
-    RETURN_IF_ERROR(CreateKuduClient(master_addresses, &kudu_client_ptr->kudu_client));
-    kudu_client_map_[master_addr_concat].reset(kudu_client_ptr);
-    *client = kudu_client_ptr->kudu_client.get();
+    // KuduClient doesn't exist, create it.
+    LOG(INFO) << "Creating a new KuduClient for masters=" << master_addr_concat;
+    kudu::client::sp::shared_ptr<kudu::client::KuduClient> kudu_client;
+    RETURN_IF_ERROR(CreateKuduClient(master_addresses, &kudu_client));
+    kudu_client_map_.insert(make_pair(master_addr_concat, kudu_client));
+    *client = kudu_client;
   } else {
     // Return existing KuduClient
-    *client = kudu_client_map_it->second->kudu_client.get();
+    *client = kudu_client_map_it->second;
+  }
+  return Status::OK();
+}
+
+bool ExecEnv::AdmissionServiceEnabled() const {
+  return !FLAGS_admission_service_host.empty();
+}
+
+Status ExecEnv::GetAdmissionServiceAddress(
+    NetworkAddressPB& admission_service_address) const {
+  if (AdmissionServiceEnabled()) {
+    IpAddr ip;
+    RETURN_IF_ERROR(HostnameToIpAddr(FLAGS_admission_service_host, &ip));
+    // TODO: get BackendId of admissiond in global admission control mode.
+    // Use admissiond's IP address as unique ID for UDS now.
+    admission_service_address = MakeNetworkAddressPB(
+        ip, FLAGS_admission_service_port, UdsAddressUniqueIdPB::IP_ADDRESS);
   }
   return Status::OK();
 }

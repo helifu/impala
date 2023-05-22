@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_RPC_INBOUND_CALL_H
-#define KUDU_RPC_INBOUND_CALL_H
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -26,12 +25,13 @@
 #include <vector>
 
 #include <glog/logging.h>
+#include <google/protobuf/arena.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/rpc_sidecar.h"
 #include "kudu/rpc/service_if.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/faststring.h"
@@ -57,7 +57,6 @@ class Connection;
 class DumpConnectionsRequestPB;
 class RemoteUser;
 class RpcCallInProgressPB;
-class RpcSidecar;
 
 struct InboundCallTiming {
   MonoTime time_received;   // Time the call was first accepted.
@@ -66,6 +65,14 @@ struct InboundCallTiming {
 
   MonoDelta TotalDuration() const {
     return time_completed - time_received;
+  }
+
+  MonoDelta ProcessingDuration() const {
+    return time_completed - time_handled;
+  }
+
+  MonoDelta QueueDuration() const {
+    return time_handled - time_received;
   }
 };
 
@@ -81,7 +88,7 @@ class InboundCall {
   // 'serialized_request_' member variables. The actual call parameter is
   // not deserialized, as this may be CPU-expensive, and this is called
   // from the reactor thread.
-  Status ParseFrom(gscoped_ptr<InboundTransfer> transfer);
+  Status ParseFrom(std::unique_ptr<InboundTransfer> transfer);
 
   // Return the serialized request parameter protobuf.
   const Slice& serialized_request() const {
@@ -127,8 +134,7 @@ class InboundCall {
 
   // Serialize the response packet for the finished call into 'slices'.
   // The resulting slices refer to memory in this object.
-  // Returns the number of slices in the serialized response.
-  size_t SerializeResponseTo(TransferPayload* slices) const;
+  void SerializeResponseTo(TransferPayload* slices) const;
 
   // See RpcContext::AddRpcSidecar()
   Status AddOutboundSidecar(std::unique_ptr<RpcSidecar> car, int* idx);
@@ -144,6 +150,10 @@ class InboundCall {
   const scoped_refptr<Connection>& connection() const;
 
   Trace* trace();
+
+  google::protobuf::Arena* pb_arena() {
+    return &arena_;
+  }
 
   const InboundCallTiming& timing() const {
     return timing_;
@@ -191,6 +201,9 @@ class InboundCall {
 
   // Return the time when this call was received.
   MonoTime GetTimeReceived() const;
+
+  // Return the time when this call was handled.
+  MonoTime GetTimeHandled() const;
 
   // Returns the set of application-specific feature flags required to service
   // the RPC.
@@ -240,7 +253,7 @@ class InboundCall {
   // The transfer that produced the call.
   // This is kept around because it retains the memory referred to
   // by 'serialized_request_' above.
-  gscoped_ptr<InboundTransfer> transfer_;
+  std::unique_ptr<InboundTransfer> transfer_;
 
   // The buffers for serialized response. Set by SerializeResponseBuffer().
   faststring response_hdr_buf_;
@@ -256,7 +269,7 @@ class InboundCall {
 
   // Inbound sidecars from the request. The slices are views onto transfer_. There are as
   // many slices as header_.sidecar_offsets_size().
-  Slice inbound_sidecar_slices_[TransferLimits::kMaxSidecars];
+  SidecarSliceVector inbound_sidecar_slices_;
 
   // The trace buffer.
   scoped_refptr<Trace> trace_;
@@ -277,10 +290,10 @@ class InboundCall {
   // client did not pass a timeout.
   MonoTime deadline_;
 
+  google::protobuf::Arena arena_;
+
   DISALLOW_COPY_AND_ASSIGN(InboundCall);
 };
 
 } // namespace rpc
 } // namespace kudu
-
-#endif

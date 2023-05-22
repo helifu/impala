@@ -35,22 +35,25 @@ namespace impala {
 class TimestampParser {
  public:
   /// Parse a default date/time string. The default timestamp format is:
-  /// yyyy-MM-dd HH:mm:ss.SSSSSSSSS or yyyy-MM-ddTHH:mm:ss.SSSSSSSSS. Either just the
-  /// date or just the time may be specified. All components are required in either the
+  /// yyyy-MM-dd HH:mm:ss.SSSSSSSSS or yyyy-MM-ddTHH:mm:ss.SSSSSSSSS. Just the
+  /// date may be specified. All components are required in either the
   /// date or time except for the fractional seconds following the period. In the case
-  /// of just a date, the time will be set to 00:00:00. In the case of just a time, the
-  /// date will be set to invalid.
+  /// of just a date, the time will be set to 00:00:00.
+  /// In case accept_time_toks_only=true, HH:mm:ss.SSSSSSSSS is also accepted and if
+  /// there is no data part in the string, the output date is set to invalid.
   /// str -- valid pointer to the string to parse
   /// len -- length of the string to parse (must be > 0)
   /// d -- the date value where the results of the parsing will be placed
   /// t -- the time value where the results of the parsing will be placed
+  /// accept_time_toks_only -- also accepts time of the day string without date part
   /// Returns true if the date/time was successfully parsed.
   static bool ParseSimpleDateFormat(const char* str, int len, boost::gregorian::date* d,
-      boost::posix_time::time_duration* t) WARN_UNUSED_RESULT;
+      boost::posix_time::time_duration* t,
+      bool accept_time_toks_only = false) WARN_UNUSED_RESULT;
 
   /// Parse a date/time string. The data must adhere to SimpleDateFormat, otherwise it
   /// will be rejected i.e. no missing tokens. In the case of just a date, the time will
-  /// be set to 00:00:00. In the case of just a time, the date will be set to invalid.
+  /// be set to 00:00:00.
   /// str -- valid pointer to the string to parse
   /// len -- length of the string to parse (must be > 0)
   /// dt_ctx -- date/time format context (must contain valid tokens)
@@ -70,12 +73,24 @@ class TimestampParser {
       const datetime_parse_util::DateTimeFormatContext& dt_ctx, boost::gregorian::date* d,
       boost::posix_time::time_duration* t) WARN_UNUSED_RESULT;
 
+  /// Optimized formatter for default short and long formats
+  static int FormatDefault(const boost::gregorian::date& d,
+      const boost::posix_time::time_duration& t, char* dst);
+
   /// Format the date/time values using the given format context.
+  /// Caller must make sure that it has enough buffer space in 'dst' to hold the output.
+  /// Return total output length that is written into 'dst'. Return -1 If 'd' or 't' is
+  /// invalid.
   /// dt_ctx -- date/time format context
   /// d -- the date value
   /// t -- the time value
-  static std::string Format(const datetime_parse_util::DateTimeFormatContext& dt_ctx,
-      const boost::gregorian::date& d, const boost::posix_time::time_duration& t);
+  /// max_length -- the maximum length of characters that 'dst' can hold. Only used for
+  ///   assertion in debug build. A DCHECK error will be raised if 'max_length' is less
+  ///   than required space. However, this method will not write more than 'max_length'.
+  /// dst -- pointer to destination buffer to write the result
+  static int Format(const datetime_parse_util::DateTimeFormatContext& dt_ctx,
+      const boost::gregorian::date& d, const boost::posix_time::time_duration& t,
+      int max_length, char* dst);
 
  private:
   /// Helper function finding the correct century for 1 or 2 digit year according to
@@ -110,6 +125,20 @@ class TimestampParser {
   /// 'd' date is expected to fall in the [1400, 9999] year range. The returned week
   /// numbering year must also fall in the [1400, 9999] range.
   static int GetIso8601WeekNumberingYear(const boost::gregorian::date& d);
+
+  /// Helper function for FormatStringVal.
+  static ALWAYS_INLINE void AppendToBuffer(
+      const char* buff, int length_to_copy, char* dst, int& pos, int max_length) {
+    int max_to_copy = std::min(length_to_copy, max_length - pos);
+    std::copy(buff, buff + max_to_copy, dst + pos);
+    pos += length_to_copy;
+  }
+  static ALWAYS_INLINE void AppendToBuffer(
+      const string& str, char* dst, int& pos, int max_length) {
+    int max_to_copy = std::min((int)str.length(), max_length - pos);
+    std::copy(str.cbegin(), str.cbegin() + max_to_copy, dst + pos);
+    pos += str.length();
+  }
 };
 
 }

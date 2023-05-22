@@ -20,6 +20,8 @@
 '''This script creates a nested version of TPC-H. Non-nested TPC-H must already be
    loaded.
 '''
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import logging
 import os
 
@@ -44,8 +46,7 @@ COMPRESSION_VALUES_MAP = {
   "parquet": {
     "none": "SNAPPY",
     "snap": "SNAPPY",
-    "gzip": "GZIP",
-    "lzo": "LZO"
+    "gzip": "GZIP"
   },
   # Currently, only three codecs are supported in Hive for ORC. See Hive codes in
   # org.apache.orc.impl.WriterImpl#createCodec (in module hive-orc)
@@ -85,17 +86,27 @@ def load():
   with cluster.impala.cursor() as impala:
     impala.ensure_empty_db(target_db)
     impala.execute("USE %s" % target_db)
+    external = ""
+    tblproperties = "'{0}' = '{1}'".format(compression_key, compression_value)
+    # For Hive 3+, workaround for HIVE-22371 (CTAS puts files in the wrong place) by
+    # explicitly creating an external table so that files are in the external warehouse
+    # directory. Use external.table.purge=true so that it is equivalent to a Hive 2
+    # managed table.
+    # For Apache Hive, HIVE-20085 (Hive 4) Allow CTAS.
+    if HIVE_MAJOR_VERSION >= 3 and os.environ["USE_APACHE_HIVE"] != "true":
+      external = "EXTERNAL"
+      tblproperties += ",'external.table.purge'='TRUE'"
     sql_params = {
         "source_db": source_db,
         "target_db": target_db,
         "file_format": file_format,
-        "compression_key": compression_key,
-        "compression_value": compression_value,
         "chunks": chunks,
-        "warehouse_dir": cluster.hive.warehouse_dir}
+        "warehouse_dir": cluster.hive.warehouse_dir,
+        "tblproperties": tblproperties,
+        "external": external}
 
     # Split table creation into multiple queries or "chunks" so less memory is needed.
-    for chunk_idx in xrange(chunks):
+    for chunk_idx in range(chunks):
       sql_params["chunk_idx"] = chunk_idx
 
       # Create the nested data in text format. The \00#'s are nested field terminators,
@@ -134,7 +145,7 @@ def load():
       else:
         impala.execute("INSERT INTO TABLE tmp_orders_string " + tmp_orders_sql)
 
-    for chunk_idx in xrange(chunks):
+    for chunk_idx in range(chunks):
       sql_params["chunk_idx"] = chunk_idx
       tmp_customer_sql = r"""
           SELECT STRAIGHT_JOIN
@@ -285,9 +296,9 @@ def load():
     # For ORC format, we create the 'part' table by Hive
     with cluster.hive.cursor(db_name=target_db) as hive:
       hive.execute("""
-        CREATE TABLE part
+        CREATE {external} TABLE part
         STORED AS ORC
-        TBLPROPERTIES('{compression_key}'='{compression_value}')
+        TBLPROPERTIES({tblproperties})
         AS SELECT * FROM {source_db}.part""".format(**sql_params))
 
   # Hive is used to convert the data into parquet/orc and drop all the temp tables.
@@ -298,14 +309,14 @@ def load():
       SET parquet.block.size=10737418240;
       SET dfs.block.size=1073741824;
 
-      CREATE TABLE region
+      CREATE {external} TABLE region
       STORED AS {file_format}
-      TBLPROPERTIES('{compression_key}'='{compression_value}')
+      TBLPROPERTIES({tblproperties})
       AS SELECT * FROM tmp_region;
 
-      CREATE TABLE supplier
+      CREATE {external} TABLE supplier
       STORED AS {file_format}
-      TBLPROPERTIES('{compression_key}'='{compression_value}')
+      TBLPROPERTIES({tblproperties})
       AS SELECT * FROM tmp_supplier;"""
 
   # A simple CTAS for tpch_nested_parquet.customer would create 3 files with Hive3 vs
@@ -316,9 +327,9 @@ def load():
   # TODO: find a less hacky way to ensure a fix number of files
   if HIVE_MAJOR_VERSION >= 3 and file_format == "parquet":
     create_final_tables_sql += """
-        CREATE TABLE customer
+        CREATE {external} TABLE customer
         STORED AS {file_format}
-        TBLPROPERTIES('{compression_key}'='{compression_value}')
+        TBLPROPERTIES({tblproperties})
         AS SELECT * FROM tmp_customer
         WHERE c_custkey >= 10;
 
@@ -327,9 +338,9 @@ def load():
         WHERE c_custkey < 10;"""
   else:
     create_final_tables_sql += """
-        CREATE TABLE customer
+        CREATE {external} TABLE customer
         STORED AS {file_format}
-        TBLPROPERTIES('{compression_key}'='{compression_value}')
+        TBLPROPERTIES({tblproperties})
         AS SELECT * FROM tmp_customer;"""
 
   with cluster.hive.cursor(db_name=target_db) as hive:
@@ -388,7 +399,7 @@ if __name__ == "__main__":
   source_db = args.source_db
   target_db = args.target_db
   file_format, compression_value = args.table_format.split("/")
-  # 'compression_value' is one of [none,def,gzip,bzip,snap,lzo]. We should translate it
+  # 'compression_value' is one of [none,def,gzip,bzip,snap]. We should translate it
   # into values that can be set to Hive.
   if file_format not in COMPRESSION_KEYS_MAP:
     raise Exception("Nested types in file format %s are not supported" % file_format)

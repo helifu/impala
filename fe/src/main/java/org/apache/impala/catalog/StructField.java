@@ -23,6 +23,8 @@ import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TStructField;
 import org.apache.impala.thrift.TTypeNode;
 
+import java.util.Objects;
+
 /**
  * TODO: Support comments for struct fields. The Metastore does not properly store
  * comments of struct fields. We set comment_ to null to avoid compatibility issues.
@@ -32,13 +34,20 @@ public class StructField {
   protected final Type type_;
   protected final String comment_;
   protected int position_;  // in struct
+  // True, if the field shouldn't be included in star expansion.
+  protected boolean isHidden_ = false;
 
-  public StructField(String name, Type type, String comment) {
+  public StructField(String name, Type type, String comment, boolean isHidden) {
     // Impala expects field names to be in lower case, but type strings stored in the HMS
     // are not guaranteed to be lower case.
     name_ = name.toLowerCase();
     type_ = type;
     comment_ = comment;
+    isHidden_ = isHidden;
+  }
+
+  public StructField(String name, Type type, String comment) {
+    this(name, type, comment, false);
   }
 
   public StructField(String name, Type type) {
@@ -50,6 +59,7 @@ public class StructField {
   public Type getType() { return type_; }
   public int getPosition() { return position_; }
   public void setPosition(int position) { position_ = position; }
+  public boolean isHidden() { return isHidden_; }
 
   public String toSql(int depth) {
     String typeSql = (depth < Type.MAX_NESTING_DEPTH) ? type_.toSql(depth) : "...";
@@ -90,5 +100,9 @@ public class StructField {
     if (!(other instanceof StructField)) return false;
     StructField otherStructField = (StructField) other;
     return otherStructField.name_.equals(name_) && otherStructField.type_.equals(type_);
+  }
+  @Override
+  public int hashCode() {
+    return Objects.hash(name_, type_);
   }
 }

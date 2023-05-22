@@ -17,9 +17,11 @@
 
 package org.apache.impala.catalog;
 
+import java.util.List;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Map;
+import java.util.HashMap;
 
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.impala.analysis.ArithmeticExpr;
@@ -34,6 +36,10 @@ import org.apache.impala.builtins.ScalarBuiltins;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
+import com.google.common.base.Preconditions;
+import org.apache.impala.compat.HiveEsriGeospatialBuiltins;
+import org.apache.impala.service.BackendConfig;
+import org.apache.impala.thrift.TGeospatialLibrary;
 
 public class BuiltinsDb extends Db {
   // Size in bytes of AvgState used for integer, floating point, and timestamp avg().
@@ -49,20 +55,37 @@ public class BuiltinsDb extends Db {
   // Must match PC_INTERMEDIATE_BYTES in aggregate-functions-ir.cc.
   private static final int PC_INTERMEDIATE_SIZE = 256;
 
-  // Size in bytes of Hyperloglog intermediate value used for ndv().
-  // Must match HLL_LEN in aggregate-functions-ir.cc.
+  // Size in bytes of the default Hyperloglog intermediate value used for ndv().
+  // Must match DEFAULT_HLL_LEN in aggregate-functions-ir.cc.
   private static final int HLL_INTERMEDIATE_SIZE = 1024;
+
+  // Sizes in bytes of all supported HyperLogLog intermediate value used for NDV(),
+  // corresponding to precision 9, 10, 11, 12, 13, 14, 15, 16, 17 and 18, respectively
+  private static final int[] hll_intermediate_sizes = {
+      512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144};
+
+  // A map of the AggregateFunction templates with all known/supported
+  // intermediate data types.
+  private final Map<Type, List<AggregateFunction>> builtinNDVs_ =
+      new HashMap<>();
 
   // Size in bytes of RankState used for rank() and dense_rank().
   private static final int RANK_INTERMEDIATE_SIZE = 16;
 
-  private static BuiltinsDb INSTANCE;
+  private static Db INSTANCE;
 
   public static final String NAME = "_impala_builtins";
 
   public static synchronized Db getInstance() {
     if (INSTANCE == null) {
       INSTANCE = new BuiltinsDb();
+    }
+    return INSTANCE;
+  }
+
+  public static synchronized Db getInstance(BuiltinsDbLoader loader) {
+    if (INSTANCE == null) {
+      INSTANCE = loader.getBuiltinsDbInstance();
     }
     return INSTANCE;
   }
@@ -90,6 +113,11 @@ public class BuiltinsDb extends Db {
     IsNullPredicate.initBuiltins(this);
     LikePredicate.initBuiltins(this);
     ScalarBuiltins.initBuiltins(this);
+
+    if (BackendConfig.INSTANCE.getGeospatialLibrary().equals(
+            TGeospatialLibrary.HIVE_ESRI)) {
+      HiveEsriGeospatialBuiltins.initBuiltins(this);
+    }
   }
 
   private static final String BUILTINS_DB_COMMENT = "System database for Impala builtin functions";
@@ -336,6 +364,84 @@ public class BuiltinsDb extends Db {
             "9HllUpdateIN10impala_udf7DateValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
         .build();
 
+  // For ndv() with two input arguments
+  private static final Map<Type, String> HLL_UPDATE_SYMBOL_WITH_PRECISION =
+      ImmutableMap.<Type, String>builder()
+        .put(Type.BOOLEAN,
+            "9HllUpdateIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPNS2_9StringValE")
+        .put(Type.TINYINT,
+             "9HllUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPNS2_9StringValE")
+        .put(Type.SMALLINT,
+             "9HllUpdateIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPNS2_9StringValE")
+        .put(Type.INT,
+             "9HllUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_RKS3_PNS2_9StringValE")
+        .put(Type.BIGINT,
+             "9HllUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPNS2_9StringValE")
+        .put(Type.FLOAT,
+             "9HllUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPNS2_9StringValE")
+        .put(Type.DOUBLE,
+             "9HllUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPNS2_9StringValE")
+        .put(Type.STRING,
+             "9HllUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPS3_")
+        .put(Type.TIMESTAMP,
+             "9HllUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPNS2_9StringValE")
+        .put(Type.DECIMAL,
+             "9HllUpdateIN10impala_udf10DecimalValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPNS2_9StringValE")
+        .put(Type.DATE,
+             "9HllUpdateIN10impala_udf7DateValEEEvPNS2_15FunctionContextERKT_RKNS2_6IntValEPNS2_9StringValE")
+        .build();
+
+    private static final Map<Type, String> DS_HLL_UPDATE_SYMBOL =
+      ImmutableMap.<Type, String>builder()
+        .put(Type.TINYINT,
+            "11DsHllUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.INT,
+            "11DsHllUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.BIGINT,
+            "11DsHllUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.FLOAT,
+            "11DsHllUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.DOUBLE,
+            "11DsHllUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+         // Hive's Datasketches implementation currently uses different hash for STRING and BINARY.
+         // Impala only supports it for STRING, but treats it as Hive treats BINARY.
+         // See IMPALA-9939 for more details.
+        .put(Type.STRING,
+            "11DsHllUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
+        .build();
+
+  private static final Map<Type, String> DS_CPC_UPDATE_SYMBOL =
+      ImmutableMap.<Type, String>builder()
+        .put(Type.TINYINT,
+            "11DsCpcUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.INT,
+            "11DsCpcUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.BIGINT,
+            "11DsCpcUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.FLOAT,
+            "11DsCpcUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.DOUBLE,
+            "11DsCpcUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.STRING,
+            "11DsCpcUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
+        .build();
+
+  private static final Map<Type, String> DS_THETA_UPDATE_SYMBOL =
+      ImmutableMap.<Type, String>builder()
+        .put(Type.TINYINT,
+            "13DsThetaUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.INT,
+            "13DsThetaUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.BIGINT,
+            "13DsThetaUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.FLOAT,
+            "13DsThetaUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.DOUBLE,
+            "13DsThetaUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(Type.STRING,
+            "13DsThetaUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
+        .build();
+
   private static final Map<Type, String> SAMPLED_NDV_UPDATE_SYMBOL =
       ImmutableMap.<Type, String>builder()
         .put(Type.BOOLEAN,
@@ -510,6 +616,8 @@ public class BuiltinsDb extends Db {
             "3MinIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PS6_")
         .put(Type.STRING,
             "3MinIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.BINARY,
+            "3MinIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
         .put(Type.TIMESTAMP,
             "3MinIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PS6_")
         .put(Type.DECIMAL,
@@ -535,6 +643,8 @@ public class BuiltinsDb extends Db {
         .put(Type.DOUBLE,
             "3MaxIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PS6_")
         .put(Type.STRING,
+            "3MaxIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.BINARY,
             "3MaxIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
         .put(Type.TIMESTAMP,
             "3MaxIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PS6_")
@@ -845,6 +955,23 @@ public class BuiltinsDb extends Db {
             "25FirstValIgnoreNullsUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
         .build();
 
+  // A helper function to return a template aggregation function for NDV with 2 arguments,
+  // for data type t. Inputs:
+  //  db: the db;
+  //  prefix: the prefix string for each function call symbol in BE;
+  //  t: the type to build the template for;
+  //  hllIntermediateType: the intermediate data type.
+  private static AggregateFunction createTemplateAggregateFunctionForNDVWith2Args(
+      Db db, String prefix, Type t, Type hllIntermediateType) {
+    return AggregateFunction.createBuiltin(db, "ndv", Lists.newArrayList(t, Type.INT),
+        Type.BIGINT, hllIntermediateType,
+        prefix + "7HllInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix + HLL_UPDATE_SYMBOL_WITH_PRECISION.get(t),
+        prefix + "8HllMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_", null,
+        prefix + "11HllFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE", true,
+        false, true);
+  }
+
   // Populate all the aggregate builtins in the catalog.
   // null symbols indicate the function does not need that step of the evaluation.
   // An empty symbol indicates a TODO for the BE to implement the function.
@@ -875,6 +1002,7 @@ public class BuiltinsDb extends Db {
       if (t.isNull()) continue; // NULL is handled through type promotion.
       if (t.isScalarType(PrimitiveType.CHAR)) continue; // promoted to STRING
       if (t.isScalarType(PrimitiveType.VARCHAR)) continue; // promoted to STRING
+
       // Count
       db.addBuiltin(AggregateFunction.createBuiltin(db, "count",
           Lists.newArrayList(t), Type.BIGINT, Type.BIGINT,
@@ -903,6 +1031,14 @@ public class BuiltinsDb extends Db {
           prefix + MAX_UPDATE_SYMBOL.get(t),
           minMaxSerializeOrFinalize, minMaxGetValue,
           null, minMaxSerializeOrFinalize, true, true, false));
+    }
+
+    for (Type t: Type.getSupportedTypes()) {
+      if (t.isNull()) continue; // NULL is handled through type promotion.
+      if (t.isScalarType(PrimitiveType.CHAR)) continue; // promoted to STRING
+      if (t.isScalarType(PrimitiveType.VARCHAR)) continue; // promoted to STRING
+      if (t.isBinary()) continue; // Only supported for count/min/max
+
       // Sample
       db.addBuiltin(AggregateFunction.createBuiltin(db, "sample",
           Lists.newArrayList(t), Type.STRING, Type.STRING,
@@ -934,10 +1070,15 @@ public class BuiltinsDb extends Db {
           false, false, true));
 
       // NDV
-      Type hllIntermediateType =
+      // Setup the intermediate type based on the default precision in the template
+      // function in the db. This type is useful when the default precision is all
+      // needed in the ndv().
+      Type defaultHllIntermediateType =
           ScalarType.createFixedUdaIntermediateType(HLL_INTERMEDIATE_SIZE);
-      db.addBuiltin(AggregateFunction.createBuiltin(db, "ndv",
-          Lists.newArrayList(t), Type.BIGINT, hllIntermediateType,
+
+      // Single input argument version
+      db.addBuiltin(AggregateFunction.createBuiltin(db, "ndv", Lists.newArrayList(t),
+          Type.BIGINT, defaultHllIntermediateType,
           prefix + "7HllInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
           prefix + HLL_UPDATE_SYMBOL.get(t),
           prefix + "8HllMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
@@ -945,14 +1086,113 @@ public class BuiltinsDb extends Db {
           prefix + "11HllFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
           true, false, true));
 
+      // Double input argument version, with the unique HllUpdate function symbols.
+      // Take an intermediate data type with the default length for now. During the
+      // analysis phase, the data type will be resolved to the correct template, based
+      // on the the value in the 2nd argument.
+      db.addBuiltin(createTemplateAggregateFunctionForNDVWith2Args(
+          db, prefix, t, defaultHllIntermediateType));
+
+      // For each type t, populate the hash map of AggregateFunctions with
+      // all known intermediate data types.
+      List<AggregateFunction> ndvList = new ArrayList<AggregateFunction>();
+      for (int size : hll_intermediate_sizes) {
+        Type hllIntermediateType = ScalarType.createFixedUdaIntermediateType(size);
+        ndvList.add(createTemplateAggregateFunctionForNDVWith2Args(
+            db, prefix, t, hllIntermediateType));
+      }
+      builtinNDVs_.put(t, ndvList);
+
+      // Used in stats computation. Will take a single input argument only.
       db.addBuiltin(AggregateFunction.createBuiltin(db, "ndv_no_finalize",
-          Lists.newArrayList(t), Type.STRING, hllIntermediateType,
+          Lists.newArrayList(t), Type.STRING, defaultHllIntermediateType,
           prefix + "7HllInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
           prefix + HLL_UPDATE_SYMBOL.get(t),
           prefix + "8HllMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
           null,
           "_Z20IncrementNdvFinalizePN10impala_udf15FunctionContextERKNS_9StringValE",
           true, false, true));
+
+      // DataSketches HLL
+      if (DS_HLL_UPDATE_SYMBOL.containsKey(t)) {
+        db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_hll_sketch_and_estimate",
+            Lists.newArrayList(t), Type.BIGINT, Type.STRING,
+            prefix + "9DsHllInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+            prefix + DS_HLL_UPDATE_SYMBOL.get(t),
+            prefix + "10DsHllMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+            prefix + "14DsHllSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+            prefix + "13DsHllFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+            true, false, true));
+
+        db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_hll_sketch",
+            Lists.newArrayList(t), Type.STRING, Type.STRING,
+            prefix + "9DsHllInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+            prefix + DS_HLL_UPDATE_SYMBOL.get(t),
+            prefix + "10DsHllMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+            prefix + "14DsHllSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+            prefix + "19DsHllFinalizeSketchEPN10impala_udf15FunctionContextERKNS1_" +
+                "9StringValE", true, false, true));
+      } else {
+        db.addBuiltin(AggregateFunction.createUnsupportedBuiltin(db,
+            "ds_hll_sketch_and_estimate", Lists.newArrayList(t), Type.STRING,
+            Type.STRING));
+        db.addBuiltin(AggregateFunction.createUnsupportedBuiltin(db, "ds_hll_sketch",
+            Lists.newArrayList(t), Type.STRING, Type.STRING));
+      }
+
+      // DataSketches CPC
+      if (DS_CPC_UPDATE_SYMBOL.containsKey(t)) {
+        db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_cpc_sketch_and_estimate",
+            Lists.newArrayList(t), Type.BIGINT, Type.STRING,
+            prefix + "9DsCpcInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+            prefix + DS_CPC_UPDATE_SYMBOL.get(t),
+            prefix + "10DsCpcMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+            prefix + "14DsCpcSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+            prefix + "13DsCpcFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+            true, false, true));
+
+        db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_cpc_sketch",
+            Lists.newArrayList(t), Type.STRING, Type.STRING,
+            prefix + "9DsCpcInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+            prefix + DS_CPC_UPDATE_SYMBOL.get(t),
+            prefix + "10DsCpcMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+            prefix + "14DsCpcSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+            prefix + "19DsCpcFinalizeSketchEPN10impala_udf15FunctionContextERKNS1_" +
+                "9StringValE", true, false, true));
+      } else {
+        db.addBuiltin(AggregateFunction.createUnsupportedBuiltin(db,
+            "ds_cpc_sketch_and_estimate", Lists.newArrayList(t), Type.STRING,
+            Type.STRING));
+        db.addBuiltin(AggregateFunction.createUnsupportedBuiltin(db, "ds_cpc_sketch",
+                Lists.newArrayList(t), Type.STRING, Type.STRING));
+      }
+
+      // DataSketches Theta
+      if (DS_THETA_UPDATE_SYMBOL.containsKey(t)) {
+        db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_theta_sketch_and_estimate",
+                Lists.newArrayList(t), Type.BIGINT, Type.STRING,
+                prefix + "11DsThetaInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+                prefix + DS_THETA_UPDATE_SYMBOL.get(t),
+                prefix + "12DsThetaMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+                prefix + "16DsThetaSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+                prefix + "15DsThetaFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+                true, false, true));
+
+        db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_theta_sketch",
+                Lists.newArrayList(t), Type.STRING, Type.STRING,
+                prefix + "11DsThetaInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+                prefix + DS_THETA_UPDATE_SYMBOL.get(t),
+                prefix + "12DsThetaMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+                prefix + "16DsThetaSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+                prefix + "21DsThetaFinalizeSketchEPN10impala_udf15FunctionContextERKNS1_" +
+                        "9StringValE", true, false, true));
+      } else {
+        db.addBuiltin(AggregateFunction.createUnsupportedBuiltin(db,
+                "ds_theta_sketch_and_estimate", Lists.newArrayList(t), Type.STRING,
+                Type.STRING));
+        db.addBuiltin(AggregateFunction.createUnsupportedBuiltin(db, "ds_theta_sketch",
+                Lists.newArrayList(t), Type.STRING, Type.STRING));
+      }
 
       // SAMPLED_NDV.
       // Size needs to be kept in sync with SampledNdvState in the BE.
@@ -1102,6 +1342,81 @@ public class BuiltinsDb extends Db {
         prefix + "9SumRemoveIN10impala_udf9BigIntValES3_EEvPNS2_15FunctionContextERKT_PT0_",
         null, false, true, true));
 
+    // Corr()
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "corr",
+        Lists.<Type>newArrayList(Type.DOUBLE, Type.DOUBLE), Type.DOUBLE, Type.STRING,
+        prefix + "8CorrInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix + "10CorrUpdateEPN10impala_udf15FunctionContextERKNS1_9DoubleValES6_PNS1_9StringValE",
+        prefix + "9CorrMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        stringValSerializeOrFinalize,
+        prefix + "12CorrGetValueEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix + "10CorrRemoveEPN10impala_udf15FunctionContextERKNS1_9DoubleValES6_PNS1_9StringValE",
+        prefix + "12CorrFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        false, true, false));
+
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "corr",
+        Lists.<Type>newArrayList(Type.TIMESTAMP, Type.TIMESTAMP), Type.DOUBLE, Type.STRING,
+        prefix + "8CorrInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix +
+                "19TimestampCorrUpdateEPN10impala_udf15FunctionContextERKNS1_12TimestampValES6_PNS1_9StringValE",
+        prefix + "9CorrMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        stringValSerializeOrFinalize,
+        prefix + "12CorrGetValueEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix +
+                "19TimestampCorrRemoveEPN10impala_udf15FunctionContextERKNS1_12TimestampValES6_PNS1_9StringValE",
+        prefix + "12CorrFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        false, true, false));
+
+    // Covar_samp()
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "covar_samp",
+        Lists.<Type>newArrayList(Type.DOUBLE, Type.DOUBLE), Type.DOUBLE, Type.STRING,
+        prefix + "9CovarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix + "11CovarUpdateEPN10impala_udf15FunctionContextERKNS1_9DoubleValES6_PNS1_9StringValE",
+        prefix + "10CovarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        stringValSerializeOrFinalize,
+        prefix + "19CovarSampleGetValueEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix + "11CovarRemoveEPN10impala_udf15FunctionContextERKNS1_9DoubleValES6_PNS1_9StringValE",
+        prefix + "19CovarSampleFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        false, true, false));
+
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "covar_samp",
+        Lists.<Type>newArrayList(Type.TIMESTAMP, Type.TIMESTAMP), Type.DOUBLE, Type.STRING,
+        prefix + "9CovarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix +
+                "20TimestampCovarUpdateEPN10impala_udf15FunctionContextERKNS1_12TimestampValES6_PNS1_9StringValE",
+        prefix + "10CovarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        stringValSerializeOrFinalize,
+        prefix + "19CovarSampleGetValueEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix +
+                "20TimestampCovarRemoveEPN10impala_udf15FunctionContextERKNS1_12TimestampValES6_PNS1_9StringValE",
+        prefix + "19CovarSampleFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        false, true, false));
+
+    // Covar_pop()
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "covar_pop",
+        Lists.<Type>newArrayList(Type.DOUBLE, Type.DOUBLE), Type.DOUBLE, Type.STRING,
+        prefix + "9CovarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix + "11CovarUpdateEPN10impala_udf15FunctionContextERKNS1_9DoubleValES6_PNS1_9StringValE",
+        prefix + "10CovarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        stringValSerializeOrFinalize,
+        prefix + "23CovarPopulationGetValueEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix + "11CovarRemoveEPN10impala_udf15FunctionContextERKNS1_9DoubleValES6_PNS1_9StringValE",
+        prefix + "23CovarPopulationFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        false, true, false));
+
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "covar_pop",
+        Lists.<Type>newArrayList(Type.TIMESTAMP, Type.TIMESTAMP), Type.DOUBLE, Type.STRING,
+        prefix + "9CovarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix +
+                "20TimestampCovarUpdateEPN10impala_udf15FunctionContextERKNS1_12TimestampValES6_PNS1_9StringValE",
+        prefix + "10CovarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        stringValSerializeOrFinalize,
+        prefix + "23CovarPopulationGetValueEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix +
+                "20TimestampCovarRemoveEPN10impala_udf15FunctionContextERKNS1_12TimestampValES6_PNS1_9StringValE",
+        prefix + "23CovarPopulationFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        false, true, false));
+
     // Avg
     Type avgIntermediateType =
         ScalarType.createFixedUdaIntermediateType(AVG_INTERMEDIATE_SIZE);
@@ -1199,6 +1514,31 @@ public class BuiltinsDb extends Db {
         prefix + "10CountMergeEPN10impala_udf15FunctionContextERKNS1_9BigIntValEPS4_",
         null, null));
 
+    // DataSketches HLL sketch
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_kll_sketch",
+        Lists.<Type>newArrayList(Type.FLOAT), Type.STRING, Type.STRING,
+        prefix + "9DsKllInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix + "11DsKllUpdateEPN10impala_udf15FunctionContextERKNS1_8FloatValEPNS1_" +
+            "9StringValE",
+        prefix + "10DsKllMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix + "14DsKllSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix + "19DsKllFinalizeSketchEPN10impala_udf15FunctionContextERKNS1_" +
+            "9StringValE", true, false, true));
+
+    // DataSketches KLL union
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_kll_union",
+        Lists.<Type>newArrayList(Type.STRING), Type.STRING, Type.STRING,
+        prefix + "14DsKllUnionInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix +
+            "16DsKllUnionUpdateEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "15DsKllUnionMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "19DsKllUnionSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix +
+            "18DsKllUnionFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        true, false, true));
+
     // The following 3 functions are never directly executed because they get rewritten
     db.addBuiltin(AggregateFunction.createAnalyticBuiltin(
         db, "percent_rank", Lists.<Type>newArrayList(), Type.DOUBLE, Type.STRING));
@@ -1207,10 +1547,68 @@ public class BuiltinsDb extends Db {
     db.addBuiltin(AggregateFunction.createAnalyticBuiltin(
         db, "ntile", Lists.<Type>newArrayList(Type.BIGINT), Type.BIGINT, Type.STRING));
 
+    // DataSketches HLL union
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_hll_union",
+        Lists.<Type>newArrayList(Type.STRING), Type.STRING, Type.STRING,
+        prefix + "14DsHllUnionInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix +
+            "16DsHllUnionUpdateEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "15DsHllUnionMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "19DsHllUnionSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix +
+            "18DsHllUnionFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        true, false, true));
+
+    // DataSketches CPC union
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_cpc_union",
+        Lists.<Type>newArrayList(Type.STRING), Type.STRING, Type.STRING,
+        prefix + "14DsCpcUnionInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix +
+            "16DsCpcUnionUpdateEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "15DsCpcUnionMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "19DsCpcUnionSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix +
+            "18DsCpcUnionFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        true, false, true));
+
+    // DataSketches Theta union
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_theta_union",
+        Lists.<Type>newArrayList(Type.STRING), Type.STRING, Type.STRING,
+        prefix + "16DsThetaUnionInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix +
+            "18DsThetaUnionUpdateEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "17DsThetaUnionMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "21DsThetaUnionSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix +
+            "20DsThetaUnionFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        true, false, true));
+
+    // DataSketches Theta intersect
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "ds_theta_intersect",
+        Lists.<Type>newArrayList(Type.STRING), Type.STRING, Type.STRING,
+        prefix + "20DsThetaIntersectInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+        prefix +
+            "22DsThetaIntersectUpdateEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "21DsThetaIntersectMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix +
+            "25DsThetaIntersectSerializeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        prefix +
+            "24DsThetaIntersectFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+        true, false, true));
+
     for (Type t: Type.getSupportedTypes()) {
       if (t.isNull()) continue; // NULL is handled through type promotion.
       if (t.isScalarType(PrimitiveType.CHAR)) continue; // promoted to STRING
       if (t.isScalarType(PrimitiveType.VARCHAR)) continue; // promoted to STRING
+      // BINARY is not supported for analytic functions.
+      if (t.isBinary()) continue;
       db.addBuiltin(AggregateFunction.createAnalyticBuiltin(
           db, "first_value", Lists.newArrayList(t), t, t,
           t.isStringType() ? initNullString : initNull,
@@ -1279,5 +1677,36 @@ public class BuiltinsDb extends Db {
       db.addBuiltin(AggregateFunction.createAnalyticBuiltin(
             db, "lead", Lists.newArrayList(t, Type.BIGINT), t, t));
     }
+
+    // Grouping ID functions for grouping sets. These are rewritten during analysis.
+    db.addBuiltin(AggregateFunction.createRewrittenBuiltin(db, "grouping_id",
+        Collections.<Type>emptyList(), Type.BIGINT, /*ignoresDistinct=*/ true,
+        /*isAnalyticFn=*/ false, /*returnsNonNullOnEmpty=*/ true));
+    // grouping() can take any grouping expression as input.
+    for (Type t: Type.getSupportedTypes()) {
+      db.addBuiltin(AggregateFunction.createRewrittenBuiltin(db, "grouping",
+          Lists.newArrayList(t), Type.TINYINT, /*ignoresDistinct=*/ true,
+          /*isAnalyticFn=*/ false, /*returnsNonNullOnEmpty=*/ true));
+    }
+  }
+
+  // Resolve the intermediate data type by searching for one in the
+  // map builtinNDVs_ that has the desired length.
+  public AggregateFunction resolveNdvIntermediateType(
+      AggregateFunction func, int length) {
+    Preconditions.checkState(func.getNumArgs() >= 1);
+    List<AggregateFunction> list = builtinNDVs_.get(func.getArgs()[0]);
+    for (AggregateFunction aggF : list) {
+      ScalarType sType = (ScalarType) aggF.getIntermediateType();
+      if (sType.getLength() == length) return aggF;
+    }
+    return null;
+  }
+
+  /**
+   * BuiltinsDbLoader allows a third party extension to create their own BuiltinsDb.
+   */
+  public interface BuiltinsDbLoader {
+    Db getBuiltinsDbInstance();
   }
 }

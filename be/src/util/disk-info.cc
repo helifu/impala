@@ -17,24 +17,21 @@
 
 #include "util/disk-info.h"
 
+#include <stdlib.h>
 #include <regex>
-#ifdef __APPLE__
-#include <sys/mount.h>
-#else
-#include <sys/vfs.h>
-#endif
-#include <sys/types.h>
-#include <sys/sysmacros.h>
 #include <sys/stat.h>
-#include <unistd.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 
-#include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/join.hpp>
-#include <iostream>
 #include <fstream>
-#include <sstream>
+#include <utility>
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/constants.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/trim.hpp>
 
-#include "util/debug-util.h"
+#include "gutil/strings/substitute.h"
+#include "util/filesystem-util.h"
 
 #include "common/names.h"
 
@@ -70,12 +67,16 @@ bool DiskInfo::TryNVMETrim(const std::string& name_in, std::string* basename_out
 // Parses /proc/partitions to get the number of disks.  A bit of looking around
 // seems to indicate this as the best way to do this.
 // TODO: is there not something better than this?
-void DiskInfo::GetDeviceNames() {
+void DiskInfo::GetDeviceNames(const std::string &proc, const std::string &sys) {
+  disks_.clear();
+  device_id_to_disk_id_.clear();
+  disk_name_to_disk_id_.clear();
+
   // Format of this file is:
   //    major, minor, #blocks, name
   // We are only interesting in name which is formatted as device_name<partition #>
   // The same device will show up multiple times for each partition (e.g. sda1, sda2).
-  ifstream partitions("/proc/partitions", ios::in);
+  ifstream partitions(Substitute("$0/partitions", proc), ios::in);
   while (partitions.good() && !partitions.eof()) {
     string line;
     getline(partitions, line);
@@ -84,19 +85,28 @@ void DiskInfo::GetDeviceNames() {
     vector<string> fields;
     split(fields, line, is_any_of(" "), token_compress_on);
     if (fields.size() != 4) continue;
-    string name = fields[3];
-    if (name == "name") continue;
+    const string& partition_name = fields[3];
+    if (partition_name == "name") continue;
 
-    // NVME devices have a special format. Try to detect that, falling back to the normal
-    // method if this is not an NVME device.
-    std::string nvme_basename;
-    if (TryNVMETrim(name, &nvme_basename)) {
-      // This is an NVME device, use the returned basename
-      name = nvme_basename;
-    } else {
-      // Does not follow the NVME pattern, so use the logic for a normal disk device
-      // Remove the partition# from the name.  e.g. sda2 --> sda
-      trim_right_if(name, is_any_of("0123456789"));
+    // Check if this is the top-level block device. If not, try to guess the
+    // name of the top-level block device.
+    bool found_device = false;
+    string dev_name = partition_name;
+    Status status = FileSystemUtil::PathExists(
+      Substitute("$0/block/$1", sys, dev_name), &found_device);
+    if (!status.ok()) LOG(WARNING) << status.GetDetail();
+    if (!found_device) {
+      // NVME devices have a special format. Try to detect that, falling back to the normal
+      // method if this is not an NVME device.
+      std::string nvme_basename;
+      if (TryNVMETrim(dev_name, &nvme_basename)) {
+        // This is an NVME device, use the returned basename
+        dev_name = nvme_basename;
+      } else {
+        // Does not follow the NVME pattern, so use the logic for a normal disk device
+        // Remove the partition# from the name.  e.g. sda2 --> sda
+        trim_right_if(dev_name, is_any_of("0123456789"));
+      }
     }
 
     // Create a mapping of all device ids (one per partition) to the disk id.
@@ -106,12 +116,12 @@ void DiskInfo::GetDeviceNames() {
     DCHECK(device_id_to_disk_id_.find(dev) == device_id_to_disk_id_.end());
 
     int disk_id = -1;
-    map<string, int>::iterator it = disk_name_to_disk_id_.find(name);
+    map<string, int>::iterator it = disk_name_to_disk_id_.find(dev_name);
     if (it == disk_name_to_disk_id_.end()) {
       // First time seeing this disk
       disk_id = disks_.size();
-      disks_.push_back(Disk(name, disk_id));
-      disk_name_to_disk_id_[name] = disk_id;
+      disks_.push_back(Disk(dev_name, disk_id));
+      disk_name_to_disk_id_[dev_name] = disk_id;
     } else {
       disk_id = it->second;
     }
@@ -132,20 +142,23 @@ void DiskInfo::GetDeviceNames() {
     // We can check if it is rotational by reading:
     // /sys/block/<device>/queue/rotational
     // If the file is missing or has unexpected data, default to rotational.
-    stringstream ss;
-    ss << "/sys/block/" << disks_[i].name << "/queue/rotational";
-    ifstream rotational(ss.str().c_str(), ios::in);
+    std::string block_rot =
+      Substitute("$0/block/$1/queue/rotational", sys, disks_[i].name);
+    ifstream rotational(block_rot, ios::in);
     if (rotational.good()) {
       string line;
       getline(rotational, line);
       if (line == "0") disks_[i].is_rotational = false;
+    } else {
+      LOG(INFO) << "Could not read " << block_rot << " for " << disks_[i].name
+                << " , assuming rotational.";
     }
     if (rotational.is_open()) rotational.close();
   }
 }
 
-void DiskInfo::Init() {
-  GetDeviceNames();
+void DiskInfo::Init(std::string proc, std::string sys) {
+  GetDeviceNames(proc, sys);
   initialized_ = true;
 }
 

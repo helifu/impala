@@ -17,6 +17,8 @@
 
 # Validates limit on scan nodes
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 import re
 import time
@@ -25,19 +27,14 @@ from subprocess import check_call
 from tests.common.environ import build_flavor_timeout, IS_DOCKERIZED_TEST_CLUSTER
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite, LOG
-from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon,
-    SkipIfLocal, SkipIfEC, SkipIfDockerizedCluster, SkipIfCatalogV2)
+from tests.common.skip import SkipIfFS, SkipIfDockerizedCluster
 from tests.common.test_dimensions import create_single_exec_option_dimension
-from tests.util.filesystem_utils import get_fs_path
+from tests.util.filesystem_utils import get_fs_path, IS_EC
 from tests.util.shell_util import exec_process
 
+
 # End to end test that hdfs caching is working.
-@SkipIfS3.caching # S3: missing coverage: verify SET CACHED gives error
-@SkipIfABFS.caching
-@SkipIfADLS.caching
-@SkipIfIsilon.caching
-@SkipIfLocal.caching
-@SkipIfEC.fix_later
+@SkipIfFS.hdfs_caching  # missing coverage: verify SET CACHED gives error
 class TestHdfsCaching(ImpalaTestSuite):
   @classmethod
   def get_workload(self):
@@ -87,10 +84,12 @@ class TestHdfsCaching(ImpalaTestSuite):
 
     if IS_DOCKERIZED_TEST_CLUSTER:
       assert num_metrics_increased == 0, "HDFS caching is disabled in dockerised cluster."
+    elif IS_EC:
+      assert num_metrics_increased == 0, "HDFS caching is disabled with erasure coding."
     elif num_metrics_increased != 1:
       # Test failed, print the metrics
       for i in range(0, len(cached_bytes_before)):
-        print "%d %d" % (cached_bytes_before[i], cached_bytes_after[i])
+        print("%d %d" % (cached_bytes_before[i], cached_bytes_after[i]))
       assert(False)
 
   def test_cache_cancellation(self, vector):
@@ -105,28 +104,21 @@ class TestHdfsCaching(ImpalaTestSuite):
       select * from t1, t2, t3 where t1.x = t2.x and t2.x = t3.x """
 
     # Run this query for some iterations since it is timing dependent.
-    for x in xrange(1, num_iters):
+    for x in range(1, num_iters):
       result = self.execute_query(query_string)
       assert(len(result.data) == 2)
+
 
 # A separate class has been created for "test_hdfs_caching_fallback_path" to make it
 # run as a part of exhaustive tests which require the workload to be 'functional-query'.
 # TODO: Move this to TestHdfsCaching once we make exhaustive tests run for other workloads
-@SkipIfS3.caching
-@SkipIfABFS.caching
-@SkipIfADLS.caching
-@SkipIfIsilon.caching
-@SkipIfLocal.caching
+@SkipIfFS.hdfs_caching
 class TestHdfsCachingFallbackPath(ImpalaTestSuite):
   @classmethod
   def get_workload(self):
     return 'functional-query'
 
-  @SkipIfS3.hdfs_encryption
-  @SkipIfABFS.hdfs_encryption
-  @SkipIfADLS.hdfs_encryption
-  @SkipIfIsilon.hdfs_encryption
-  @SkipIfLocal.hdfs_encryption
+  @SkipIfFS.hdfs_encryption
   def test_hdfs_caching_fallback_path(self, vector, unique_database, testid_checksum):
     """ This tests the code path of the query execution where the hdfs cache read fails
     and the execution falls back to the normal read path. To reproduce this situation we
@@ -174,12 +166,7 @@ class TestHdfsCachingFallbackPath(ImpalaTestSuite):
           shell=False)
 
 
-@SkipIfS3.caching
-@SkipIfABFS.caching
-@SkipIfADLS.caching
-@SkipIfIsilon.caching
-@SkipIfLocal.caching
-@SkipIfCatalogV2.hdfs_caching_ddl_unsupported()
+@SkipIfFS.hdfs_caching
 class TestHdfsCachingDdl(ImpalaTestSuite):
   @classmethod
   def get_workload(self):
@@ -341,13 +328,27 @@ def get_num_cache_requests():
   def get_num_cache_requests_util():
     rc, stdout, stderr = exec_process("hdfs cacheadmin -listDirectives -stats")
     assert rc == 0, 'Error executing hdfs cacheadmin: %s %s' % (stdout, stderr)
-    return len(stdout.split('\n'))
+    # remove blank new lines from output count
+    lines = [line for line in stdout.split('\n') if line.strip()]
+    count = None
+    for line in lines:
+      if line.startswith("Found "):
+        # the line should say "Found <int> entries"
+        # if we find this line we parse the number of entries
+        # from this line.
+        count = int(re.search(r'\d+', line).group())
+        break
+    # if count is available we return it else we just
+    # return the total number of lines
+    if count is not None:
+      return count
+    else:
+      return len(stdout.split('\n'))
 
   # IMPALA-3040: This can take time, especially under slow builds like ASAN.
   wait_time_in_sec = build_flavor_timeout(5, slow_build_timeout=20)
   num_stabilization_attempts = 0
   max_num_stabilization_attempts = 10
-  new_requests = None
   num_requests = None
   LOG.info("{0} Entered get_num_cache_requests()".format(time.time()))
   while num_stabilization_attempts < max_num_stabilization_attempts:

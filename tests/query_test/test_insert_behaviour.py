@@ -15,17 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import getpass
 import grp
+import os
 import pwd
 import pytest
 import re
 
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon,
-    SkipIfLocal, SkipIfDockerizedCluster, SkipIfCatalogV2)
-from tests.util.filesystem_utils import WAREHOUSE, get_fs_path, IS_S3
+from tests.common.skip import (SkipIfFS, SkipIfLocal, SkipIfDockerizedCluster,
+    SkipIfCatalogV2)
+from tests.util.filesystem_utils import WAREHOUSE, IS_S3
+
 
 @SkipIfLocal.hdfs_client
 class TestInsertBehaviour(ImpalaTestSuite):
@@ -47,12 +51,12 @@ class TestInsertBehaviour(ImpalaTestSuite):
     if method.__name__ == "test_insert_select_with_empty_resultset":
       self.cleanup_db(self.TEST_DB_NAME)
 
-  @SkipIfADLS.eventually_consistent
+  @SkipIfFS.eventually_consistent
   @pytest.mark.execute_serially
   def test_insert_removes_staging_files(self):
     TBL_NAME = "insert_overwrite_nopart"
-    insert_staging_dir = ("test-warehouse/functional.db/%s/"
-        "_impala_insert_staging" % TBL_NAME)
+    insert_staging_dir = ("%s/functional.db/%s/"
+        "_impala_insert_staging" % (WAREHOUSE, TBL_NAME))
     self.filesystem_client.delete_file_dir(insert_staging_dir, recursive=True)
     self.client.execute("INSERT OVERWRITE functional.%s "
                         "SELECT int_col FROM functional.tinyinttable" % TBL_NAME)
@@ -63,7 +67,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
   def test_insert_preserves_hidden_files(self):
     """Test that INSERT OVERWRITE preserves hidden files in the root table directory"""
     TBL_NAME = "insert_overwrite_nopart"
-    table_dir = "test-warehouse/functional.db/%s/" % TBL_NAME
+    table_dir = "%s/functional.db/%s/" % (WAREHOUSE, TBL_NAME)
     hidden_file_locations = [".hidden", "_hidden"]
     dir_locations = ["dir", ".hidden_dir"]
 
@@ -102,8 +106,10 @@ class TestInsertBehaviour(ImpalaTestSuite):
   def test_insert_alter_partition_location(self, unique_database):
     """Test that inserts after changing the location of a partition work correctly,
     including the creation of a non-existant partition dir"""
-    part_dir = "tmp/{0}".format(unique_database)
-    qualified_part_dir = get_fs_path('/' + part_dir)
+    # Moved to WAREHOUSE for Ozone because it does not allow rename between buckets.
+    work_dir = "%s/tmp" % WAREHOUSE
+    self.filesystem_client.make_dir(work_dir)
+    part_dir = os.path.join(work_dir, unique_database)
     table_name = "`{0}`.`insert_alter_partition_location`".format(unique_database)
 
     self.execute_query_expect_success(self.client, "DROP TABLE IF EXISTS %s" % table_name)
@@ -118,7 +124,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     self.execute_query_expect_success(
         self.client,
         "ALTER TABLE %s PARTITION(p=1) SET LOCATION '%s'" % (table_name,
-                                                             qualified_part_dir))
+                                                             part_dir))
     self.execute_query_expect_success(
         self.client,
         "INSERT OVERWRITE %s PARTITION(p=1) VALUES(1)" % table_name)
@@ -132,10 +138,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     # a subdirectory)
     assert len(self.filesystem_client.ls(part_dir)) == 1
 
-  @SkipIfS3.hdfs_acls
-  @SkipIfABFS.hdfs_acls
-  @SkipIfADLS.hdfs_acls
-  @SkipIfIsilon.hdfs_acls
+  @SkipIfFS.hdfs_acls
   @pytest.mark.xfail(run=False, reason="Fails intermittently on test clusters")
   @pytest.mark.execute_serially
   def test_insert_inherit_acls(self):
@@ -194,10 +197,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
                                       "PARTITION(p1=1, p2=2, p3=30) VALUES(1)")
     check_has_acls("p1=1/p2=2/p3=30", "default:group:new_leaf_group:-w-")
 
-  @SkipIfS3.hdfs_acls
-  @SkipIfABFS.hdfs_acls
-  @SkipIfADLS.hdfs_acls
-  @SkipIfIsilon.hdfs_acls
+  @SkipIfFS.hdfs_acls
   @SkipIfCatalogV2.impala_7539()
   def test_insert_file_permissions(self, unique_database):
     """Test that INSERT correctly respects file permission (minimum ACLs)"""
@@ -247,10 +247,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     # Should be writable because 'other' ACLs allow writes
     self.execute_query_expect_success(self.client, insert_query)
 
-  @SkipIfS3.hdfs_acls
-  @SkipIfABFS.hdfs_acls
-  @SkipIfADLS.hdfs_acls
-  @SkipIfIsilon.hdfs_acls
+  @SkipIfFS.hdfs_acls
   @SkipIfCatalogV2.impala_7539()
   def test_mixed_partition_permissions(self, unique_database):
     """
@@ -329,10 +326,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     self.execute_query_expect_success(self.client, insert_query("added_part"))
     load_data(self.execute_query_expect_success, "added_part")
 
-  @SkipIfS3.hdfs_acls
-  @SkipIfABFS.hdfs_acls
-  @SkipIfADLS.hdfs_acls
-  @SkipIfIsilon.hdfs_acls
+  @SkipIfFS.hdfs_acls
   @SkipIfCatalogV2.impala_7539()
   def test_readonly_table_dir(self, unique_database):
     """
@@ -362,10 +356,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     err = self.execute_query_expect_failure(self.client, insert_query("some_new_part"))
     assert re.search(r'Impala does not have WRITE access.*' + table_path, str(err))
 
-  @SkipIfS3.hdfs_acls
-  @SkipIfABFS.hdfs_acls
-  @SkipIfADLS.hdfs_acls
-  @SkipIfIsilon.hdfs_acls
+  @SkipIfFS.hdfs_acls
   @SkipIfDockerizedCluster.insert_acls
   @SkipIfCatalogV2.impala_7539()
   def test_insert_acl_permissions(self, unique_database):
@@ -443,10 +434,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     # Should be writable because 'other' ACLs allow writes
     self.execute_query_expect_success(self.client, insert_query)
 
-  @SkipIfS3.hdfs_acls
-  @SkipIfABFS.hdfs_acls
-  @SkipIfADLS.hdfs_acls
-  @SkipIfIsilon.hdfs_acls
+  @SkipIfFS.hdfs_acls
   @SkipIfCatalogV2.impala_7539()
   def test_load_permissions(self, unique_database):
     # We rely on test_insert_acl_permissions() to exhaustively check that ACL semantics
@@ -499,7 +487,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     # We expect this to succeed, it's not an error if all files in the dir cannot be read
     self.execute_query_expect_success(self.client, load_dir_query)
 
-  @SkipIfADLS.eventually_consistent
+  @SkipIfFS.eventually_consistent
   @pytest.mark.execute_serially
   def test_insert_select_with_empty_resultset(self):
     """Test insert/select query won't trigger partition directory or zero size data file
@@ -509,7 +497,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
           "should {1}exist but does {2}exist.".format(
               path, '' if should_exist else 'not ', 'not ' if should_exist else '')
 
-    db_path = "test-warehouse/%s.db/" % self.TEST_DB_NAME
+    db_path = "%s/%s.db/" % (WAREHOUSE, self.TEST_DB_NAME)
     table_path = db_path + "test_insert_empty_result"
     partition_path = "{0}/year=2009/month=1".format(table_path)
     check_path_exists(table_path, False)
@@ -569,10 +557,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     self.filesystem_client.delete_file_dir(target_table_path, recursive=True)
     self.execute_query_expect_failure(self.client, insert_query)
 
-  @SkipIfS3.hdfs_acls
-  @SkipIfABFS.hdfs_acls
-  @SkipIfADLS.hdfs_acls
-  @SkipIfIsilon.hdfs_acls
+  @SkipIfFS.hdfs_acls
   @SkipIfDockerizedCluster.insert_acls
   @SkipIfCatalogV2.impala_7539()
   def test_multiple_group_acls(self, unique_database):
@@ -620,14 +605,13 @@ class TestInsertBehaviour(ImpalaTestSuite):
     if self.exploration_strategy() != 'exhaustive' and IS_S3:
       pytest.skip("only runs in exhaustive")
     table = "{0}.insert_clustered".format(unique_database)
-    table_path = "test-warehouse/{0}.db/insert_clustered".format(unique_database)
-    table_location = get_fs_path("/" + table_path)
+    table_path = "{1}/{0}.db/insert_clustered".format(unique_database, WAREHOUSE)
 
     create_stmt = """create table {0} like functional.alltypes""".format(table)
     self.execute_query_expect_success(self.client, create_stmt)
 
     set_location_stmt = """alter table {0} set location '{1}'""".format(
-        table, table_location)
+        table, table_path)
     self.execute_query_expect_success(self.client, set_location_stmt)
 
     # Setting a lower batch size will result in multiple row batches being written.
@@ -655,8 +639,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     if self.exploration_strategy() != 'exhaustive':
       pytest.skip("only runs in exhaustive")
     table = "{0}.insert_clustered".format(unique_database)
-    table_path = "test-warehouse/{0}.db/insert_clustered".format(unique_database)
-    table_location = get_fs_path("/" + table_path)
+    table_path = "{1}/{0}.db/insert_clustered".format(unique_database, WAREHOUSE)
 
     create_stmt = """create table {0} (
                      l_orderkey BIGINT,
@@ -679,7 +662,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     self.execute_query_expect_success(self.client, create_stmt)
 
     set_location_stmt = """alter table {0} set location '{1}'""".format(
-        table, table_location)
+        table, table_path)
     self.execute_query_expect_success(self.client, set_location_stmt)
 
     # Setting a lower parquet file size will result in multiple files being written.

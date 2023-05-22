@@ -20,10 +20,19 @@
 #include <sstream>
 #include <boost/scoped_ptr.hpp>
 
+#include <rapidjson/ostreamwrapper.h>
+#include <rapidjson/rapidjson.h>
+#include <rapidjson/writer.h>
+
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/slot-ref.h"
 #include "rpc/thrift-util.h"
+#include "runtime/complex-value-writer.inline.h"
+#include "runtime/descriptors.h"
 #include "runtime/raw-value.h"
 #include "runtime/row-batch.h"
+#include "runtime/tuple.h"
+#include "runtime/tuple-row.h"
 #include "runtime/types.h"
 #include "service/hs2-util.h"
 #include "util/bit-util.h"
@@ -49,8 +58,14 @@ namespace impala {
 class AsciiQueryResultSet : public QueryResultSet {
  public:
   /// Rows are added into 'rowset'.
-  AsciiQueryResultSet(const TResultSetMetadata& metadata, vector<string>* rowset)
-    : metadata_(metadata), result_set_(rowset) {}
+  AsciiQueryResultSet(const TResultSetMetadata& metadata, vector<string>* rowset,
+      bool stringify_map_keys)
+    : metadata_(metadata), result_set_(rowset), stringify_map_keys_(stringify_map_keys) {
+    types_.reserve(metadata.columns.size());
+    for (int i = 0; i < metadata.columns.size(); ++i) {
+      types_.push_back(ColumnType::FromThrift(metadata_.columns[i].columnType));
+    }
+  }
 
   virtual ~AsciiQueryResultSet() {}
 
@@ -74,13 +89,20 @@ class AsciiQueryResultSet : public QueryResultSet {
 
   /// Points to the result set to be filled. Not owned by this object.
   vector<string>* result_set_;
+
+  // If true, converts map keys to strings; see IMPALA-11778.
+  const bool stringify_map_keys_;
+
+  // De-serialized column metadata
+  vector<ColumnType> types_;
 };
 
 /// Result set container for Hive protocol versions >= V6, where results are returned in
 /// column-orientation.
 class HS2ColumnarResultSet : public QueryResultSet {
  public:
-  HS2ColumnarResultSet(const TResultSetMetadata& metadata, TRowSet* rowset);
+  HS2ColumnarResultSet(const TResultSetMetadata& metadata, TRowSet* rowset,
+      bool stringify_map_keys, int expected_result_count);
 
   virtual ~HS2ColumnarResultSet() {}
 
@@ -112,6 +134,13 @@ class HS2ColumnarResultSet : public QueryResultSet {
   boost::scoped_ptr<TRowSet> owned_result_set_;
 
   int64_t num_rows_;
+
+  // If true, converts map keys to strings; see IMPALA-11778.
+  const bool stringify_map_keys_;
+
+  // Expected number of result rows that will be returned with this
+  // fetch request. Used to reserve results vector memory.
+  const int expected_result_count_;
 
   void InitColumns();
 };
@@ -151,16 +180,18 @@ class HS2RowOrientedResultSet : public QueryResultSet {
 };
 
 QueryResultSet* QueryResultSet::CreateAsciiQueryResultSet(
-    const TResultSetMetadata& metadata, vector<string>* rowset) {
-  return new AsciiQueryResultSet(metadata, rowset);
+    const TResultSetMetadata& metadata, vector<string>* rowset, bool stringify_map_keys) {
+  return new AsciiQueryResultSet(metadata, rowset, stringify_map_keys);
 }
 
 QueryResultSet* QueryResultSet::CreateHS2ResultSet(
-    TProtocolVersion::type version, const TResultSetMetadata& metadata, TRowSet* rowset) {
+    TProtocolVersion::type version, const TResultSetMetadata& metadata, TRowSet* rowset,
+    bool stringify_map_keys, int expected_result_count) {
   if (version < TProtocolVersion::HIVE_CLI_SERVICE_PROTOCOL_V6) {
     return new HS2RowOrientedResultSet(metadata, rowset);
   } else {
-    return new HS2ColumnarResultSet(metadata, rowset);
+    return new HS2ColumnarResultSet(
+        metadata, rowset, stringify_map_keys, expected_result_count);
   }
 }
 
@@ -186,15 +217,59 @@ Status AsciiQueryResultSet::AddRows(const vector<ScalarExprEvaluator*>& expr_eva
     for (int i = 0; i < num_col; ++i) {
       // ODBC-187 - ODBC can only take "\t" as the delimiter
       out_stream << (i > 0 ? "\t" : "");
-      DCHECK_EQ(1, metadata_.columns[i].columnType.types.size());
-      RawValue::PrintValue(expr_evals[i]->GetValue(it.Get()),
-          ColumnType::FromThrift(metadata_.columns[i].columnType), scales[i],
-          &out_stream);
+
+      if (!types_[i].IsComplexType()) {
+        RawValue::PrintValue(expr_evals[i]->GetValue(it.Get()), types_[i],
+            scales[i], &out_stream);
+      } else {
+        PrintComplexValue(expr_evals[i], it.Get(), &out_stream, types_[i],
+            stringify_map_keys_);
+      }
     }
     result_set_->push_back(out_stream.str());
     out_stream.str("");
   }
   return Status::OK();
+}
+
+void QueryResultSet::PrintComplexValue(ScalarExprEvaluator* expr_eval,
+    const TupleRow* row, stringstream *stream, const ColumnType& type,
+    bool stringify_map_keys) {
+  DCHECK(type.IsComplexType());
+  const ScalarExpr& scalar_expr = expr_eval->root();
+  // Currently scalar_expr can be only a slot ref as no functions return complex types.
+  DCHECK(scalar_expr.IsSlotRef());
+  void* value = expr_eval->GetValue(row);
+
+  if (value == nullptr) {
+    (*stream) << RawValue::NullLiteral(/*top-level*/ true);
+    return;
+  }
+
+  rapidjson::BasicOStreamWrapper<stringstream> wrapped_stream(*stream);
+  rapidjson::Writer<rapidjson::BasicOStreamWrapper<stringstream>> writer(wrapped_stream);
+
+  if (type.IsCollectionType()) {
+    const CollectionValue* collection_val = static_cast<const CollectionValue*>(value);
+    const TupleDescriptor* item_tuple_desc = scalar_expr.GetCollectionTupleDesc();
+    DCHECK(item_tuple_desc != nullptr);
+
+    ComplexValueWriter<rapidjson::BasicOStreamWrapper<stringstream>>
+        complex_value_writer(&writer, stringify_map_keys);
+    complex_value_writer.CollectionValueToJSON(*collection_val, type.type,
+            item_tuple_desc);
+  } else {
+    DCHECK(type.IsStructType());
+    const StructVal* struct_val = static_cast<const StructVal*>(value);
+    const SlotDescriptor* slot_desc =
+        static_cast<const SlotRef&>(scalar_expr).GetSlotDescriptor();
+    DCHECK(slot_desc != nullptr);
+    DCHECK_EQ(type, slot_desc->type());
+
+    ComplexValueWriter<rapidjson::BasicOStreamWrapper<stringstream>>
+        complex_value_writer(&writer, stringify_map_keys);
+    complex_value_writer.StructValToJSON(*struct_val, *slot_desc);
+  }
 }
 
 Status AsciiQueryResultSet::AddOneRow(const TResultRow& row) {
@@ -226,7 +301,7 @@ int64_t AsciiQueryResultSet::ByteSize(int start_idx, int num_rows) {
   int64_t bytes = 0;
   const int end = min(static_cast<size_t>(num_rows), result_set_->size() - start_idx);
   for (int i = start_idx; i < start_idx + end; ++i) {
-    bytes += sizeof(result_set_[i]) + result_set_[i].capacity();
+    bytes += sizeof(result_set_[i]) + result_set_[i].size();
   }
   return bytes;
 }
@@ -237,7 +312,7 @@ namespace {
 
 // Utility functions for computing the size of HS2 Thrift structs in bytes.
 inline int64_t ByteSize(const ThriftTColumnValue& val) {
-  return sizeof(val) + val.stringVal.value.capacity();
+  return sizeof(val) + val.stringVal.value.size();
 }
 
 int64_t ByteSize(const TRow& row) {
@@ -276,8 +351,11 @@ uint32_t TColumnByteSize(const ThriftTColumn& col, uint32_t start_idx, uint32_t 
 // Result set container for Hive protocol versions >= V6, where results are returned in
 // column-orientation.
 HS2ColumnarResultSet::HS2ColumnarResultSet(
-    const TResultSetMetadata& metadata, TRowSet* rowset)
-  : metadata_(metadata), result_set_(rowset), num_rows_(0) {
+    const TResultSetMetadata& metadata, TRowSet* rowset, bool stringify_map_keys,
+    int expected_result_count)
+  : metadata_(metadata), result_set_(rowset), num_rows_(0),
+    stringify_map_keys_(stringify_map_keys),
+    expected_result_count_(expected_result_count) {
   if (rowset == NULL) {
     owned_result_set_.reset(new TRowSet());
     result_set_ = owned_result_set_.get();
@@ -288,13 +366,15 @@ HS2ColumnarResultSet::HS2ColumnarResultSet(
 Status HS2ColumnarResultSet::AddRows(const vector<ScalarExprEvaluator*>& expr_evals,
     RowBatch* batch, int start_idx, int num_rows) {
   DCHECK_GE(batch->num_rows(), start_idx + num_rows);
+  int expected_result_count =
+      std::max((int64_t) expected_result_count_, num_rows + num_rows_);
   int num_col = expr_evals.size();
   DCHECK_EQ(num_col, metadata_.columns.size());
   for (int i = 0; i < num_col; ++i) {
     const TColumnType& type = metadata_.columns[i].columnType;
     ScalarExprEvaluator* expr_eval = expr_evals[i];
     ExprValuesToHS2TColumn(expr_eval, type, batch, start_idx, num_rows, num_rows_,
-        &(result_set_->columns[i]));
+        expected_result_count, stringify_map_keys_, &(result_set_->columns[i]));
   }
   num_rows_ += num_rows;
   return Status::OK();
@@ -323,7 +403,13 @@ int HS2ColumnarResultSet::AddRows(
   for (int j = 0; j < metadata_.columns.size(); ++j) {
     ThriftTColumn* from = &o->result_set_->columns[j];
     ThriftTColumn* to = &result_set_->columns[j];
-    switch (metadata_.columns[j].columnType.types[0].scalar_type.type) {
+    const TColumnType& colType = metadata_.columns[j].columnType;
+    TPrimitiveType::type primitiveType = colType.types[0].scalar_type.type;
+    if (colType.types[0].type != TTypeNodeType::SCALAR) {
+      DCHECK(from->__isset.stringVal);
+      primitiveType = TPrimitiveType::STRING;
+    }
+    switch (primitiveType) {
       case TPrimitiveType::NULL_TYPE:
       case TPrimitiveType::BOOLEAN:
         StitchNulls(
@@ -380,6 +466,12 @@ int HS2ColumnarResultSet::AddRows(
             from->stringVal.values.begin() + start_idx,
             from->stringVal.values.begin() + start_idx + rows_added);
         break;
+      case TPrimitiveType::BINARY:
+        StitchNulls(num_rows_, rows_added, start_idx, from->binaryVal.nulls,
+            &(to->binaryVal.nulls));
+        to->binaryVal.values.insert(to->binaryVal.values.end(),
+            from->binaryVal.values.begin() + start_idx,
+            from->binaryVal.values.begin() + start_idx + rows_added);
       default:
         DCHECK(false) << "Unsupported type: "
                       << TypeToString(ThriftToType(
@@ -402,45 +494,57 @@ int64_t HS2ColumnarResultSet::ByteSize(int start_idx, int num_rows) {
 
 void HS2ColumnarResultSet::InitColumns() {
   result_set_->__isset.columns = true;
-  for (const TColumn& col : metadata_.columns) {
-    DCHECK(col.columnType.types.size() == 1)
-        << "Structured columns unsupported in HS2 interface";
-    ThriftTColumn column;
-    switch (col.columnType.types[0].scalar_type.type) {
-      case TPrimitiveType::NULL_TYPE:
-      case TPrimitiveType::BOOLEAN:
-        column.__isset.boolVal = true;
-        break;
-      case TPrimitiveType::TINYINT:
-        column.__isset.byteVal = true;
-        break;
-      case TPrimitiveType::SMALLINT:
-        column.__isset.i16Val = true;
-        break;
-      case TPrimitiveType::INT:
-        column.__isset.i32Val = true;
-        break;
-      case TPrimitiveType::BIGINT:
-        column.__isset.i64Val = true;
-        break;
-      case TPrimitiveType::FLOAT:
-      case TPrimitiveType::DOUBLE:
-        column.__isset.doubleVal = true;
-        break;
-      case TPrimitiveType::TIMESTAMP:
-      case TPrimitiveType::DATE:
-      case TPrimitiveType::DECIMAL:
-      case TPrimitiveType::VARCHAR:
-      case TPrimitiveType::CHAR:
-      case TPrimitiveType::STRING:
-        column.__isset.stringVal = true;
-        break;
-      default:
-        DCHECK(false) << "Unhandled column type: "
-                      << TypeToString(
-                             ThriftToType(col.columnType.types[0].scalar_type.type));
+  for (const TColumn& col_input : metadata_.columns) {
+    const vector<TTypeNode>& type_nodes = col_input.columnType.types;
+    DCHECK(type_nodes.size() > 0);
+    ThriftTColumn col_output;
+    if (type_nodes[0].type == TTypeNodeType::STRUCT
+        || type_nodes[0].type == TTypeNodeType::ARRAY
+        || type_nodes[0].type == TTypeNodeType::MAP) {
+      // Return structs, arrays and maps as string.
+      col_output.__isset.stringVal = true;
+    } else {
+      DCHECK(type_nodes.size() == 1);
+      DCHECK(type_nodes[0].__isset.scalar_type);
+      TPrimitiveType::type input_type = type_nodes[0].scalar_type.type;
+      switch (input_type) {
+        case TPrimitiveType::NULL_TYPE:
+        case TPrimitiveType::BOOLEAN:
+          col_output.__isset.boolVal = true;
+          break;
+        case TPrimitiveType::TINYINT:
+          col_output.__isset.byteVal = true;
+          break;
+        case TPrimitiveType::SMALLINT:
+          col_output.__isset.i16Val = true;
+          break;
+        case TPrimitiveType::INT:
+          col_output.__isset.i32Val = true;
+          break;
+        case TPrimitiveType::BIGINT:
+          col_output.__isset.i64Val = true;
+          break;
+        case TPrimitiveType::FLOAT:
+        case TPrimitiveType::DOUBLE:
+          col_output.__isset.doubleVal = true;
+          break;
+        case TPrimitiveType::TIMESTAMP:
+        case TPrimitiveType::DATE:
+        case TPrimitiveType::DECIMAL:
+        case TPrimitiveType::VARCHAR:
+        case TPrimitiveType::CHAR:
+        case TPrimitiveType::STRING:
+          col_output.__isset.stringVal = true;
+          break;
+        case TPrimitiveType::BINARY:
+          col_output.__isset.binaryVal = true;
+          break;
+        default:
+          DCHECK(false) << "Unhandled column type: "
+              << TypeToString(ThriftToType(input_type));
+      }
     }
-    result_set_->columns.push_back(column);
+    result_set_->columns.push_back(col_output);
   }
 }
 

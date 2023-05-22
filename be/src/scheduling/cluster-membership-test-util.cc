@@ -20,6 +20,7 @@
 #include "common/names.h"
 #include "scheduling/executor-group.h"
 #include "service/impala-server.h"
+#include "util/uid-util.h"
 
 static const int BACKEND_PORT = 1000;
 static const int KRPC_PORT = 2000;
@@ -44,35 +45,39 @@ string HostIdxToIpAddr(int host_idx) {
   return IP_PREFIX + suffix;
 }
 
-TBackendDescriptor MakeBackendDescriptor(
-    int idx, const TExecutorGroupDesc& group_desc, int port_offset) {
-  TBackendDescriptor be_desc;
-  be_desc.address.hostname = HostIdxToHostname(idx);
-  be_desc.address.port = BACKEND_PORT + port_offset;
-  be_desc.ip_address = HostIdxToIpAddr(idx);
+BackendDescriptorPB MakeBackendDescriptor(
+    int idx, const ExecutorGroupDescPB& group_desc, int port_offset,
+    int64_t admit_mem_limit) {
+  BackendDescriptorPB be_desc;
+  UUIDToUniqueIdPB(boost::uuids::random_generator()(), be_desc.mutable_backend_id());
+  be_desc.mutable_address()->set_hostname(HostIdxToHostname(idx));
+  be_desc.mutable_address()->set_port(BACKEND_PORT + port_offset);
+  be_desc.set_ip_address(HostIdxToIpAddr(idx));
   // krpc_address is always resolved
-  be_desc.krpc_address.hostname = be_desc.ip_address;
-  be_desc.krpc_address.port = KRPC_PORT + port_offset;
-  be_desc.__set_is_coordinator(true);
-  be_desc.__set_is_executor(true);
-  be_desc.is_quiescing = false;
-  be_desc.executor_groups.push_back(group_desc);
+  be_desc.mutable_krpc_address()->set_hostname(be_desc.ip_address());
+  be_desc.mutable_krpc_address()->set_port(KRPC_PORT + port_offset);
+  be_desc.set_is_coordinator(true);
+  be_desc.set_is_executor(true);
+  be_desc.set_is_quiescing(false);
+  be_desc.set_admit_mem_limit(admit_mem_limit);
+  *be_desc.add_executor_groups() = group_desc;
   return be_desc;
 }
 
-TBackendDescriptor MakeBackendDescriptor(
-    int idx, const ExecutorGroup& group, int port_offset) {
-  TExecutorGroupDesc group_desc;
-  group_desc.name = group.name();
-  group_desc.min_size = group.min_size();
-  return MakeBackendDescriptor(idx, group_desc, port_offset);
+BackendDescriptorPB MakeBackendDescriptor(
+    int idx, const ExecutorGroup& group, int port_offset, int64_t admit_mem_limit) {
+  ExecutorGroupDescPB group_desc;
+  group_desc.set_name(group.name());
+  group_desc.set_min_size(group.min_size());
+  return MakeBackendDescriptor(idx, group_desc, port_offset, admit_mem_limit);
 }
 
-TBackendDescriptor MakeBackendDescriptor(int idx, int port_offset) {
-  TExecutorGroupDesc group_desc;
-  group_desc.name = ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME;
-  group_desc.min_size = 1;
-  return MakeBackendDescriptor(idx, group_desc, port_offset);
+BackendDescriptorPB MakeBackendDescriptor(int idx, int port_offset,
+    int64_t admit_mem_limit) {
+  ExecutorGroupDescPB group_desc;
+  group_desc.set_name(ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME);
+  group_desc.set_min_size(1);
+  return MakeBackendDescriptor(idx, group_desc, port_offset, admit_mem_limit);
 }
 
 }  // end namespace test

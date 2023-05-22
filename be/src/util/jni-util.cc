@@ -129,8 +129,6 @@ Status JniUtil::LocalToGlobalRef(JNIEnv* env, jobject local_ref, jobject* global
 }
 
 Status JniUtil::Init() {
-  InitLibhdfs();
-
   // Get the JNIEnv* corresponding to current thread.
   JNIEnv* env = JniUtil::GetJNIEnv();
   if (env == NULL) return Status("Failed to get/create JVM");
@@ -281,15 +279,20 @@ Status JniUtil::GetJniExceptionMsg(JNIEnv* env, bool log_stack, const string& pr
       env->ExceptionClear();
       string oom_msg = Substitute(oom_msg_template, "throwableToStackTrace");
       LOG(ERROR) << oom_msg;
+      DCHECK(msg_str_guard.get() != nullptr);
+      LOG(ERROR) << msg_str_guard.get();
       return Status(oom_msg);
     }
     JniUtfCharGuard c_stack_guard;
     RETURN_IF_ERROR(JniUtfCharGuard::create(env, stack, &c_stack_guard));
     VLOG(1) << c_stack_guard.get();
+    env->DeleteLocalRef(stack);
   }
 
+  const char* msg_str = msg_str_guard.get();
+  env->DeleteLocalRef(msg);
   env->DeleteLocalRef(exc);
-  return Status(Substitute("$0$1", prefix, msg_str_guard.get()));
+  return Status(Substitute("$0$1", prefix, msg_str));
 }
 
 Status JniUtil::GetJvmMemoryMetrics(TGetJvmMemoryMetricsResponse* result) {

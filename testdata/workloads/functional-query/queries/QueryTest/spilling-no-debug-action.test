@@ -51,6 +51,22 @@ BIGINT
 row_regex: .*NumHashTableBuildsSkipped: .* \([1-9][0-9]*\)
 ====
 ---- QUERY
+# spilled partition with 0 probe rows, RIGHT OUTER JOIN
+# Setting max_row_size == default_spillable_buffer_size was sufficient to trigger
+# IMPALA-9349, because it means there is no surplus reservation during repartitioning.
+set debug_action="-1:OPEN:SET_DENY_RESERVATION_PROBABILITY@1.0";
+select straight_join count(*)
+from
+supplier right outer join lineitem on s_suppkey = l_suppkey
+where s_acctbal > 0 and s_acctbal < 10;
+---- TYPES
+BIGINT
+---- RESULTS
+12138
+---- RUNTIME_PROFILE
+row_regex: .*NumHashTableBuildsSkipped: .* \([1-9][0-9]*\)
+====
+---- QUERY
 # spilled partition with 0 probe rows, RIGHT ANTI JOIN
 set debug_action="-1:OPEN:SET_DENY_RESERVATION_PROBABILITY@1.0";
 with x as (select * from supplier limit 10)
@@ -67,8 +83,8 @@ row_regex: .*NumHashTableBuildsSkipped: .* \([1-9][0-9]*\)
 ---- QUERY
 # Aggregation query that will OOM and fail to spill because of IMPALA-3304 without
 # any help from DEBUG_ACTION.
-set mem_limit=80m;
-select l_orderkey, group_concat(l_comment) comments
+set mem_limit=75m;
+select l_orderkey, group_concat(repeat(l_comment, 10)) comments
 from lineitem
 group by l_orderkey
 order by comments desc

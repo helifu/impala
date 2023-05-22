@@ -17,6 +17,7 @@
 
 #include "kudu/security/ca/cert_management.h"
 
+#include <initializer_list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,9 +29,9 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/crypto.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/security-test-util.h"
 #include "kudu/security/test/test_certs.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -71,7 +72,8 @@ class CertManagementTest : public KuduTest {
   template<class CSRGen = CertRequestGenerator>
   CertSignRequest PrepareTestCSR(typename CSRGen::Config config,
                                  PrivateKey* key) {
-    CHECK_OK(GeneratePrivateKey(512, key));
+    int key_size = UseLargeKeys() ? 2048 : 512;
+    CHECK_OK(GeneratePrivateKey(key_size, key));
     CSRGen gen(std::move(config));
     CHECK_OK(gen.Init());
     CertSignRequest req;

@@ -20,12 +20,12 @@
 
 #include <jni.h>
 
-#include "gen-cpp/ImpalaService.h"
-#include "gen-cpp/ImpalaHiveServer2Service.h"
-#include "gen-cpp/ImpalaInternalService.h"
-#include "gen-cpp/Frontend_types.h"
-#include "gen-cpp/LineageGraph_types.h"
 #include "common/status.h"
+#include "gen-cpp/Frontend_types.h"
+#include "gen-cpp/ImpalaHiveServer2Service.h"
+#include "gen-cpp/ImpalaService.h"
+#include "gen-cpp/LineageGraph_types.h"
+#include "gen-cpp/Types_types.h"
 
 namespace impala {
 
@@ -97,6 +97,10 @@ class Frontend {
   Status GetPrincipalPrivileges(const TShowGrantPrincipalParams& params,
       TResultSet* result);
 
+  /// Call FE to get table history for an Iceberg table.
+  Status GetTableHistory(const TDescribeHistoryParams& params,
+      TGetTableHistoryResult* result);
+
   /// Return all functions of 'category' that match the optional argument 'pattern'.
   /// If pattern is NULL match all functions, otherwise match only those functions that
   /// match the pattern string.
@@ -167,6 +171,9 @@ class Frontend {
   /// completed successfully.
   Status LoadData(const TLoadDataReq& load_data_request, TLoadDataResp* response);
 
+  /// Adds a transaction that was started externally
+  Status addTransaction(const TQueryCtx& queryCtx);
+
   /// Aborts transaction with the given transaction id.
   Status AbortTransaction(int64_t transaction_id);
 
@@ -195,6 +202,26 @@ class Frontend {
   // Call FE post-query execution hook
   Status CallQueryCompleteHooks(const TQueryCompleteContext& context);
 
+  // Call FE to create a http response that redirects to the SSO service.
+  Status GetSaml2Redirect(const TWrappedHttpRequest& request,
+      TWrappedHttpResponse* response);
+
+  // Call FE to validate the SAML2 AuthNResponse.
+  // The response is an HTML form that contains a bearer token or an error
+  // message.
+  Status ValidateSaml2Response(
+      const TWrappedHttpRequest& request, TWrappedHttpResponse* response);
+
+  // Call FE to validate the bearer token.
+  // Fills "user" if the validation was successful.
+  Status ValidateSaml2Bearer(const TWrappedHttpRequest& request, string* user);
+
+  /// Aborts Kudu transaction with the given query id.
+  Status AbortKuduTransaction(const TUniqueId& query_id);
+
+  /// Commits Kudu transaction with the given query id.
+  Status CommitKuduTransaction(const TUniqueId& query_id);
+
  private:
   jobject fe_;  // instance of org.apache.impala.service.JniFrontend
   jmethodID create_exec_request_id_;  // JniFrontend.createExecRequest()
@@ -214,6 +241,7 @@ class Frontend {
   jmethodID get_data_src_metadata_id_; // JniFrontend.getDataSrcMetadata
   jmethodID get_stats_id_; // JniFrontend.getTableStats
   jmethodID get_functions_id_; // JniFrontend.getFunctions
+  jmethodID get_table_history_id_; // JniFrontend.getTableHistory
   jmethodID get_catalog_object_id_; // JniFrontend.getCatalogObject
   jmethodID show_roles_id_; // JniFrontend.getRoles
   jmethodID get_principal_privileges_id_; // JniFrontend.getPrincipalPrivileges
@@ -224,8 +252,14 @@ class Frontend {
   jmethodID get_table_files_id_; // JniFrontend.getTableFiles
   jmethodID show_create_function_id_; // JniFrontend.showCreateFunction
   jmethodID call_query_complete_hooks_id_; // JniFrontend.callQueryCompleteHooks
+  jmethodID add_txn_; // JniFrontend.addTransaction()
   jmethodID abort_txn_; // JniFrontend.abortTransaction()
-  jmethodID unregister_txn_; // JniFrontend.abortTransaction()
+  jmethodID unregister_txn_; // JniFrontend.unregisterTransaction()
+  jmethodID get_saml2_redirect_id_; // JniFrontend.getSaml2Redirect()
+  jmethodID validate_saml2_response_id_; // JniFrontend.validateSaml2Response()
+  jmethodID validate_saml2_bearer_id_; // JniFrontend.validateSaml2Bearer()
+  jmethodID abort_kudu_txn_; // JniFrontend.abortKuduTransaction()
+  jmethodID commit_kudu_txn_; // JniFrontend.commitKuduTransaction()
 
   // Only used for testing.
   jmethodID build_test_descriptor_table_id_; // JniFrontend.buildTestDescriptorTable()

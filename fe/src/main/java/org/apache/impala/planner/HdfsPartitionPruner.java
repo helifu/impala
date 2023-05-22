@@ -18,6 +18,7 @@
 package org.apache.impala.planner;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -38,6 +39,8 @@ import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.SlotId;
 import org.apache.impala.analysis.SlotRef;
+import org.apache.impala.analysis.TableRef;
+import org.apache.impala.analysis.TableSampleClause;
 import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
@@ -47,6 +50,7 @@ import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.rewrite.BetweenToCompoundRule;
 import org.apache.impala.rewrite.ExprRewriter;
+import org.apache.impala.rewrite.FoldConstantsRule;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -87,7 +91,9 @@ public class HdfsPartitionPruner {
   // For converting BetweenPredicates to CompoundPredicates so they can be
   // executed in the BE.
   private final ExprRewriter exprRewriter_ =
-      new ExprRewriter(BetweenToCompoundRule.INSTANCE);
+      new ExprRewriter(new ArrayList<>(
+          Arrays.asList(BetweenToCompoundRule.INSTANCE,
+                        FoldConstantsRule.INSTANCE)));
 
   public HdfsPartitionPruner(TupleDescriptor tupleDesc) {
     Preconditions.checkState(tupleDesc.getTable() instanceof FeFsTable);
@@ -99,13 +105,15 @@ public class HdfsPartitionPruner {
   /**
    * Return a list of partitions left after applying the conjuncts.
    * Conjuncts used for filtering will be removed from the list 'conjuncts' and
-   * returned as the second item in the returned Pair. These expressions can be
+   * returned as the second item in the returned Pair. These expressions
+   * include planner rewrites such as view reference substitutions and can be
    * shown in the EXPLAIN output.
    *
    * If 'allowEmpty' is False, empty partitions are not returned.
    */
   public Pair<List<? extends FeFsPartition>, List<Expr>> prunePartitions(
-      Analyzer analyzer, List<Expr> conjuncts, boolean allowEmpty)
+      Analyzer analyzer, List<Expr> conjuncts, boolean allowEmpty,
+      TableRef hdfsTblRef)
       throws ImpalaException {
     // Start with creating a collection of partition filters for the applicable conjuncts.
     List<HdfsPartitionFilter> partitionFilters = new ArrayList<>();
@@ -133,7 +141,7 @@ public class HdfsPartitionPruner {
         } else {
           partitionFilters.add(new HdfsPartitionFilter(clonedConjunct, tbl_, analyzer));
         }
-        partitionConjuncts.add(conjunct);
+        partitionConjuncts.add(clonedConjunct);
         it.remove();
       }
     }
@@ -174,7 +182,51 @@ public class HdfsPartitionPruner {
             }
           }));
     }
+    if (hdfsTblRef != null) {
+      // check and apply pruning for simple limit
+      results = pruneForSimpleLimit(hdfsTblRef, analyzer, results);
+    }
     return new Pair<>(results, partitionConjuncts);
+  }
+
+  /**
+   * Prune partitions based on eligibility of simple limit optimization:
+   *  - Either the table ref should not already have a TABLESAMPLE clause
+   *    or if it does then the simple_limit_to_sample hint must be set
+   *  - OPTIMIZE_SIMPLE_LIMIT is enabled and the query block satisfies
+   *    simple limit criteria
+   */
+  private List<? extends FeFsPartition> pruneForSimpleLimit(TableRef tblRef,
+    Analyzer analyzer, List<? extends FeFsPartition> partitions) {
+    if ((tblRef.getSampleParams() == null
+          || tblRef.hasConvertLimitToSampleHint())
+        && analyzer.getQueryCtx().client_request.getQuery_options()
+        .isOptimize_simple_limit()
+        && analyzer.getSimpleLimitStatus() != null
+        && analyzer.getSimpleLimitStatus().first) {
+      long limitValue = analyzer.getSimpleLimitStatus().second;
+      if (tblRef.hasConvertLimitToSampleHint()) {
+        tblRef.setTableSampleClause(new TableSampleClause(
+            tblRef.getConvertLimitToSampleHintPercent(), /* seed */ 1L));
+      } else {
+        List<FeFsPartition> prunedPartitions = new ArrayList<>();
+        long numRows = 0;
+        // Instead of using the partitions num rows statistic which may be stale,
+        // we use a conservative estimate of number of files within a partition and
+        // 1 row per file
+        for (FeFsPartition p : partitions) {
+          numRows += p.getNumFileDescriptors();
+          prunedPartitions.add(p);
+          if (numRows >= limitValue) {
+            // here we only limit the partitions; later in HdfsScanNode we will
+            // limit the file descriptors within a partition
+            break;
+          }
+        }
+        return prunedPartitions;
+      }
+    }
+    return partitions;
   }
 
   /**
@@ -189,8 +241,8 @@ public class HdfsPartitionPruner {
     if (expr instanceof BinaryPredicate) {
       // Evaluate any constant expression in the BE
       try {
-        // TODO: Analyzer should already have done constant folding
-        // and rewrite -- unless this is a copy of an expression taken
+        // Constant folding and rewrite should already be done by this
+        // point -- unless this is a copy of an expression taken
         // before analysis, which would introduce its own issues.
         expr = analyzer.getConstantFolder().rewrite(expr, analyzer);
         Preconditions.checkState(expr instanceof BinaryPredicate);

@@ -62,9 +62,10 @@ public class BaseTableRef extends TableRef {
     if (isAnalyzed_) return;
     analyzer.registerAuthAndAuditEvent(resolvedPath_.getRootTable(), priv_,
         requireGrantOption_);
+    analyzeTimeTravel(analyzer);
     desc_ = analyzer.registerTableRef(this);
     isAnalyzed_ = true;
-    analyzer.checkTableCapability(getTable(), Analyzer.OperationType.ANY);
+    Analyzer.checkTableCapability(getTable(), Analyzer.OperationType.ANY);
     analyzeTableSample(analyzer);
     analyzeHints(analyzer);
     analyzeJoin(analyzer);
@@ -78,13 +79,15 @@ public class BaseTableRef extends TableRef {
     String aliasSql = "";
     String alias = getExplicitAlias();
     if (alias != null) aliasSql = " " + ToSqlUtils.getIdentSql(alias);
+    String timeTravelSql = "";
+    if (timeTravelSpec_ != null) timeTravelSql = " " + timeTravelSpec_.toSql();
     String tableSampleSql = "";
     if (sampleParams_ != null) tableSampleSql = " " + sampleParams_.toSql(options);
     String tableHintsSql = ToSqlUtils.getPlanHintsSql(options, tableHints_);
-    return getTable().getTableName().toSql() + aliasSql + tableSampleSql + tableHintsSql;
+    return getTable().getTableName().toSql() +
+        timeTravelSql + aliasSql + tableSampleSql + tableHintsSql;
   }
 
-  public String debugString() { return tableRefToSql(); }
   @Override
   protected TableRef clone() { return new BaseTableRef(this); }
 

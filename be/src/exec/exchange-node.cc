@@ -22,6 +22,7 @@
 #include "exec/exec-node-util.h"
 #include "exprs/scalar-expr.h"
 #include "runtime/exec-env.h"
+#include "runtime/fragment-state.h"
 #include "runtime/krpc-data-stream-mgr.h"
 #include "runtime/krpc-data-stream-recvr.h"
 #include "runtime/row-batch.h"
@@ -42,15 +43,23 @@ using namespace impala;
 DEFINE_int64(exchg_node_buffer_size_bytes, 1024 * 1024 * 10,
     "(Advanced) Maximum size of per-query receive-side buffer");
 
-Status ExchangePlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+Status ExchangePlanNode::Init(const TPlanNode& tnode, FragmentState* state) {
   RETURN_IF_ERROR(PlanNode::Init(tnode, state));
-  if (!tnode.exchange_node.__isset.sort_info) return Status::OK();
+  bool is_merging = tnode_->exchange_node.__isset.sort_info;
+  if (!is_merging) return Status::OK();
 
-  RETURN_IF_ERROR(ScalarExpr::Create(tnode.exchange_node.sort_info.ordering_exprs,
-      *row_descriptor_, state, &ordering_exprs_));
-  is_asc_order_ = tnode.exchange_node.sort_info.is_asc_order;
-  nulls_first_ = tnode.exchange_node.sort_info.nulls_first;
+  const TSortInfo& sort_info = tnode.exchange_node.sort_info;
+  RETURN_IF_ERROR(ScalarExpr::Create(
+      sort_info.ordering_exprs, *row_descriptor_, state, &ordering_exprs_));
+  row_comparator_config_ =
+      state->obj_pool()->Add(new TupleRowComparatorConfig(sort_info, ordering_exprs_));
+  state->CheckAndAddCodegenDisabledMessage(codegen_status_msgs_);
   return Status::OK();
+}
+
+void ExchangePlanNode::Close() {
+  ScalarExpr::Close(ordering_exprs_);
+  PlanNode::Close();
 }
 
 Status ExchangePlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const {
@@ -77,9 +86,7 @@ ExchangeNode::ExchangeNode(
   DCHECK_GE(offset_, 0);
   DCHECK(is_merging_ || (offset_ == 0));
   if (!is_merging_) return;
-  ordering_exprs_ = pnode.ordering_exprs_;
-  is_asc_order_ = pnode.is_asc_order_;
-  nulls_first_ = pnode.nulls_first_;
+  less_than_.reset(new TupleRowLexicalComparator(*pnode.row_comparator_config_));
 }
 
 Status ExchangeNode::Prepare(RuntimeState* state) {
@@ -105,22 +112,23 @@ Status ExchangeNode::Prepare(RuntimeState* state) {
       FLAGS_exchg_node_buffer_size_bytes, is_merging_, runtime_profile(), mem_tracker(),
       &recvr_buffer_pool_client_);
 
-  if (is_merging_) {
-    less_than_.reset(
-        new TupleRowComparator(ordering_exprs_, is_asc_order_, nulls_first_));
-    state->CheckAndAddCodegenDisabledMessage(runtime_profile());
-  }
   return Status::OK();
 }
 
-void ExchangeNode::Codegen(RuntimeState* state) {
+void ExchangePlanNode::Codegen(FragmentState* state) {
   DCHECK(state->ShouldCodegen());
-  ExecNode::Codegen(state);
+  PlanNode::Codegen(state);
   if (IsNodeCodegenDisabled()) return;
 
-  if (is_merging_) {
-    Status codegen_status = less_than_->Codegen(state);
-    runtime_profile()->AddCodegenMsg(codegen_status.ok(), codegen_status);
+  if (row_comparator_config_ != nullptr) {
+    Status codegen_status;
+    llvm::Function* compare_fn = nullptr;
+    codegen_status = row_comparator_config_->Codegen(state, &compare_fn);
+    if (codegen_status.ok()) {
+      codegen_status =
+          SortedRunMerger::Codegen(state, compare_fn, &codegend_heapify_helper_fn_);
+    }
+    AddCodegenStatus(codegen_status);
   }
 }
 
@@ -130,11 +138,13 @@ Status ExchangeNode::Open(RuntimeState* state) {
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   if (is_merging_) {
+    const ExchangePlanNode& pnode = static_cast<const ExchangePlanNode&>(plan_node_);
     // CreateMerger() will populate its merging heap with batches from the stream_recvr_,
     // so it is not necessary to call FillInputRowBatch().
     RETURN_IF_ERROR(
         less_than_->Open(pool_, state, expr_perm_pool(), expr_results_pool()));
-    RETURN_IF_ERROR(stream_recvr_->CreateMerger(*less_than_.get()));
+    RETURN_IF_ERROR(stream_recvr_->CreateMerger(*less_than_.get(),
+        pnode.codegend_heapify_helper_fn_));
   } else {
     RETURN_IF_ERROR(FillInputRowBatch(state));
   }
@@ -151,7 +161,6 @@ void ExchangeNode::Close(RuntimeState* state) {
   if (less_than_.get() != nullptr) less_than_->Close(state);
   if (stream_recvr_ != nullptr) stream_recvr_->Close();
   ExecEnv::GetInstance()->buffer_pool()->DeregisterClient(&recvr_buffer_pool_client_);
-  ScalarExpr::Close(ordering_exprs_);
   ExecNode::Close(state);
 }
 

@@ -28,9 +28,10 @@
 
 #include "gen-cpp/ErrorCodes_types.h"
 #include "gen-cpp/Frontend_types.h"
-#include "gen-cpp/StatestoreService_types.h"
 #include "gen-cpp/Status_types.h"
 #include "gen-cpp/Types_types.h"
+#include "gen-cpp/StatestoreService_types.h"
+#include "gen-cpp/common.pb.h"
 
 /// Comparators for types that we commonly use in containers.
 namespace impala {
@@ -62,14 +63,40 @@ inline bool operator<(const TUniqueId& lhs, const TUniqueId& rhs) {
   return std::tie(lhs.hi, lhs.lo) < std::tie(rhs.hi, rhs.lo);
 }
 
+// UniqueIdPB
+STATIC_ASSERT_SIZE(UniqueIdPB, 40);
+
+inline bool operator==(const UniqueIdPB& lhs, const UniqueIdPB& rhs) {
+  return lhs.hi() == rhs.hi() && lhs.lo() == rhs.lo();
+}
+
+inline bool operator!=(const UniqueIdPB& lhs, const UniqueIdPB& rhs) {
+  return !(lhs == rhs);
+}
+
+inline bool operator<(const UniqueIdPB& lhs, const UniqueIdPB& rhs) {
+  return lhs.hi() < rhs.hi() || (lhs.hi() == rhs.hi() && lhs.lo() < rhs.lo());
+}
+
 // TNetworkAddress
-STATIC_ASSERT_SIZE(TNetworkAddress, 24);
+STATIC_ASSERT_SIZE(TNetworkAddress, 88);
 
 inline bool operator==(const TNetworkAddress& lhs, const TNetworkAddress& rhs) {
   return std::tie(lhs.hostname, lhs.port) == std::tie(rhs.hostname, rhs.port);
 }
 
 inline bool operator!=(const TNetworkAddress& lhs, const TNetworkAddress& rhs) {
+  return !(lhs == rhs);
+}
+
+// NetworkAddressPB
+STATIC_ASSERT_SIZE(NetworkAddressPB, 48);
+
+inline bool operator==(const NetworkAddressPB& lhs, const NetworkAddressPB& rhs) {
+  return lhs.hostname() == rhs.hostname() && lhs.port() == rhs.port();
+}
+
+inline bool operator!=(const NetworkAddressPB& lhs, const NetworkAddressPB& rhs) {
   return !(lhs == rhs);
 }
 
@@ -83,11 +110,19 @@ inline bool operator==(const TStatus& lhs, const TStatus& rhs) {
 }
 
 // TCounter
-STATIC_ASSERT_SIZE(TCounter, 32);
+STATIC_ASSERT_SIZE(TCounter, 56);
 
 inline bool operator==(const TCounter& lhs, const TCounter& rhs) {
   return std::tie(lhs.name, lhs.unit, lhs.value)
       == std::tie(rhs.name, rhs.unit, rhs.value);
+}
+
+// THeavyMemoryQuery
+STATIC_ASSERT_SIZE(THeavyMemoryQuery, 40);
+
+inline bool operator>(const THeavyMemoryQuery& lhs, const THeavyMemoryQuery& rhs) {
+  return std::tie(lhs.memory_consumed, lhs.queryId)
+      > std::tie(rhs.memory_consumed, rhs.queryId);
 }
 
 /// Hash function for TNetworkAddress. This function must be called hash_value to be picked
@@ -98,6 +133,15 @@ inline std::size_t hash_value(const TNetworkAddress& host_port) {
   return HashUtil::Hash(&host_port.port, sizeof(host_port.port), hash);
 }
 
+/// Hash function for NetworkAddressPB. This function must be called hash_value to be
+/// picked up properly by boost.
+inline std::size_t hash_value(const NetworkAddressPB& host_port) {
+  uint32_t hash =
+      HashUtil::Hash(host_port.hostname().c_str(), host_port.hostname().length(), 0);
+  int32_t port = host_port.port();
+  return HashUtil::Hash(&port, sizeof(port), hash);
+}
+
 } // end namespace impala
 
 /// Hash function for std:: containers
@@ -105,6 +149,13 @@ namespace std {
 
 template<> struct hash<impala::TNetworkAddress> {
   std::size_t operator()(const impala::TNetworkAddress& host_port) const {
+    return impala::hash_value(host_port);
+  }
+};
+
+template <>
+struct hash<impala::NetworkAddressPB> {
+  std::size_t operator()(const impala::NetworkAddressPB& host_port) const {
     return impala::hash_value(host_port);
   }
 };
@@ -181,6 +232,14 @@ template <typename K, typename V>
 const V& FindWithDefault(const boost::unordered_map<K, V>& m, const K& key,
                          const V& default_val) {
   typename boost::unordered_map<K,V>::const_iterator it = m.find(key);
+  if (it == m.end()) return default_val;
+  return it->second;
+}
+
+template <typename K, typename V>
+const V& FindWithDefault(const google::protobuf::Map<K, V>& m, const K& key,
+                         const V& default_val) {
+  typename google::protobuf::Map<K,V>::const_iterator it = m.find(key);
   if (it == m.end()) return default_val;
   return it->second;
 }

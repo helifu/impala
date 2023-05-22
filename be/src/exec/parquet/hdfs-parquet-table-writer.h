@@ -76,11 +76,13 @@ class HdfsParquetTableWriter : public HdfsTableWriter {
   virtual void Close() override;
 
   /// Returns the target HDFS block size to use.
-  virtual uint64_t default_block_size() const override;
+  virtual uint64_t default_block_size() const override { return default_block_size_; }
 
   virtual std::string file_extension() const override { return "parq"; }
 
   int32_t page_row_count_limit() const { return page_row_count_limit_; }
+  int64_t default_plain_page_size() const { return default_plain_page_size_; }
+  int64_t dict_page_size() const { return dict_page_size_; }
 
  private:
   /// Default data page size. In bytes.
@@ -149,6 +151,14 @@ class HdfsParquetTableWriter : public HdfsTableWriter {
   /// Writes the file metadata and footer.
   Status WriteFileFooter();
 
+  /// Writes the ParquetBloomFilter of 'col_writer' if it has one, including the header,
+  /// and updates '*meta_data'.
+  Status WriteParquetBloomFilter(BaseColumnWriter* col_writer,
+      parquet::ColumnMetaData* meta_data) WARN_UNUSED_RESULT;
+
+  /// Add per-column statistics to 'iceberg_file_stats_' for the current data file.
+  void CollectIcebergDmlFileColumnStats(int field_id, const BaseColumnWriter* col_writer);
+
   /// Flushes the current row group to file.  This will compute the final
   /// offsets of column chunks, updating the file metadata.
   Status FlushCurrentRowGroup();
@@ -156,6 +166,23 @@ class HdfsParquetTableWriter : public HdfsTableWriter {
   /// Adds a row group to the metadata and updates current_row_group_ to the
   /// new row group.  current_row_group_ will be flushed.
   Status AddRowGroup();
+
+  /// Configures writer for non-Iceberg tables.
+  /// 'num_cols' is the number of non-partitioning columns in the target table.
+  /// Selects the Parquet timestamp type to be used by this writer.
+  /// Sets 'string_utf8_' based on query options and table type.
+  /// Sets 'default_block_size_', 'default_plain_page_size_' and 'dict_page_size_'.
+  void Configure(int num_cols);
+
+  /// Configures writer for Iceberg tables.
+  /// 'num_cols' is the number of non-partitioning columns in the target table.
+  /// Selects the Parquet timestamp type to be used by this writer.
+  /// Sets 'string_utf8_' to true.
+  /// Sets 'default_block_size_', 'default_plain_page_size_' and 'dict_page_size_'.
+  void ConfigureForIceberg(int num_cols);
+
+  /// Updates output partition with some summary about the written file.
+  void FinalizePartitionInfo();
 
   /// Thrift serializer utility object.  Reusing this object allows for
   /// fewer memory allocations.
@@ -212,6 +239,25 @@ class HdfsParquetTableWriter : public HdfsTableWriter {
 
   /// Maximum row count written in a page.
   int32_t page_row_count_limit_ = std::numeric_limits<int32_t>::max();
+
+  /// The Timestamp type used to write timestamp values.
+  TParquetTimestampType::type timestamp_type_;
+
+  /// True if we are writing an Iceberg data file. In that case the writer behaves a
+  /// bit differently, e.g. writes specific type of timestamps, fills some extra metadata.
+  bool is_iceberg_file_ = false;
+
+  /// If true, STRING values are annotated with UTF8 in Parquet metadata.
+  bool string_utf8_ = false;
+
+  // File block size, set in Configure() or ConfigureForIceberg().
+  int64_t default_block_size_;
+
+  // Default plain page size, set in Configure() or ConfigureForIceberg().
+  int64_t default_plain_page_size_;
+
+  // Dictionary page size, set in Configure() or ConfigureForIceberg().
+  int64_t dict_page_size_;
 };
 
 }

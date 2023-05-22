@@ -19,6 +19,7 @@
 
 #include <gutil/strings/substitute.h>
 #include <thrift/protocol/TDebugProtocol.h>
+#include <thrift/protocol/TJSONProtocol.h>
 
 #include "catalog/catalog-util.h"
 #include "exec/read-write-util.h"
@@ -31,6 +32,7 @@
 #include "util/event-metrics.h"
 #include "util/logging-support.h"
 #include "util/metrics.h"
+#include "util/thrift-debug-util.h"
 #include "util/webserver.h"
 
 #include "common/names.h"
@@ -38,7 +40,6 @@
 using boost::bind;
 using boost::mem_fn;
 using namespace apache::thrift;
-using namespace impala;
 using namespace rapidjson;
 using namespace strings;
 
@@ -73,11 +74,75 @@ DEFINE_int64_hidden(catalog_partial_fetch_rpc_queue_timeout_s, LLONG_MAX, "Maxim
     "(in seconds) a partial catalog object fetch RPC spends in the queue waiting "
     "to run. Must be set to a value greater than zero.");
 
+DEFINE_int32(catalog_max_lock_skipped_topic_updates, 3, "Maximum number of topic "
+    "updates skipped for a table due to lock contention in catalogd after which it must"
+    "be added to the topic the update log. This limit only applies to distinct lock "
+    "operations which block the topic update thread.");
+
+DEFINE_int64(topic_update_tbl_max_wait_time_ms, 120000, "Maximum time "
+     "(in milliseconds) catalog's topic update thread will wait to acquire lock on "
+     "table. If the topic update thread cannot acquire a table lock it skips the table "
+     "from that topic update and processes the table in the next update. However to "
+     "prevent starvation it only skips the table catalog_max_lock_skipped_topic_updates "
+     "many times. After that limit is hit, topic thread block until it acquires the "
+     "table lock. A value of 0 disables the timeout based locking which means topic "
+     "update thread will always block until table lock is acquired.");
+
+DEFINE_int32(max_wait_time_for_sync_ddl_s, 0, "Maximum time (in seconds) until "
+     "which a sync ddl operation will wait for the updated tables "
+     "to be the added to the catalog topic. A value of 0 means sync ddl operation will "
+     "wait as long as necessary until the update is propogated to all the coordinators. "
+     "This flag only takes effect when topic_update_tbl_max_wait_time_ms is enabled."
+     "A value greater than 0 means catalogd will wait until that number of seconds "
+     "before throwing an error indicating that not all the "
+     "coordinators might have applied the changes caused due to the ddl.");
+
+DECLARE_string(debug_actions);
+DEFINE_bool(start_hms_server, false, "When set to true catalog server starts a HMS "
+    "server at a port specified by hms_port flag");
+
+DEFINE_int32(hms_port, 5899, "If start_hms_server is set to true, this "
+    "configuration specifies the port number at which it is started.");
+
+DEFINE_bool(fallback_to_hms_on_errors, true, "This configuration is only used if "
+    "start_hms_server is true. This is used to determine if the Catalog should fallback "
+    "to the backing HMS service if there are errors while processing the HMS request");
+
+DEFINE_bool(invalidate_hms_cache_on_ddls, true, "This configuration is used "
+    "only if start_hms_server is true. This is used to invalidate catalogd cache "
+    "for non transactional tables if alter/create/delete table hms apis are "
+     "invoked over catalogd's metastore endpoint");
+
+DEFINE_bool(hms_event_incremental_refresh_transactional_table, true, "When set to true "
+    "events processor will refresh transactional tables incrementally for partition "
+    "level events. Otherwise, it will always reload the whole table for transactional "
+    "tables.");
+
+DEFINE_bool(enable_sync_to_latest_event_on_ddls, false, "This configuration is "
+    "used to sync db/table in catalogd cache to latest HMS event id whenever DDL "
+    "operations are performed from Impala shell and catalog metastore server "
+    "(if enabled). If this config is enabled, then the flag invalidate_hms_cache_on_ddls "
+    "should be disabled");
+
+DEFINE_bool(enable_reload_events, false, "This configuration is used to fire a "
+    "refresh/invalidate table event to the HMS such that other event processors "
+    "(such as other Impala catalogds) that poll HMS notification logs can process "
+    "this event. The default value is false, so impala will not fire this "
+    "event. If enabled, impala will fire this event and other catalogD will process it."
+    "This config only affects the firing of the reload event. Processing of reload "
+    "event will always happen");
+
 DECLARE_string(state_store_host);
 DECLARE_int32(state_store_subscriber_port);
 DECLARE_int32(state_store_port);
 DECLARE_string(hostname);
 DECLARE_bool(compact_catalog_topic);
+
+#ifndef NDEBUG
+DECLARE_int32(stress_catalog_startup_delay_ms);
+#endif
+
+namespace impala {
 
 string CatalogServer::IMPALA_CATALOG_TOPIC = "catalog-update";
 
@@ -91,10 +156,13 @@ const string CATALOG_WEB_PAGE = "/catalog";
 const string CATALOG_TEMPLATE = "catalog.tmpl";
 const string CATALOG_OBJECT_WEB_PAGE = "/catalog_object";
 const string CATALOG_OBJECT_TEMPLATE = "catalog_object.tmpl";
+const string CATALOG_OPERATIONS_WEB_PAGE = "/operations";
+const string CATALOG_OPERATIONS_TEMPLATE = "catalog_operations.tmpl";
 const string TABLE_METRICS_WEB_PAGE = "/table_metrics";
 const string TABLE_METRICS_TEMPLATE = "table_metrics.tmpl";
 const string EVENT_WEB_PAGE = "/events";
 const string EVENT_METRICS_TEMPLATE = "events.tmpl";
+const string CATALOG_SERVICE_HEALTH_WEB_PAGE = "/healthz";
 
 const int REFRESH_METRICS_INTERVAL_MS = 1000;
 
@@ -120,6 +188,7 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   void ResetMetadata(TResetMetadataResponse& resp, const TResetMetadataRequest& req)
       override {
     VLOG_RPC << "ResetMetadata(): request=" << ThriftDebugString(req);
+    DebugActionNoFail(FLAGS_debug_actions, "RESET_METADATA_DELAY");
     Status status = catalog_server_->catalog()->ResetMetadata(req, &resp);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     TStatus thrift_status;
@@ -161,7 +230,7 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
     Status status = catalog_server_->catalog()->GetCatalogObject(req.object_desc,
         &resp.catalog_object);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
-    VLOG_RPC << "GetCatalogObject(): response=" << ThriftDebugString(resp);
+    VLOG_RPC << "GetCatalogObject(): response=" << ThriftDebugStringNoThrow(resp);
   }
 
   void GetPartialCatalogObject(TGetPartialCatalogObjectResponse& resp,
@@ -179,7 +248,7 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
     resp.__set_status(thrift_status);
-    VLOG_RPC << "GetPartialCatalogObject(): response=" << ThriftDebugString(resp);
+    VLOG_RPC << "GetPartialCatalogObject(): response=" << ThriftDebugStringNoThrow(resp);
   }
 
   void GetPartitionStats(TGetPartitionStatsResponse& resp,
@@ -190,7 +259,7 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
     resp.__set_status(thrift_status);
-    VLOG_RPC << "GetPartitionStats(): response=" << ThriftDebugString(resp);
+    VLOG_RPC << "GetPartitionStats(): response=" << ThriftDebugStringNoThrow(resp);
   }
 
   // Prioritizes the loading of metadata for one or more catalog objects. Currently only
@@ -205,17 +274,6 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
     status.ToThrift(&thrift_status);
     resp.__set_status(thrift_status);
     VLOG_RPC << "PrioritizeLoad(): response=" << ThriftDebugString(resp);
-  }
-
-  void SentryAdminCheck(TSentryAdminCheckResponse& resp,
-      const TSentryAdminCheckRequest& req) override {
-    VLOG_RPC << "SentryAdminCheck(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->SentryAdminCheck(req, &resp);
-    if (!status.ok()) LOG(ERROR) << status.GetDetail();
-    TStatus thrift_status;
-    status.ToThrift(&thrift_status);
-    resp.__set_status(thrift_status);
-    VLOG_RPC << "SentryAdminCheck(): response=" << ThriftDebugString(resp);
   }
 
   void UpdateTableUsage(TUpdateTableUsageResponse& resp,
@@ -250,6 +308,11 @@ Status CatalogServer::Start() {
 
   // This will trigger a full Catalog metadata load.
   catalog_.reset(new Catalog());
+#ifndef NDEBUG
+  if (FLAGS_stress_catalog_startup_delay_ms > 0) {
+    SleepForMs(FLAGS_stress_catalog_startup_delay_ms);
+  }
+#endif
   RETURN_IF_ERROR(Thread::Create("catalog-server", "catalog-update-gathering-thread",
       &CatalogServer::GatherCatalogUpdatesThread, this,
       &catalog_update_gathering_thread_));
@@ -284,7 +347,15 @@ Status CatalogServer::Start() {
   return Status::OK();
 }
 
-void CatalogServer::RegisterWebpages(Webserver* webserver) {
+void CatalogServer::RegisterWebpages(Webserver* webserver, bool metrics_only) {
+  Webserver::RawUrlCallback healthz_callback =
+      [this](const auto& req, auto* data, auto* response) {
+        return this->HealthzHandler(req, data, response);
+      };
+  webserver->RegisterUrlCallback(CATALOG_SERVICE_HEALTH_WEB_PAGE, healthz_callback);
+
+  if (metrics_only) return;
+
   webserver->RegisterUrlCallback(CATALOG_WEB_PAGE, CATALOG_TEMPLATE,
       [this](const auto& args, auto* doc) { this->CatalogUrlCallback(args, doc); }, true);
   webserver->RegisterUrlCallback(CATALOG_OBJECT_WEB_PAGE, CATALOG_OBJECT_TEMPLATE,
@@ -296,6 +367,9 @@ void CatalogServer::RegisterWebpages(Webserver* webserver) {
   webserver->RegisterUrlCallback(EVENT_WEB_PAGE, EVENT_METRICS_TEMPLATE,
       [this](const auto& args, auto* doc) { this->EventMetricsUrlCallback(args, doc); },
       false);
+  webserver->RegisterUrlCallback(CATALOG_OPERATIONS_WEB_PAGE, CATALOG_OPERATIONS_TEMPLATE,
+      [this](const auto& args, auto* doc) { this->OperationUsageUrlCallback(args, doc); },
+      true);
   RegisterLogLevelCallbacks(webserver, true);
 }
 
@@ -306,7 +380,7 @@ void CatalogServer::UpdateCatalogTopicCallback(
       incoming_topic_deltas.find(CatalogServer::IMPALA_CATALOG_TOPIC);
   if (topic == incoming_topic_deltas.end()) return;
 
-  try_mutex::scoped_try_lock l(catalog_lock_);
+  unique_lock<mutex> l(catalog_lock_, std::try_to_lock);
   // Return if unable to acquire the catalog_lock_ or if the topic update data is
   // not yet ready for processing. This indicates the catalog_update_gathering_thread_
   // is still building a topic update.
@@ -610,6 +684,7 @@ void CatalogServer::CatalogObjectsUrlCallback(const Webserver::WebRequest& req,
   const auto& args = req.parsed_args;
   Webserver::ArgumentMap::const_iterator object_type_arg = args.find("object_type");
   Webserver::ArgumentMap::const_iterator object_name_arg = args.find("object_name");
+  Webserver::ArgumentMap::const_iterator json_arg = args.find("json");
   if (object_type_arg != args.end() && object_name_arg != args.end()) {
     TCatalogObjectType::type object_type =
         TCatalogObjectTypeFromName(object_type_arg->second);
@@ -619,13 +694,28 @@ void CatalogServer::CatalogObjectsUrlCallback(const Webserver::WebRequest& req,
     Status status =
         TCatalogObjectFromObjectName(object_type, object_name_arg->second, &request);
 
-    // Get the object and dump its contents.
-    TCatalogObject result;
-    if (status.ok()) status = catalog_->GetCatalogObject(request, &result);
-    if (status.ok()) {
-      Value debug_string(ThriftDebugString(result).c_str(), document->GetAllocator());
-      document->AddMember("thrift_string", debug_string, document->GetAllocator());
+    if (json_arg != args.end()) {
+      // Get the JSON string from FE since Thrift doesn't have a cpp implementation for
+      // SimpleJsonProtocol (THRIFT-2476), so we use it's java implementation.
+      // TODO: switch to use cpp implementation of SimpleJsonProtocol after THRIFT-2476
+      //  is resolved.
+      string json_str;
+      if (status.ok()) status = catalog_->GetJsonCatalogObject(request, &json_str);
+      if (status.ok()) {
+        Value debug_string(json_str.c_str(), document->GetAllocator());
+        document->AddMember("json_string", debug_string, document->GetAllocator());
+      }
     } else {
+      // Get the object and dump its contents.
+      TCatalogObject result;
+      if (status.ok()) status = catalog_->GetCatalogObject(request, &result);
+      if(status.ok()) {
+        Value debug_string(
+            ThriftDebugStringNoThrow(result).c_str(), document->GetAllocator());
+        document->AddMember("thrift_string", debug_string, document->GetAllocator());
+      }
+    }
+    if (!status.ok()) {
       Value error(status.GetDetail().c_str(), document->GetAllocator());
       document->AddMember("error", error, document->GetAllocator());
     }
@@ -634,6 +724,49 @@ void CatalogServer::CatalogObjectsUrlCallback(const Webserver::WebRequest& req,
         document->GetAllocator());
     document->AddMember("error", error, document->GetAllocator());
   }
+}
+
+void CatalogServer::OperationUsageUrlCallback(
+    const Webserver::WebRequest& req, Document* document) {
+  TGetOperationUsageResponse opeartion_usage;
+  Status status = catalog_->GetOperationUsage(&opeartion_usage);
+  if (!status.ok()) {
+    Value error(status.GetDetail().c_str(), document->GetAllocator());
+    document->AddMember("error", error, document->GetAllocator());
+    return;
+  }
+
+  // Add the catalog operation counters to the document
+  Value catalog_op_list(kArrayType);
+  for (const auto& catalog_op : opeartion_usage.catalog_op_counters) {
+    Value catalog_op_obj(kObjectType);
+    Value op_name(catalog_op.catalog_op_name.c_str(), document->GetAllocator());
+    catalog_op_obj.AddMember("catalog_op_name", op_name, document->GetAllocator());
+    Value op_counter;
+    op_counter.SetInt64(catalog_op.op_counter);
+    catalog_op_obj.AddMember("op_counter", op_counter, document->GetAllocator());
+    Value table_name(catalog_op.table_name.c_str(), document->GetAllocator());
+    catalog_op_obj.AddMember("table_name", table_name, document->GetAllocator());
+    catalog_op_list.PushBack(catalog_op_obj, document->GetAllocator());
+  }
+  document->AddMember("catalog_op_list", catalog_op_list, document->GetAllocator());
+
+  // Create a summary and add it to the document
+  map<string, int> aggregated_operations;
+  for (const auto& catalog_op : opeartion_usage.catalog_op_counters) {
+    aggregated_operations[catalog_op.catalog_op_name] += catalog_op.op_counter;
+  }
+  Value catalog_op_summary(kArrayType);
+  for (const auto& catalog_op : aggregated_operations) {
+    Value catalog_op_obj(kObjectType);
+    Value op_name(catalog_op.first.c_str(), document->GetAllocator());
+    catalog_op_obj.AddMember("catalog_op_name", op_name, document->GetAllocator());
+    Value op_counter;
+    op_counter.SetInt64(catalog_op.second);
+    catalog_op_obj.AddMember("op_counter", op_counter, document->GetAllocator());
+    catalog_op_summary.PushBack(catalog_op_obj, document->GetAllocator());
+  }
+  document->AddMember("catalog_op_summary", catalog_op_summary, document->GetAllocator());
 }
 
 void CatalogServer::TableMetricsUrlCallback(const Webserver::WebRequest& req,
@@ -669,7 +802,7 @@ void CatalogServer::TableMetricsUrlCallback(const Webserver::WebRequest& req,
   }
 }
 
-bool CatalogServer::AddPendingTopicItem(std::string key, int64_t version,
+int CatalogServer::AddPendingTopicItem(std::string key, int64_t version,
     const uint8_t* item_data, uint32_t size, bool deleted) {
   pending_topic_updates_.emplace_back();
   TTopicItem& item = pending_topic_updates_.back();
@@ -678,7 +811,7 @@ bool CatalogServer::AddPendingTopicItem(std::string key, int64_t version,
     if (!status.ok()) {
       pending_topic_updates_.pop_back();
       LOG(ERROR) << "Error compressing topic item: " << status.GetDetail();
-      return false;
+      return -1;
     }
   } else {
     item.value.assign(reinterpret_cast<const char*>(item_data),
@@ -686,9 +819,26 @@ bool CatalogServer::AddPendingTopicItem(std::string key, int64_t version,
   }
   item.key = std::move(key);
   item.deleted = deleted;
+  // Skip logging partition items since FE will log their summary (IMPALA-10076).
+  if (item.key.find("HDFS_PARTITION") != string::npos) return item.value.size();
   VLOG(1) << "Collected " << (deleted ? "deletion: " : "update: ") << item.key
           << ", version=" << version << ", original size=" << size
           << (FLAGS_compact_catalog_topic ?
               Substitute(", compressed size=$0", item.value.size()) : string());
-  return true;
+  return item.value.size();
+}
+
+void CatalogServer::MarkServiceAsStarted() { service_started_ = true; }
+
+void CatalogServer::HealthzHandler(
+    const Webserver::WebRequest& req, std::stringstream* data, HttpStatusCode* response) {
+  if (service_started_) {
+    (*data) << "OK";
+    *response = HttpStatusCode::Ok;
+    return;
+  }
+  *(data) << "Not Available";
+  *response = HttpStatusCode::ServiceUnavailable;
+}
+
 }

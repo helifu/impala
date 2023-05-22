@@ -17,12 +17,14 @@
 
 #include "exec/parquet/hdfs-parquet-table-writer.h"
 
+#include <boost/algorithm/string.hpp>
 #include <boost/unordered_set.hpp>
 
 #include "common/version.h"
 #include "exec/hdfs-table-sink.h"
 #include "exec/parquet/parquet-column-stats.inline.h"
 #include "exec/parquet/parquet-metadata-utils.h"
+#include "exec/parquet/parquet-bloom-filter-util.h"
 #include "exprs/scalar-expr-evaluator.h"
 #include "exprs/scalar-expr.h"
 #include "rpc/thrift-util.h"
@@ -32,6 +34,7 @@
 #include "runtime/raw-value.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
+#include "runtime/scoped-buffer.h"
 #include "runtime/string-value.inline.h"
 #include "util/bit-stream-utils.h"
 #include "util/bit-util.h"
@@ -40,11 +43,13 @@
 #include "util/debug-util.h"
 #include "util/dict-encoding.h"
 #include "util/hdfs-util.h"
+#include "util/parquet-bloom-filter.h"
 #include "util/pretty-printer.h"
 #include "util/rle-encoding.h"
 #include "util/string-util.h"
 
 #include <sstream>
+#include <string>
 
 #include "gen-cpp/ImpalaService_types.h"
 
@@ -86,7 +91,28 @@ using namespace apache::thrift;
 // the columns and run that function over row batches.
 // TODO: we need to pass in the compression from the FE/metadata
 
+static const string PARQUET_MEM_LIMIT_EXCEEDED =
+    "HdfsParquetTableWriter::$0() failed to allocate $1 bytes for $2.";
+
+DEFINE_bool_hidden(write_new_parquet_dictionary_encodings, false,
+    "(Experimental) Write parquet files with PLAIN/RLE_DICTIONARY encoding instead of "
+    "PLAIN_DICTIONARY as recommended by Parquet 2.0 standard");
+
 namespace impala {
+
+// Returns the parquet::Encoding enum value to use for plain-encoded dictionary pages.
+static parquet::Encoding::type DictPageEncoding() {
+  return FLAGS_write_new_parquet_dictionary_encodings ?
+          parquet::Encoding::PLAIN :
+          parquet::Encoding::PLAIN_DICTIONARY;
+}
+
+// Returns the parquet::Encoding enum value to use for dictionary-encoded data pages.
+static parquet::Encoding::type DataPageDictionaryEncoding() {
+  return FLAGS_write_new_parquet_dictionary_encodings ?
+          parquet::Encoding::RLE_DICTIONARY:
+          parquet::Encoding::PLAIN_DICTIONARY;
+}
 
 // Base class for column writers. This contains most of the logic except for
 // the type specific functions which are implemented in the subclasses.
@@ -98,7 +124,7 @@ class HdfsParquetTableWriter::BaseColumnWriter {
     : parent_(parent),
       expr_eval_(expr_eval),
       codec_info_(codec_info),
-      page_size_(DEFAULT_DATA_PAGE_SIZE),
+      plain_page_size_(parent->default_plain_page_size()),
       current_page_(nullptr),
       num_values_(0),
       total_compressed_byte_size_(0),
@@ -280,11 +306,25 @@ class HdfsParquetTableWriter::BaseColumnWriter {
   // Implemented in the subclass.
   virtual bool ProcessValue(void* value, int64_t* bytes_needed) WARN_UNUSED_RESULT = 0;
 
+  // Returns the bytes needed to represent the value in a PLAIN encoded page.
+  virtual int64_t BytesNeededFor(void* value) = 0;
+
+  // Increases the page size to be able to hold a value of size bytes_needed.
+  Status GrowPageSize(int64_t bytes_needed) WARN_UNUSED_RESULT;
 
   // Subclasses can override this function to convert values after the expression was
   // evaluated. Used by int64 timestamp writers to change the TimestampValue returned by
   // the expression to an int64.
   virtual void* ConvertValue(void* value) { return value; }
+
+  // Some subclasses may write a ParquetBloomFilter, in which case they should override
+  // this method.
+  virtual const ParquetBloomFilter* GetParquetBloomFilter() const {
+    return nullptr;
+  }
+
+  // Some subclasses need to flush their dictionary to a bloom filter when full.
+  virtual void FlushDictionaryToParquetBloomFilterIfNeeded() { }
 
   // Encodes out all data for the current page and updates the metadata.
   virtual Status FinalizeCurrentPage() WARN_UNUSED_RESULT;
@@ -324,12 +364,14 @@ class HdfsParquetTableWriter::BaseColumnWriter {
   // compressed.
   scoped_ptr<Codec> compressor_;
 
-  // Size of newly created pages. Defaults to DEFAULT_DATA_PAGE_SIZE and is increased
-  // when pages are not big enough. This only happens when there are enough unique values
-  // such that we switch from PLAIN_DICTIONARY to PLAIN encoding and then have very
-  // large values (i.e. greater than DEFAULT_DATA_PAGE_SIZE).
+  // Size of newly created PLAIN encoded pages. Defaults to DEFAULT_DATA_PAGE_SIZE or to
+  // the value of 'write.parquet.page-size-bytes' table property for Iceberg tables.
+  // Its value is increased when pages are not big enough. This only happens when there
+  // are enough unique values such that we switch from PLAIN_DICTIONARY/RLE_DICTIONARY to
+  // PLAIN encoding and then have very large values (i.e. greater than
+  // DEFAULT_DATA_PAGE_SIZE).
   // TODO: Consider removing and only creating a single large page as necessary.
-  int64_t page_size_;
+  int64_t plain_page_size_;
 
   // Pages belong to this column chunk. We need to keep them in memory in order to write
   // them together.
@@ -409,45 +451,80 @@ class HdfsParquetTableWriter::ColumnWriter :
       const Codec::CodecInfo& codec_info, const std::string& col_name)
     : BaseColumnWriter(parent, eval, codec_info, col_name),
       num_values_since_dict_size_check_(0),
+      parquet_bloom_filter_bytes_(0),
+      parquet_bloom_filter_buffer_(table_sink_mem_tracker_),
       plain_encoded_value_size_(
           ParquetPlainEncoder::EncodedByteSize(eval->root().type())) {
     DCHECK_NE(eval->root().type().type, TYPE_BOOLEAN);
+
+    const std::map<string, int64_t>& col_to_size =
+      parent->parent_->GetParquetBloomFilterColumns();
+    const auto it = col_to_size.find(column_name());
+
+    if (GetBloomFilterWriteOption() == TParquetBloomFilterWrite::NEVER
+        || it == col_to_size.end()) {
+      // Parquet Bloom filtering is disabled altogether or is not turned on for this
+      // column.
+      parquet_bloom_filter_state_ = ParquetBloomFilterState::DISABLED;
+    } else {
+      // Parquet Bloom filtering is enabled for this column either immediately or if
+      // falling back from dict encoding.
+      parquet_bloom_filter_state_ = ParquetBloomFilterState::UNINITIALIZED;
+
+      // It is the responsibility of the FE to enforce the below constraints.
+      parquet_bloom_filter_bytes_ = it->second;
+      DCHECK_LE(parquet_bloom_filter_bytes_, ParquetBloomFilter::MAX_BYTES);
+      DCHECK_GE(parquet_bloom_filter_bytes_, ParquetBloomFilter::MIN_BYTES);
+      DCHECK(BitUtil::IsPowerOf2(parquet_bloom_filter_bytes_));
+    }
+    parquet_type_ = ParquetMetadataUtils::ConvertInternalToParquetType(type().type,
+        parent_->timestamp_type_);
   }
 
-  virtual void Reset() {
+  void Reset() override {
     BaseColumnWriter::Reset();
     valid_column_index_ = true;
     // Default to dictionary encoding.  If the cardinality ends up being too high,
     // it will fall back to plain.
-    current_encoding_ = parquet::Encoding::PLAIN_DICTIONARY;
-    next_page_encoding_ = parquet::Encoding::PLAIN_DICTIONARY;
-    dict_encoder_.reset(
-        new DictEncoder<T>(parent_->per_file_mem_pool_.get(), plain_encoded_value_size_,
-            parent_->parent_->mem_tracker()));
+    current_encoding_ = DataPageDictionaryEncoding();
+    next_page_encoding_ = DataPageDictionaryEncoding();
+    dict_encoder_.reset(new DictEncoder<T>(parent_->per_file_mem_pool_.get(),
+        plain_encoded_value_size_, parent_->parent_->mem_tracker()));
     dict_encoder_base_ = dict_encoder_.get();
     page_stats_.reset(
         new ColumnStats<T>(parent_->per_file_mem_pool_.get(), plain_encoded_value_size_));
     page_stats_base_ = page_stats_.get();
     row_group_stats_.reset(
         new ColumnStats<T>(parent_->per_file_mem_pool_.get(), plain_encoded_value_size_));
+    if (parquet_bloom_filter_state_ != ParquetBloomFilterState::DISABLED) {
+      Status status = InitParquetBloomFilter();
+      if (!status.ok()) {
+        VLOG(google::WARNING)
+            << "Failed to initialise Parquet Bloom filter for column "
+            << column_name() << "."
+            << " Error message: " << status.msg().msg();
+        ReleaseParquetBloomFilterResources();
+      }
+    }
     row_group_stats_base_ = row_group_stats_.get();
   }
 
  protected:
-  virtual bool ProcessValue(void* value, int64_t* bytes_needed) {
+  bool ProcessValue(void* value, int64_t* bytes_needed) override {
     T* val = CastValue(value);
-    if (current_encoding_ == parquet::Encoding::PLAIN_DICTIONARY) {
+    if (IsDictionaryEncoding(current_encoding_)) {
       if (UNLIKELY(num_values_since_dict_size_check_ >=
                    DICTIONARY_DATA_PAGE_SIZE_CHECK_PERIOD)) {
         num_values_since_dict_size_check_ = 0;
-        if (dict_encoder_->EstimatedDataEncodedSize() >= page_size_) return false;
+        if (dict_encoder_->EstimatedDataEncodedSize() >= parent_->dict_page_size()) {
+          return false;
+        }
       }
       ++num_values_since_dict_size_check_;
       *bytes_needed = dict_encoder_->Put(*val);
-      // If the dictionary contains the maximum number of values, switch to plain
-      // encoding for the next page. The current page is full and must be written out.
+      // If the dictionary contains the maximum number of values, the current page is
+      // full and must be written out. FinalizeCurrentPage handles dict cleanup.
       if (UNLIKELY(*bytes_needed < 0)) {
-        next_page_encoding_ = parquet::Encoding::PLAIN;
         return false;
       }
       parent_->file_size_estimate_ += *bytes_needed;
@@ -455,7 +532,10 @@ class HdfsParquetTableWriter::ColumnWriter :
       *bytes_needed = plain_encoded_value_size_ < 0 ?
           ParquetPlainEncoder::ByteSize<T>(*val) :
           plain_encoded_value_size_;
-      if (current_page_->header.uncompressed_page_size + *bytes_needed > page_size_) {
+      if (current_page_->header.uncompressed_page_size + *bytes_needed >
+          plain_page_size_) {
+        // Shouldn't happen on an empty page as it should be sized for bytes_needed.
+        DCHECK_GT(current_page_->header.uncompressed_page_size, 0);
         return false;
       }
       uint8_t* dst_ptr = values_buffer_ + current_page_->header.uncompressed_page_size;
@@ -477,7 +557,40 @@ class HdfsParquetTableWriter::ColumnWriter :
     }
 
     page_stats_->Update(*val);
+    UpdateParquetBloomFilterIfNeeded(val);
+
     return true;
+  }
+
+  int64_t BytesNeededFor(void* value) override {
+    if (plain_encoded_value_size_ >= 0) return plain_encoded_value_size_;
+    T* val = CastValue(value);
+    return ParquetPlainEncoder::ByteSize<T>(*val);
+  }
+
+  const ParquetBloomFilter* GetParquetBloomFilter() const override {
+    return parquet_bloom_filter_.get();
+  }
+
+  void FlushDictionaryToParquetBloomFilterIfNeeded() override {
+    if (parquet_bloom_filter_state_
+        == ParquetBloomFilterState::WAIT_FOR_FALLBACK_FROM_DICT) {
+      parquet_bloom_filter_state_ = ParquetBloomFilterState::ENABLED;
+
+      // Write dictionary keys to Parquet Bloom filter if we haven't been filling it so
+      // far (and Bloom filtering is enabled). If there are too many values for a
+      // dictionary, a Bloom filter may still be useful.
+      Status status = DictKeysToParquetBloomFilter();
+      if (!status.ok()) {
+        VLOG(google::WARNING)
+            << "Failed to add dictionary keys to Parquet Bloom filter for column "
+            << column_name()
+            << " when falling back from dictionary encoding to plain encoding."
+            << " Error message: " << status.msg().msg();
+        parquet_bloom_filter_state_ = ParquetBloomFilterState::FAILED;
+        ReleaseParquetBloomFilterResources();
+      }
+    }
   }
 
  private:
@@ -505,10 +618,142 @@ class HdfsParquetTableWriter::ColumnWriter :
   // Tracks statistics per row group. This gets reset when starting a new row group.
   scoped_ptr<ColumnStats<T>> row_group_stats_;
 
+
+  enum struct ParquetBloomFilterState {
+    /// Parquet Bloom filtering is turned off either completely or for this column.
+    DISABLED,
+
+    /// The Parquet Bloom filter needs to be initialised before being used.
+    UNINITIALIZED,
+
+    /// The Bloom filter has been initialised but it is not being used as the dictionary
+    /// can hold all elements. If the dictionary becomes full and there are still new
+    /// elements, we fall back from dictionary encoding to plain encoding and start using
+    /// the Bloom filter.
+    WAIT_FOR_FALLBACK_FROM_DICT,
+
+    /// The Parquet Bloom filter is being used.
+    ENABLED,
+
+    /// An error occured with the Parquet Bloom filter so we are not using it.
+    FAILED
+  };
+
+  ParquetBloomFilterState parquet_bloom_filter_state_;
+  uint64_t parquet_bloom_filter_bytes_;
+  ScopedBuffer parquet_bloom_filter_buffer_;
+
+  // The parquet type corresponding to this->type(). Needed by the Parquet Bloom filter.
+  parquet::Type::type parquet_type_;
+
+  // Buffer used when converting values to the form that is used for hashing and insertion
+  // into the ParquetBloomFilter. The conversion function, 'BytesToParquetType' requires a
+  // vector to be able to allocate space if necessary. However, by caching the allocated
+  // buffer here we avoid the overhead of allocation for every conversion - when
+  // 'BytesToParquetType' calls 'resize' on the vector it will already have at least the
+  // desired length in most (or all) cases.
+  //
+  // We prellocate 16 bytes because that is the longest fixed size type (except for fixed
+  // length arrays).
+  std::vector<uint8_t> parquet_bloom_conversion_buffer{16, 0};
+
+  // The ParquetBloomFilter object if one is being written. If
+  // 'ShouldInitParquetBloomFilter()' is false, the combination of the impala type and the
+  // parquet type is not supported or some error occurs during the initialisation of the
+  // ParquetBloomFilter object, it is set to NULL.
+  unique_ptr<ParquetBloomFilter> parquet_bloom_filter_;
+
   // Converts a slot pointer to a raw value suitable for encoding
   inline T* CastValue(void* value) {
     return reinterpret_cast<T*>(value);
   }
+
+  Status InitParquetBloomFilter() WARN_UNUSED_RESULT {
+    DCHECK(parquet_bloom_filter_state_ != ParquetBloomFilterState::DISABLED);
+    const ColumnType& impala_type = type();
+    if (!IsParquetBloomFilterSupported(parquet_type_, impala_type)) {
+      stringstream ss;
+      ss << "Parquet Bloom filtering not supported for parquet type " << parquet_type_
+          << " and impala type " << impala_type << ".";
+      return Status::Expected(ss.str());
+    }
+
+    parquet_bloom_filter_buffer_.Release();
+    if (!parquet_bloom_filter_buffer_.TryAllocate(parquet_bloom_filter_bytes_)) {
+      parquet_bloom_filter_state_ = ParquetBloomFilterState::FAILED;
+      return Status(Substitute("Could not allocate buffer of $0 bytes for Parquet "
+            "Bloom filter data when writing column '$1'.",
+            parquet_bloom_filter_bytes_, column_name()));
+    }
+    std::memset(parquet_bloom_filter_buffer_.buffer(), 0,
+        parquet_bloom_filter_buffer_.Size());
+
+    parquet_bloom_filter_ = make_unique<ParquetBloomFilter>();
+    Status status = parquet_bloom_filter_->Init(parquet_bloom_filter_buffer_.buffer(),
+          parquet_bloom_filter_buffer_.Size(), true);
+
+    if (!status.ok()) {
+      parquet_bloom_filter_state_ = ParquetBloomFilterState::FAILED;
+      return status;
+    } else {
+      const bool should_wait_for_fallback =
+          (GetBloomFilterWriteOption() == TParquetBloomFilterWrite::IF_NO_DICT)
+          && IsDictionaryEncoding(current_encoding_);
+      parquet_bloom_filter_state_ = should_wait_for_fallback
+          ? ParquetBloomFilterState::WAIT_FOR_FALLBACK_FROM_DICT
+          : ParquetBloomFilterState::ENABLED;;
+      return Status::OK();
+    }
+  }
+
+  void UpdateParquetBloomFilterIfNeeded(const void* val) {
+    if (parquet_bloom_filter_state_ == ParquetBloomFilterState::ENABLED) {
+      Status status = UpdateParquetBloomFilter(val);
+      if (!status.ok()) {
+        // If an error happens, for example conversion to the form expected by the Bloom
+        // filter fails, we stop writing the Bloom filter and release resources associated
+        // with it.
+        VLOG(google::WARNING)
+            << "An error happened updating Parquet Bloom filter in column "
+            << column_name() << " at row idx " << parent_->row_idx_ << "."
+            << " Error message: " << status.msg().msg();
+        parquet_bloom_filter_state_ = ParquetBloomFilterState::FAILED;
+        ReleaseParquetBloomFilterResources();
+      }
+    }
+  }
+
+  Status UpdateParquetBloomFilter(const void* val) WARN_UNUSED_RESULT {
+    DCHECK(parquet_bloom_filter_state_ == ParquetBloomFilterState::ENABLED);
+    DCHECK(parquet_bloom_filter_ != nullptr);
+
+    uint8_t* ptr = nullptr;
+    size_t len = -1;
+    const ColumnType& impala_type = type();
+    RETURN_IF_ERROR(BytesToParquetType(val, impala_type, parquet_type_,
+        &parquet_bloom_conversion_buffer, &ptr, &len));
+    DCHECK(ptr != nullptr);
+    DCHECK(len != -1);
+    parquet_bloom_filter_->HashAndInsert(ptr, len);
+
+    return Status::OK();
+  }
+
+  void ReleaseParquetBloomFilterResources() {
+    parquet_bloom_filter_ = nullptr;
+    parquet_bloom_filter_buffer_.Release();
+  }
+
+  Status DictKeysToParquetBloomFilter() {
+    return dict_encoder_->ForEachDictKey([this](const T& value) {
+        return UpdateParquetBloomFilter(&value);
+        });
+  }
+
+  TParquetBloomFilterWrite::type GetBloomFilterWriteOption() {
+    return parent_->state_->query_options().parquet_bloom_filter_write;
+  }
+
  protected:
   // Size of each encoded value in plain encoding. -1 if the type is variable-length.
   int64_t plain_encoded_value_size_;
@@ -547,14 +792,18 @@ class HdfsParquetTableWriter::BoolColumnWriter :
   }
 
  protected:
-  virtual bool ProcessValue(void* value, int64_t* bytes_needed) {
+  bool ProcessValue(void* value, int64_t* bytes_needed) override {
     bool v = *reinterpret_cast<bool*>(value);
     if (!bool_values_->PutValue(v, 1)) return false;
     page_stats_.Update(v);
     return true;
   }
 
-  virtual Status FinalizeCurrentPage() {
+  int64_t BytesNeededFor(void* value) override {
+    return 1;
+  }
+
+  Status FinalizeCurrentPage() override {
     DCHECK(current_page_ != nullptr);
     if (current_page_->finalized) return Status::OK();
     bool_values_->Flush();
@@ -594,6 +843,7 @@ public:
 
 protected:
   virtual void* ConvertValue(void* value) override {
+    if (UNLIKELY(value == nullptr)) return nullptr;
     const TimestampValue* ts = reinterpret_cast<TimestampValue*>(value);
     return ConvertTimestamp(*ts, &result_) ? &result_ : nullptr;
   }
@@ -661,49 +911,45 @@ inline Status HdfsParquetTableWriter::BaseColumnWriter::AppendRow(TupleRow* row)
   void* value = ConvertValue(expr_eval_->GetValue(row));
   if (current_page_ == nullptr) NewPage();
 
+  int64_t bytes_needed = 0;
   if (ShouldStartNewPage()) {
     RETURN_IF_ERROR(FinalizeCurrentPage());
+
+    if (value != nullptr) {
+      // Ensure the new page can hold the value so we don't create an empty page.
+      bytes_needed = BytesNeededFor(value);
+      if (UNLIKELY(bytes_needed > plain_page_size_)) {
+        RETURN_IF_ERROR(GrowPageSize(bytes_needed));
+      }
+    }
     NewPage();
   }
 
   // Encoding may fail for several reasons - because the current page is not big enough,
   // because we've encoded the maximum number of unique dictionary values and need to
-  // switch to plain encoding, etc. so we may need to try again more than once.
-  // TODO: Have a clearer set of state transitions here, to make it easier to see that
-  // this won't loop forever.
-  while (true) {
-    // Nulls don't get encoded. Increment the null count of the parquet statistics.
-    if (value == nullptr) {
-      DCHECK(page_stats_base_ != nullptr);
-      page_stats_base_->IncrementNullCount(1);
-      break;
-    }
-
-    int64_t bytes_needed = 0;
-    if (ProcessValue(value, &bytes_needed)) {
-      ++current_page_->num_non_null;
-      break; // Succesfully appended, don't need to retry.
-    }
-
+  // switch to plain encoding, etc. In these events, we finalize and create a new page.
+  // Nulls don't get encoded. Increment the null count of the parquet statistics.
+  if (value == nullptr) {
+    DCHECK(page_stats_base_ != nullptr);
+    page_stats_base_->IncrementNullCount(1);
+  } else if (ProcessValue(value, &bytes_needed)) {
+    // Succesfully appended.
+    ++current_page_->num_non_null;
+  } else {
     // Value didn't fit on page, try again on a new page.
     RETURN_IF_ERROR(FinalizeCurrentPage());
 
     // Check how much space is needed to write this value. If that is larger than the
     // page size then increase page size and try again.
-    if (UNLIKELY(bytes_needed > page_size_)) {
-      if (bytes_needed > MAX_DATA_PAGE_SIZE) {
-        stringstream ss;
-        ss << "Cannot write value of size "
-           << PrettyPrinter::Print(bytes_needed, TUnit::BYTES) << " bytes to a Parquet "
-           << "data page that exceeds the max page limit "
-           << PrettyPrinter::Print(MAX_DATA_PAGE_SIZE , TUnit::BYTES) << ".";
-        return Status(ss.str());
-      }
-      page_size_ = bytes_needed;
-      values_buffer_len_ = page_size_;
-      values_buffer_ = parent_->reusable_col_mem_pool_->Allocate(values_buffer_len_);
+    if (UNLIKELY(bytes_needed > plain_page_size_)) {
+      RETURN_IF_ERROR(GrowPageSize(bytes_needed));
     }
     NewPage();
+
+    // Try again. This must succeed as we've created a new page for this value.
+    bool ret = ProcessValue(value, &bytes_needed);
+    DCHECK(ret);
+    ++current_page_->num_non_null;
   }
 
   // Now that the value has been successfully written, write the definition level.
@@ -713,6 +959,20 @@ inline Status HdfsParquetTableWriter::BaseColumnWriter::AppendRow(TupleRow* row)
   DCHECK(ret);
   ++current_page_->header.data_page_header.num_values;
 
+  return Status::OK();
+}
+
+inline Status HdfsParquetTableWriter::BaseColumnWriter::GrowPageSize(
+    int64_t bytes_needed) {
+  if (bytes_needed > MAX_DATA_PAGE_SIZE) {
+    return Status(Substitute("Cannot write value of size $0 to a Parquet data page that "
+        "exceeds the max page limit $1.",
+        PrettyPrinter::Print(bytes_needed, TUnit::BYTES),
+        PrettyPrinter::Print(MAX_DATA_PAGE_SIZE , TUnit::BYTES)));
+  }
+  plain_page_size_ = bytes_needed;
+  values_buffer_len_ = plain_page_size_;
+  values_buffer_ = parent_->reusable_col_mem_pool_->Allocate(values_buffer_len_);
   return Status::OK();
 }
 
@@ -750,7 +1010,7 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
     // Write dictionary page header
     parquet::DictionaryPageHeader dict_header;
     dict_header.num_values = dict_encoder_base_->num_entries();
-    dict_header.encoding = parquet::Encoding::PLAIN_DICTIONARY;
+    dict_header.encoding = DictPageEncoding();
     ++dict_encoding_stats_[dict_header.encoding];
 
     parquet::PageHeader header;
@@ -759,8 +1019,14 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
     header.__set_dictionary_page_header(dict_header);
 
     // Write the dictionary page data, compressing it if necessary.
-    uint8_t* dict_buffer = parent_->per_file_mem_pool_->Allocate(
-        header.uncompressed_page_size);
+    uint8_t* dict_buffer =
+        parent_->per_file_mem_pool_->TryAllocate(header.uncompressed_page_size);
+    if (UNLIKELY(dict_buffer == nullptr)) {
+      string details = (Substitute(PARQUET_MEM_LIMIT_EXCEEDED, "BaseColumnWriter::Flush",
+          header.uncompressed_page_size, "dictionary page"));
+      return parent_->per_file_mem_pool_->mem_tracker()->MemLimitExceeded(
+          parent_->state_, details, header.uncompressed_page_size);
+    }
     dict_encoder_base_->WriteDict(dict_buffer);
     if (compressor_.get() != nullptr) {
       SCOPED_TIMER(parent_->parent_->compress_timer());
@@ -768,7 +1034,14 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
           compressor_->MaxOutputLen(header.uncompressed_page_size);
       DCHECK_GT(max_compressed_size, 0);
       uint8_t* compressed_data =
-          parent_->per_file_mem_pool_->Allocate(max_compressed_size);
+          parent_->per_file_mem_pool_->TryAllocate(max_compressed_size);
+      if (UNLIKELY(compressed_data == nullptr)) {
+        string details =
+            (Substitute(PARQUET_MEM_LIMIT_EXCEEDED, "BaseColumnWriter::Flush",
+                max_compressed_size, "compressed dictionary page"));
+        return parent_->per_file_mem_pool_->mem_tracker()->MemLimitExceeded(
+            parent_->state_, details, max_compressed_size);
+      }
       header.compressed_page_size = max_compressed_size;
       const Status& status =
           compressor_->ProcessBlock32(true, header.uncompressed_page_size, dict_buffer,
@@ -808,15 +1081,8 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
   // Write data pages
   for (const DataPage& page : pages_) {
     parquet::PageLocation location;
-
-    if (page.header.data_page_header.num_values == 0) {
-      // Skip empty pages
-      location.offset = -1;
-      location.compressed_page_size = 0;
-      location.first_row_index = -1;
-      AddLocationToOffsetIndex(location);
-      continue;
-    }
+    // There should be no empty pages.
+    DCHECK_NE(page.header.data_page_header.num_values, 0);
 
     location.offset = *file_pos;
     location.first_row_index = current_row_group_index;
@@ -846,6 +1112,7 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
 
 Status HdfsParquetTableWriter::BaseColumnWriter::FinalizeCurrentPage() {
   DCHECK(current_page_ != nullptr);
+  DCHECK_NE(current_page_->header.data_page_header.num_values, 0);
   if (current_page_->finalized) return Status::OK();
 
   // If the entire page was NULL, encode it as PLAIN since there is no
@@ -853,7 +1120,16 @@ Status HdfsParquetTableWriter::BaseColumnWriter::FinalizeCurrentPage() {
   // around a parquet MR bug (see IMPALA-759 for more details).
   if (current_page_->num_non_null == 0) current_encoding_ = parquet::Encoding::PLAIN;
 
-  if (current_encoding_ == parquet::Encoding::PLAIN_DICTIONARY) WriteDictDataPage();
+  if (IsDictionaryEncoding(current_encoding_)) {
+    // If the dictionary contains the maximum number of values, switch to plain
+    // encoding for the next page and flush the dictionary as well.
+    if (UNLIKELY(dict_encoder_base_->IsFull())) {
+      FlushDictionaryToParquetBloomFilterIfNeeded();
+      next_page_encoding_ = parquet::Encoding::PLAIN;
+    }
+
+    WriteDictDataPage();
+  }
 
   parquet::PageHeader& header = current_page_->header;
   header.data_page_header.encoding = current_encoding_;
@@ -920,6 +1196,7 @@ Status HdfsParquetTableWriter::BaseColumnWriter::FinalizeCurrentPage() {
 
   // Update row group statistics from page statistics.
   DCHECK(row_group_stats_base_ != nullptr);
+  RETURN_IF_ERROR(row_group_stats_base_->MaterializeStringValuesToInternalBuffers());
   row_group_stats_base_->Merge(*page_stats_base_);
 
   // Add the size of the data page header
@@ -964,14 +1241,77 @@ HdfsParquetTableWriter::HdfsParquetTableWriter(HdfsTableSink* parent, RuntimeSta
     file_size_limit_(0),
     reusable_col_mem_pool_(new MemPool(parent_->mem_tracker())),
     per_file_mem_pool_(new MemPool(parent_->mem_tracker())),
-    row_idx_(0) {}
+    row_idx_(0),
+    default_block_size_(0),
+    default_plain_page_size_(0),
+    dict_page_size_(0) {
+  is_iceberg_file_ = table_desc->IsIcebergTable();
+}
 
 HdfsParquetTableWriter::~HdfsParquetTableWriter() {
 }
 
+void HdfsParquetTableWriter::Configure(int num_cols) {
+  DCHECK(!is_iceberg_file_);
+
+  timestamp_type_ = state_->query_options().parquet_timestamp_type;
+
+  string_utf8_ = state_->query_options().parquet_annotate_strings_utf8;
+
+  if (state_->query_options().__isset.parquet_file_size &&
+      state_->query_options().parquet_file_size > 0) {
+    // If the user specified a value explicitly, use it. InitNewFile() will verify that
+    // the actual file's block size is sufficient.
+    default_block_size_ = state_->query_options().parquet_file_size;
+  } else {
+    default_block_size_ = HDFS_BLOCK_SIZE;
+    // Blocks are usually HDFS_BLOCK_SIZE bytes, unless there are many columns, in
+    // which case a per-column minimum kicks in.
+    default_block_size_ = max(default_block_size_, MinBlockSize(num_cols));
+  }
+  // HDFS does not like block sizes that are not aligned
+  default_block_size_ = BitUtil::RoundUp(default_block_size_, HDFS_BLOCK_ALIGNMENT);
+
+  default_plain_page_size_ = DEFAULT_DATA_PAGE_SIZE;
+  dict_page_size_ = DEFAULT_DATA_PAGE_SIZE;
+}
+
+void HdfsParquetTableWriter::ConfigureForIceberg(int num_cols) {
+  DCHECK(is_iceberg_file_);
+
+  // The Iceberg spec states that timestamps are stored as INT64 micros.
+  timestamp_type_ = TParquetTimestampType::INT64_MICROS;
+
+  string_utf8_ = true;
+
+  if (state_->query_options().__isset.parquet_file_size &&
+      state_->query_options().parquet_file_size > 0) {
+    // If the user specified a value explicitly, use it. InitNewFile() will verify that
+    // the actual file's block size is sufficient.
+    default_block_size_ = state_->query_options().parquet_file_size;
+  } else if (table_desc_->IcebergParquetRowGroupSize() > 0) {
+    // If the user specified a value explicitly, use it. InitNewFile() will verify that
+    // the actual file's block size is sufficient.
+    default_block_size_ = table_desc_->IcebergParquetRowGroupSize();
+  } else {
+    default_block_size_ = HDFS_BLOCK_SIZE;
+    // Blocks are usually HDFS_BLOCK_SIZE bytes, unless there are many columns, in
+    // which case a per-column minimum kicks in.
+    default_block_size_ = max(default_block_size_, MinBlockSize(num_cols));
+  }
+  // HDFS does not like block sizes that are not aligned
+  default_block_size_ = BitUtil::RoundUp(default_block_size_, HDFS_BLOCK_ALIGNMENT);
+
+  default_plain_page_size_ = table_desc_->IcebergParquetPlainPageSize();
+  if (default_plain_page_size_ <= 0) default_plain_page_size_ = DEFAULT_DATA_PAGE_SIZE;
+
+  dict_page_size_ = table_desc_->IcebergParquetDictPageSize();
+  if (dict_page_size_ <= 0) dict_page_size_ = DEFAULT_DATA_PAGE_SIZE;
+}
+
 Status HdfsParquetTableWriter::Init() {
   // Initialize file metadata
-  file_metadata_.version = PARQUET_CURRENT_VERSION;
+  file_metadata_.version = PARQUET_WRITER_VERSION;
 
   stringstream created_by;
   created_by << "impala version " << GetDaemonBuildVersion()
@@ -986,6 +1326,12 @@ Status HdfsParquetTableWriter::Init() {
   if (query_options.__isset.compression_codec) {
     codec = query_options.compression_codec.codec;
     clevel = query_options.compression_codec.compression_level;
+  } else if (table_desc_->IsIcebergTable()) {
+    TCompressionCodec compression_codec = table_desc_->IcebergParquetCompressionCodec();
+    codec = compression_codec.codec;
+    if (compression_codec.__isset.compression_level) {
+      clevel = compression_codec.compression_level;
+    }
   }
 
   if (!(codec == THdfsCompression::NONE ||
@@ -1033,6 +1379,12 @@ Status HdfsParquetTableWriter::Init() {
 
   Codec::CodecInfo codec_info(codec, clevel);
 
+  if (is_iceberg_file_) {
+    ConfigureForIceberg(num_cols);
+  } else {
+    Configure(num_cols);
+  }
+
   columns_.resize(num_cols);
   // Initialize each column structure.
   for (int i = 0; i < columns_.size(); ++i) {
@@ -1070,7 +1422,7 @@ Status HdfsParquetTableWriter::Init() {
           new ColumnWriter<double>(this, output_expr_evals_[i], codec_info, col_name);
         break;
       case TYPE_TIMESTAMP:
-        switch (state_->query_options().parquet_timestamp_type) {
+        switch (timestamp_type_) {
           case TParquetTimestampType::INT96_NANOS:
             writer =
                 new ColumnWriter<TimestampValue>(
@@ -1138,13 +1490,18 @@ Status HdfsParquetTableWriter::CreateSchema() {
   file_metadata_.schema.resize(columns_.size() + 1);
   file_metadata_.schema[0].__set_num_children(columns_.size());
   file_metadata_.schema[0].name = "schema";
+  const int num_clustering_cols = table_desc_->num_clustering_cols();
 
   for (int i = 0; i < columns_.size(); ++i) {
     parquet::SchemaElement& col_schema = file_metadata_.schema[i + 1];
     const ColumnType& col_type = output_expr_evals_[i]->root().type();
     col_schema.name = columns_[i]->column_name();
-    ParquetMetadataUtils::FillSchemaElement(col_type, state_->query_options(),
-                                            &col_schema);
+    const ColumnDescriptor& col_desc = table_desc_->col_descs()[i + num_clustering_cols];
+    DCHECK_EQ(col_desc.name(), columns_[i]->column_name());
+    const int field_id = col_desc.field_id();
+    if (field_id != -1) col_schema.__set_field_id(field_id);
+    ParquetMetadataUtils::FillSchemaElement(col_type, string_utf8_, timestamp_type_,
+                                            col_desc.auxType(), &col_schema);
   }
 
   return Status::OK();
@@ -1160,7 +1517,7 @@ Status HdfsParquetTableWriter::AddRowGroup() {
   for (int i = 0; i < columns_.size(); ++i) {
     parquet::ColumnMetaData metadata;
     metadata.type = ParquetMetadataUtils::ConvertInternalToParquetType(
-        columns_[i]->type().type, state_->query_options());
+        columns_[i]->type().type, timestamp_type_);
     metadata.path_in_schema.push_back(columns_[i]->column_name());
     metadata.codec = columns_[i]->GetParquetCodec();
     current_row_group_->columns[i].__set_meta_data(metadata);
@@ -1172,23 +1529,6 @@ Status HdfsParquetTableWriter::AddRowGroup() {
 int64_t HdfsParquetTableWriter::MinBlockSize(int64_t num_file_cols) const {
   // See file_size_limit_ calculation in InitNewFile().
   return 3 * DEFAULT_DATA_PAGE_SIZE * num_file_cols;
-}
-
-uint64_t HdfsParquetTableWriter::default_block_size() const {
-  int64_t block_size;
-  if (state_->query_options().__isset.parquet_file_size &&
-      state_->query_options().parquet_file_size > 0) {
-    // If the user specified a value explicitly, use it. InitNewFile() will verify that
-    // the actual file's block size is sufficient.
-    block_size = state_->query_options().parquet_file_size;
-  } else {
-    block_size = HDFS_BLOCK_SIZE;
-    // Blocks are usually HDFS_BLOCK_SIZE bytes, unless there are many columns, in
-    // which case a per-column minimum kicks in.
-    block_size = max(block_size, MinBlockSize(columns_.size()));
-  }
-  // HDFS does not like block sizes that are not aligned
-  return BitUtil::RoundUp(block_size, HDFS_BLOCK_ALIGNMENT);
 }
 
 Status HdfsParquetTableWriter::InitNewFile() {
@@ -1261,7 +1601,7 @@ Status HdfsParquetTableWriter::AppendRows(
     }
     ++row_idx_;
     ++row_count_;
-    ++output_->num_rows;
+    ++output_->current_file_rows;
 
     if (file_size_estimate_ > file_size_limit_) {
       // This file is full.  We need a new file.
@@ -1278,6 +1618,7 @@ Status HdfsParquetTableWriter::AppendRows(
   // Reset the row_idx_ when we exhaust the batch.  We can exit before exhausting
   // the batch if we run out of file space and will continue from the last index.
   row_idx_ = 0;
+  RETURN_IF_ERROR(state_->CheckQueryState());
   return Status::OK();
 }
 
@@ -1300,7 +1641,12 @@ Status HdfsParquetTableWriter::Finalize() {
   RETURN_IF_ERROR(WriteFileFooter());
   *stats_.mutable_parquet_stats() = parquet_dml_stats_;
   COUNTER_ADD(parent_->rows_inserted_counter(), row_count_);
+  FinalizePartitionInfo();
   return Status::OK();
+}
+
+void HdfsParquetTableWriter::FinalizePartitionInfo() {
+  output_->current_file_bytes = file_pos_;
 }
 
 void HdfsParquetTableWriter::Close() {
@@ -1321,9 +1667,57 @@ Status HdfsParquetTableWriter::WriteFileHeader() {
   return Status::OK();
 }
 
+Status HdfsParquetTableWriter::WriteParquetBloomFilter(BaseColumnWriter* col_writer,
+    parquet::ColumnMetaData* meta_data) {
+  DCHECK(col_writer != nullptr);
+  DCHECK(meta_data != nullptr);
+
+  const ParquetBloomFilter* bloom_filter = col_writer->GetParquetBloomFilter();
+  if (bloom_filter == nullptr || bloom_filter->AlwaysFalse()) {
+    // If there is no Bloom filter for this column or if it is empty we don't need to do
+    // anything.
+    // If bloom_filter->AlwaysFalse() is true, it means the Bloom filter was initialised
+    // but no element was inserted, probably because we have not fallen back to plain
+    // encoding from dictionary encoding.
+    return Status::OK();
+  }
+
+  // Update metadata.
+  meta_data->__set_bloom_filter_offset(file_pos_);
+
+  // Write the header to the file.
+  parquet::BloomFilterHeader header = CreateBloomFilterHeader(*bloom_filter);
+  uint8_t* buffer = nullptr;
+  uint32_t len = 0;
+  RETURN_IF_ERROR(thrift_serializer_->SerializeToBuffer(&header, &len, &buffer));
+  DCHECK(buffer != nullptr);
+  DCHECK_GT(len, 0);
+  RETURN_IF_ERROR(Write(buffer, len));
+  file_pos_ += len;
+
+  // Write the Bloom filter directory (bitset) to the file.
+  const uint8_t* directory = bloom_filter->directory();
+  const int64_t directory_size = bloom_filter->directory_size();
+  RETURN_IF_ERROR(Write(directory, directory_size));
+  file_pos_ += directory_size;
+
+  return Status::OK();
+}
+
+void HdfsParquetTableWriter::CollectIcebergDmlFileColumnStats(int field_id,
+    const BaseColumnWriter* col_writer) {
+  // Each data file consists of a single row group, so row group null_count / min / max
+  // stats can be used as data file stats.
+  // Get column_size from column writer.
+  col_writer->row_group_stats_base_->GetIcebergStats(
+      col_writer->total_compressed_size(), col_writer->num_values(),
+      &iceberg_file_stats_[field_id]);
+}
+
 Status HdfsParquetTableWriter::FlushCurrentRowGroup() {
   if (current_row_group_ == nullptr) return Status::OK();
 
+  const int num_clustering_cols = table_desc_->num_clustering_cols();
   for (int i = 0; i < columns_.size(); ++i) {
     int64_t data_page_offset, dict_page_offset;
     // Flush this column.  This updates the final metadata sizes for this column.
@@ -1348,6 +1742,14 @@ Status HdfsParquetTableWriter::FlushCurrentRowGroup() {
     google::protobuf::Map<string,int64>* column_size_map =
         parquet_dml_stats_.mutable_per_column_size();
     (*column_size_map)[col_name] += col_writer->total_compressed_size();
+
+    if (is_iceberg_file_ ) {
+      const ColumnDescriptor& col_desc =
+          table_desc_->col_descs()[i + num_clustering_cols];
+      DCHECK_EQ(col_desc.name(), col_name);
+      const int field_id = col_desc.field_id();
+      if (field_id != -1) CollectIcebergDmlFileColumnStats(field_id, col_writer);
+    }
 
     // Write encodings and encoding stats for this column
     col_metadata.encodings.clear();
@@ -1377,6 +1779,10 @@ Status HdfsParquetTableWriter::FlushCurrentRowGroup() {
     // Build column statistics and add them to the header.
     col_writer->EncodeRowGroupStats(&current_row_group_->columns[i].meta_data);
 
+    // Write Bloom filter and update metadata.
+    RETURN_IF_ERROR(WriteParquetBloomFilter(col_writer,
+        &current_row_group_->columns[i].meta_data));
+
     // Since we don't supported complex schemas, all columns should have the same
     // number of values.
     DCHECK_EQ(current_row_group_->columns[0].meta_data.num_values,
@@ -1394,13 +1800,17 @@ Status HdfsParquetTableWriter::FlushCurrentRowGroup() {
   }
 
   // Populate RowGroup::sorting_columns with all columns specified by the Frontend.
-  for (int col_idx : parent_->sort_columns()) {
-    current_row_group_->sorting_columns.push_back(parquet::SortingColumn());
-    parquet::SortingColumn& sorting_column = current_row_group_->sorting_columns.back();
-    sorting_column.column_idx = col_idx;
-    sorting_column.descending = false;
-    sorting_column.nulls_first = false;
+  // Do that only, if the sorting type is lexical.
+  if (parent_->sorting_order() == TSortingOrder::LEXICAL){
+    for (int col_idx : parent_->sort_columns()) {
+      current_row_group_->sorting_columns.push_back(parquet::SortingColumn());
+      parquet::SortingColumn& sorting_column = current_row_group_->sorting_columns.back();
+      sorting_column.column_idx = col_idx;
+      sorting_column.descending = false;
+      sorting_column.nulls_first = false;
+    }
   }
+
   current_row_group_->__isset.sorting_columns =
       !current_row_group_->sorting_columns.empty();
 
@@ -1458,9 +1868,12 @@ Status HdfsParquetTableWriter::WriteFileFooter() {
   RETURN_IF_ERROR(thrift_serializer_->SerializeToBuffer(
       &file_metadata_, &file_metadata_len, &buffer));
   RETURN_IF_ERROR(Write(buffer, file_metadata_len));
+  file_pos_ += file_metadata_len;
 
   // Write footer
   RETURN_IF_ERROR(Write<uint32_t>(file_metadata_len));
+  file_pos_ += sizeof(uint32_t);
   RETURN_IF_ERROR(Write(PARQUET_VERSION_NUMBER, sizeof(PARQUET_VERSION_NUMBER)));
+  file_pos_ += sizeof(PARQUET_VERSION_NUMBER);
   return Status::OK();
 }

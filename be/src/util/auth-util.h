@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
-#ifndef IMPALA_UTIL_AUTH_UTIL_H
-#define IMPALA_UTIL_AUTH_UTIL_H
+#pragma once
 
 #include <string>
+#include <gflags/gflags_declare.h>
+
+#include "common/status.h"
 #include "service/impala-server.h"
 
+DECLARE_bool(skip_external_kerberos_auth);
+DECLARE_bool(skip_internal_kerberos_auth);
 DECLARE_string(principal);
 
 namespace impala {
@@ -69,5 +72,13 @@ inline bool IsKerberosEnabled() {
   return !FLAGS_principal.empty();
 }
 
+/// Returns true if kerberos is enabled for incoming connections on internal services.
+inline bool IsInternalKerberosEnabled() {
+  return IsKerberosEnabled() && !FLAGS_skip_internal_kerberos_auth;
+}
+
+/// Returns true if kerberos is enabled for incoming connections on external services.
+inline bool IsExternalKerberosEnabled() {
+  return IsKerberosEnabled() && !FLAGS_skip_external_kerberos_auth;
+}
 } // namespace impala
-#endif

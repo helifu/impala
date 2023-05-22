@@ -29,12 +29,25 @@ static const uint32_t NUM_HASH_RING_REPLICAS = 25;
 ExecutorGroup::ExecutorGroup(string name) : ExecutorGroup(name, 1) {}
 
 ExecutorGroup::ExecutorGroup(string name, int64_t min_size)
-  : name_(name), min_size_(min_size), executor_ip_hash_ring_(NUM_HASH_RING_REPLICAS) {
-    DCHECK_GT(min_size_, 0);
-  }
+  : name_(name), min_size_(min_size), executor_ip_hash_ring_(NUM_HASH_RING_REPLICAS),
+    per_executor_admit_mem_limit_(0) {
+  DCHECK_GT(min_size_, 0);
+}
 
-ExecutorGroup::ExecutorGroup(const TExecutorGroupDesc& desc)
-  : ExecutorGroup(desc.name, desc.min_size) {}
+ExecutorGroup::ExecutorGroup(const ExecutorGroupDescPB& desc)
+  : ExecutorGroup(desc.name(), desc.min_size()) {}
+
+ExecutorGroup* ExecutorGroup::GetFilteredExecutorGroup(const ExecutorGroup* group,
+    const std::unordered_set<NetworkAddressPB>& blacklisted_executor_addresses) {
+  ExecutorGroup* filtered_group = new ExecutorGroup(*group);
+  for (const NetworkAddressPB& be_address : blacklisted_executor_addresses) {
+    const BackendDescriptorPB* be_desc = filtered_group->LookUpBackendDesc(be_address);
+    if (be_desc != nullptr) {
+      filtered_group->RemoveExecutor(BackendDescriptorPB(*be_desc));
+    }
+  }
+  return filtered_group;
+}
 
 const ExecutorGroup::Executors& ExecutorGroup::GetExecutorsForHost(
     const IpAddr& ip) const {
@@ -59,58 +72,76 @@ ExecutorGroup::Executors ExecutorGroup::GetAllExecutorDescriptors() const {
   return executors;
 }
 
-void ExecutorGroup::AddExecutor(const TBackendDescriptor& be_desc) {
+void ExecutorGroup::AddExecutor(const BackendDescriptorPB& be_desc) {
   // be_desc.is_executor can be false for the local backend when scheduling queries to run
   // on the coordinator host.
-  DCHECK(!be_desc.ip_address.empty());
-  Executors& be_descs = executor_map_[be_desc.ip_address];
-  auto eq = [&be_desc](const TBackendDescriptor& existing) {
+  DCHECK(!be_desc.ip_address().empty());
+  Executors& be_descs = executor_map_[be_desc.ip_address()];
+  auto eq = [&be_desc](const BackendDescriptorPB& existing) {
     // The IP addresses must already match, so it is sufficient to check the port.
-    DCHECK_EQ(existing.ip_address, be_desc.ip_address);
-    return existing.address.port == be_desc.address.port;
+    DCHECK_EQ(existing.ip_address(), be_desc.ip_address());
+    return existing.address().port() == be_desc.address().port();
   };
   if (find_if(be_descs.begin(), be_descs.end(), eq) != be_descs.end()) {
     LOG(DFATAL) << "Tried to add existing backend to executor group: "
-        << be_desc.krpc_address;
+                << be_desc.krpc_address();
     return;
   }
   if (!CheckConsistencyOrWarn(be_desc)) {
     LOG(WARNING) << "Ignoring inconsistent backend for executor group: "
-                 << be_desc.krpc_address;
+                 << be_desc.krpc_address();
     return;
   }
   if (be_descs.empty()) {
-    executor_ip_hash_ring_.AddNode(be_desc.ip_address);
+    executor_ip_hash_ring_.AddNode(be_desc.ip_address());
   }
   be_descs.push_back(be_desc);
-  executor_ip_map_[be_desc.address.hostname] = be_desc.ip_address;
+  executor_ip_map_[be_desc.address().hostname()] = be_desc.ip_address();
+
+  DCHECK(be_desc.admit_mem_limit() > 0) << "Admit memory limit must be set for backends";
+  if (per_executor_admit_mem_limit_ > 0) {
+    per_executor_admit_mem_limit_ =
+        std::min(be_desc.admit_mem_limit(), per_executor_admit_mem_limit_);
+  } else if (per_executor_admit_mem_limit_ == 0) {
+    per_executor_admit_mem_limit_ = be_desc.admit_mem_limit();
+  }
+
+  if (be_desc.ip_address() == "127.0.0.1") {
+    // Include localhost as an alias for filesystems that don't translate it.
+    LOG(INFO) << "Adding executor localhost alias for "
+              << be_desc.address().hostname() << " -> " << be_desc.ip_address();
+    executor_ip_map_["localhost"] = be_desc.ip_address();
+  }
 }
 
-void ExecutorGroup::RemoveExecutor(const TBackendDescriptor& be_desc) {
-  auto be_descs_it = executor_map_.find(be_desc.ip_address);
+void ExecutorGroup::RemoveExecutor(const BackendDescriptorPB& be_desc) {
+  auto be_descs_it = executor_map_.find(be_desc.ip_address());
   if (be_descs_it == executor_map_.end()) {
     LOG(DFATAL) << "Tried to remove a backend from non-existing host: "
-        << be_desc.krpc_address;
+                << be_desc.krpc_address();
     return;
   }
-  auto eq = [&be_desc](const TBackendDescriptor& existing) {
+  auto eq = [&be_desc](const BackendDescriptorPB& existing) {
     // The IP addresses must already match, so it is sufficient to check the port.
-    DCHECK_EQ(existing.ip_address, be_desc.ip_address);
-    return existing.address.port == be_desc.address.port;
+    DCHECK_EQ(existing.ip_address(), be_desc.ip_address());
+    return existing.address().port() == be_desc.address().port();
   };
 
   Executors& be_descs = be_descs_it->second;
   auto remove_it = find_if(be_descs.begin(), be_descs.end(), eq);
   if (remove_it == be_descs.end()) {
     LOG(DFATAL) << "Tried to remove non-existing backend from per-host list: "
-        << be_desc.krpc_address;
+                << be_desc.krpc_address();
     return;
   }
   be_descs.erase(remove_it);
+  if (per_executor_admit_mem_limit_ == be_desc.admit_mem_limit()) {
+    CalculatePerExecutorMemLimitForAdmission();
+  }
   if (be_descs.empty()) {
     executor_map_.erase(be_descs_it);
-    executor_ip_map_.erase(be_desc.address.hostname);
-    executor_ip_hash_ring_.RemoveNode(be_desc.ip_address);
+    executor_ip_map_.erase(be_desc.address().hostname());
+    executor_ip_hash_ring_.RemoveNode(be_desc.ip_address());
   }
 }
 
@@ -128,13 +159,13 @@ bool ExecutorGroup::LookUpExecutorIp(const Hostname& hostname, IpAddr* ip) const
   return false;
 }
 
-const TBackendDescriptor* ExecutorGroup::LookUpBackendDesc(
-    const TNetworkAddress& host) const {
+const BackendDescriptorPB* ExecutorGroup::LookUpBackendDesc(
+    const NetworkAddressPB& host) const {
   IpAddr ip;
-  if (LookUpExecutorIp(host.hostname, &ip)) {
+  if (LookUpExecutorIp(host.hostname(), &ip)) {
     const ExecutorGroup::Executors& be_list = GetExecutorsForHost(ip);
-    for (const TBackendDescriptor& desc : be_list) {
-      if (desc.address == host) return &desc;
+    for (const BackendDescriptorPB& desc : be_list) {
+      if (desc.address() == host) return &desc;
     }
   }
   return nullptr;
@@ -156,15 +187,16 @@ bool ExecutorGroup::IsHealthy() const {
   return true;
 }
 
-bool ExecutorGroup::CheckConsistencyOrWarn(const TBackendDescriptor& be_desc) const {
+bool ExecutorGroup::CheckConsistencyOrWarn(const BackendDescriptorPB& be_desc) const {
   // Check if the executor's group configuration matches this group.
-  for (const TExecutorGroupDesc& desc : be_desc.executor_groups) {
-    if (desc.name == name_) {
-      if (desc.min_size == min_size_) {
+  for (const ExecutorGroupDescPB& desc : be_desc.executor_groups()) {
+    if (desc.name() == name_) {
+      if (desc.min_size() == min_size_) {
         return true;
       } else {
-        LOG(WARNING) << "Backend " << be_desc << " is configured for executor group "
-                     << desc << " but group has minimum size " << min_size_;
+        LOG(WARNING) << "Backend " << be_desc.DebugString()
+                     << " is configured for executor group " << desc.DebugString()
+                     << " but group has minimum size " << min_size_;
         return false;
       }
     }
@@ -172,6 +204,22 @@ bool ExecutorGroup::CheckConsistencyOrWarn(const TBackendDescriptor& be_desc) co
   // If the backend does not mention the group we consider it consistent to allow backends
   // to be added to unrelated groups, e.g. for the coordinator-only scheuduling.
   return true;
+}
+
+void ExecutorGroup::CalculatePerExecutorMemLimitForAdmission() {
+  per_executor_admit_mem_limit_ = numeric_limits<int64_t>::max();
+  int num_executors = 0;
+  for (const auto& executor_list: executor_map_) {
+    const Executors& be_descs = executor_list.second;
+    num_executors += be_descs.size();
+    for (const auto& be_desc: be_descs) {
+      per_executor_admit_mem_limit_ = std::min(per_executor_admit_mem_limit_,
+          be_desc.admit_mem_limit());
+    }
+  }
+  if (num_executors == 0) {
+    per_executor_admit_mem_limit_ = 0;
+  }
 }
 
 }  // end ns impala

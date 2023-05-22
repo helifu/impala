@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_RPC_AUTH_PROVIDER_H
-#define IMPALA_RPC_AUTH_PROVIDER_H
+#pragma once
 
+#include <mutex>
 #include <string>
-#include <boost/thread/mutex.hpp>
 #include <sasl/sasl.h>
 
 #include "common/status.h"
@@ -47,7 +46,7 @@ class AuthProvider {
   virtual Status GetServerTransportFactory(
       ThriftServer::TransportType underlying_transport_type,
       const std::string& server_name, MetricGroup* metrics,
-      boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory)
+      std::shared_ptr<apache::thrift::transport::TTransportFactory>* factory)
       WARN_UNUSED_RESULT = 0;
 
   /// Called by Thrift clients to wrap a raw transport with any intermediate transport
@@ -55,9 +54,9 @@ class AuthProvider {
   /// TODO: Return the correct clients for HTTP base transport. At this point, no clients
   /// for HTTP endpoints are internal to the Impala service, so it should be OK.
   virtual Status WrapClientTransport(const std::string& hostname,
-      boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
+      std::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
       const std::string& service_name,
-      boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport)
+      std::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport)
       WARN_UNUSED_RESULT = 0;
 
   /// Setup 'connection_ptr' to get its username with the given transports and sets
@@ -65,7 +64,7 @@ class AuthProvider {
   /// by the factory returned by GetServerTransportFactory() when called with the same
   /// 'underlying_transport_type'.
   virtual void SetupConnectionContext(
-      const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+      const std::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
       ThriftServer::TransportType underlying_transport_type,
       apache::thrift::transport::TTransport* input_transport,
       apache::thrift::transport::TTransport* output_transport) = 0;
@@ -84,9 +83,9 @@ class AuthProvider {
 class SecureAuthProvider : public AuthProvider {
  public:
   SecureAuthProvider(bool is_internal)
-    : has_ldap_(false), is_internal_(is_internal), needs_kinit_(false) {}
+    : has_ldap_(false), has_saml_(false), has_jwt_(false), is_internal_(is_internal) {}
 
-  /// Performs initialization of external state. Kinit if configured to use kerberos.
+  /// Performs initialization of external state.
   /// If we're using ldap, set up appropriate certificate usage.
   virtual Status Start();
 
@@ -95,9 +94,9 @@ class SecureAuthProvider : public AuthProvider {
   /// we can go straight to Kerberos.
   /// This is only applicable to Thrift connections and not KRPC connections.
   virtual Status WrapClientTransport(const std::string& hostname,
-      boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
+      std::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
       const std::string& service_name,
-      boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport);
+      std::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport);
 
   /// This sets up a mapping between auth types (PLAIN and GSSAPI) and callbacks.
   /// When a connection comes in, thrift will see one of the above on the wire, do
@@ -107,14 +106,14 @@ class SecureAuthProvider : public AuthProvider {
   virtual Status GetServerTransportFactory(
       ThriftServer::TransportType underlying_transport_type,
       const std::string& server_name, MetricGroup* metrics,
-      boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory);
+      std::shared_ptr<apache::thrift::transport::TTransportFactory>* factory);
 
   /// IF sasl was used, the username will be available from the handshake, and we set it
   /// here. If HTTP Basic or SPNEGO auth was used, the username won't be available until
   /// one or more packets are received, so we register a callback with the transport that
   /// will set the username when it's available.
   virtual void SetupConnectionContext(
-      const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+      const std::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
       ThriftServer::TransportType underlying_transport_type,
       apache::thrift::transport::TTransport* input_transport,
       apache::thrift::transport::TTransport* output_transport);
@@ -124,11 +123,15 @@ class SecureAuthProvider : public AuthProvider {
   /// Initializes kerberos items and checks for sanity.  Failures can occur on a
   /// malformed principal or when setting some environment variables.  Called
   /// prior to Start().
-  Status InitKerberos(const std::string& principal, const std::string& keytab_path);
+  Status InitKerberos(const std::string& principal);
 
   /// Initializes ldap - just record that we're going to use it.  Called prior to
   /// Start().
   void InitLdap() { has_ldap_ = true; }
+
+  void InitSaml() { has_saml_ = true; }
+
+  void InitJwt() { has_jwt_ = true; }
 
   /// Used for testing
   const std::string& principal() const { return principal_; }
@@ -140,6 +143,10 @@ class SecureAuthProvider : public AuthProvider {
  private:
   /// Do we (the server side only) support ldap for this connnection?
   bool has_ldap_;
+
+  bool has_saml_;
+
+  bool has_jwt_;
 
   /// Hostname of this machine - if kerberos, derived from principal.  If there
   /// is no kerberos, but LDAP is used, then acquired via GetHostname().
@@ -154,9 +161,6 @@ class SecureAuthProvider : public AuthProvider {
   /// supplied, this is --be_principal.  In all other cases this is --principal.
   std::string principal_;
 
-  /// The full path to the keytab where the above principal can be found.
-  std::string keytab_file_;
-
   /// The service name, deduced from the principal. Used by servers to indicate
   /// what service a principal must have a ticket for in order to be granted
   /// access to this service.
@@ -164,11 +168,6 @@ class SecureAuthProvider : public AuthProvider {
 
   /// Principal's realm, again derived from principal.
   std::string realm_;
-
-  /// True if tickets for this principal should be obtained.  This is true if
-  /// we're an auth provider for an "internal" connection, because we may
-  /// function as a client.
-  bool needs_kinit_;
 
   /// Used to generate and verify signatures for cookies.
   AuthenticationHash hash_;
@@ -188,16 +187,15 @@ class NoAuthProvider : public AuthProvider {
   virtual Status GetServerTransportFactory(
       ThriftServer::TransportType underlying_transport_type,
       const std::string& server_name, MetricGroup* metrics,
-      boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory);
-
+      std::shared_ptr<apache::thrift::transport::TTransportFactory>* factory);
   virtual Status WrapClientTransport(const std::string& hostname,
-      boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
+      std::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
       const std::string& service_name,
-      boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport);
+      std::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport);
 
   /// If there is no auth, then we don't have a username available.
   virtual void SetupConnectionContext(
-      const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+      const std::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
       ThriftServer::TransportType underlying_transport_type,
       apache::thrift::transport::TTransport* input_transport,
       apache::thrift::transport::TTransport* output_transport);
@@ -214,5 +212,3 @@ class NoAuthProvider : public AuthProvider {
 Status InitAuth(const std::string& appname);
 
 }
-
-#endif

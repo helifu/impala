@@ -43,9 +43,8 @@ class DequeRowBatchQueue;
 /// synchronize access to the queue.
 class BufferedPlanRootSink : public PlanRootSink {
  public:
-  BufferedPlanRootSink(TDataSinkId sink_id, const RowDescriptor* row_desc,
-      RuntimeState* state, const TBackendResourceProfile& resource_profile,
-      const TDebugOptions& debug_options);
+  BufferedPlanRootSink(TDataSinkId sink_id, const DataSinkConfig& sink_config,
+      RuntimeState* state, const TDebugOptions& debug_options);
 
   /// Initializes the row_batches_get_wait_timer_ and row_batches_send_wait_timer_
   /// counters.
@@ -77,6 +76,13 @@ class BufferedPlanRootSink : public PlanRootSink {
   /// status.
   virtual void Cancel(RuntimeState* state) override;
 
+  /// Blocks until all results are spooled or we fail to do this due to batch_queue_ is
+  /// full, cancellation or any errors. Returns if we fail to do this due to batch_queue_
+  /// is full.
+  bool WaitForAllResultsSpooled() {
+    return all_results_spooled_.Get();
+  }
+
  private:
   /// The maximum number of rows that can be fetched at a time. Set to 100x the
   /// DEFAULT_BATCH_SIZE. Limiting the fetch size is necessary so that the resulting
@@ -86,7 +92,7 @@ class BufferedPlanRootSink : public PlanRootSink {
   static const int MAX_FETCH_SIZE = QueryState::DEFAULT_BATCH_SIZE * 100;
 
   /// Protects the RowBatchQueue and all ConditionVariables.
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// Waited on by the consumer inside GetNext() until rows are available for consumption.
   /// Signaled when the producer adds a RowBatch to the queue. Also signaled by
@@ -139,6 +145,13 @@ class BufferedPlanRootSink : public PlanRootSink {
   /// The index of the next row to be read from 'current_batch_' in the next call to
   /// 'GetNext'. If 'current_batch_' is nullptr, the value of 'current_batch_row_' is 0.
   int current_batch_row_ = 0;
+
+  /// Set when all results are spooled or we fail to do this due to batch_queue_ full,
+  /// cancellation or any errors. Set by either the fragment instance execution thread or
+  /// the cancellation thread. The boolean result is just used to decide whether to log
+  /// a warning. The result is true when batch_queue_ is full so we can't spool all
+  /// results. Coordinator will log a warning on this if it's waiting on this promise.
+  Promise<bool, PromiseMode::MULTIPLE_PRODUCER> all_results_spooled_;
 
   /// Returns true if the 'queue' (not the 'batch_queue_') is empty. 'queue' refers to
   /// the logical queue of RowBatches and thus includes any RowBatch that

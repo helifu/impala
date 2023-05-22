@@ -59,14 +59,38 @@ const char* ImpaladMetricKeys::IO_MGR_SHORT_CIRCUIT_BYTES_READ =
     "impala-server.io-mgr.short-circuit-bytes-read";
 const char* ImpaladMetricKeys::IO_MGR_CACHED_BYTES_READ =
     "impala-server.io-mgr.cached-bytes-read";
+const char* ImpaladMetricKeys::IO_MGR_ENCRYPTED_BYTES_READ =
+    "impala-server.io-mgr.encrypted-bytes-read";
+const char* ImpaladMetricKeys::IO_MGR_ERASURE_CODED_BYTES_READ =
+    "impala-server.io-mgr.erasure-coded-bytes-read";
 const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES =
     "impala-server.io-mgr.remote-data-cache-hit-bytes";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_HIT_COUNT =
+    "impala-server.io-mgr.remote-data-cache-hit-count";
 const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES =
     "impala-server.io-mgr.remote-data-cache-miss-bytes";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_MISS_COUNT =
+    "impala-server.io-mgr.remote-data-cache-miss-count";
 const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_TOTAL_BYTES =
     "impala-server.io-mgr.remote-data-cache-total-bytes";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_NUM_ENTRIES =
+    "impala-server.io-mgr.remote-data-cache-num-entries";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_NUM_WRITES =
+    "impala-server.io-mgr.remote-data-cache-num-writes";
 const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES =
     "impala-server.io-mgr.remote-data-cache-dropped-bytes";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_DROPPED_ENTRIES =
+    "impala-server.io-mgr.remote-data-cache-dropped-entries";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS =
+    "impala-server.io-mgr.remote-data-cache-instant-evictions";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES =
+    "impala-server.io-mgr.remote-data-cache-async-writes-outstanding-bytes";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED =
+    "impala-server.io-mgr.remote-data-cache-num-async-writes-submitted";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES =
+    "impala-server.io-mgr.remote-data-cache-async-writes-dropped-bytes";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES =
+    "impala-server.io-mgr.remote-data-cache-async-writes-dropped-entries";
 const char* ImpaladMetricKeys::IO_MGR_BYTES_WRITTEN =
     "impala-server.io-mgr.bytes-written";
 const char* ImpaladMetricKeys::IO_MGR_NUM_CACHED_FILE_HANDLES =
@@ -155,9 +179,22 @@ IntCounter* ImpaladMetrics::IO_MGR_BYTES_READ = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_LOCAL_BYTES_READ = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_SHORT_CIRCUIT_BYTES_READ = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_CACHED_BYTES_READ = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_ENCRYPTED_BYTES_READ = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_ERASURE_CODED_BYTES_READ = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_HIT_COUNT = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_MISS_COUNT = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_NUM_WRITES = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_DROPPED_ENTRIES = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES =
+    nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES =
+    nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_BYTES_WRITTEN = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_CACHED_FILE_HANDLES_REOPENED = nullptr;
 IntCounter* ImpaladMetrics::HEDGED_READ_OPS = nullptr;
@@ -189,6 +226,7 @@ IntGauge* ImpaladMetrics::IO_MGR_NUM_FILE_HANDLES_OUTSTANDING = nullptr;
 IntGauge* ImpaladMetrics::IO_MGR_CACHED_FILE_HANDLES_HIT_COUNT = nullptr;
 IntGauge* ImpaladMetrics::IO_MGR_CACHED_FILE_HANDLES_MISS_COUNT = nullptr;
 IntGauge* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_TOTAL_BYTES = nullptr;
+IntGauge* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_NUM_ENTRIES = nullptr;
 IntGauge* ImpaladMetrics::NUM_FILES_OPEN_FOR_INSERT = nullptr;
 IntGauge* ImpaladMetrics::NUM_QUERIES_REGISTERED = nullptr;
 IntGauge* ImpaladMetrics::RESULTSET_CACHE_TOTAL_NUM_ROWS = nullptr;
@@ -323,6 +361,10 @@ void ImpaladMetrics::CreateMetrics(MetricGroup* m) {
       ImpaladMetricKeys::IO_MGR_LOCAL_BYTES_READ, 0);
   IO_MGR_CACHED_BYTES_READ = IO_MGR_METRICS->AddCounter(
       ImpaladMetricKeys::IO_MGR_CACHED_BYTES_READ, 0);
+  IO_MGR_ENCRYPTED_BYTES_READ = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_ENCRYPTED_BYTES_READ, 0);
+  IO_MGR_ERASURE_CODED_BYTES_READ = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_ERASURE_CODED_BYTES_READ, 0);
   IO_MGR_SHORT_CIRCUIT_BYTES_READ = IO_MGR_METRICS->AddCounter(
       ImpaladMetricKeys::IO_MGR_SHORT_CIRCUIT_BYTES_READ, 0);
   IO_MGR_BYTES_WRITTEN = IO_MGR_METRICS->AddCounter(
@@ -330,12 +372,32 @@ void ImpaladMetrics::CreateMetrics(MetricGroup* m) {
 
   IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES = IO_MGR_METRICS->AddCounter(
       ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_HIT_COUNT = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_HIT_COUNT, 0);
   IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES = IO_MGR_METRICS->AddCounter(
       ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_MISS_COUNT = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_MISS_COUNT, 0);
   IO_MGR_REMOTE_DATA_CACHE_TOTAL_BYTES = IO_MGR_METRICS->AddGauge(
       ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_TOTAL_BYTES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_NUM_ENTRIES = IO_MGR_METRICS->AddGauge(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_NUM_ENTRIES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_NUM_WRITES = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_NUM_WRITES, 0);
   IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES = IO_MGR_METRICS->AddCounter(
       ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_DROPPED_ENTRIES = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_DROPPED_ENTRIES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS, 0);
+  IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED, 0);
+  IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES, 0);
 
   IO_MGR_CACHED_FILE_HANDLES_HIT_RATIO =
       StatsMetric<uint64_t, StatsType::MEAN>::CreateAndRegister(IO_MGR_METRICS,

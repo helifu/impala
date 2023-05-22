@@ -70,17 +70,20 @@ if [[ "$REPLY" =~ ^[Yy]$ ]]; then
   else
     # Either isilon or hdfs, no change in procedure.
     if hadoop fs -test -d ${FILESYSTEM_PREFIX}${TEST_WAREHOUSE_DIR}; then
-      echo "Removing existing ${TEST_WAREHOUSE_DIR} directory"
+      echo "Removing existing ${TEST_WAREHOUSE_DIR} directory contents"
       # For filesystems that don't allow 'rm' without 'x', chmod to 777 for the
       # subsequent 'rm -r'.
       if [ "${TARGET_FILESYSTEM}" = "isilon" ] || \
           [ "${TARGET_FILESYSTEM}" = "local" ]; then
         hadoop fs -chmod -R 777 ${FILESYSTEM_PREFIX}${TEST_WAREHOUSE_DIR}
       fi
-      hadoop fs -rm -r -skipTrash ${FILESYSTEM_PREFIX}${TEST_WAREHOUSE_DIR}
+      hadoop fs -rm -f -r -skipTrash "${FILESYSTEM_PREFIX}${TEST_WAREHOUSE_DIR}/*"
+    else
+      # Only create the directory if it doesn't exist. Some filesystems - such as Ozone -
+      # are created with extra properties.
+      echo "Creating ${TEST_WAREHOUSE_DIR} directory"
+      hadoop fs -mkdir -p ${FILESYSTEM_PREFIX}${TEST_WAREHOUSE_DIR}
     fi
-    echo "Creating ${TEST_WAREHOUSE_DIR} directory"
-    hadoop fs -mkdir -p ${FILESYSTEM_PREFIX}${TEST_WAREHOUSE_DIR}
     if [[ -n "${HDFS_ERASURECODE_POLICY:-}" ]]; then
       hdfs ec -enablePolicy -policy "${HDFS_ERASURECODE_POLICY}"
       hdfs ec -setPolicy -policy "${HDFS_ERASURECODE_POLICY}" \
@@ -110,6 +113,14 @@ if [ ! -f ${SNAPSHOT_STAGING_DIR}${TEST_WAREHOUSE_DIR}/githash.txt ]; then
   exit 1
 fi
 
+if [ "${TARGET_FILESYSTEM}" != "hdfs" ]; then
+  # Need to rewrite test metadata regardless of ${WAREHOUSE_LOCATION_PREFIX} because
+  # paths can have "hdfs://" scheme
+  echo "Updating Iceberg locations with warehouse prefix ${WAREHOUSE_LOCATION_PREFIX}"
+  ${IMPALA_HOME}/testdata/bin/rewrite-iceberg-metadata.py "${WAREHOUSE_LOCATION_PREFIX}" \
+      $(find ${SNAPSHOT_STAGING_DIR}${TEST_WAREHOUSE_DIR}/ -name "metadata")
+fi
+
 echo "Copying data to ${TARGET_FILESYSTEM}"
 if [ "${TARGET_FILESYSTEM}" = "s3" ]; then
   # hive does not yet work well with s3, so we won't need hive builtins.
@@ -117,6 +128,15 @@ if [ "${TARGET_FILESYSTEM}" = "s3" ]; then
   if ! aws s3 cp --recursive ${SNAPSHOT_STAGING_DIR}${TEST_WAREHOUSE_DIR} \
       s3://${S3_BUCKET}${TEST_WAREHOUSE_DIR}; then
     echo "Copying the test-warehouse to s3 failed, aborting."
+    exit 1
+  fi
+elif [ "${TARGET_FILESYSTEM}" = "gs" ]; then
+  # Authenticate with the service account before using gsutil
+  gcloud auth activate-service-account --key-file "$GOOGLE_APPLICATION_CREDENTIALS"
+  # Parallelly(-m) upload files
+  if ! gsutil -m -q cp -r ${SNAPSHOT_STAGING_DIR}${TEST_WAREHOUSE_DIR} \
+      gs://${GCS_BUCKET}; then
+    echo "Copying the test-warehouse to GCS failed, aborting."
     exit 1
   fi
 else

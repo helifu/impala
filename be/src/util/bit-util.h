@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
-#ifndef IMPALA_BIT_UTIL_H
-#define IMPALA_BIT_UTIL_H
+#pragma once
 
 #if defined(__APPLE__)
 #include <machine/endian.h>
@@ -25,78 +23,25 @@
 #include <endian.h>
 #endif
 
+#include <algorithm>
 #include <climits>
+#include <cstdint>
 #include <limits>
-#include <typeinfo>
-#include <type_traits>
+#include <vector>
 
 #include "common/compiler-util.h"
+#include "common/logging.h"
 #include "gutil/bits.h"
-#include "runtime/multi-precision.h"
+#include "util/arithmetic-util.h"
 #include "util/cpu-info.h"
 #include "util/sse-util.h"
 
 namespace impala {
 
-// Doubles the width of integer types (e.g. int32_t -> int64_t).
-// Currently only works with a few signed types.
-// Feel free to extend it to other types as well.
-template <typename T>
-struct DoubleWidth {};
-
-template <>
-struct DoubleWidth<int32_t> {
-  using type = int64_t;
-};
-
-template <>
-struct DoubleWidth<int64_t> {
-  using type = int128_t;
-};
-
-template <>
-struct DoubleWidth<int128_t> {
-  using type = int256_t;
-};
-
 /// Utility class to do standard bit tricks
 /// TODO: is this in boost or something else like that?
 class BitUtil {
  public:
-
-  /// Returns the width of the integer portion of the type, not counting the sign bit.
-  /// Not safe for use with unknown or non-native types, so make it undefined
-  template<typename T, typename CVR_REMOVED = typename std::decay<T>::type,
-      typename std::enable_if<std::is_integral<CVR_REMOVED>{} ||
-                              std::is_same<CVR_REMOVED, unsigned __int128>{} ||
-                              std::is_same<CVR_REMOVED, __int128>{}, int>::type = 0>
-  constexpr static inline int UnsignedWidth() {
-    return std::is_integral<CVR_REMOVED>::value ?
-        std::numeric_limits<CVR_REMOVED>::digits :
-        std::is_same<CVR_REMOVED, unsigned __int128>::value ? 128 :
-        std::is_same<CVR_REMOVED, __int128>::value ? 127 : -1;
-  }
-
-  /// Returns the max value that can be represented in T.
-  template<typename T, typename CVR_REMOVED = typename std::decay<T>::type,
-      typename std::enable_if<std::is_integral<CVR_REMOVED> {}||
-                              std::is_same<CVR_REMOVED, __int128> {}, int>::type = 0>
-  constexpr static inline CVR_REMOVED Max() {
-    return std::is_integral<CVR_REMOVED>::value ?
-        std::numeric_limits<CVR_REMOVED>::max() :
-        std::is_same<CVR_REMOVED, __int128>::value ?
-            static_cast<UnsignedType<CVR_REMOVED>>(-1) / 2 : -1;
-  }
-
-  /// Return an integer signifying the sign of the value, returning +1 for
-  /// positive integers (and zero), -1 for negative integers.
-  /// The extra shift is to silence GCC warnings about full width shift on
-  /// unsigned types. It compiles out in optimized builds into the expected increment.
-  template<typename T>
-  constexpr static inline T Sign(T value) {
-    return 1 | ((value >> (UnsignedWidth<T>() - 1)) >> 1);
-  }
-
   /// Returns the ceil of value/divisor
   constexpr static inline int64_t Ceil(int64_t value, int64_t divisor) {
     return value / divisor + (value % divisor != 0);
@@ -175,6 +120,24 @@ class BitUtil {
   /// Returns the rounded down to 64 multiple.
   constexpr static inline uint32_t RoundDownNumi64(uint32_t bits) { return bits >> 6; }
 
+  /// Returns whether the given byte is the start byte of a UTF-8 character.
+  constexpr static inline bool IsUtf8StartByte(uint8_t b) {
+    return (b & 0xC0) != 0x80;
+  }
+
+  /// Returns the byte length of a *legal* UTF-8 character (code point) given its first
+  /// byte. If the first byte is between 0xC0 and 0xDF, the UTF-8 character has two
+  /// bytes; if it is between 0xE0 and 0xEF, the UTF-8 character has 3 bytes; and if it
+  /// is 0xF0 and 0xFF, the UTF-8 character has 4 bytes.
+  constexpr static inline int NumBytesInUTF8Encoding(int8_t first_byte) {
+    if (first_byte >= 0) return 1;
+    switch (first_byte & 0xF0) {
+      case 0xE0: return 3;
+      case 0xF0: return 4;
+      default: return 2;
+    }
+  }
+
   /// Non hw accelerated pop count.
   /// TODO: we don't use this in any perf sensitive code paths currently.  There
   /// might be a much faster way to implement this.
@@ -185,6 +148,11 @@ class BitUtil {
   }
 
   /// Returns the number of set bits in x
+#ifdef __aarch64__
+  static inline int Popcount(uint64_t x) {
+    return PopcountNoHw(x);
+  }
+#else
   static inline int Popcount(uint64_t x) {
     if (LIKELY(CpuInfo::IsSupported(CpuInfo::POPCNT))) {
       return POPCNT_popcnt_u64(x);
@@ -192,6 +160,7 @@ class BitUtil {
       return PopcountNoHw(x);
     }
   }
+#endif
 
   // Compute correct population count for various-width signed integers
   template<typename T>
@@ -235,6 +204,11 @@ class BitUtil {
 /// Converts to big endian format (if not already in big endian) from the
 /// machine's native endian format.
 #if __BYTE_ORDER == __LITTLE_ENDIAN
+  static inline __int128_t ToBigEndian(__int128_t value) {
+    __int128_t res = 0;
+    ByteSwap(&res, &value, sizeof(__int128_t));
+    return res;
+  }
   static inline int64_t ToBigEndian(int64_t value) { return ByteSwap(value); }
   static inline uint64_t ToBigEndian(uint64_t value) { return ByteSwap(value); }
   static inline int32_t ToBigEndian(int32_t value) { return ByteSwap(value); }
@@ -242,6 +216,7 @@ class BitUtil {
   static inline int16_t ToBigEndian(int16_t value) { return ByteSwap(value); }
   static inline uint16_t ToBigEndian(uint16_t value) { return ByteSwap(value); }
 #else
+  static inline __int128_t ToBigEndian(__int128_t val) { return val; }
   static inline int64_t ToBigEndian(int64_t val) { return val; }
   static inline uint64_t ToBigEndian(uint64_t val) { return val; }
   static inline int32_t ToBigEndian(int32_t val) { return val; }
@@ -252,6 +227,11 @@ class BitUtil {
 
 /// Converts from big endian format to the machine's native endian format.
 #if __BYTE_ORDER == __LITTLE_ENDIAN
+  static inline __int128_t FromBigEndian(__int128_t value) {
+    __int128_t res = 0;
+    ByteSwap(&res, &value, sizeof(__int128_t));
+    return res;
+  }
   static inline int64_t FromBigEndian(int64_t value) { return ByteSwap(value); }
   static inline uint64_t FromBigEndian(uint64_t value) { return ByteSwap(value); }
   static inline int32_t FromBigEndian(int32_t value) { return ByteSwap(value); }
@@ -259,6 +239,7 @@ class BitUtil {
   static inline int16_t FromBigEndian(int16_t value) { return ByteSwap(value); }
   static inline uint16_t FromBigEndian(uint16_t value) { return ByteSwap(value); }
 #else
+  static inline __int128_t FromBigEndian(__int128_t val) { return val; }
   static inline int64_t FromBigEndian(int64_t val) { return val; }
   static inline uint64_t FromBigEndian(uint64_t val) { return val; }
   static inline int32_t FromBigEndian(int32_t val) { return val; }
@@ -323,8 +304,15 @@ class BitUtil {
   }
 
   template<typename T>
-  static inline int CountLeadingZeros(T v) {
+  static constexpr inline int CountLeadingZeros(T v) {
+    static_assert(sizeof(T) == 4 || sizeof(T) == 8 || sizeof(T) == 16);
     DCHECK(v >= 0);
+
+    // __builtin_clz() and __builtin_clzll() is undefined for 0.
+    if (UNLIKELY(v == 0)) {
+      return sizeof(T) * CHAR_BIT;
+    }
+
     if (sizeof(T) == 4) {
       uint32_t orig = static_cast<uint32_t>(v);
       return __builtin_clz(orig);
@@ -333,7 +321,6 @@ class BitUtil {
       return __builtin_clzll(orig);
     } else {
       DCHECK(sizeof(T) == 16);
-      if (UNLIKELY(v == 0)) return 128;
       unsigned __int128 orig = static_cast<unsigned __int128>(v);
       unsigned __int128 shifted = orig >> 64;
       if (shifted != 0) {
@@ -392,12 +379,34 @@ class BitUtil {
       return floor + 1;
     }
   }
-};
 
-template<>
-inline int256_t BitUtil::Sign(int256_t value) {
-  return value < 0 ? -1 : 1;
-}
+  /// The purpose of this function is to replicate Java's BigInteger.toByteArray()
+  /// function. Receives an int input (it can be any size) and returns a buffer that
+  /// represents the byte sequence representation of this number where the most
+  /// significant byte is in the zeroth element.
+  /// Note, the return value is stored in a string instead of in a vector of chars for
+  /// potential optimisations with small strings.
+  /// E.g. 520 = [2, 8]
+  /// E.g. 12065530 = [0, -72, 26, -6]
+  /// E.g. -129 = [-1, 127]
+  template<typename T>
+  static std::string IntToByteBuffer(T input) {
+    std::string buffer;
+    T value = input;
+    for (int i = 0; i < sizeof(value); ++i) {
+      // Applies a mask for a byte range on the input.
+      char value_to_save = value & 0XFF;
+      buffer.push_back(value_to_save);
+      // Remove the just processed part from the input so that we can exit early if there
+      // is nothing left to process.
+      value >>= 8;
+      if (value == 0 && value_to_save >= 0) break;
+      if (value == -1 && value_to_save < 0) break;
+    }
+    std::reverse(buffer.begin(), buffer.end());
+    return buffer;
+  }
+};
 
 /// An encapsulation class of SIMD byteswap functions
 class SimdByteSwap {
@@ -427,5 +436,3 @@ class SimdByteSwap {
   static void ByteSwapSimd(const void* src, const int len, void* dst);
 };
 }
-
-#endif

@@ -73,7 +73,8 @@ class SpillableRowBatchQueue {
   /// achieved because there is no more available reserved memory, this method will unpin
   /// the stream and then add the RowBatch. If the batch still cannot be added, this
   /// method returns an error Status. It is not valid to call this method if the queue is
-  /// full or closed.
+  /// full or closed. After this returns, 'batch' can be safely destroyed (i.e. the
+  /// queue makes copies of all the data from 'batch' that it needs).
   Status AddBatch(RowBatch* batch);
 
   /// Returns and removes the RowBatch at the head of the queue. Returns Status::OK() if
@@ -129,7 +130,7 @@ class SpillableRowBatchQueue {
   const TDebugOptions& debug_options_;
 
   /// The max number of bytes that can be unpinned in the BufferedTupleStream. Set by the
-  /// query option MAX_UNPINNED_RESULT_SPOOLING_MEMORY.
+  /// query option MAX_SPILLED_RESULT_SPOOLING_MEM.
   const int64_t max_unpinned_bytes_;
 
   /// True if the queue has been closed, false otherwise.

@@ -15,9 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import filter, range
 from collections import defaultdict
 from copy import deepcopy
-from itertools import ifilter
 from logging import getLogger
 from random import shuffle, choice, randint, randrange
 
@@ -253,7 +254,7 @@ class QueryGenerator(object):
     table_exprs = TableExprList(table_exprs)
     with_clause_inline_views = TableExprList()
     for with_clause_inline_view_idx \
-        in xrange(self.profile.get_with_clause_table_ref_count()):
+        in range(self.profile.get_with_clause_table_ref_count()):
       query = self.generate_statement(table_exprs,
                                       allow_with_clause=self.profile.use_nested_with())
       with_clause_alias_count = getattr(self.root_query, 'with_clause_alias_count', 0) + 1
@@ -751,7 +752,7 @@ class QueryGenerator(object):
         # A root_func was chosen and it's children are in one or more of the
         # null_args_by_func_allowed pools. A pool will be chosen, then a child function.
         null_arg_counts_by_pool = dict((pool_category, len(pool)) for pool_category, pool
-                                       in null_args_by_func_allowed.iteritems())
+                                       in null_args_by_func_allowed.items())
         # There is a special case that would lead to a dead end. If there is only one
         # distinct place holder across all the pools and an analytic is still needed,
         # then that place holder cannot be replaced by an aggregate since aggregates
@@ -787,7 +788,7 @@ class QueryGenerator(object):
 
       if parent_func:
         # Remove the place holder from all of the other pools.
-        for pool_category, pool in null_args_by_func_allowed.iteritems():
+        for pool_category, pool in null_args_by_func_allowed.items():
           for null_arg_idx, (func, arg_idx) in enumerate(pool):
             if func is parent_func and arg_idx == parent_arg_idx:
               del pool[null_arg_idx]
@@ -848,7 +849,7 @@ class QueryGenerator(object):
             continue
           null_args.append((chosen_func, idx))
 
-      if not any(null_args_by_func_allowed.itervalues()):
+      if not any(null_args_by_func_allowed.values()):
         # Some analytic functions take no arguments. Ex: ROW_NUM()
         break
 
@@ -932,7 +933,7 @@ class QueryGenerator(object):
     else:
       excluded_designs.append('DETERMINISTIC_ORDER')
 
-    allow_agg = any(ifilter(lambda expr: expr.contains_agg, select_item_exprs))
+    allow_agg = any(filter(lambda expr: expr.contains_agg, select_item_exprs))
     value = self._create_analytic_func_tree(return_type, excluded_designs, allow_agg)
     value = self.populate_func_with_vals(
         value,
@@ -1124,7 +1125,7 @@ class QueryGenerator(object):
     table_expr.alias = self.get_next_id()
     from_clause = FromClause(table_expr)
 
-    for idx in xrange(1, table_count):
+    for idx in range(1, table_count):
       join_clause = self._create_join_clause(from_clause, table_exprs)
       join_clause.table_expr.alias = self.get_next_id()
       from_clause.join_clauses.append(join_clause)
@@ -1252,7 +1253,7 @@ class QueryGenerator(object):
 
     root_predicate, relational_predicates = self._create_boolean_func_tree(
       require_relational_func=True,
-      relational_col_types=table_exprs_by_col_types.keys(),
+      relational_col_types=list(table_exprs_by_col_types.keys()),
       allowed_signatures=join_signatures)
 
     for predicate in relational_predicates:
@@ -1293,7 +1294,7 @@ class QueryGenerator(object):
           % (arg_stop_idx, arg_start_idx))
     if null_args is None:
       null_args = list()
-    for idx in xrange(arg_start_idx, arg_stop_idx):
+    for idx in range(arg_start_idx, arg_stop_idx):
       arg = func.args[idx]
       if arg.is_constant and issubclass(arg.type, allowed_types):
         assert arg.val is None
@@ -1421,7 +1422,7 @@ class QueryGenerator(object):
     if not relational_col_types:
       relational_col_types = tuple()
 
-    for _ in xrange(func_count):
+    for _ in range(func_count):
       is_relational = False
 
       if and_or_count > 0:
@@ -1439,7 +1440,7 @@ class QueryGenerator(object):
           # Prefer to replace Boolean leaves to get a more realistic expression.
           return_type = Boolean
         else:
-          return_type = choice(null_args_by_type.keys())
+          return_type = choice(list(null_args_by_type.keys()))
         # Rather than track if this is a child of a relational function, in which case
         # the arg type needs to be preserved, just always assume that this is a child of
         # a relational function.
@@ -1494,12 +1495,12 @@ def generate_queries_for_manual_inspection():
   tables = list()
   data_types = list(TYPES)
   data_types.remove(Float)
-  for table_idx in xrange(NUM_TABLES):
+  for table_idx in range(NUM_TABLES):
     table = Table('table_%s' % table_idx)
     tables.append(table)
     cols = table.cols
     col_idx = 0
-    for _ in xrange(NUM_COLS_EACH_TYPE):
+    for _ in range(NUM_COLS_EACH_TYPE):
       for col_type in data_types:
         col = Column(table, '%s_col_%s' % (col_type.__name__.lower(), col_idx), col_type)
         cols.append(col)
@@ -1511,7 +1512,7 @@ def generate_queries_for_manual_inspection():
   sql_writer = SqlWriter.create(dialect='IMPALA')
   ref_writer = SqlWriter.create(dialect='POSTGRESQL',
       nulls_order_asc=query_profile.nulls_order_asc())
-  for _ in xrange(NUM_QUERIES):
+  for _ in range(NUM_QUERIES):
     query = query_generator.generate_statement(tables)
     print("Test db")
     print(sql_writer.write_query(query) + '\n')

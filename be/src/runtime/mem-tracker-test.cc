@@ -152,7 +152,7 @@ TEST(MemTestTest, ConsumptionMetric) {
   EXPECT_EQ(t.peak_consumption(), 10);
   EXPECT_EQ(neg_t.consumption(), -10);
   metric.Increment(-5);
-  t.Consume(-1);
+  t.Release(1);
   neg_t.Consume(1);
   EXPECT_EQ(t.consumption(), 5);
   EXPECT_EQ(t.peak_consumption(), 10);
@@ -166,7 +166,7 @@ TEST(MemTestTest, ConsumptionMetric) {
   EXPECT_TRUE(t.LimitExceeded(MemLimit::HARD));
   EXPECT_EQ(neg_t.consumption(), -155);
   metric.Increment(-150);
-  t.Consume(-1);
+  t.Release(1);
   neg_t.Consume(1);
   EXPECT_EQ(t.consumption(), 5);
   EXPECT_EQ(t.peak_consumption(), 155);
@@ -175,15 +175,22 @@ TEST(MemTestTest, ConsumptionMetric) {
   // consumption_ is not updated when Consume()/Release() is called with a zero value
   metric.Increment(10);
   t.Consume(0);
-  neg_t.Consume(0);
+  neg_t.Release(0);
+  EXPECT_EQ(t.consumption(), 5);
+  EXPECT_EQ(t.peak_consumption(), 155);
+  EXPECT_FALSE(t.LimitExceeded(MemLimit::HARD));
+  EXPECT_EQ(neg_t.consumption(), -5);
+  // consumption_ is not updated when TryConsume() is called with a zero value
+  EXPECT_TRUE(t.TryConsume(0));
+  EXPECT_TRUE(neg_t.TryConsume(0));
   EXPECT_EQ(t.consumption(), 5);
   EXPECT_EQ(t.peak_consumption(), 155);
   EXPECT_FALSE(t.LimitExceeded(MemLimit::HARD));
   EXPECT_EQ(neg_t.consumption(), -5);
   // Clean up.
   metric.Increment(-15);
-  t.Consume(-1);
-  neg_t.Consume(-1);
+  t.Release(1);
+  neg_t.Release(1);
 }
 
 TEST(MemTestTest, TrackerHierarchy) {
@@ -352,6 +359,43 @@ TEST(MemTestTest, GcFunctions) {
 
   // Clean up.
   t.Release(10);
+}
+
+// Test that we can compute topN queries from a hierarchy of mem trackers. These
+// queries are represented by 100 query mem trackers.
+TEST(MemTestTest, TopN) {
+  MemTracker root;
+  root.Consume(10);
+
+  static const int NUM_QUERY_MEM_TRACKERS = 100;
+  // Populate these many query mem trackers with some memory consumptions.
+  std::vector<MemTracker*> trackers;
+  for (int i = 0; i < NUM_QUERY_MEM_TRACKERS; i++) {
+    MemTracker* tracker = new MemTracker(-1, "", &root);
+    tracker->query_id_.hi = 0;
+    tracker->query_id_.lo = i;
+    tracker->Consume(int64_t(i + 1));
+    tracker->is_query_mem_tracker_ = true;
+    trackers.push_back(tracker);
+  }
+  // Ready to compute top 5 queries which should be the last 5 of those
+  // populated above. The result is to be saved in pool_stats.heavy_memory_queries.
+  TPoolStats pool_stats;
+  root.UpdatePoolStatsForQueries(5, pool_stats);
+  // Validate the top entries
+  for (int i = 0; i < 5; i++) {
+    EXPECT_EQ(pool_stats.heavy_memory_queries[i].queryId.hi, 0);
+    EXPECT_EQ(
+        pool_stats.heavy_memory_queries[i].queryId.lo, NUM_QUERY_MEM_TRACKERS - i - 1);
+    EXPECT_EQ(
+        pool_stats.heavy_memory_queries[i].memory_consumed, NUM_QUERY_MEM_TRACKERS - i);
+  }
+  // Delete the allocated query mem trackers.
+  for (int i = 0; i < NUM_QUERY_MEM_TRACKERS; i++) {
+    trackers[i]->Release(int64_t(i + 1));
+    delete trackers[i];
+  }
+  root.Release(10);
 }
 }
 

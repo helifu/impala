@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/util/logging.h"
+
 #include <atomic>
 #include <cstdint>
 #include <ctime>
+#include <functional>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -31,7 +34,6 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/async_logger.h"
 #include "kudu/util/barrier.h"
-#include "kudu/util/logging.h"
 #include "kudu/util/logging_test_util.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/stopwatch.h"
@@ -245,5 +247,22 @@ TEST(LoggingTest, TestLogTiming) {
   }
 
   ASSERT_EQ("hello", s2);
+}
+
+// Test that VLOG(n) does not evaluate its message if the verbose level is < n,
+// ensuring that it is perf-safe to write things like
+//
+//   VLOG(1) << Substitute("your foo is $0", compute_costly_bar_string());
+//
+// in hot code paths.
+TEST(LoggingTest, TestVlogDoesNotEvaluateMessage) {
+  if (VLOG_IS_ON(1)) {
+    LOG(INFO) << "Test skipped: verbose level is at least 1";
+    return;
+  }
+
+  int numVlogs = 0;
+  VLOG(1) << "This shouldn't be logged: " << numVlogs++;
+  ASSERT_EQ(0, numVlogs);
 }
 } // namespace kudu

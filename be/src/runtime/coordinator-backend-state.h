@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_RUNTIME_COORDINATOR_BACKEND_STATE_H
-#define IMPALA_RUNTIME_COORDINATOR_BACKEND_STATE_H
+#pragma once
 
-#include <vector>
+#include <mutex>
 #include <unordered_set>
+#include <vector>
 
 #include <boost/accumulators/accumulators.hpp>
 #include <boost/accumulators/statistics/max.hpp>
@@ -28,12 +28,11 @@
 #include <boost/accumulators/statistics/min.hpp>
 #include <boost/accumulators/statistics/stats.hpp>
 #include <boost/accumulators/statistics/variance.hpp>
-#include <boost/thread/mutex.hpp>
 
+#include "gen-cpp/admission_control_service.pb.h"
 #include "gen-cpp/control_service.proxy.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "runtime/coordinator.h"
-#include "scheduling/query-schedule.h"
 #include "util/error-util-internal.h"
 #include "util/progress-updater.h"
 #include "util/runtime-profile.h"
@@ -48,22 +47,39 @@ namespace impala {
 class ProgressUpdater;
 class ObjectPool;
 class DebugOptions;
-class CountingBarrier;
 class ReportExecStatusRequestPB;
 class TUniqueId;
 class TQueryCtx;
 class ExecSummary;
-struct FInstanceExecParams;
 
 /// This class manages all aspects of the execution of all fragment instances of a
 /// single query on a particular backend. For the coordinator backend its possible to have
 /// no fragment instances scheduled on it. In that case, no RPCs are issued and the
-/// Backend state transitions to 'done' state right after Exec() is called on it.
-/// Thread-safe unless pointed out otherwise.
+/// Backend state transitions to 'done' state right after ExecAsync() is called on it.
+///
+/// Object Lifecycle/Thread Safety:
+/// - Init() must be called first followed by ExecAsync() and then WaitOnExecRpc().
+/// - Cancel() may be called at any time after Init(). After Cancel() is called, it is no
+///   longer valid to call ExecAsync().
+/// - After WaitOnExecRpc() has completed, all other functions are valid to call and
+//    thread-safe.
+/// - 'lock_' is used to protect all members that may be read and modified concurrently,
+///   subject to the restrictions above on when methods may be called.
 class Coordinator::BackendState {
  public:
-  BackendState(const QuerySchedule& schedule, const TQueryCtx& query_ctx, int state_idx,
-      TRuntimeFilterMode::type filter_mode, const BackendExecParams& exec_params);
+  BackendState(const QueryExecParams& exec_params, int state_idx,
+      TRuntimeFilterMode::type filter_mode,
+      const BackendExecParamsPB& backend_exec_params);
+
+  /// The following are initialized in the constructor and always valid to call.
+  int state_idx() const { return state_idx_; }
+  const BackendExecParamsPB& exec_params() const { return backend_exec_params_; }
+  const NetworkAddressPB& impalad_address() const { return host_; }
+  const NetworkAddressPB& krpc_impalad_address() const { return krpc_host_; }
+  /// Returns true if there are no fragment instances scheduled on this backend.
+  bool IsEmptyBackend() const { return backend_exec_params_.instance_params().empty(); }
+  /// Return true if execution at this backend is done.
+  bool IsDone();
 
   /// Creates InstanceStats for all instance in backend_exec_params in obj_pool
   /// and installs the instance profiles as children of the corresponding FragmentStats'
@@ -73,41 +89,84 @@ class Coordinator::BackendState {
   void Init(const std::vector<FragmentStats*>& fragment_stats,
       RuntimeProfile* host_profile_parent, ObjectPool* obj_pool);
 
-  /// Starts query execution at this backend by issuing an ExecQueryFInstances rpc and
-  /// notifies on rpc_complete_barrier when the rpc completes. Success/failure is
-  /// communicated through GetStatus(). Uses filter_routing_table to remove filters
-  /// that weren't selected during its construction.
+  /// Starts query execution at this backend by issuing an ExecQueryFInstances rpc
+  /// asynchronously and returns immediately. 'exec_status_barrier' is notified when the
+  /// rpc completes or when an error occurs. Success/failure is communicated through
+  /// GetStatus() after WaitOnExecRpc() returns.
+  /// Uses 'filter_routing_table' to remove filters that weren't selected during its
+  /// construction.
   /// No RPC is issued if there are no fragment instances scheduled on this backend.
-  /// The debug_options are applied to the appropriate TPlanFragmentInstanceCtxs, based
+  /// The 'debug_options' are applied to the appropriate TPlanFragmentInstanceCtxs, based
   /// on their node_id/instance_idx.
-  void Exec(const DebugOptions& debug_options,
+  void ExecAsync(const DebugOptions& debug_options,
       const FilterRoutingTable& filter_routing_table,
-      const kudu::Slice& serialized_query_ctx, CountingBarrier* rpc_complete_barrier);
+      const kudu::Slice& serialized_query_ctx,
+      TypedCountingBarrier<Status>* exec_status_barrier);
+
+  /// Waits until the ExecQueryFInstances() rpc has completed. May be called multiple
+  /// times and from different threads.
+  void WaitOnExecRpc();
+
+  /// Result of attempting to cancel a backend.
+  struct CancelResult {
+    // Whether we tried to cancel the backend in some fashion, e.g. attempted to send
+    // an RPC. This is for informational purpose only (logging, metrics, etc), not
+    // control flow.
+    bool cancel_attempted = false;
+
+    // True iff this changed IsDone() from false to true.
+    bool became_done = false;
+  };
+
+  /// Cancel execution at this backend if anything is running. See CancelResult
+  /// for explanation of the return value.
+  ///
+  /// May be called at any time after Init(). If the ExecQueryFInstances() rpc is
+  /// inflight, will attempt to cancel the rpc. If ExecQueryFInstances() has already
+  /// completed or cancelling it is unsuccessful, sends the Cancel() rpc.
+  /// If 'fire_and_forget' is true, the RPC is sent and the backend is immediately
+  /// considered done, without waiting for a final status report. If 'fire_and_forget'
+  /// is false, the backend is only considered done once the final status report is
+  /// received.
+  CancelResult Cancel(bool fire_and_forget);
+
+  /////////////////////////////////////////
+  /// BEGIN: Functions that should only be called after WaitOnExecRpc() has returned.
 
   /// Update overall execution status, including the instances' exec status/profiles
   /// and the error log, if this backend is not already done. Updates the fragment
   /// instances' TExecStats in exec_summary (exec_summary->nodes.exec_stats) and updates
-  /// progress_update. If any instance reports an error, the overall execution status
-  /// becomes the first reported error status. Returns true iff this update changed
-  /// IsDone() from false to true, either because it was the last fragment to complete or
-  /// because it was the first error received.
+  /// scan_range_progress with any newly-completed scan ranges.
+  ///
+  /// If any instance reports an error, the overall execution status becomes the first
+  /// reported error status. Returns true iff this update changed IsDone() from false
+  /// to true, either because it was the last fragment to complete or because it was
+  /// the first error received. Adds the AuxErrorInfoPB from each
+  /// FragmentInstanceExecStatusPB in backend_exec_status to the vector aux_error_info.
   bool ApplyExecStatusReport(const ReportExecStatusRequestPB& backend_exec_status,
       const TRuntimeProfileForest& thrift_profiles, ExecSummary* exec_summary,
-      ProgressUpdater* scan_range_progress, DmlExecState* dml_exec_state);
+      ProgressUpdater* scan_range_progress, DmlExecState* dml_exec_state,
+      std::vector<AuxErrorInfoPB>* aux_error_info,
+      const std::vector<FragmentStats*>& fragment_stats);
 
   /// Merges the incoming 'thrift_profile' into this backend state's host profile.
   void UpdateHostProfile(const TRuntimeProfileTree& thrift_profile);
 
-  /// Update completion_times, rates, and avg_profile for all fragment_stats.
-  void UpdateExecStats(const std::vector<FragmentStats*>& fragment_stats);
+  /// Update completion_times, rates, and agg_profile for instances where the stats are
+  /// not up-to-date with the latest status report received for that instance. Only
+  /// updates for completed instances when --gen_experimental_profile=false, consistent
+  /// with past behaviour, to avoid adding overhead.  If 'finalize' is true, this is the
+  /// last call to this function for the query and we must update all instances,
+  /// regardless of whether they are done or not.
+  void UpdateExecStats(const std::vector<FragmentStats*>& fragment_stats, bool finalize);
 
-  /// Make a PublishFilter rpc with given params if this backend has instances of the
-  /// fragment with idx == rpc_params->dst_fragment_idx, otherwise do nothing.
-  void PublishFilter(const TPublishFilterParams& rpc_params);
-
-  /// Cancel execution at this backend if anything is running. Returns true
-  /// if cancellation was attempted, false otherwise.
-  bool Cancel();
+  /// Make a PublishFilter rpc with given params to this backend. The backend
+  /// must be one of the filter targets for the filter being published.
+  void PublishFilter(FilterState* state, MemTracker* mem_tracker,
+      const PublishFilterParamsPB& rpc_params, kudu::rpc::RpcController& controller,
+      PublishFilterResultPB& res);
+  void PublishFilterCompleteCb(const kudu::rpc::RpcController* rpc_controller,
+      FilterState* state, MemTracker* mem_tracker);
 
   /// Return the overall execution status. For an error status, the error could come
   /// from the fragment instance level or it can be a general error from the backend
@@ -123,36 +182,34 @@ class Coordinator::BackendState {
   Status GetStatus(bool* is_fragment_failure = nullptr,
       TUniqueId* failed_instance_id = nullptr) WARN_UNUSED_RESULT;
 
-  /// Return true if execution at this backend is done. Thread-safe. Caller must not hold
-  /// lock_.
-  bool IsDone();
-
   /// Return peak memory consumption and aggregated resource usage across all fragment
   /// instances for this backend.
-  ResourceUtilization ComputeResourceUtilization();
+  ResourceUtilization GetResourceUtilization();
+
+  bool IsLocalDiskFaulty() {
+    std::lock_guard<std::mutex> l(lock_);
+    return local_disk_faulty_;
+  }
 
   /// Merge the accumulated error log into 'merged'.
   void MergeErrorLog(ErrorLogMap* merged);
 
-  const TNetworkAddress& impalad_address() const { return host_; }
-  const TNetworkAddress& krpc_impalad_address() const { return krpc_host_; }
-  int state_idx() const { return state_idx_; }
+  /// Return true if this backend has instances of the fragment with the index
+  /// 'fragment_idx'
+  bool HasFragmentIdx(int fragment_idx) const;
 
-  /// Valid after Init().
-  const BackendExecParams* exec_params() const { return backend_exec_params_; }
+  /// Return true if this backend has instances of a fragment with an index in
+  /// 'fragment_idxs'
+  bool HasFragmentIdx(const std::unordered_set<int>& fragment_idxs) const;
 
-  /// Only valid after Exec().
   int64_t rpc_latency() const { return rpc_latency_; }
-  Status exec_rpc_status() const { return exec_rpc_status_; }
+  kudu::Status exec_rpc_status() const { return exec_rpc_status_; }
 
   int64_t last_report_time_ms() {
-    boost::lock_guard<boost::mutex> l(lock_);
+    std::lock_guard<std::mutex> l(lock_);
+    DCHECK(exec_done_) << "May only be called after WaitOnExecRpc() completes.";
     return last_report_time_ms_;
   }
-
-  /// Print host/port info for the first backend that's still in progress as a
-  /// debugging aid for backend deadlocks.
-  static void LogFirstInProgress(std::vector<BackendState*> backend_states);
 
   /// Serializes backend state to JSON by adding members to 'value', including total
   /// number of instances, peak memory consumption, host and status amongst others.
@@ -162,30 +219,47 @@ class Coordinator::BackendState {
   /// adding members to 'value', including the remote host name.
   void InstanceStatsToJson(rapidjson::Value* value, rapidjson::Document* doc);
 
+  /// END: Functions that should only be called after WaitOnExecRpc() has returned.
+  /////////////////////////////////////////
+
+  /// Print host/port info for the first backend that's still in progress as a
+  /// debugging aid for backend deadlocks.
+  static void LogFirstInProgress(std::vector<BackendState*> backend_states);
+
   /// Returns a timestamp using monotonic time for tracking arrival of status reports.
   static int64_t GenerateReportTimestamp() { return MonotonicMillis(); }
-
-  /// Returns True if there are no fragment instances scheduled on this backend.
-  bool IsEmptyBackend() { return backend_exec_params_->instance_params.empty(); }
 
  private:
   /// Execution stats for a single fragment instance.
   /// Not thread-safe.
   class InstanceStats {
    public:
-    InstanceStats(const FInstanceExecParams& exec_params, FragmentStats* fragment_stats,
+    InstanceStats(const FInstanceExecParamsPB& exec_params, const TPlanFragment* fragment,
+        const NetworkAddressPB& address, FragmentStats* fragment_stats,
         ObjectPool* obj_pool);
 
-    /// Updates 'this' with exec_status and the fragment intance's thrift profile. Also
-    /// updates the fragment instance's TExecStats in exec_summary and 'progress_updater'
-    /// with the number of newly completed scan ranges. Also updates the instance's avg
-    /// profile. Caller must hold BackendState::lock_.
+    /// Updates 'this' with exec_status and, if --gen_experimental_profile=false, the
+    /// fragment instance's thrift profile. Also updates the fragment instance's
+    /// TExecStats in exec_summary. Also updates the instance's avg profile.
+    /// 'report_time_ms' should be the UnixMillis() value of when the report was received.
+    /// Caller must hold BackendState::lock_.
     void Update(const FragmentInstanceExecStatusPB& exec_status,
-        const TRuntimeProfileTree& thrift_profile, ExecSummary* exec_summary,
-        ProgressUpdater* scan_range_progress);
+        const TRuntimeProfileTree* thrift_profile, int64_t report_time_ms,
+        ExecSummary* exec_summary);
+
+    /// Update completion_times, rates, and agg_profile for this instance's
+    /// corresponding fragment in 'fragment_stats'. This may only be called
+    /// once the exec RPC is done, i.e. 'BackendState::exec_done_' is true.
+    /// This depends on the status report applied in Update(), so can be
+    /// called sometime after each Update() call to refresh the stats. It
+    /// may make sense to defer the updates in some cases because the amount of work
+    /// involved, particularly in merging RuntimeProfiles, is not trivial.
+    /// If 'finalize' is true, this is the last call to this function for the query
+    /// and we must update the instance, whether it is done or not.
+    void UpdateExecStats(const vector<FragmentStats*>& fragment_stats, bool finalize);
 
     int per_fragment_instance_idx() const {
-      return exec_params_.per_fragment_instance_idx;
+      return exec_params_.per_fragment_instance_idx();
     }
 
     /// Serializes instance stats to JSON by adding members to 'value', including its
@@ -196,8 +270,12 @@ class Coordinator::BackendState {
    private:
     friend class BackendState;
 
-    /// query lifetime
-    const FInstanceExecParams& exec_params_;
+    /// The exec params for this fragment instance. Owned by the QuerySchedulePB in
+    /// ClientRequestState.
+    const FInstanceExecParamsPB& exec_params_;
+
+    /// The corresponding fragment. Owned by the TExecRequest in QueryDriver.
+    const TPlanFragment* fragment_;
 
     /// Unix time in milliseconds of the last status report update for this fragment
     /// instance. Set in Update(). Uses UnixMillis() instead of MonotonicMillis() as
@@ -210,19 +288,31 @@ class Coordinator::BackendState {
     /// persists for the duration of one status report update (5 seconds by default).
     int64_t last_report_time_ms_ = 0;
 
-    /// The sequence number of the last report.
+    /// The sequence number of the last report for this fragment instance.
     int64_t last_report_seq_no_ = 0;
 
-    /// owned by coordinator object pool provided in the c'tor, created in Update()
+    /// The profile tree for this instance. Owned by coordinator object pool provided in
+    /// the c'tor, created in Update().
+    /// When --gen_experimental_profile=true, this contains a copy of the full instance
+    /// profile from the executor, which is updated with each status report. It also
+    /// includes some additional counters added by the coordinator.
+    /// When --gen_experimental_profile=false, this only includes the counters added
+    /// by the coordinator.
     RuntimeProfile* profile_ = nullptr;
+
+    /// True if 'agg_profile_' for the fragment is up-to-date with 'profile_'.
+    /// Set to false in Update() when a new profile is received for this instance
+    /// and back to true in UpdateExecStats() when the updated profile is merged into
+    /// 'agg_profile_'.
+    bool agg_profile_up_to_date_ = true;
+
+    /// If true, the completion time for this instance has been set.
+    bool completion_time_set_ = false;
 
     /// true if the final report has been received for the fragment instance.
     /// Used to handle duplicate done ReportExecStatus RPC messages. Used only
     /// in ApplyExecStatusReport()
     bool done_ = false;
-
-    /// true after the first call to profile->Update()
-    bool profile_created_ = false;
 
     /// cumulative size of all splits; set in c'tor
     int64_t total_split_size_ = 0;
@@ -230,37 +320,23 @@ class Coordinator::BackendState {
     /// wall clock timer for this instance
     MonotonicStopWatch stopwatch_;
 
-    /// total scan ranges complete across all scan nodes
-    int64_t total_ranges_complete_ = 0;
-
-    /// SCAN_RANGES_COMPLETE_COUNTERs in profile_
-    std::vector<RuntimeProfile::Counter*> scan_ranges_complete_counters_;
-
-    /// Collection of BYTES_READ_COUNTERs of all scan nodes in this fragment instance.
-    std::vector<RuntimeProfile::Counter*> bytes_read_counters_;
-
-    /// Collection of TotalBytesSent of all data stream senders in this fragment instance.
-    std::vector<RuntimeProfile::Counter*> bytes_sent_counters_;
-
     /// Descriptor string for the last query status report time in the profile.
     static const char* LAST_REPORT_TIME_DESC;
 
     /// The current state of this fragment instance's execution. This gets serialized in
     /// ToJson() and is displayed in the debug webpages.
     FInstanceExecStatePB current_state_ = FInstanceExecStatePB::WAITING_FOR_EXEC;
-
-    /// Extracts scan_ranges_complete_counters_ and  bytes_read_counters_ from profile_.
-    void InitCounters();
   };
 
-  /// QuerySchedule associated with the Coordinator that owns this BackendState.
-  const QuerySchedule& schedule_;
+  /// ExecParams associated with the Coordinator that owns this BackendState.
+  const QueryExecParams& exec_params_;
 
   const int state_idx_;  /// index of 'this' in Coordinator::backend_states_
   const TRuntimeFilterMode::type filter_mode_;
 
-  /// Backend exec params, owned by the QuerySchedule and has query lifetime.
-  const BackendExecParams* backend_exec_params_;
+  /// Backend exec params, owned by the QuerySchedulePB in ClientRequestState and has
+  /// query lifetime.
+  const BackendExecParamsPB& backend_exec_params_;
 
   /// map from instance idx to InstanceStats, the latter live in the obj_pool parameter
   /// of Init()
@@ -274,27 +350,45 @@ class Coordinator::BackendState {
   /// Owned by coordinator object pool provided in the c'tor, created in Update().
   RuntimeProfile* host_profile_ = nullptr;
 
-  /// Thrift address of execution backend.
-  TNetworkAddress host_;
-  /// Krpc address of execution backend.
-  TNetworkAddress krpc_host_;
+  /// Address of execution backend: hostname + krpc_port.
+  NetworkAddressPB host_;
+  /// Krpc address of execution backend: ip_address + krpc_port.
+  NetworkAddressPB krpc_host_;
 
-  /// protects fields below
-  /// lock ordering: Coordinator::lock_ must only be obtained *prior* to lock_
-  boost::mutex lock_;
+  /// The query context of the Coordinator that owns this BackendState.
+  const TQueryCtx& query_ctx_;
 
-  // number of in-flight instances
+  /// The query id of the Coordinator that owns this BackendState. Owned by
+  /// 'exec_params_'.
+  const UniqueIdPB& query_id_;
+
+  /// Used to issue the ExecQueryFInstances() rpc.
+  kudu::rpc::RpcController exec_rpc_controller_;
+
+  /// Response from ExecQueryFInstances().
+  ExecQueryFInstancesResponsePB exec_response_;
+
+  /// The status returned by KRPC for the ExecQueryFInstances() rpc. If this is an error,
+  /// we were unable to successfully communicate with the backend, eg. because of a
+  /// network error, or the rpc was cancelled by Cancel().
+  kudu::Status exec_rpc_status_;
+
+  /// Time, in ms, that it took to execute the ExecQueryFInstances() rpc.
+  int64_t rpc_latency_ = 0;
+
+  /////////////////////////////////////////
+  /// BEGIN: Members that are protected by 'lock_'.
+
+  /// Lock ordering: Coordinator::lock_ must only be obtained *prior* to lock_
+  std::mutex lock_;
+
+  // Number of in-flight instances
   int num_remaining_instances_ = 0;
 
   /// If the status indicates an error status, execution has either been aborted by the
   /// executing impalad (which then reported the error) or cancellation has been
   /// initiated; either way, execution must not be cancelled.
   Status status_;
-
-  /// The status returned by KRPC for the ExecQueryFInstances() rpc. If this is an error,
-  /// we were unable to successfully communicate with the backend, eg. because of a
-  /// network error.
-  Status exec_rpc_status_;
 
   /// Used to distinguish between errors reported by a specific fragment instance,
   /// which would set failed_instance_id_, rather than an error independent of any
@@ -305,25 +399,45 @@ class Coordinator::BackendState {
   /// Invalid if no fragment instance has reported an error status.
   TUniqueId failed_instance_id_;
 
+  /// If true, the backend reported that the query failure was caused by disk IO error
+  /// on its local disk.
+  bool local_disk_faulty_ = false;
+
   /// Errors reported by this fragment instance.
   ErrorLogMap error_log_;
 
-  /// Time, in ms, that it took to execute the ExecRemoteFragment() RPC.
-  int64_t rpc_latency_ = 0;
+  /// If true, ExecQueryFInstances() rpc has been sent.
+  bool exec_rpc_sent_ = false;
 
-  /// If true, ExecPlanFragment() rpc has been sent - even if it was not determined to be
-  /// successful.
-  bool rpc_sent_ = false;
+  /// If true, any work related to Exec() is done. The usual case is that the
+  /// ExecQueryFInstances() rpc callback has been executed, but it may also be set to true
+  /// if Cancel() is called before Exec() or if no Exec() rpc needs to be sent.
+  bool exec_done_ = false;
 
-  /// Initialized in Init(), then set in each call to ApplyExecStatusReport().
+  /// Notified when the ExecQueryFInstances() rpc is completed.
+  ConditionVariable exec_done_cv_;
+
+  /// Initialized in ExecCompleteCb(), then set in each call to ApplyExecStatusReport().
   /// Uses GenerateReportTimeout().
   int64_t last_report_time_ms_ = 0;
 
-  /// The query context of the Coordinator that owns this BackendState.
-  const TQueryCtx& query_ctx_;
+  /// The sequence number of the last report for this backend.
+  int64_t last_backend_report_seq_no_ = 0;
 
-  /// The query id of the Coordinator that owns this BackendState.
-  const TUniqueId& query_id_;
+  /// True if a CancelQueryFInstances RPC was already sent to this backend.
+  bool sent_cancel_rpc_ = false;
+
+  /// True if Exec() RPC is cancelled.
+  bool cancel_exec_rpc_ = false;
+
+  /// Total scan ranges complete across all scan nodes. Set in ApplyExecStatusReport().
+  int64_t total_ranges_complete_ = 0;
+
+  /// Resource utilization values. Set in ApplyExecStatusReport().
+  ResourceUtilization backend_utilization_;
+
+  /// END: Members that are protected by 'lock_'.
+  /////////////////////////////////////////
 
   /// Fill in 'request' and 'fragment_info' based on state. Uses 'filter_routing_table' to
   /// remove filters that weren't selected during its construction.
@@ -332,14 +446,33 @@ class Coordinator::BackendState {
       ExecQueryFInstancesRequestPB* request, TExecPlanFragmentInfo* fragment_info);
 
   /// Expects that 'status' is an error. Sets 'status_' to a formatted version of its
-  /// message.
-  void SetExecError(const Status& status);
+  /// message and notifies 'exec_status_barrier' with it. Caller must hold 'lock_'.
+  void SetExecError(
+      const Status& status, TypedCountingBarrier<Status>* exec_status_barrier);
+
+  /// Waits until the ExecQueryFInstances() rpc has completed, or been timeout.
+  /// 'l' must own 'lock_'. 'timeout_ms' specifies timeout in milli-seconds. Wait
+  /// indefinitely until rpc has completed if 'timeout_ms' is less or equal to 0.
+  /// Return true if the rpc has completed in time, return false otherwise.
+  bool WaitOnExecLocked(std::unique_lock<std::mutex>* l, int64_t timeout_ms = 0);
+
+  /// Called when the ExecQueryFInstances() rpc completes. Notifies 'exec_status_barrier'
+  /// with the status. 'start' is the MonotonicMillis() timestamp when the rpc was sent.
+  void ExecCompleteCb(
+      TypedCountingBarrier<Status>* exec_status_barrier, int64_t start_ms);
 
   /// Version of IsDone() where caller must hold lock_ via lock;
-  bool IsDoneLocked(const boost::unique_lock<boost::mutex>& lock) const;
+  bool IsDoneLocked(const std::unique_lock<std::mutex>& lock) const;
 
-  /// Same as ComputeResourceUtilization() but caller must hold lock.
-  ResourceUtilization ComputeResourceUtilizationLocked();
+  /// Same as GetResourceUtilization() but caller must hold lock.
+  ResourceUtilization GetResourceUtilizationLocked();
+
+  /// Implementation of UpdateExecStats(). Caller must hold 'lock_' via 'lock'.
+  void UpdateExecStatsLocked(const std::unique_lock<std::mutex>& lock,
+      const std::vector<FragmentStats*>& fragment_stats, bool finalize);
+
+  /// Logs 'msg' at the VLOG_QUERY level, along with 'query_id_' and 'krpc_host_'.
+  void VLogForBackend(const std::string& msg);
 };
 
 /// Per fragment execution statistics.
@@ -354,16 +487,15 @@ class Coordinator::FragmentStats {
       boost::accumulators::tag::variance>
   > SummaryStats;
 
-  /// Create avg and root profiles in obj_pool.
-  FragmentStats(const std::string& avg_profile_name,
-      const std::string& root_profile_name,
+  /// Create aggregated and root profiles in obj_pool.
+  FragmentStats(const std::string& agg_profile_name, const std::string& root_profile_name,
       int num_instances, ObjectPool* obj_pool);
 
-  RuntimeProfile* avg_profile() { return avg_profile_; }
+  AggregatedRuntimeProfile* agg_profile() { return agg_profile_; }
   RuntimeProfile* root_profile() { return root_profile_; }
   SummaryStats* bytes_assigned() { return &bytes_assigned_; }
 
-  /// Compute stats for 'bytes_assigned' and add as info string to avg_profile.
+  /// Compute stats for 'bytes_assigned' and add as info string to agg_profile.
   void AddSplitStats();
 
   /// Add summary string with execution stats to avg profile.
@@ -377,7 +509,7 @@ class Coordinator::FragmentStats {
   /// counters in the fragment instance profiles.
   /// Note that the individual fragment instance profiles themselves are stored and
   /// displayed as children of the root_profile below.
-  RuntimeProfile* avg_profile_;
+  AggregatedRuntimeProfile* agg_profile_;
 
   /// root profile for all fragment instances for this fragment; resides in obj_pool
   RuntimeProfile* root_profile_;
@@ -386,12 +518,15 @@ class Coordinator::FragmentStats {
   int num_instances_;
 
   /// Bytes assigned for instances of this fragment
+  /// TODO: IMPALA-9846: can remove when we switch to the transposed profile.
   SummaryStats bytes_assigned_;
 
   /// Completion times for instances of this fragment
+  /// TODO: IMPALA-9846: can remove when we switch to the transposed profile.
   SummaryStats completion_times_;
 
   /// Execution rates for instances of this fragment
+  /// TODO: IMPALA-9846: can remove when we switch to the transposed profile.
   SummaryStats rates_;
 };
 
@@ -454,8 +589,7 @@ class Coordinator::BackendResourceState {
  public:
   /// Create the BackendResourceState with the given vector of BackendStates. All
   /// BackendStates are initially in the IN_USE state.
-  BackendResourceState(
-      const std::vector<BackendState*>& backend_states, const QuerySchedule& schedule);
+  BackendResourceState(const std::vector<BackendState*>& backend_states);
   ~BackendResourceState();
 
   /// Mark a BackendState as finished and transition it to the PENDING state. Applies
@@ -518,9 +652,6 @@ class Coordinator::BackendResourceState {
   // True if the BackendResourceState is closed, false otherwise.
   bool closed_ = false;
 
-  /// QuerySchedule associated with the Coordinator that owns this BackendResourceState.
-  const QuerySchedule& schedule_;
-
   /// Configured value of FLAGS_release_backend_states_delay_ms in nanoseconds.
   const int64_t release_backend_states_delay_ns_;
 
@@ -533,5 +664,3 @@ class Coordinator::BackendResourceState {
   FRIEND_TEST(CoordinatorBackendStateTest, StateMachine);
 };
 }
-
-#endif

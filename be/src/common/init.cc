@@ -19,21 +19,21 @@
 
 #include <csignal>
 #include <gperftools/heap-profiler.h>
-#include <gperftools/malloc_extension.h>
 #include <third_party/lss/linux_syscall_support.h>
 
 #include "common/global-flags.h"
 #include "common/logging.h"
 #include "common/status.h"
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/string-functions.h"
+#include "exprs/timezone_db.h"
 #include "gutil/atomicops.h"
 #include "gutil/strings/substitute.h"
 #include "rpc/authentication.h"
 #include "rpc/thrift-util.h"
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/datetime-simple-date-format-parser.h"
-#include "runtime/decimal-value.h"
 #include "runtime/exec-env.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
@@ -42,7 +42,6 @@
 #include "util/cgroup-util.h"
 #include "util/cpu-info.h"
 #include "util/debug-util.h"
-#include "util/decimal-util.h"
 #include "util/disk-info.h"
 #include "util/jni-util.h"
 #include "util/logging-support.h"
@@ -52,6 +51,7 @@
 #include "util/network-util.h"
 #include "util/openssl-util.h"
 #include "util/os-info.h"
+#include "util/parse-util.h"
 #include "util/periodic-counter-updater.h"
 #include "util/pretty-printer.h"
 #include "util/redactor.h"
@@ -67,17 +67,18 @@ using namespace impala;
 DECLARE_bool(enable_process_lifetime_heap_profiling);
 DECLARE_string(heap_profile_dir);
 DECLARE_string(hostname);
+DECLARE_bool(use_resolved_hostname);
 // TODO: rename this to be more generic when we have a good CM release to do so.
 DECLARE_int32(logbufsecs);
 DECLARE_int32(max_log_files);
 DECLARE_int32(max_minidumps);
 DECLARE_string(redaction_rules_file);
+DECLARE_bool(redirect_stdout_stderr);
+DECLARE_string(re2_mem_limit);
 DECLARE_string(reserved_words_version);
 DECLARE_bool(symbolize_stacktrace);
-
-DEFINE_int32(max_audit_event_log_files, 0, "Maximum number of audit event log files "
-    "to retain. The most recent audit event log files are retained. If set to 0, "
-    "all audit event log files are retained.");
+DECLARE_string(debug_actions);
+DECLARE_int32(thrift_rpc_max_message_size);
 
 DEFINE_int32(memory_maintenance_sleep_time_ms, 10000, "Sleep time in milliseconds "
     "between memory maintenance iterations");
@@ -92,6 +93,10 @@ DEFINE_int64(pause_monitor_warn_threshold_ms, 10000, "If the pause monitor sleep
 DEFINE_string(local_library_dir, "/tmp",
     "Scratch space for local fs operations. Currently used for copying "
     "UDF binaries locally from HDFS and also for initializing the timezone db");
+
+DEFINE_bool(jvm_automatic_add_opens, true,
+    "Adds necessary --add-opens options for core Java modules necessary to correctly "
+    "calculate catalog metadata cache object sizes.");
 
 // Defined by glog. This allows users to specify the log level using a glob. For
 // example -vmodule=*scanner*=3 would enable full logging for scanners. If redaction
@@ -125,6 +130,10 @@ static unique_ptr<impala::Thread> pause_monitor;
 // Thread only used in backend tests to implement a test timeout.
 static unique_ptr<impala::Thread> be_timeout_thread;
 
+// Fault injection thread that is spawned if FLAGS_debug_actions has label
+// 'LOG_MAINTENANCE_STDERR'.
+static unique_ptr<impala::Thread> log_fault_inject_thread;
+
 // Timeout after 2 hours - backend tests should generally run in minutes or tens of
 // minutes at worst.
 #if defined(UNDEFINED_SANITIZER_FULL)
@@ -137,22 +146,58 @@ static const int64_t BE_TEST_TIMEOUT_S = 60L * 60L * 2L;
 extern "C" { void __gcov_flush(); }
 #endif
 
-[[noreturn]] static void LogMaintenanceThread() {
+[[noreturn]] static void LogFaultInjectionThread() {
+  const int64_t sleep_duration = 1;
   while (true) {
-    sleep(FLAGS_logbufsecs);
+    sleep(sleep_duration);
+
+    const int64_t now = MonotonicMillis();
+    Status status = DebugAction(FLAGS_debug_actions, "LOG_MAINTENANCE_STDERR");
+    if (!status.ok()) {
+      // Fault injection activated. Print the error message several times to cerr.
+      for (int i = 0; i < 128; i++) {
+        std::cerr << now << " " << i << " "
+                  << " LOG_MAINTENANCE_STDERR " << status.msg().msg() << endl;
+      }
+
+      // Check that impalad can always find INFO and ERROR log path.
+      DCHECK(impala::HasLog(google::INFO));
+      DCHECK(impala::HasLog(google::ERROR));
+    }
+  }
+}
+
+[[noreturn]] static void LogMaintenanceThread() {
+  int64_t last_flush = MonotonicMillis();
+  const int64_t sleep_duration = std::min(1, FLAGS_logbufsecs);
+  while (true) {
+    sleep(sleep_duration);
+
+    const int64_t now = MonotonicMillis();
+    bool max_log_file_exceeded = RedirectStdoutStderr() && impala::CheckLogSize(false);
+    if ((now - last_flush) / 1000 < FLAGS_logbufsecs && !max_log_file_exceeded) {
+      continue;
+    }
 
     google::FlushLogFiles(google::GLOG_INFO);
 
+    // Check log size again and force log rotation this time if they still big after
+    // FlushLogFiles.
+    if (max_log_file_exceeded && impala::CheckLogSize(true)) impala::ForceRotateLog();
+
     // No need to rotate log files in tests.
     if (impala::TestInfo::is_test()) continue;
+    // Reattach stdout and stderr if necessary.
+    if (impala::RedirectStdoutStderr()) impala::AttachStdoutStderr();
     // Check for log rotation in every interval of the maintenance thread
     impala::CheckAndRotateLogFiles(FLAGS_max_log_files);
-    // Check for audit event log rotation in every interval of the maintenance thread
-    impala::CheckAndRotateAuditEventLogFiles(FLAGS_max_audit_event_log_files);
     // Check for minidump rotation in every interval of the maintenance thread. This is
     // necessary since an arbitrary number of minidumps can be written by sending SIGUSR1
     // to the process.
     impala::CheckAndRotateMinidumps(FLAGS_max_minidumps);
+
+    // update last_flush.
+    last_flush = MonotonicMillis();
   }
 }
 
@@ -195,8 +240,7 @@ extern "C" { void __gcov_flush(); }
     CHECK(err == 0) << "sigwait(): " << GetStrErrMsg(err) << ": " << err;
     CHECK_EQ(IMPALA_SHUTDOWN_SIGNAL, signal);
     ShutdownStatusPB shutdown_status;
-    const int ONE_YEAR_IN_SECONDS = 365 * 24 * 60 * 60;
-    Status status = impala_server->StartShutdown(ONE_YEAR_IN_SECONDS, &shutdown_status);
+    Status status = impala_server->StartShutdown(-1, &shutdown_status);
     if (!status.ok()) {
       LOG(ERROR) << "Shutdown signal received but unable to initiate shutdown. Status: "
                  << status.GetDetail();
@@ -257,8 +301,59 @@ void BlockImpalaShutdownSignal() {
   AbortIfError(pthread_sigmask(SIG_BLOCK, &signals, nullptr), error_msg);
 }
 
+// Append add-opens args to JAVA_TOOL_OPTIONS for ehcache.
+static Status JavaAddOpens() {
+  if (!FLAGS_jvm_automatic_add_opens) return Status::OK();
+
+  stringstream val_out;
+  char* current_val_c = getenv("JAVA_TOOL_OPTIONS");
+  if (current_val_c != NULL) {
+    val_out << current_val_c;
+  }
+
+  // These options are required for Java 9+, and ignored by Java 8.
+  for (const string& param : {
+    "--add-opens=java.base/java.io=ALL-UNNAMED",
+    "--add-opens=java.base/java.lang.module=ALL-UNNAMED",
+    "--add-opens=java.base/java.lang.ref=ALL-UNNAMED",
+    "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+    "--add-opens=java.base/java.lang=ALL-UNNAMED",
+    "--add-opens=java.base/java.net=ALL-UNNAMED",
+    "--add-opens=java.base/java.nio.charset=ALL-UNNAMED",
+    "--add-opens=java.base/java.nio.file.attribute=ALL-UNNAMED",
+    "--add-opens=java.base/java.nio=ALL-UNNAMED",
+    "--add-opens=java.base/java.security=ALL-UNNAMED",
+    "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
+    "--add-opens=java.base/java.util.jar=ALL-UNNAMED",
+    "--add-opens=java.base/java.util.zip=ALL-UNNAMED",
+    "--add-opens=java.base/java.util=ALL-UNNAMED",
+    "--add-opens=java.base/jdk.internal.loader=ALL-UNNAMED",
+    "--add-opens=java.base/jdk.internal.math=ALL-UNNAMED",
+    "--add-opens=java.base/jdk.internal.module=ALL-UNNAMED",
+    "--add-opens=java.base/jdk.internal.perf=ALL-UNNAMED",
+    "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED",
+    "--add-opens=java.base/jdk.internal.reflect=ALL-UNNAMED",
+    "--add-opens=java.base/jdk.internal.util.jar=ALL-UNNAMED",
+    "--add-opens=java.base/sun.nio.fs=ALL-UNNAMED",
+    "--add-opens=jdk.dynalink/jdk.dynalink.beans=ALL-UNNAMED",
+    "--add-opens=jdk.dynalink/jdk.dynalink.linker.support=ALL-UNNAMED",
+    "--add-opens=jdk.dynalink/jdk.dynalink.linker=ALL-UNNAMED",
+    "--add-opens=jdk.dynalink/jdk.dynalink.support=ALL-UNNAMED",
+    "--add-opens=jdk.dynalink/jdk.dynalink=ALL-UNNAMED",
+    "--add-opens=jdk.management.jfr/jdk.management.jfr=ALL-UNNAMED",
+    "--add-opens=jdk.management/com.sun.management.internal=ALL-UNNAMED"
+  }) {
+    val_out << " " << param;
+  }
+
+  if (setenv("JAVA_TOOL_OPTIONS", val_out.str().c_str(), 1) < 0) {
+    return Status(Substitute("Could not update JAVA_TOOL_OPTIONS: $0", GetStrErrMsg()));
+  }
+  return Status::OK();
+}
+
 void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
-    TestInfo::Mode test_mode) {
+    TestInfo::Mode test_mode, bool external_fe) {
   srand(time(NULL));
   BlockImpalaShutdownSignal();
 
@@ -267,10 +362,6 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   MemInfo::Init();
   OsInfo::Init();
   TestInfo::Init(test_mode);
-
-  // Verify CPU meets the minimum requirements before calling InitGoogleLoggingSafe()
-  // which might use SSSE3 instructions (see IMPALA-160).
-  CpuInfo::VerifyCpuRequirements();
 
   // Set the default hostname. The user can override this with the hostname flag.
   ABORT_IF_ERROR(GetHostname(&FLAGS_hostname));
@@ -281,6 +372,16 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
 # else
   FLAGS_symbolize_stacktrace = true;
 #endif
+
+  if (external_fe) {
+    // Change defaults for flags when loaded as part of external frontend.
+    // Write logs to stderr by default (otherwise logs get written to
+    // FeSupport.INFO/ERROR).
+    FLAGS_logtostderr = true;
+    // Do not redirct stdout/stderr by default.
+    FLAGS_redirect_stdout_stderr = false;
+  }
+
   google::SetVersionString(impala::GetBuildVersion());
   google::ParseCommandLineFlags(&argc, &argv, true);
   if (!FLAGS_redaction_rules_file.empty()) {
@@ -296,17 +397,38 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     CLEAN_EXIT_WITH_ERROR(Substitute("read_size can not be lower than $0",
         READ_SIZE_MIN_VALUE));
   }
+
+  bool is_percent = false; // not used
+  int64_t re2_mem_limit = ParseUtil::ParseMemSpec(FLAGS_re2_mem_limit, &is_percent, 0);
+  if (re2_mem_limit <= 0) {
+    CLEAN_EXIT_WITH_ERROR(
+        Substitute("Invalid mem limit for re2's regex engine: $0", FLAGS_re2_mem_limit));
+  } else {
+    StringFunctions::SetRE2MemLimit(re2_mem_limit);
+  }
+
   if (FLAGS_reserved_words_version != "2.11.0" && FLAGS_reserved_words_version != "3.0.0")
   {
     CLEAN_EXIT_WITH_ERROR(Substitute("Invalid flag reserved_words_version. The value must"
         " be one of [\"2.11.0\", \"3.0.0\"], while the provided value is $0.",
         FLAGS_reserved_words_version));
   }
+
+  if (!impala::TestInfo::is_test() && FLAGS_thrift_rpc_max_message_size > 0
+      && FLAGS_thrift_rpc_max_message_size < ThriftDefaultMaxMessageSize()) {
+    CLEAN_EXIT_WITH_ERROR(Substitute("thrift_rpc_max_message_size must be >= $0 or <= 0.",
+        ThriftDefaultMaxMessageSize()));
+  }
+
   impala::InitGoogleLoggingSafe(argv[0]);
   // Breakpad needs flags and logging to initialize.
-  ABORT_IF_ERROR(RegisterMinidump(argv[0]));
+  if (!external_fe) {
+    ABORT_IF_ERROR(RegisterMinidump(argv[0]));
+  }
 #ifndef THREAD_SANITIZER
+#ifndef __aarch64__
   AtomicOps_x86CPUFeaturesInit();
+#endif
 #endif
   impala::InitThreading();
   impala::datetime_parse_util::SimpleDateFormatTokenizer::InitCtx();
@@ -321,6 +443,13 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   thread_spawn_status =
       Thread::Create("common", "pause-monitor", &PauseMonitorLoop, &pause_monitor);
   if (!thread_spawn_status.ok()) CLEAN_EXIT_WITH_ERROR(thread_spawn_status.GetDetail());
+
+  // Initialize log fault injection if such debug action exist.
+  if (strstr(FLAGS_debug_actions.c_str(), "LOG_MAINTENANCE_STDERR") != NULL) {
+    thread_spawn_status = Thread::Create("common", "log-fault-inject-thread",
+        &LogFaultInjectionThread, &log_fault_inject_thread);
+    if (!thread_spawn_status.ok()) CLEAN_EXIT_WITH_ERROR(thread_spawn_status.GetDetail());
+  }
 
   // Implement timeout for backend tests.
   if (impala::TestInfo::is_be_test()) {
@@ -337,6 +466,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
 
   LOG(INFO) << impala::GetVersionString();
   LOG(INFO) << "Using hostname: " << FLAGS_hostname;
+  LOG(INFO) << "Using locale: " << std::locale("").name();
   impala::LogCommandLineFlags();
 
   // When a process calls send(2) on a socket closed on the other end, linux generates
@@ -355,15 +485,38 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   LOG(INFO) << "Default AES cipher mode for spill-to-disk: "
             << EncryptionKey::ModeToString(EncryptionKey::GetSupportedDefaultMode());
 
+  // After initializing logging and printing the machine information, verify the
+  // minimal CPU requirements and exit if they are not met.
+  Status cpu_requirement_status = CpuInfo::EnforceCpuRequirements();
+  if (!cpu_requirement_status.ok()) {
+    CLEAN_EXIT_WITH_ERROR(cpu_requirement_status.GetDetail());
+  }
+
+  if (FLAGS_use_resolved_hostname) {
+    IpAddr ip_address;
+    Status status = HostnameToIpAddr(FLAGS_hostname, &ip_address);
+    if (!status.ok()) CLEAN_EXIT_WITH_ERROR(status.GetDetail());
+    LOG(INFO) << Substitute("Resolved hostname $0 to $1", FLAGS_hostname, ip_address);
+    FLAGS_hostname = ip_address;
+  }
+
   // Required for the FE's Catalog
-  ABORT_IF_ERROR(impala::LibCache::Init());
+  ABORT_IF_ERROR(impala::LibCache::Init(external_fe));
   Status fs_cache_init_status = impala::HdfsFsCache::Init();
   if (!fs_cache_init_status.ok()) CLEAN_EXIT_WITH_ERROR(fs_cache_init_status.GetDetail());
 
   if (init_jvm) {
+    // Add JAVA_TOOL_OPTIONS for ehcache
+    ABORT_IF_ERROR(JavaAddOpens());
+
+    if (!external_fe) {
+      JniUtil::InitLibhdfs();
+    }
     ABORT_IF_ERROR(JniUtil::Init());
     InitJvmLoggingSupport();
-    ABORT_IF_ERROR(JniUtil::InitJvmPauseMonitor());
+    if (!external_fe) {
+      ABORT_IF_ERROR(JniUtil::InitJvmPauseMonitor());
+    }
     ZipUtil::InitJvm();
   }
 
@@ -394,6 +547,12 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     error_msg << "Failed to register action for SIGTERM: " << GetStrErrMsg();
     CLEAN_EXIT_WITH_ERROR(error_msg.str());
   }
+
+  if (external_fe || test_mode == TestInfo::FE_TEST) {
+    // Explicitly load the timezone database for external FEs and FE tests.
+    // Impala daemons load it through ImpaladMain
+    ABORT_IF_ERROR(TimezoneDatabase::Initialize());
+  }
 }
 
 Status impala::StartMemoryMaintenanceThread() {
@@ -416,10 +575,23 @@ extern "C" const char *__asan_default_options() {
 #endif
 
 #if defined(THREAD_SANITIZER)
-// Default TSAN_OPTIONS. Override by setting environment variable $TSAN_OPTIONS.
-extern "C" const char *__tsan_default_options() {
-  // Note that backend test should re-configure to halt_on_error=1
-  return "halt_on_error=0 history_size=7";
+extern "C" const char* __tsan_default_options() {
+  // Default TSAN_OPTIONS. Override by setting environment variable $TSAN_OPTIONS.
+  // TSAN and Java don't play nicely together because JVM code is not instrumented with
+  // TSAN. TSAN requires all libs to be compiled with '-fsanitize=thread' (see
+  // https://github.com/google/sanitizers/wiki/ThreadSanitizerCppManual#non-instrumented-code),
+  // which is not currently possible for Java code. See
+  // https://wiki.openjdk.java.net/display/tsan/Main and JDK-8208520 for efforts to get
+  // TSAN to run against Java code. The flag ignore_noninstrumented_modules tells TSAN to
+  // ignore all interceptors called from any non-instrumented libraries (e.g. Java).
+  return "ignore_noninstrumented_modules="
+#if defined(THREAD_SANITIZER_FULL)
+         "0 "
+#else
+         "1 "
+#endif
+         "halt_on_error=1 history_size=7 allocator_may_return_null=1 "
+         "suppressions=" THREAD_SANITIZER_SUPPRESSIONS;
 }
 #endif
 

@@ -45,6 +45,9 @@ class FileSystemUtil {
   /// Returns Status::OK if it is, or a runtime error with a message otherwise.
   static Status VerifyIsDirectory(const std::string& directory_path) WARN_UNUSED_RESULT;
 
+  /// Check if a path exists. Returns an error if this could not be determined.
+  static Status PathExists(const std::string& path, bool* exists);
+
   /// Returns the space available on the file system containing 'directory_path'
   /// in 'available_bytes'
   static Status GetSpaceAvailable(
@@ -105,6 +108,10 @@ class FileSystemUtil {
   /// Returns OK otherwise.
   static Status CheckHolePunch(const std::string& path);
 
+  /// Return the approximate file size of 'path' into output argument 'file_size', based
+  /// on what file system sees.
+  static Status ApproximateFileSize(const std::string& path, uintmax_t& file_size);
+
   class Directory {
    public:
     // Different types of entry in the directory
@@ -137,9 +144,12 @@ class FileSystemUtil {
     /// entry is returned. Directory entries "." and ".." will be skipped. If 'type' is
     /// specified and filesystem of 'path' supports returning type of directory entries,
     /// only entries of 'type' will be included in 'entry_names'. Otherwise, it will
-    /// include entries of all types.
+    /// include entries of all types. Optionally, a 'regex' can be specified. If the
+    /// regex is not empty, only entries that match the regex are returned. See
+    /// std::regex for the regex pattern syntax.
     static Status GetEntryNames(const string& path, std::vector<std::string>* entry_names,
-        int max_result_size = 0, EntryType type = DIR_ENTRY_ANY);
+        int max_result_size = 0, EntryType type = DIR_ENTRY_ANY,
+        const std::string& regex = "");
 
    private:
     DIR* dir_stream_;

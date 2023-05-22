@@ -25,6 +25,8 @@ setup_report_build_error
 cd "${IMPALA_HOME}"
 
 export IMPALA_MAVEN_OPTIONS="-U"
+# Allow unlimited pytest failures
+export MAX_PYTEST_FAILURES=0
 
 # When UBSAN_FAIL is "death", the logs are monitored for UBSAN errors. Any errors will
 # then cause this script to exit.
@@ -60,15 +62,33 @@ then
   trap "kill -i $KILLER_PID" EXIT
 fi
 
-source bin/bootstrap_development.sh
-
 RET_CODE=0
-if ! bin/run-all-tests.sh; then
+if ! bin/bootstrap_development.sh; then
   RET_CODE=1
 fi
 
-# Shutdown minicluster at the end
-testdata/bin/kill-all.sh
+source bin/impala-config.sh
 
+# Sanity check: bootstrap_development.sh should not have modified any of
+# the Impala files. This is important for the continued functioning of
+# bin/single_node_perf_run.py.
+NUM_MODIFIED_FILES=$(git status --porcelain --untracked-files=no | wc -l)
+if [[ "${NUM_MODIFIED_FILES}" -ne 0 ]]; then
+  echo "ERROR: Impala source files were modified during bin/bootstrap_development.sh"
+  echo "Dumping diff:"
+  git status --porcelain --untracked-files=no
+  git --no-pager diff
+  RET_CODE=1
+fi
+
+# Skip tests if build/dataload failed
+if [[ $RET_CODE -eq 0 ]]; then
+  if ! bin/run-all-tests.sh; then
+    RET_CODE=1
+  fi
+fi
+
+# Always shutdown minicluster at the end and run finalize.sh
+testdata/bin/kill-all.sh
 bin/jenkins/finalize.sh
 exit $RET_CODE

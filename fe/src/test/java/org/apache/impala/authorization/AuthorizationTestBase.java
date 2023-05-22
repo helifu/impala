@@ -27,12 +27,10 @@ import org.apache.impala.authorization.ranger.RangerAuthorizationFactory;
 import org.apache.impala.authorization.ranger.RangerCatalogdAuthorizationManager;
 import org.apache.impala.authorization.ranger.RangerImpalaPlugin;
 import org.apache.impala.authorization.ranger.RangerImpalaResourceBuilder;
-import org.apache.impala.authorization.sentry.SentryAuthorizationConfig;
-import org.apache.impala.authorization.sentry.SentryAuthorizationFactory;
-import org.apache.impala.authorization.sentry.SentryPolicyService;
 import org.apache.impala.catalog.Role;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.service.Frontend;
@@ -41,7 +39,6 @@ import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeResult;
 import org.apache.impala.thrift.TFunctionBinaryType;
-import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.thrift.TPrivilegeLevel;
 import org.apache.impala.thrift.TPrivilegeScope;
@@ -50,13 +47,13 @@ import org.apache.impala.thrift.TTableName;
 import org.apache.ranger.plugin.util.GrantRevokeRequest;
 import org.apache.ranger.plugin.util.RangerRESTClient;
 import org.apache.ranger.plugin.util.RangerRESTUtils;
-import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
+import org.json.simple.parser.ParseException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import javax.ws.rs.core.Response;
 import javax.ws.rs.core.Response.Status.Family;
-import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -73,6 +70,7 @@ import static org.junit.Assert.fail;
  * Base class for authorization tests.
  */
 public abstract class AuthorizationTestBase extends FrontendTestBase {
+  public static final Logger LOG = LoggerFactory.getLogger(AuthorizationTestBase.class);
   protected static final String RANGER_ADMIN_URL = "http://localhost:6080";
   protected static final String RANGER_USER = "admin";
   protected static final String RANGER_PASSWORD = "admin";
@@ -109,7 +107,6 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
   protected final AuthorizationFactory authzFactory_;
   protected final AuthorizationProvider authzProvider_;
   protected final AnalysisContext authzCtx_;
-  protected final SentryPolicyService sentryService_;
   protected final ImpaladTestCatalog authzCatalog_;
   protected final Frontend authzFrontend_;
   protected final RangerImpalaPlugin rangerImpalaPlugin_;
@@ -119,24 +116,10 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
       throws ImpalaException {
     authzProvider_ = authzProvider;
     switch (authzProvider) {
-      case SENTRY:
-        user_ = new User(System.getProperty("user.name"));
-        authzConfig_ = SentryAuthorizationConfig.createHadoopGroupAuthConfig(
-            "server1",
-            System.getenv("IMPALA_HOME") + "/fe/src/test/resources/sentry-site.xml");
-        authzFactory_ = createAuthorizationFactory(authzProvider);
-        authzCtx_ = createAnalysisCtx(authzFactory_, user_.getName());
-        authzCatalog_ = new ImpaladTestCatalog(authzFactory_);
-        authzFrontend_ = new Frontend(authzFactory_, authzCatalog_);
-        sentryService_ = new SentryPolicyService(
-            ((SentryAuthorizationConfig) authzConfig_).getSentryConfig());
-        rangerImpalaPlugin_ = null;
-        rangerRestClient_ = null;
-        break;
       case RANGER:
         user_ = new User("non_owner");
         authzConfig_ = new RangerAuthorizationConfig(RANGER_SERVICE_TYPE, RANGER_APP_ID,
-            SERVER_NAME);
+            SERVER_NAME, null, null, null);
         authzFactory_ = createAuthorizationFactory(authzProvider);
         authzCtx_ = createAnalysisCtx(authzFactory_, user_.getName());
         authzCatalog_ = new ImpaladTestCatalog(authzFactory_);
@@ -145,8 +128,8 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
             ((RangerAuthorizationChecker) authzFrontend_.getAuthzChecker())
                 .getRangerImpalaPlugin();
         assertEquals("test-cluster", rangerImpalaPlugin_.getClusterName());
-        sentryService_ = null;
-        rangerRestClient_ = new RangerRESTClient(RANGER_ADMIN_URL, null);
+        rangerRestClient_ = new RangerRESTClient(RANGER_ADMIN_URL, null,
+            rangerImpalaPlugin_.getConfig());
         rangerRestClient_.setBasicAuthInfo(RANGER_USER, RANGER_PASSWORD);
         break;
       default:
@@ -157,77 +140,13 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
 
   protected AuthorizationFactory createAuthorizationFactory(
       AuthorizationProvider authzProvider) {
-    return authzProvider == AuthorizationProvider.SENTRY ?
-        new SentryAuthorizationFactory(authzConfig_) :
-        new RangerAuthorizationFactory(authzConfig_);
+    return new RangerAuthorizationFactory(authzConfig_);
   }
 
   protected interface WithPrincipal {
     void init(TPrivilege[]... privileges) throws ImpalaException;
     void cleanUp() throws ImpalaException;
     String getName();
-  }
-
-  protected abstract class WithSentryPrincipal implements WithPrincipal {
-    protected final String role_ = "authz_test_role";
-    protected final String sentry_user_ = user_.getName();
-
-    protected void createRole(TPrivilege[]... privileges) throws ImpalaException {
-      Role role = authzCatalog_.addRole(role_);
-      authzCatalog_.addRoleGrantGroup(role_, sentry_user_);
-      for (TPrivilege[] privs: privileges) {
-        for (TPrivilege privilege: privs) {
-          privilege.setPrincipal_id(role.getId());
-          privilege.setPrincipal_type(TPrincipalType.ROLE);
-          authzCatalog_.addRolePrivilege(role_, privilege);
-        }
-      }
-    }
-
-    protected void createUser(TPrivilege[]... privileges) throws ImpalaException {
-      org.apache.impala.catalog.User user = authzCatalog_.addUser(sentry_user_);
-      for (TPrivilege[] privs: privileges) {
-        for (TPrivilege privilege: privs) {
-          privilege.setPrincipal_id(user.getId());
-          privilege.setPrincipal_type(TPrincipalType.USER);
-          authzCatalog_.addUserPrivilege(sentry_user_, privilege);
-        }
-      }
-    }
-
-    protected void dropRole() throws ImpalaException {
-      authzCatalog_.removeRole(role_);
-    }
-
-    protected void dropUser() throws ImpalaException {
-      authzCatalog_.removeUser(sentry_user_);
-    }
-  }
-
-  public class WithSentryUser extends WithSentryPrincipal {
-    @Override
-    public void init(TPrivilege[]... privileges) throws ImpalaException {
-      createUser(privileges);
-    }
-
-    @Override
-    public void cleanUp() throws ImpalaException { dropUser(); }
-
-    @Override
-    public String getName() { return sentry_user_; }
-  }
-
-  public class WithSentryRole extends WithSentryPrincipal {
-    @Override
-    public void init(TPrivilege[]... privileges) throws ImpalaException {
-      createRole(privileges);
-    }
-
-    @Override
-    public void cleanUp() throws ImpalaException { dropRole(); }
-
-    @Override
-    public String getName() { return role_; }
   }
 
   protected abstract class WithRanger implements WithPrincipal {
@@ -283,7 +202,7 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
           // to whether or not we test the query with the requesting user that is the
           // owner of the resource.
           getName(),
-          Collections.emptyList(),
+          Collections.emptyList(), Collections.emptyList(),
           rangerImpalaPlugin_.getClusterName(), "127.0.0.1", privileges);
     }
   }
@@ -296,7 +215,7 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
           // We provide the name of the grantee, which is a group in this case, according
           // to whether or not we test the query with the requesting user that is the
           // owner of the resource.
-          (as_owner_ ? OWNER_GROUPS : GROUPS),
+          (as_owner_ ? OWNER_GROUPS : GROUPS), Collections.emptyList(),
           // groups,
           rangerImpalaPlugin_.getClusterName(), "127.0.0.1", privileges);
     }
@@ -371,10 +290,6 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
   protected List<WithPrincipal> buildWithPrincipals() {
     List<WithPrincipal> withPrincipals = new ArrayList<>();
     switch (authzProvider_) {
-      case SENTRY:
-        withPrincipals.add(new WithSentryRole());
-        withPrincipals.add(new WithSentryUser());
-        break;
       case RANGER:
         withPrincipals.add(new WithRangerUser());
         withPrincipals.add(new WithRangerGroup());
@@ -405,13 +320,22 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
      */
     public AuthzTest ok(TPrivilege[]... privileges)
         throws ImpalaException {
+      ok(/* expectAnalysisOk */ true, privileges);
+      return this;
+    }
+
+    /**
+     * This method runs with the specified privileges.
+     */
+    public AuthzTest ok(boolean expectAnalysisOk, TPrivilege[]... privileges)
+        throws ImpalaException {
       for (WithPrincipal withPrincipal: buildWithPrincipals()) {
         try {
           withPrincipal.init(privileges);
           if (context_ != null) {
-            authzOk(context_, stmt_, withPrincipal);
+            authzOk(context_, stmt_, withPrincipal, expectAnalysisOk);
           } else {
-            authzOk(stmt_, withPrincipal);
+            authzOk(stmt_, withPrincipal, expectAnalysisOk);
           }
         } finally {
           withPrincipal.cleanUp();
@@ -567,13 +491,60 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
     return privileges;
   }
 
+  protected TPrivilege[] onStorageHandlerUri(String storageType, String storageUri,
+      TPrivilegeLevel... levels) {
+    return onStorageHandlerUri(false, storageType, storageUri, levels);
+  }
+
+  protected TPrivilege[] onStorageHandlerUri(boolean grantOption, String storageType,
+      String storageUri, TPrivilegeLevel... levels) {
+    TPrivilege[] privileges = new TPrivilege[levels.length];
+    for (int i = 0; i < levels.length; i++) {
+      privileges[i] = new TPrivilege(levels[i], TPrivilegeScope.STORAGEHANDLER_URI,
+          false);
+      privileges[i].setServer_name(SERVER_NAME);
+      privileges[i].setStorage_type(storageType);
+      privileges[i].setStorage_url(storageUri);
+      privileges[i].setHas_grant_opt(grantOption);
+    }
+    return privileges;
+  }
+
+  protected TPrivilege[] onUdf(String db, String fn, TPrivilegeLevel... levels) {
+    return onUdf(false, db, fn, levels);
+  }
+
+  protected TPrivilege[] onUdf(boolean grantOption, String db, String fn,
+      TPrivilegeLevel... levels) {
+    TPrivilege[] privileges = new TPrivilege[levels.length];
+    for (int i = 0; i < levels.length; i++) {
+      privileges[i] = new TPrivilege(levels[i], TPrivilegeScope.USER_DEFINED_FN, false);
+      privileges[i].setServer_name(SERVER_NAME);
+      privileges[i].setDb_name(db);
+      privileges[i].setFn_name(fn);
+      privileges[i].setHas_grant_opt(grantOption);
+    }
+    return privileges;
+  }
+
   private void authzOk(String stmt, WithPrincipal withPrincipal) throws ImpalaException {
-    authzOk(authzCtx_, stmt, withPrincipal);
+    authzOk(authzCtx_, stmt, withPrincipal, /* expectAnalysisOk */ true);
+  }
+
+  private void authzOk(String stmt, WithPrincipal withPrincipal,
+      boolean expectAnalysisOk) throws ImpalaException {
+    authzOk(authzCtx_, stmt, withPrincipal, expectAnalysisOk);
   }
 
   private void authzOk(AnalysisContext context, String stmt, WithPrincipal withPrincipal)
       throws ImpalaException {
+    authzOk(context, stmt, withPrincipal, /* expectAnalysisOk */ true);
+  }
+
+  private void authzOk(AnalysisContext context, String stmt, WithPrincipal withPrincipal,
+      boolean expectAnalysisOk) throws ImpalaException {
     try {
+      LOG.info("Testing authzOk for {}", stmt);
       parseAndAnalyze(stmt, context, authzFrontend_);
     } catch (AuthorizationException e) {
       // Because the same test can be called from multiple statements
@@ -581,6 +552,13 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
       throw new AuthorizationException(String.format(
           "\nPrincipal: %s\nStatement: %s\nError: %s", withPrincipal.getName(),
           stmt, e.getMessage(), e));
+    } catch (AnalysisException e) {
+      // We throw an AnalysisException only if we did not expect query analysis to fail.
+      if (expectAnalysisOk) {
+        throw new AnalysisException(String.format(
+            "\nPrincipal: %s\nStatement: %s\nError: %s", withPrincipal.getName(),
+            stmt, e.getMessage(), e));
+      }
     }
   }
 
@@ -616,6 +594,7 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
       throws ImpalaException {
     Preconditions.checkNotNull(expectedErrorString);
     try {
+      LOG.info("Testing authzError for {}", stmt);
       parseAndAnalyze(stmt, ctx, authzFrontend_);
     } catch (AuthorizationException e) {
       // Insert the username into the error.
@@ -630,7 +609,7 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
         "Principal: %s\nStatement: %s", withPrincipal.getName(), stmt));
   }
 
-  protected void createRangerPolicy(String policyName, String json) {
+  protected long createRangerPolicy(String policyName, String json) {
     ClientResponse response = rangerRestClient_
         .getResource("/service/public/v2/api/policy")
         .accept(RangerRESTUtils.REST_MIME_TYPE_JSON)
@@ -641,6 +620,17 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
           "Unable to create a Ranger policy: %s Response: %s",
           policyName, response.getEntity(String.class)));
     }
+    String content = response.getEntity(String.class);
+    JSONParser parser = new JSONParser();
+    long policyId = -1;
+    try {
+      Object obj = parser.parse(content);
+      policyId = (Long) ((JSONObject) obj).get("id");
+    } catch (ParseException e) {
+      LOG.error("Error parsing response content: {}", content);
+    }
+    LOG.info("Created ranger policy id={}, {}: {}", policyId, policyName, json);
+    return policyId;
   }
 
   protected void deleteRangerPolicy(String policyName) {
@@ -653,32 +643,7 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
       throw new RuntimeException(
           String.format("Unable to delete Ranger policy: %s.", policyName));
     }
-  }
-
-  protected void clearRangerRowFilterPolicies(String dbName, String tableName) {
-    ClientResponse response = rangerRestClient_
-        .getResource("/service/public/v2/api/policy")
-        .queryParam("servicename", RANGER_SERVICE_NAME)
-        .queryParam("policyType", "2")  // Row filter policy type: "2"
-        .queryParam("databases", dbName)
-        .queryParam("tables", tableName)
-        .get(ClientResponse.class);
-    if (response.getStatusInfo().getFamily() != Response.Status.Family.SUCCESSFUL) {
-      throw new RuntimeException(String.format(
-          "Unable to search Ranger policies on %s.%s", dbName, tableName));
-    }
-    JSONParser parser = new JSONParser();
-    JSONArray policies;
-    try {
-      policies = (JSONArray) parser.parse(
-          new InputStreamReader(response.getEntityInputStream()));
-    } catch (Exception e) {
-      throw new RuntimeException("Error parsing ranger response", e);
-    }
-    for (Object obj: policies) {
-      JSONObject policy = (JSONObject) obj;
-      deleteRangerPolicy(policy.get("name").toString());
-    }
+    LOG.info("Deleted ranger policy {}", policyName);
   }
 
   // Convert TDescribeResult to list of strings.
@@ -702,6 +667,10 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
 
   protected static String createError(String object) {
     return "User '%s' does not have privileges to execute 'CREATE' on: " + object;
+  }
+
+  protected static String rwstorageError(String object) {
+    return "User '%s' does not have privileges to execute 'RWSTORAGE' on: " + object;
   }
 
   protected static String alterError(String object) {
@@ -747,14 +716,23 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
     return "User '%s' does not have privileges to ANY functions in: " + object;
   }
 
+  protected static String selectFunctionError(String object) {
+    return "User '%s' does not have privileges to SELECT functions in: " + object;
+  }
+
   protected static String columnMaskError(String object) {
-    return "Impala does not support column masking yet. Column masking is enabled on " +
-        "column: " + object;
+    return "Column masking is disabled by --enable_column_masking flag. Can't access " +
+        "column " + object + " that has column masking policy.";
   }
 
   protected static String rowFilterError(String object) {
-    return "Impala does not support row filtering yet. Row filtering is enabled on " +
-        "table: " + object;
+    return "Row filtering is disabled by --enable_row_filtering flag. Can't access " +
+        "table " + object + " that has row filtering policy.";
+  }
+
+  protected static String mvSelectError(String object) {
+    return "Materialized view " +  object +
+        " references tables with column masking or row filtering policies.";
   }
 
   protected ScalarFunction addFunction(String db, String fnName, List<Type> argTypes,

@@ -25,20 +25,25 @@ namespace impala {
 
 class PartialSortPlanNode : public PlanNode {
  public:
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status Init(const TPlanNode& tnode, FragmentState* state) override;
+  virtual void Close() override;
   virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+  virtual void Codegen(FragmentState* state) override;
 
   ~PartialSortPlanNode(){}
 
-    /// Expressions and parameters used for tuple comparison.
+  /// Expressions used for tuple comparison.
   std::vector<ScalarExpr*> ordering_exprs_;
 
   /// Expressions used to materialize slots in the tuples to be sorted.
   /// One expr per slot in the materialized tuple.
   std::vector<ScalarExpr*> sort_tuple_slot_exprs_;
 
-  std::vector<bool> is_asc_order_;
-  std::vector<bool> nulls_first_;
+  /// Config used to create a TupleRowComparator instance.
+  TupleRowComparatorConfig* row_comparator_config_ = nullptr;
+
+  /// Codegened version of Sort::TupleSorter::SortHelper().
+  CodegenFnPtr<Sorter::SortHelperFn> codegend_sort_helper_fn_;
 };
 
 /// Node that implements a partial sort, where its input is divided up into runs, each
@@ -66,7 +71,6 @@ class PartialSortNode : public ExecNode {
   ~PartialSortNode();
 
   virtual Status Prepare(RuntimeState* state);
-  virtual void Codegen(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
   virtual Status Reset(RuntimeState* state, RowBatch* row_batch);
@@ -76,15 +80,11 @@ class PartialSortNode : public ExecNode {
   virtual void DebugString(int indentation_level, std::stringstream* out) const;
 
  private:
-  /// Expressions and parameters used for tuple comparison.
-  std::vector<ScalarExpr*> ordering_exprs_;
-
   /// Expressions used to materialize slots in the tuples to be sorted.
   /// One expr per slot in the materialized tuple.
-  std::vector<ScalarExpr*> sort_tuple_exprs_;
+  const std::vector<ScalarExpr*>& sort_tuple_exprs_;
 
-  std::vector<bool> is_asc_order_;
-  std::vector<bool> nulls_first_;
+  const TupleRowComparatorConfig& tuple_row_comparator_config_;
 
   /////////////////////////////////////////
   /// BEGIN: Members that must be Reset()

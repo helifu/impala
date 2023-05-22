@@ -38,7 +38,10 @@ cd ${IMPALA_BE_DIR}
 cd ..
 
 export CTEST_OUTPUT_ON_FAILURE=1
-# Override default TSAN_OPTIONS so that halt_on_error is set.
-export TSAN_OPTIONS="halt_on_error=1 history_size=7"
-export PATH="${IMPALA_TOOLCHAIN}/llvm-${IMPALA_LLVM_VERSION}/bin:${PATH}"
+
+export TSAN_OPTIONS="disable_coredump=0:unmap_shadow_on_exit=1"
+export ASAN_OPTIONS="disable_coredump=0:unmap_shadow_on_exit=1"
+export UBSAN_OPTIONS="disable_coredump=0:unmap_shadow_on_exit=1"
+
+export PATH="${IMPALA_TOOLCHAIN_PACKAGES_HOME}/llvm-${IMPALA_LLVM_VERSION}/bin:${PATH}"
 "${MAKE_CMD:-make}" test ARGS="${BE_TEST_ARGS}"

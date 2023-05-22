@@ -15,9 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-
-cmake_minimum_required(VERSION 2.6)
-
 # Helper function to generate build rules.  For each input thrift file, this function will
 # generate a rule that maps the input file to the output c++ file.
 # Thrift will generate multiple output files for each input (including java files) and
@@ -50,47 +47,57 @@ function(THRIFT_GEN VAR)
     #   - Does not include java output files
     set(OUTPUT_BE_FILE "${BE_OUTPUT_DIR}/gen-cpp/${THRIFT_FILE_WE}_types.cpp")
     set(OUTPUT_BE_FILE ${OUTPUT_BE_FILE} "${BE_OUTPUT_DIR}/gen-cpp/${THRIFT_FILE_WE}_types.h")
-    set(OUTPUT_BE_FILE ${OUTPUT_BE_FILE} "${BE_OUTPUT_DIR}/gen-cpp/${THRIFT_FILE_WE}_constants.cpp")
-    set(OUTPUT_BE_FILE ${OUTPUT_BE_FILE} "${BE_OUTPUT_DIR}/gen-cpp/${THRIFT_FILE_WE}_constants.h")
     list(APPEND ${VAR} ${OUTPUT_BE_FILE})
 
     # BeeswaxService thrift generation
     # It depends on hive_meta_store, which in turn depends on fb303.
     # The java dependency is handled by maven.
     # We need to generate C++ src file for the parent dependencies using the "-r" option.
-    set(CPP_ARGS ${THRIFT_INCLUDE_DIR_OPTION}
-        --gen cpp:moveable_types,no_default_operators -o ${BE_OUTPUT_DIR})
+    set(CPP_ARGS ${THRIFT_CPP_INCLUDE_DIR_OPTION}
+        --gen cpp:moveable_types,no_default_operators,templates -o ${BE_OUTPUT_DIR})
     IF (THRIFT_FILE STREQUAL "beeswax.thrift")
       set(CPP_ARGS -r ${CPP_ARGS})
     ENDIF(THRIFT_FILE STREQUAL "beeswax.thrift")
 
-    IF (THRIFT_FILE STREQUAL ${TCLI_SERVICE_THRIFT} OR THRIFT_FILE STREQUAL "parquet.thrift" OR
-        THRIFT_FILE STREQUAL "ImpalaService.thrift")
+    IF (THRIFT_FILE STREQUAL ${TCLI_SERVICE_THRIFT} OR THRIFT_FILE STREQUAL "parquet.thrift")
       # Do not generate Java HiveServer2 and Parquet files because we should use the jar
       # from Hive or Parquet.
-      # Also do not generate ImpalaService.thrift because the generated code doesn't
-      # compile with hive if the thrift version in hive is 0.9.0
       add_custom_command(
         OUTPUT ${OUTPUT_BE_FILE}
-        COMMAND ${THRIFT_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
-        COMMAND ${THRIFT_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_CPP_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_PY_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
         DEPENDS ${ABS_THRIFT_FILE}
         COMMENT "Running thrift compiler on ${THRIFT_FILE}"
         VERBATIM
       )
-    ELSE (THRIFT_FILE STREQUAL ${TCLI_SERVICE_THRIFT} OR THRIFT_FILE STREQUAL "parquet.thrift" OR
-        THRIFT_FILE STREQUAL "ImpalaService.thrift")
+    ELSEIF (THRIFT_FILE STREQUAL "ImpalaService.thrift")
       add_custom_command(
         OUTPUT ${OUTPUT_BE_FILE}
-        COMMAND ${THRIFT_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
-        COMMAND ${THRIFT_COMPILER} ${JAVA_FE_ARGS} ${THRIFT_FILE}
-        COMMAND ${THRIFT_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_CPP_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
+        # Because of some CMake bug we can't just use
+        #     sed -i.bak "'s|\\(dispatchCallTemplated.*\\));|\\1) override;|'"
+        # here because for some reason CMake doesn't remove the quotes and generates
+        # wrong Makefiles. Strange, because at global scope add_custom_command works fine.
+        COMMAND ${CMAKE_SOURCE_DIR}/bin/cmake_aux/add_override.sh
+            ${BE_OUTPUT_DIR}/gen-cpp/ImpalaHiveServer2Service.h
+            ${BE_OUTPUT_DIR}/gen-cpp/ImpalaService.h
+        COMMAND ${THRIFT_JAVA_COMPILER} ${JAVA_FE_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_PY_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
+        DEPENDS ${ABS_THRIFT_FILE}
+        COMMENT "Running thrift compiler on ${THRIFT_FILE}"
+        VERBATIM
+      )
+    ELSE (THRIFT_FILE STREQUAL ${TCLI_SERVICE_THRIFT} OR THRIFT_FILE STREQUAL "parquet.thrift")
+      add_custom_command(
+        OUTPUT ${OUTPUT_BE_FILE}
+        COMMAND ${THRIFT_CPP_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_JAVA_COMPILER} ${JAVA_FE_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_PY_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
         DEPENDS ${ABS_THRIFT_FILE}
         COMMENT "Running thrift compiler on ${THRIFT_FILE}"
         VERBATIM
     )
-    ENDIF (THRIFT_FILE STREQUAL ${TCLI_SERVICE_THRIFT} OR THRIFT_FILE STREQUAL "parquet.thrift" OR
-        THRIFT_FILE STREQUAL "ImpalaService.thrift")
+    ENDIF (THRIFT_FILE STREQUAL ${TCLI_SERVICE_THRIFT} OR THRIFT_FILE STREQUAL "parquet.thrift")
   endforeach(THRIFT_FILE)
 
   set(${VAR} ${${VAR}} PARENT_SCOPE)
@@ -118,7 +125,7 @@ function(THRIFT_GEN_DS VAR)
     list(APPEND ${VAR} ${OUTPUT_FILE})
     add_custom_command(
       OUTPUT ${OUTPUT_FILE}
-      COMMAND ${THRIFT_COMPILER} ${JAVA_EXT_DS_ARGS} ${THRIFT_FILE} &&
+      COMMAND ${THRIFT_JAVA_COMPILER} ${JAVA_EXT_DS_ARGS} ${THRIFT_FILE} &&
               mkdir -p ${OUTPUT_DIR} && echo ${OUTPUT_FILE_MESSAGE} > ${OUTPUT_FILE}
       DEPENDS ${ABS_THRIFT_FILE}
       COMMENT "Running thrift compiler for ext-data-source on ${THRIFT_FILE}"
@@ -128,72 +135,34 @@ function(THRIFT_GEN_DS VAR)
   set(${VAR} ${${VAR}} PARENT_SCOPE)
 endfunction(THRIFT_GEN_DS)
 
-# Helper function similar to THRIFT_GEN and THRIFT_GEN_DS, but specific to Thrift 11. For
-# now the method only generates Python code. The generated Python code is not used by
-# any other Impala module, it is merely meant to provide devs access to Thrift 11 Python
-# generated code until a full upgrade from Thrift 0.9 to 0.11 has been completed. Once
-# the complete upgrade to Thrift 11 has been complete (see IMPALA-7825), this method
-# should be removed.
-function(THRIFT11_GEN VAR)
-  IF (NOT ARGN)
-    MESSAGE(SEND_ERROR "Error: THRIFT11_GEN called without any src files")
-    RETURN()
-  ENDIF(NOT ARGN)
-
-  set(${VAR})
-  foreach(THRIFT_FILE ${ARGN})
-    # Get full path
-    get_filename_component(ABS_THRIFT__FILE ${THRIFT_FILE} ABSOLUTE)
-    # Get basename without the file extension
-    get_filename_component(THRIFT_FILE_WE ${THRIFT_FILE} NAME_WE)
-
-    # This isn't the exact output file that's created, just a unique file
-    set(OUTPUT_FILE "${THRIFT11_PYTHON_OUTPUT_DIR}/gen-py/${THRIFT_FILE_WE}/__init__.py")
-
-    # We have to special case beeswax.thrift because its Python namespace is beeswaxd
-    # instead of beeswax
-    if (${THRIFT_FILE_WE} STREQUAL "beeswax")
-      set(OUTPUT_FILE "${THRIFT11_PYTHON_OUTPUT_DIR}/gen-py/beeswaxd/__init__.py")
-    endif(${THRIFT_FILE_WE} STREQUAL "beeswax")
-
-    list(APPEND ${VAR} ${OUTPUT_FILE})
-    add_custom_command(
-      OUTPUT ${OUTPUT_FILE}
-      COMMAND ${THRIFT11_COMPILER} ${THRIFT11_PYTHON_ARGS} ${THRIFT_FILE}
-      DEPENDS ${ABS_THRIFT_FILE}
-      COMMENT "Running thrift 11 compiler on ${THRIFT_FILE}"
-      VERBATIM
-    )
-  endforeach(THRIFT_FILE)
-  set(${VAR} ${${VAR}} PARENT_SCOPE)
-endfunction(THRIFT11_GEN)
-
 set(HIVE_THRIFT_SOURCE_DIR "hive-$ENV{IMPALA_HIVE_MAJOR_VERSION}-api")
 set(TCLI_SERVICE_THRIFT "${HIVE_THRIFT_SOURCE_DIR}/TCLIService.thrift")
-message("Using Thrift compiler: ${THRIFT_COMPILER}")
-message("Using Thrift 11 compiler: ${THRIFT11_COMPILER}")
-set(THRIFT_INCLUDE_DIR_OPTION -I ${THRIFT_CONTRIB_DIR} -I $ENV{HIVE_METASTORE_THRIFT_DIR}
-  -I ${HIVE_THRIFT_SOURCE_DIR})
+message("Using Thrift CPP compiler: ${THRIFT_CPP_COMPILER}")
+message("Using Thrift JAVA compiler: ${THRIFT_JAVA_COMPILER}")
+message("Using Thrift PY compiler: ${THRIFT_PY_COMPILER}")
+set(THRIFT_CPP_INCLUDE_DIR_OPTION -I ${THRIFT_CPP_CONTRIB_DIR}
+  -I $ENV{HIVE_METASTORE_THRIFT_DIR} -I ${HIVE_THRIFT_SOURCE_DIR})
+set(THRIFT_JAVA_INCLUDE_DIR_OPTION -I ${THRIFT_JAVA_CONTRIB_DIR}
+  -I $ENV{HIVE_METASTORE_THRIFT_DIR} -I ${HIVE_THRIFT_SOURCE_DIR})
+set(THRIFT_PY_INCLUDE_DIR_OPTION -I ${THRIFT_PY_CONTRIB_DIR}
+  -I $ENV{HIVE_METASTORE_THRIFT_DIR} -I ${HIVE_THRIFT_SOURCE_DIR})
 set(BE_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/be/generated-sources)
 set(FE_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/fe/generated-sources)
 # TODO: avoid duplicating generated java classes
-set(EXT_DS_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/ext-data-source/api/generated-sources)
+set(EXT_DS_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/java/ext-data-source/api/generated-sources)
 set(PYTHON_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/shell/)
-set(THRIFT11_PYTHON_OUTPUT_DIR ${PYTHON_OUTPUT_DIR}/build/thrift-11-gen)
 MESSAGE("Found output dir: " ${PYTHON_OUTPUT_DIR})
 file(MAKE_DIRECTORY ${BE_OUTPUT_DIR})
 file(MAKE_DIRECTORY ${FE_OUTPUT_DIR})
 file(MAKE_DIRECTORY ${EXT_DS_OUTPUT_DIR})
 file(MAKE_DIRECTORY ${PYTHON_OUTPUT_DIR})
 file(MAKE_DIRECTORY ${HIVE_THRIFT_SOURCE_DIR})
-file(MAKE_DIRECTORY ${THRIFT11_PYTHON_OUTPUT_DIR})
 
 # Args passed to thrift for Java gen
-set(JAVA_FE_ARGS ${THRIFT_INCLUDE_DIR_OPTION} --gen java -o ${FE_OUTPUT_DIR})
-set(JAVA_EXT_DS_ARGS ${THRIFT_INCLUDE_DIR_OPTION} --gen java -o ${EXT_DS_OUTPUT_DIR})
-set(PYTHON_ARGS ${THRIFT_INCLUDE_DIR_OPTION} -r --gen py -o ${PYTHON_OUTPUT_DIR})
-set(THRIFT11_PYTHON_ARGS ${THRIFT_INCLUDE_DIR_OPTION} -r --gen py -o
-                         ${THRIFT11_PYTHON_OUTPUT_DIR})
+set(JAVA_FE_ARGS ${THRIFT_JAVA_INCLUDE_DIR_OPTION} --gen java -o ${FE_OUTPUT_DIR})
+set(JAVA_EXT_DS_ARGS ${THRIFT_JAVA_INCLUDE_DIR_OPTION} --gen java -o ${EXT_DS_OUTPUT_DIR})
+set(PYTHON_ARGS ${THRIFT_PY_INCLUDE_DIR_OPTION} -r --gen py:no_utf8strings -o
+                ${PYTHON_OUTPUT_DIR})
 
 set (EXT_DATA_SRC_FILES
   ErrorCodes.thrift
@@ -229,8 +198,10 @@ set (SRC_FILES
   Partitions.thrift
   parquet.thrift
   ResourceProfile.thrift
+  Query.thrift
   Results.thrift
   RuntimeProfile.thrift
+  SqlConstraints.thrift
   StatestoreService.thrift
   Zip.thrift
   ${TCLI_SERVICE_THRIFT}
@@ -252,17 +223,10 @@ add_custom_command(OUTPUT MetricDefs.thrift
 # org.apache.hive.service.cli.thrift to org.apache.hive.service.rpc.thrift. Impala calls
 # various Hive methods that have these classes in the interface and if the packages don't
 # match it won't compile.
-add_custom_command(OUTPUT hive-2-api/TCLIService.thrift
+add_custom_command(OUTPUT hive-$ENV{IMPALA_HIVE_MAJOR_VERSION}-api/TCLIService.thrift
   COMMAND sed
       's/namespace java org.apache.hive.service.cli.thrift/namespace java org.apache.hive.service.rpc.thrift/'
-      hive-1-api/TCLIService.thrift > hive-2-api/TCLIService.thrift
-  DEPENDS hive-1-api/TCLIService.thrift
-)
-
-add_custom_command(OUTPUT hive-3-api/TCLIService.thrift
-  COMMAND sed
-      's/namespace java org.apache.hive.service.cli.thrift/namespace java org.apache.hive.service.rpc.thrift/'
-      hive-1-api/TCLIService.thrift > hive-3-api/TCLIService.thrift
+      hive-1-api/TCLIService.thrift > hive-$ENV{IMPALA_HIVE_MAJOR_VERSION}-api/TCLIService.thrift
   DEPENDS hive-1-api/TCLIService.thrift
 )
 
@@ -270,7 +234,6 @@ add_custom_command(OUTPUT hive-3-api/TCLIService.thrift
 # a list of files they produce
 THRIFT_GEN(THRIFT_ALL_FILES ${SRC_FILES})
 THRIFT_GEN_DS(THRIFT_DATA_SRC_FILES ${EXT_DATA_SRC_FILES})
-THRIFT11_GEN(THRIFT11_ALL_FILES ${SRC_FILES})
 
 add_custom_target(thrift-generated-files-error DEPENDS ErrorCodes.thrift)
 add_custom_target(thrift-generated-files-metrics DEPENDS MetricDefs.thrift)
@@ -284,9 +247,6 @@ add_dependencies(thrift-cpp thrift-generated-files-metrics thrift-generated-file
 add_custom_target(thrift-ext-data-src ALL DEPENDS ${THRIFT_DATA_SRC_FILES})
 add_dependencies(thrift-ext-data-src thrift-cpp)
 
-add_custom_target(thrift11-py ALL DEPENDS ${THRIFT11_ALL_FILES})
-add_dependencies(thrift11-py thrift-ext-data-src)
-
 # Combined target for all thrift dependencies
 add_custom_target(thrift-deps ALL)
-add_dependencies(thrift-deps thrift11-py)
+add_dependencies(thrift-deps thrift-ext-data-src)

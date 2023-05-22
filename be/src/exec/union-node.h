@@ -21,6 +21,7 @@
 
 #include <boost/scoped_ptr.hpp>
 
+#include "codegen/codegen-fn-ptr.h"
 #include "codegen/impala-ir.h"
 #include "exec/exec-node.h"
 #include "runtime/row-batch.h"
@@ -35,13 +36,19 @@ class ScalarExprEvaluator;
 class Tuple;
 class TupleRow;
 class TPlanNode;
+class UnionNode;
 
 class UnionPlanNode : public PlanNode {
  public:
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status Init(const TPlanNode& tnode, FragmentState* state) override;
+  virtual void Close() override;
   virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+  virtual void Codegen(FragmentState* state) override;
 
   ~UnionPlanNode(){}
+
+  /// Descriptor for tuples this union node constructs.
+  const TupleDescriptor* tuple_desc_ = nullptr;
 
   /// Const exprs materialized by this node. These exprs don't refer to any children.
   /// Only materialized by the first fragment instance to avoid duplication.
@@ -49,6 +56,33 @@ class UnionPlanNode : public PlanNode {
 
   /// Exprs materialized by this node. The i-th result expr list refers to the i-th child.
   std::vector<std::vector<ScalarExpr*>> child_exprs_lists_;
+
+  /// Index of the first non-passthrough child; i.e. a child that needs materialization.
+  /// 0 when all children are materialized, 'children_.size()' when no children are
+  /// materialized.
+  int first_materialized_child_idx_ = -1;
+
+  /// Number of const scalar expressions which will be codegened.
+  /// This is only used for observability.
+  int64_t num_const_scalar_expr_to_be_codegened_ = 0;
+
+  /// Set as TRUE if codegen status is added.
+  bool is_codegen_status_added_ = false;
+
+  typedef void (*UnionMaterializeBatchFn)(UnionNode*, RowBatch*, uint8_t**);
+  /// Vector of pointers to codegen'ed MaterializeBatch functions. The vector contains one
+  /// function for each child. The size of the vector should be equal to the number of
+  /// children. If a child is passthrough, there should be a NULL for that child. If
+  /// Codegen is disabled, there should be a NULL for every child.
+  std::vector<CodegenFnPtr<UnionMaterializeBatchFn>>
+      codegend_union_materialize_batch_fns_;
+
+ private:
+  /// Returns true if the child at 'child_idx' can be passed through.
+  bool IsChildPassthrough(int child_idx) const {
+    DCHECK_LT(child_idx, children_.size());
+    return child_idx < first_materialized_child_idx_;
+  }
 };
 
 /// Node that merges the results of its children by either materializing their
@@ -64,16 +98,12 @@ class UnionNode : public ExecNode {
   UnionNode(ObjectPool* pool, const UnionPlanNode& pnode, const DescriptorTbl& descs);
 
   virtual Status Prepare(RuntimeState* state);
-  virtual void Codegen(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
   virtual Status Reset(RuntimeState* state, RowBatch* row_batch);
   virtual void Close(RuntimeState* state);
 
  private:
-  /// Tuple id resolved in Prepare() to set tuple_desc_;
-  const int tuple_id_;
-
   /// Descriptor for tuples this union node constructs.
   const TupleDescriptor* tuple_desc_;
 
@@ -82,14 +112,25 @@ class UnionNode : public ExecNode {
   /// materialized.
   const int first_materialized_child_idx_;
 
+  /// Number of const scalar expressions which will be codegened.
+  const int64_t num_const_scalar_expr_to_be_codegened_;
+
+  /// Reference to UnionPlanNode::is_codegen_status_added_.
+  const bool& is_codegen_status_added_;
+
   /// Const exprs materialized by this node. These exprs don't refer to any children.
   /// Only materialized by the first fragment instance to avoid duplication.
-  std::vector<std::vector<ScalarExpr*>> const_exprs_lists_;
+  const std::vector<std::vector<ScalarExpr*>>& const_exprs_lists_;
   std::vector<std::vector<ScalarExprEvaluator*>> const_expr_evals_lists_;
 
   /// Exprs materialized by this node. The i-th result expr list refers to the i-th child.
-  std::vector<std::vector<ScalarExpr*>> child_exprs_lists_;
+  const std::vector<std::vector<ScalarExpr*>>& child_exprs_lists_;
   std::vector<std::vector<ScalarExprEvaluator*>> child_expr_evals_lists_;
+
+  /// Reference to the codegened vector containing codegened function pointer owned by the
+  /// UnionPlanNode object that was used to create this instance.
+  const std::vector<CodegenFnPtr<UnionPlanNode::UnionMaterializeBatchFn>>&
+      codegend_union_materialize_batch_fns_;
 
   /////////////////////////////////////////
   /// BEGIN: Members that must be Reset()
@@ -103,13 +144,6 @@ class UnionNode : public ExecNode {
 
   /// Index of current row in child_row_batch_.
   int child_row_idx_;
-
-  typedef void (*UnionMaterializeBatchFn)(UnionNode*, RowBatch*, uint8_t**);
-  /// Vector of pointers to codegen'ed MaterializeBatch functions. The vector contains one
-  /// function for each child. The size of the vector should be equal to the number of
-  /// children. If a child is passthrough, there should be a NULL for that child. If
-  /// Codegen is disabled, there should be a NULL for every child.
-  std::vector<UnionMaterializeBatchFn> codegend_union_materialize_batch_fns_;
 
   /// Saved from the last to GetNext() on the current child.
   bool child_eos_;

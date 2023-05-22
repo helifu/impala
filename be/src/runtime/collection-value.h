@@ -19,6 +19,7 @@
 #define IMPALA_RUNTIME_COLLECTION_VALUE_H
 
 #include "runtime/descriptors.h"
+#include "udf/udf-internal.h"
 
 namespace impala {
 
@@ -35,12 +36,34 @@ struct __attribute__((__packed__)) CollectionValue {
   int num_tuples;
 
   CollectionValue() : ptr(NULL), num_tuples(0) {}
+  CollectionValue(const impala_udf::CollectionVal& val) :
+      ptr(val.is_null ? nullptr : val.ptr),
+      num_tuples(val.num_tuples)
+  {}
 
   /// Returns the size of this collection in bytes, i.e. the number of bytes written to
   /// ptr.
   inline int64_t ByteSize(const TupleDescriptor& item_tuple_desc) const {
     return static_cast<int64_t>(num_tuples) * item_tuple_desc.byte_size();
   }
+
+  /// For C++/IR interop, we need to be able to look up types by name.
+  static const char* LLVM_CLASS_NAME;
+};
+
+// A struct that contains a pointer to a CollectionValue and its byte size. Used instead
+// of std::pair because of codegen, because
+//   - the std::pair type is difficult to name in codegen and
+//   - we are not in control of the layout of std::pair.
+struct CollValueAndSize {
+  CollectionValue* coll_value;
+  // In most (maybe all) cases a 32 bit int should be enough but
+  // 'CollectionValue::ByteSize()' returns int64_t so we use that.
+  int64_t byte_size;
+
+  CollValueAndSize(): CollValueAndSize(nullptr, 0) {}
+  CollValueAndSize(CollectionValue* cv, int64_t size)
+    : coll_value(cv), byte_size(size) {}
 
   /// For C++/IR interop, we need to be able to look up types by name.
   static const char* LLVM_CLASS_NAME;

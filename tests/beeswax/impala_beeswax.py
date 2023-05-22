@@ -25,6 +25,8 @@
 #   client.connect()
 #   result = client.execute(query_string)
 #   where result is an object of the class ImpalaBeeswaxResult.
+from __future__ import absolute_import, division, print_function
+from builtins import filter, map, range
 import logging
 import time
 import shlex
@@ -126,7 +128,7 @@ class ImpalaBeeswaxClient(object):
     self.query_states = QueryState._NAMES_TO_VALUES
 
   def __options_to_string_list(self):
-    return ["%s=%s" % (k,v) for (k,v) in self.__query_options.iteritems()]
+    return ["%s=%s" % (k, v) for (k, v) in self.__query_options.items()]
 
   def get_query_options(self):
     return self.__query_options
@@ -136,9 +138,9 @@ class ImpalaBeeswaxClient(object):
 
   def set_query_options(self, query_option_dict):
     if query_option_dict is None:
-      raise ValueError, 'Cannot pass None value for query options'
+      raise ValueError('Cannot pass None value for query options')
     self.clear_query_options()
-    for name, value in query_option_dict.iteritems():
+    for name, value in query_option_dict.items():
       self.set_query_option(name, value)
 
   def get_query_option(self, name):
@@ -155,10 +157,12 @@ class ImpalaBeeswaxClient(object):
     try:
       self.transport = self.__get_transport()
       self.transport.open()
-      protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
+      # TODO: TBinaryProtocol led to negative size error, check if this is a known
+      #       issue in Thrift
+      protocol = TBinaryProtocol.TBinaryProtocolAccelerated(self.transport)
       self.imp_service = ImpalaService.Client(protocol)
       self.connected = True
-    except Exception, e:
+    except Exception as e:
       raise ImpalaBeeswaxException(self.__build_error_message(e), e)
 
   def close_connection(self):
@@ -280,7 +284,7 @@ class ImpalaBeeswaxClient(object):
             setattr(max_stats, attr, max(getattr(max_stats, attr), val))
 
       if len(node.exec_stats) > 0:
-        avg_time = agg_stats.latency_ns / len(node.exec_stats)
+        avg_time = agg_stats.latency_ns // len(node.exec_stats)
       else:
         avg_time = 0
 
@@ -333,7 +337,7 @@ class ImpalaBeeswaxClient(object):
       idx = \
         self.__build_summary_table(
             summary, idx, False, indent_level, False, first_child_output)
-      for child_idx in xrange(1, node.num_children):
+      for child_idx in range(1, node.num_children):
         # All other children are indented (we only have 0, 1 or 2 children for every exec
         # node at the moment)
         idx = self.__build_summary_table(
@@ -479,7 +483,7 @@ class ImpalaBeeswaxClient(object):
     result = self.close_dml(handle)
     # The insert was successful
     num_rows = sum(map(int, result.rows_modified.values()))
-    data = ["%s: %s" % row for row in result.rows_modified.iteritems()]
+    data = ["%s: %s" % row for row in result.rows_modified.items()]
     exec_result = ImpalaBeeswaxResult(query_id=handle.id, success=True, data=data)
     exec_result.summary = "Inserted %d rows" % (num_rows,)
     return exec_result
@@ -495,7 +499,7 @@ class ImpalaBeeswaxClient(object):
       return tokens[0].lower()
     # Because the WITH clause may precede INSERT or SELECT queries,
     # just checking the first token is insufficient.
-    if filter(self.INSERT_REGEX.match, tokens):
+    if list(filter(self.INSERT_REGEX.match, tokens)):
       return "insert"
     return tokens[0].lower()
 
@@ -516,12 +520,12 @@ class ImpalaBeeswaxClient(object):
       raise ImpalaBeeswaxException("Not connected", None)
     try:
       return rpc()
-    except BeeswaxService.BeeswaxException, b:
+    except BeeswaxService.BeeswaxException as b:
       raise ImpalaBeeswaxException(self.__build_error_message(b), b)
-    except TTransportException, e:
+    except TTransportException as e:
       self.connected = False
       raise ImpalaBeeswaxException(self.__build_error_message(e), e)
-    except TApplicationException, t:
+    except TApplicationException as t:
       raise ImpalaBeeswaxException(self.__build_error_message(t), t)
-    except Exception, u:
+    except Exception as u:
       raise ImpalaBeeswaxException(self.__build_error_message(u), u)

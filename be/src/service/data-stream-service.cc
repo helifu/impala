@@ -21,17 +21,20 @@
 
 #include "common/constant-strings.h"
 #include "common/status.h"
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/util/monotime.h"
 #include "rpc/rpc-mgr.h"
 #include "rpc/rpc-mgr.inline.h"
-#include "runtime/krpc-data-stream-mgr.h"
 #include "runtime/exec-env.h"
+#include "runtime/krpc-data-stream-mgr.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/query-state.h"
 #include "runtime/row-batch.h"
+#include "service/impala-server.h"
 #include "util/memory-metrics.h"
 #include "util/parse-util.h"
+#include "util/uid-util.h"
 
 #include "gen-cpp/data_stream_service.pb.h"
 #include "gen-cpp/data_stream_service.proxy.h"
@@ -74,12 +77,13 @@ Status DataStreamService::Init() {
   // The maximum queue length is set to maximum 32-bit value. Its actual capacity is
   // bound by memory consumption against 'mem_tracker_'.
   RETURN_IF_ERROR(ExecEnv::GetInstance()->rpc_mgr()->RegisterService(num_svc_threads,
-      std::numeric_limits<int32_t>::max(), this, mem_tracker()));
+      std::numeric_limits<int32_t>::max(), this, mem_tracker(),
+      ExecEnv::GetInstance()->rpc_metrics()));
   return Status::OK();
 }
 
-Status DataStreamService::GetProxy(const TNetworkAddress& address, const string& hostname,
-    unique_ptr<DataStreamServiceProxy>* proxy) {
+Status DataStreamService::GetProxy(const NetworkAddressPB& address,
+    const string& hostname, unique_ptr<DataStreamServiceProxy>* proxy) {
   // Create a DataStreamService proxy to the destination.
   RETURN_IF_ERROR(ExecEnv::GetInstance()->rpc_mgr()->GetProxy(address, hostname, proxy));
   (*proxy)->set_network_plane("datastream");
@@ -106,10 +110,43 @@ void DataStreamService::TransmitData(const TransmitDataRequestPB* request,
   ExecEnv::GetInstance()->stream_mgr()->AddData(request, response, rpc_context);
 }
 
+void DataStreamService::UpdateFilter(
+    const UpdateFilterParamsPB* req, UpdateFilterResultPB* resp, RpcContext* context) {
+  // This failpoint is to allow jitter to be injected.
+  DebugActionNoFail(FLAGS_debug_actions, "UPDATE_FILTER_DELAY");
+  DCHECK(req->has_filter_id());
+  DCHECK(req->has_query_id());
+  DCHECK(req->has_bloom_filter() || req->has_min_max_filter()
+      || req->has_in_list_filter());
+  ExecEnv::GetInstance()->impala_server()->UpdateFilter(resp, *req, context);
+  RespondAndReleaseRpc(Status::OK(), resp, context, mem_tracker_.get());
+}
+
+void DataStreamService::PublishFilter(
+    const PublishFilterParamsPB* req, PublishFilterResultPB* resp, RpcContext* context) {
+  // This failpoint is to allow jitter to be injected.
+  DebugActionNoFail(FLAGS_debug_actions, "PUBLISH_FILTER_DELAY");
+  DCHECK(req->has_filter_id());
+  DCHECK(req->has_dst_query_id());
+  DCHECK(req->has_bloom_filter() || req->has_min_max_filter()
+      || req->has_in_list_filter());
+  QueryState::ScopedRef qs(ProtoToQueryId(req->dst_query_id()));
+
+  if (qs.get() != nullptr) {
+    qs->PublishFilter(*req, context);
+    RespondAndReleaseRpc(Status::OK(), resp, context, mem_tracker_.get());
+  } else {
+    string err_msg = Substitute("Query State not found for query_id=$0",
+        PrintId(ProtoToQueryId(req->dst_query_id())));
+    LOG(INFO) << err_msg;
+    RespondAndReleaseRpc(Status(err_msg), resp, context, mem_tracker_.get());
+  }
+}
+
 template<typename ResponsePBType>
 void DataStreamService::RespondRpc(const Status& status,
     ResponsePBType* response, kudu::rpc::RpcContext* ctx) {
-  MonoDelta duration(MonoTime::Now().GetDeltaSince(ctx->GetTimeReceived()));
+  MonoDelta duration(MonoTime::Now() - ctx->GetTimeReceived());
   status.ToProto(response->mutable_status());
   response->set_receiver_latency_ns(duration.ToNanoseconds());
   ctx->RespondSuccess();

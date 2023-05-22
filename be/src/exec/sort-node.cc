@@ -17,17 +17,21 @@
 
 #include "exec/sort-node.h"
 
+#include "codegen/llvm-codegen.h"
 #include "exec/exec-node-util.h"
+#include "runtime/fragment-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/sorted-run-merger.h"
+#include "runtime/sorter-internal.h"
+#include "util/pretty-printer.h"
 #include "util/runtime-profile-counters.h"
 
 #include "common/names.h"
 
 namespace impala {
 
-Status SortPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+Status SortPlanNode::Init(const TPlanNode& tnode, FragmentState* state) {
   RETURN_IF_ERROR(PlanNode::Init(tnode, state));
   const TSortInfo& tsort_info = tnode.sort_node.sort_info;
   RETURN_IF_ERROR(ScalarExpr::Create(
@@ -35,9 +39,17 @@ Status SortPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
   DCHECK(tsort_info.__isset.sort_tuple_slot_exprs);
   RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.sort_tuple_slot_exprs,
       *children_[0]->row_descriptor_, state, &sort_tuple_slot_exprs_));
-  is_asc_order_ = tnode.sort_node.sort_info.is_asc_order;
-  nulls_first_ = tnode.sort_node.sort_info.nulls_first;
+  row_comparator_config_ =
+      state->obj_pool()->Add(new TupleRowComparatorConfig(tsort_info, ordering_exprs_));
+  state->CheckAndAddCodegenDisabledMessage(codegen_status_msgs_);
+  num_backends_ = state->instance_ctxs()[0]->num_backends;
   return Status::OK();
+}
+
+void SortPlanNode::Close() {
+  ScalarExpr::Close(ordering_exprs_);
+  ScalarExpr::Close(sort_tuple_slot_exprs_);
+  PlanNode::Close();
 }
 
 Status SortPlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const {
@@ -50,13 +62,13 @@ SortNode::SortNode(
     ObjectPool* pool, const SortPlanNode& pnode, const DescriptorTbl& descs)
   : ExecNode(pool, pnode, descs),
     offset_(pnode.tnode_->sort_node.__isset.offset ? pnode.tnode_->sort_node.offset : 0),
+    sort_tuple_exprs_(pnode.sort_tuple_slot_exprs_),
+    tuple_row_comparator_config_(*pnode.row_comparator_config_),
+    num_backends_(pnode.num_backends_),
     sorter_(NULL),
     num_rows_skipped_(0) {
-  ordering_exprs_ = pnode.ordering_exprs_;
-  sort_tuple_exprs_ = pnode.sort_tuple_slot_exprs_;
-  is_asc_order_ = pnode.is_asc_order_;
-  nulls_first_ = pnode.nulls_first_;
   runtime_profile()->AddInfoString("SortType", "Total");
+  add_batch_timer_ = ADD_SUMMARY_STATS_TIMER(runtime_profile(), "AddBatchTime");
 }
 
 SortNode::~SortNode() {
@@ -65,21 +77,50 @@ SortNode::~SortNode() {
 Status SortNode::Prepare(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecNode::Prepare(state));
-  sorter_.reset(new Sorter(ordering_exprs_, is_asc_order_, nulls_first_,
-      sort_tuple_exprs_, &row_descriptor_, mem_tracker(), buffer_pool_client(),
-      resource_profile_.spillable_buffer_size, runtime_profile(), state, label(), true));
+  const SortPlanNode& pnode = static_cast<const SortPlanNode&>(plan_node_);
+  sorter_.reset(new Sorter(tuple_row_comparator_config_, sort_tuple_exprs_,
+      &row_descriptor_, mem_tracker(), buffer_pool_client(),
+      resource_profile_.spillable_buffer_size, runtime_profile(), state, label(), true,
+      pnode.codegend_sort_helper_fn_, pnode.codegend_heapify_helper_fn_,
+      ComputeInputSizeEstimate()));
   RETURN_IF_ERROR(sorter_->Prepare(pool_));
   DCHECK_GE(resource_profile_.min_reservation, sorter_->ComputeMinReservation());
-  state->CheckAndAddCodegenDisabledMessage(runtime_profile());
   return Status::OK();
 }
 
-void SortNode::Codegen(RuntimeState* state) {
+int64_t SortNode::ComputeInputSizeEstimate() {
+  const SortPlanNode& pnode = static_cast<const SortPlanNode&>(plan_node_);
+  const TSortNode& sort_node = pnode.tnode_->sort_node;
+  int64_t estimated_input_size = -1;
+  if (sort_node.__isset.estimated_full_input_size
+      && sort_node.estimated_full_input_size > 0) {
+    estimated_input_size = sort_node.estimated_full_input_size / num_backends_;
+  }
+
+  VLOG(3) << Substitute("Sort estimation: estimated_full_input_size=$0 "
+                        "num_backends=$1 estimated_input_size=$2",
+      PrettyPrinter::PrintBytes(sort_node.estimated_full_input_size), num_backends_,
+      PrettyPrinter::PrintBytes(estimated_input_size));
+  return estimated_input_size;
+}
+
+void SortPlanNode::Codegen(FragmentState* state) {
   DCHECK(state->ShouldCodegen());
-  ExecNode::Codegen(state);
+  PlanNode::Codegen(state);
   if (IsNodeCodegenDisabled()) return;
-  Status codegen_status = sorter_->Codegen(state);
-  runtime_profile()->AddCodegenMsg(codegen_status.ok(), codegen_status);
+  llvm::Function* compare_fn = nullptr;
+  Status codegen_status = row_comparator_config_->Codegen(state, &compare_fn);
+  if (codegen_status.ok()) {
+    codegen_status =
+        Sorter::TupleSorter::Codegen(state, compare_fn,
+            row_descriptor_->tuple_descriptors()[0]->byte_size(),
+            &codegend_sort_helper_fn_);
+  }
+  if (codegen_status.ok()) {
+    codegen_status =
+        SortedRunMerger::Codegen(state, compare_fn, &codegend_heapify_helper_fn_);
+  }
+  AddCodegenStatus(codegen_status);
 }
 
 Status SortNode::Open(RuntimeState* state) {
@@ -163,18 +204,17 @@ void SortNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   if (sorter_ != nullptr) sorter_->Close(state);
   sorter_.reset();
-  ScalarExpr::Close(ordering_exprs_);
-  ScalarExpr::Close(sort_tuple_exprs_);
   ExecNode::Close(state);
 }
 
 void SortNode::DebugString(int indentation_level, stringstream* out) const {
   *out << string(indentation_level * 2, ' ');
-  *out << "SortNode(" << ScalarExpr::DebugString(ordering_exprs_);
-  for (int i = 0; i < is_asc_order_.size(); ++i) {
-    *out << (i > 0 ? " " : "")
-         << (is_asc_order_[i] ? "asc" : "desc")
-         << " nulls " << (nulls_first_[i] ? "first" : "last");
+  const SortPlanNode& pnode = static_cast<const SortPlanNode&>(plan_node_);
+  const TSortInfo& tsort_info = pnode.tnode_->sort_node.sort_info;
+  *out << "SortNode(" << ScalarExpr::DebugString(pnode.ordering_exprs_);
+  for (int i = 0; i < tsort_info.is_asc_order.size(); ++i) {
+    *out << (i > 0 ? " " : "") << (tsort_info.is_asc_order[i] ? "asc" : "desc")
+         << " nulls " << (tsort_info.nulls_first[i] ? "first" : "last");
   }
   ExecNode::DebugString(indentation_level, out);
   *out << ")";
@@ -185,7 +225,14 @@ Status SortNode::SortInput(RuntimeState* state) {
   bool eos;
   do {
     RETURN_IF_ERROR(child(0)->GetNext(state, &batch, &eos));
-    RETURN_IF_ERROR(sorter_->AddBatch(&batch));
+
+    MonotonicStopWatch timer;
+    timer.Start();
+    Status add_status = sorter_->AddBatch(&batch);
+    timer.Stop();
+    add_batch_timer_->UpdateCounter(timer.ElapsedTime());
+    if (UNLIKELY(!add_status.ok())) return add_status;
+
     batch.Reset();
     RETURN_IF_CANCELLED(state);
     RETURN_IF_ERROR(QueryMaintenance(state));

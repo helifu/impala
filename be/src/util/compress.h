@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_UTIL_COMPRESS_H
-#define IMPALA_UTIL_COMPRESS_H
+#include <cstdint>
+#include <string>
 
 /// We need zlib.h here to declare stream_ below.
 #include <zlib.h>
 #include <zstd.h>
 
+#include "common/status.h"
 #include "util/codec.h"
 
 namespace impala {
@@ -144,7 +146,7 @@ class ZstandardCompressor : public Codec {
   virtual Status ProcessBlock(bool output_preallocated, int64_t input_length,
       const uint8_t* input, int64_t* output_length,
       uint8_t** output) override WARN_UNUSED_RESULT;
-  virtual std::string file_extension() const override { return "zstd"; }
+  virtual std::string file_extension() const override { return "zst"; }
 
  private:
   int clevel_;
@@ -164,4 +166,3 @@ class Lz4BlockCompressor : public Codec {
   virtual std::string file_extension() const override { return "lz4"; }
 };
 }
-#endif

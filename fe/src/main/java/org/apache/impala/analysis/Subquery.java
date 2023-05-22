@@ -86,13 +86,15 @@ public class Subquery extends Expr {
     List<Expr> stmtResultExprs = stmt_.getResultExprs();
     if (stmtResultExprs.size() == 1) {
       type_ = stmtResultExprs.get(0).getType();
-      Preconditions.checkState(!type_.isComplexType());
+      if (type_.isComplexType()) {
+        throw new AnalysisException("A subquery can't return complex types. " + toSql());
+      }
     } else {
       type_ = createStructTypeFromExprList();
     }
 
     // If the subquery can return many rows, do the cardinality check at runtime.
-    if (!((SelectStmt)stmt_).returnsSingleRow()) stmt_.setIsRuntimeScalar(true);
+    if (!((SelectStmt)stmt_).returnsAtMostOneRow()) stmt_.setIsRuntimeScalar(true);
 
     Preconditions.checkNotNull(type_);
   }
@@ -163,4 +165,16 @@ public class Subquery extends Expr {
 
   @Override
   protected void toThrift(TExprNode msg) {}
+
+  @Override
+  public boolean resolveTableMask(Analyzer analyzer) throws AnalysisException {
+    return stmt_.resolveTableMask(analyzer);
+  }
+
+  @Override
+  protected void resetAnalysisState() {
+    super.resetAnalysisState();
+    stmt_.reset();
+    analyzer_ = null;
+  }
 }

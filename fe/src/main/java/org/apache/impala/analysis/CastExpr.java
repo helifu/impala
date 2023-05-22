@@ -31,7 +31,7 @@ import org.apache.impala.thrift.TExpr;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -184,6 +184,11 @@ public class CastExpr extends Expr {
         }
         // Disable no-op casts
         if (fromType.equals(toType) && !fromType.isDecimal()) continue;
+        // No built-in function needed for BINARY <-> STRING conversion, while there is
+        // no conversion from / to any other type.
+        if (fromType.isBinary() || toType.isBinary()) {
+          continue;
+        }
         String beClass = toType.isDecimal() || fromType.isDecimal() ?
             "DecimalOperators" : "CastFunctions";
         String beSymbol = "impala::" + beClass + "::CastTo" + Function.getUdfType(toType);
@@ -257,7 +262,7 @@ public class CastExpr extends Expr {
 
   @Override
   public String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("isImplicit", isImplicit_)
         .add("target", type_)
         .add("format", castFormat_)
@@ -277,7 +282,23 @@ public class CastExpr extends Expr {
 
   @Override
   protected float computeEvalCost() {
-    return getChild(0).hasCost() ? getChild(0).getCost() + CAST_COST : UNKNOWN_COST;
+    // By default, assume that casting requires some non-trivial logic - i.e. is similar
+    // to calling an arbitrary function.
+    float castCost = FUNCTION_CALL_COST;
+    Type inType = children_.get(0).getType();
+    if ((type_.isVarchar() || type_.getPrimitiveType() == PrimitiveType.STRING) &&
+        (inType.isVarchar() || inType.getPrimitiveType() == PrimitiveType.STRING)) {
+      // Casting between variable-length string types requires at most adjusting the
+      // length field.
+      castCost = ARITHMETIC_OP_COST;
+    } else if (
+        (type_.isFloatingPointType() || type_.isIntegerType() || type_.isBoolean()) &&
+        (inType.isFloatingPointType() || inType.isIntegerType() ||  inType.isBoolean())) {
+      // Casting between machine primitive types can be done cheaply, e.g. with a
+      // machine instruction or two.
+      castCost = ARITHMETIC_OP_COST;
+    }
+    return getChild(0).hasCost() ? getChild(0).getCost() + castCost : UNKNOWN_COST;
   }
 
   private void analyze() throws AnalysisException {
@@ -314,10 +335,23 @@ public class CastExpr extends Expr {
     }
 
     if (children_.get(0) instanceof NumericLiteral && type_.isFloatingPointType()) {
-      // Special case casting a decimal literal to a floating point number. The
-      // decimal literal can be interpreted as either and we want to avoid casts
-      // since that can result in loss of accuracy.
-      ((NumericLiteral)children_.get(0)).explicitlyCastToFloat(type_);
+      // Special case casting a decimal literal to a floating point number. The decimal
+      // literal can be interpreted as either and we want to avoid casts since that can
+      // result in loss of accuracy. However, if 'type_' is FLOAT and the value does not
+      // fit in a FLOAT, we do not do an unchecked conversion
+      // ('NumericLiteral.explicitlyCastToFloat()') here but let the conversion fail in
+      // the BE.
+      NumericLiteral child = (NumericLiteral) children_.get(0);
+      final boolean isOverflow = NumericLiteral.isOverflow(child.getValue(), type_);
+      if (type_.isScalarType(PrimitiveType.FLOAT)) {
+        if (!isOverflow) {
+          ((NumericLiteral)children_.get(0)).explicitlyCastToFloat(type_);
+        }
+      } else {
+        Preconditions.checkState(type_.isScalarType(PrimitiveType.DOUBLE));
+        Preconditions.checkState(!isOverflow);
+        ((NumericLiteral)children_.get(0)).explicitlyCastToFloat(type_);
+      }
     }
 
     if (children_.get(0).getType().isNull()) {
@@ -334,11 +368,19 @@ public class CastExpr extends Expr {
 
     Type childType = children_.get(0).type_;
     Preconditions.checkState(!childType.isNull());
+
     // IMPALA-4550: We always need to set noOp_ to the correct value, since we could
     // be performing a subsequent analysis run and its correct value might have changed.
     // This can happen if the child node gets substituted and its type changes.
     noOp_ = childType.equals(type_);
     if (noOp_) return;
+
+    // BINARY can be only converted from / to STRING and the conversion is NOOP.
+    if ((childType.isBinary() && type_.getPrimitiveType() == PrimitiveType.STRING)
+        || (type_.isBinary() && childType.getPrimitiveType() == PrimitiveType.STRING)) {
+      noOp_ = true;
+      return;
+    }
 
     FunctionName fnName = new FunctionName(BuiltinsDb.NAME, getFnName(type_));
     Type[] args = { childType };
@@ -391,6 +433,12 @@ public class CastExpr extends Expr {
     CastExpr other = (CastExpr) that;
     return isImplicit_ == other.isImplicit_
         && type_.equals(other.type_);
+  }
+
+  // Pass through since cast's are cheap.
+  @Override
+  public boolean shouldConvertToCNF() {
+    return getChild(0).shouldConvertToCNF();
   }
 
   @Override

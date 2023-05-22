@@ -17,21 +17,20 @@
 
 # Targeted tests for Impala joins
 #
+from __future__ import absolute_import, division, print_function
 import pytest
 from copy import deepcopy
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (
-    SkipIf,
-    SkipIfIsilon,
-    SkipIfLocal,
-    SkipIfS3,
-    SkipIfABFS,
-    SkipIfADLS)
+from tests.common.skip import SkipIf, SkipIfFS
 from tests.common.test_vector import ImpalaTestDimension
 
 class TestJoinQueries(ImpalaTestSuite):
   BATCH_SIZES = [0, 1]
+  MT_DOP_VALUES = [0, 4]
+  # Additional values for exhaustive tests.
+  MT_DOP_VALUES_EXHAUSTIVE = [1]
+  ENABLE_OUTER_JOIN_TO_INNER_TRANSFORMATION = ['false', 'true']
 
   @classmethod
   def get_workload(cls):
@@ -42,6 +41,11 @@ class TestJoinQueries(ImpalaTestSuite):
     super(TestJoinQueries, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('batch_size', *TestJoinQueries.BATCH_SIZES))
+    mt_dop_values = cls.MT_DOP_VALUES
+    if cls.exploration_strategy() == 'exhaustive':
+      mt_dop_values += cls.MT_DOP_VALUES_EXHAUSTIVE
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('mt_dop', *mt_dop_values))
     # TODO: Look into splitting up join tests to accomodate hbase.
     # Joins with hbase tables produce drastically different results.
     cls.ImpalaTestMatrix.add_constraint(lambda v:\
@@ -51,33 +55,43 @@ class TestJoinQueries(ImpalaTestSuite):
       # Cut down on execution time when not running in exhaustive mode.
       cls.ImpalaTestMatrix.add_constraint(lambda v: v.get_value('batch_size') != 1)
 
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('enable_outer_join_to_inner_transformation',
+        *TestJoinQueries.ENABLE_OUTER_JOIN_TO_INNER_TRANSFORMATION))
+
   def test_basic_joins(self, vector):
     new_vector = deepcopy(vector)
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    new_vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/joins', new_vector)
 
   def test_single_node_joins_with_limits_exhaustive(self, vector):
     if self.exploration_strategy() != 'exhaustive': pytest.skip()
     new_vector = deepcopy(vector)
     new_vector.get_value('exec_option')['num_nodes'] = 1
+    new_vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     del new_vector.get_value('exec_option')['batch_size']  # .test file sets batch_size
     self.run_test_case('QueryTest/single-node-joins-with-limits-exhaustive', new_vector)
 
-  @SkipIfS3.hbase
-  @SkipIfABFS.hbase
-  @SkipIfADLS.hbase
-  @SkipIfIsilon.hbase
+  @SkipIfFS.hbase
   @SkipIf.skip_hbase
-  @SkipIfLocal.hbase
   def test_joins_against_hbase(self, vector):
     new_vector = deepcopy(vector)
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    new_vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/joins-against-hbase', new_vector)
 
   def test_outer_joins(self, vector):
     new_vector = deepcopy(vector)
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    new_vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/outer-joins', new_vector)
+
+  def test_outer_to_inner_joins(self, vector):
+    new_vector = deepcopy(vector)
+    new_vector.get_value('exec_option')['enable_outer_join_to_inner_transformation']\
+        = vector.get_value('enable_outer_join_to_inner_transformation')
+    self.run_test_case('QueryTest/outer-to-inner-joins', new_vector)
 
   def test_single_node_nested_loop_joins(self, vector):
     # Test the execution of nested-loops joins for join types that can only be
@@ -90,11 +104,13 @@ class TestJoinQueries(ImpalaTestSuite):
     if self.exploration_strategy() != 'exhaustive': pytest.skip()
     new_vector = deepcopy(vector)
     new_vector.get_value('exec_option')['num_nodes'] = 1
+    new_vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/single-node-nlj-exhaustive', new_vector)
 
   def test_empty_build_joins(self, vector):
     new_vector = deepcopy(vector)
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    new_vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/empty-build-joins', new_vector)
 
 class TestTPCHJoinQueries(ImpalaTestSuite):

@@ -19,7 +19,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <iostream>
 #include <limits>
 #include <vector>
 
@@ -80,14 +79,16 @@ class HashTableTest : public testing::Test {
     // Not very easy to test complex tuple layouts so this test will use the
     // simplest.  The purpose of these tests is to exercise the hash map
     // internals so a simple build/probe expr is fine.
-    ScalarExpr* build_expr = pool_.Add(new SlotRef(TYPE_INT, 1, true /* nullable */));
+    ScalarExpr* build_expr =
+      pool_.Add(new SlotRef(ColumnType(TYPE_INT), 1, true /* nullable */));
     ASSERT_OK(build_expr->Init(desc, true, nullptr));
     build_exprs_.push_back(build_expr);
     ASSERT_OK(ScalarExprEvaluator::Create(build_exprs_, nullptr, &pool_, &mem_pool_,
         &mem_pool_, &build_expr_evals_));
     ASSERT_OK(ScalarExprEvaluator::Open(build_expr_evals_, nullptr));
 
-    ScalarExpr* probe_expr = pool_.Add(new SlotRef(TYPE_INT, 1, true /* nullable */));
+    ScalarExpr* probe_expr =
+      pool_.Add(new SlotRef(ColumnType(TYPE_INT), 1, true /* nullable */));
     ASSERT_OK(probe_expr->Init(desc, true, nullptr));
     probe_exprs_.push_back(probe_expr);
     ASSERT_OK(ScalarExprEvaluator::Create(probe_exprs_, nullptr, &pool_, &mem_pool_,
@@ -740,4 +741,10 @@ TEST_F(HashTableTest, VeryLowMemTest) {
   VeryLowMemTest(false);
 }
 
+// Test to ensure the bucket size doesn't change accidentally.
+// On intentional changes to Bucket Size this test should be changed.
+TEST_F(HashTableTest, BucketSize) {
+  int bucket_size = HashTable::BUCKET_SIZE;
+  EXPECT_EQ(bucket_size, 8);
+}
 }

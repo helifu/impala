@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from tests.util.test_file_parser import QueryTestSectionReader
 
 # TODO: This interface needs to be more robust; At the moment, it has two users with
@@ -52,6 +53,9 @@ class Query(object):
             self.test_vector == other.test_vector and
             self.workload_name == other.workload_name and
             self.db == other.db)
+
+  def __hash__(self):
+    return hash((self.query_str, self.name, self.scale_factor, self.test_vector, self.db))
 
   def _build_query(self):
     """Populates db, query_str, table_format_str"""

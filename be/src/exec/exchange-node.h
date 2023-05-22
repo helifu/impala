@@ -21,7 +21,7 @@
 
 #include <boost/scoped_ptr.hpp>
 #include "exec/exec-node.h"
-
+#include "runtime/sorted-run-merger.h"
 #include "runtime/bufferpool/buffer-pool.h"
 
 namespace impala {
@@ -30,18 +30,25 @@ class KrpcDataStreamRecvr;
 class RowBatch;
 class ScalarExpr;
 class TupleRowComparator;
+class TupleRowComparatorConfig;
 
 class ExchangePlanNode : public PlanNode {
  public:
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status Init(const TPlanNode& tnode, FragmentState* state) override;
+  virtual void Close() override;
   virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+  virtual void Codegen(FragmentState* state) override;
 
   ~ExchangePlanNode(){}
 
-  /// Sort expressions and parameters passed to the merging receiver.
+  /// Sort expressions passed to the merging receiver.
   std::vector<ScalarExpr*> ordering_exprs_;
-  std::vector<bool> is_asc_order_;
-  std::vector<bool> nulls_first_;
+
+  /// Config used to create a TupleRowComparator instance. Non null for merging exchange.
+  TupleRowComparatorConfig* row_comparator_config_ = nullptr;
+
+  /// Codegened version of SortedRunMerger::HeapifyHelper().
+  CodegenFnPtr<SortedRunMerger::HeapifyHelperFn> codegend_heapify_helper_fn_;
 };
 
 /// Receiver node for data streams. The data stream receiver is created in Prepare()
@@ -62,7 +69,6 @@ class ExchangeNode : public ExecNode {
       ObjectPool* pool, const ExchangePlanNode& pnode, const DescriptorTbl& descs);
 
   virtual Status Prepare(RuntimeState* state);
-  virtual void Codegen(RuntimeState* state);
   /// Blocks until the first batch is available for consumption via GetNext().
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
@@ -126,11 +132,6 @@ class ExchangeNode : public ExecNode {
 
   /// The TupleRowComparator based on 'sort_exec_exprs_' for merging exchange.
   boost::scoped_ptr<TupleRowComparator> less_than_;
-
-  /// Sort expressions and parameters passed to the merging receiver..
-  std::vector<ScalarExpr*> ordering_exprs_;
-  std::vector<bool> is_asc_order_;
-  std::vector<bool> nulls_first_;
 
   /// Offset specifying number of rows to skip.
   int64_t offset_;

@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import json
 
 from collections import defaultdict
@@ -161,7 +162,7 @@ class ValExpr(object):
     if self.is_func:
       for arg in self.args:
         if isinstance(arg, ValExpr):
-          for col, count in arg.count_col_refs().iteritems():
+          for col, count in arg.count_col_refs().items():
             col_ref_counts[col] += count
     elif self.is_col:
       col_ref_counts[self] += 1
@@ -450,6 +451,9 @@ class ArrayColumn(CollectionColumn):
       return True
     return self.name == other.name and self.owner.identifier == other.owner.identifier
 
+  def __hash__(self):
+    return hash((self.name, self.owner.identifier))
+
   def __deepcopy__(self, memo):
     other = ArrayColumn(
         owner=self.owner,
@@ -478,6 +482,9 @@ class MapColumn(CollectionColumn):
     if self is other:
       return True
     return self.name == other.name and self.owner.identifier == other.owner.identifier
+
+  def __hash__(self):
+    return hash((self.name, self.owner.identifier))
 
   def __deepcopy__(self, memo):
     other = MapColumn(
@@ -630,7 +637,7 @@ class TableExprList(list):
   def joinable_cols_by_type(self):
     cols_by_type = defaultdict(ValExprList)
     for table_expr in self:
-      for type_, cols in table_expr.joinable_cols_by_type.iteritems():
+      for type_, cols in table_expr.joinable_cols_by_type.items():
         cols_by_type[type_].extend(cols)
     return cols_by_type
 
@@ -638,7 +645,7 @@ class TableExprList(list):
   def cols_by_type(self):
     cols_by_type = defaultdict(ValExprList)
     for table_expr in self:
-      for type_, cols in table_expr.cols_by_type.iteritems():
+      for type_, cols in table_expr.cols_by_type.items():
         cols_by_type[type_].extend(cols)
     return cols_by_type
 

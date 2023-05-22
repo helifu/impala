@@ -49,11 +49,19 @@ struct TSlotDescriptor {
   7: required i32 nullIndicatorByte
   8: required i32 nullIndicatorBit
   9: required i32 slotIdx
+  10: required CatalogObjects.TVirtualColumnType virtual_col_type =
+      CatalogObjects.TVirtualColumnType.NONE
 }
 
 struct TColumnDescriptor {
   1: required string name
   2: required Types.TColumnType type
+
+  // Field id of an iceberg column.
+  3: optional i32 icebergFieldId
+  // Key and value field id for Iceberg column with Map type.
+  4: optional i32 icebergFieldMapKeyId
+  5: optional i32 icebergFieldMapValueId
 }
 
 // "Union" of all table types.
@@ -69,6 +77,7 @@ struct TTableDescriptor {
   6: optional CatalogObjects.THBaseTable hbaseTable
   9: optional CatalogObjects.TDataSourceTable dataSourceTable
   10: optional CatalogObjects.TKuduTable kuduTable
+  11: optional CatalogObjects.TIcebergTable icebergTable
 
   // Unqualified name of table
   7: required string tableName
@@ -103,4 +112,4 @@ struct TDescriptorTable {
 struct TDescriptorTableSerialized {
   // TDescriptorTable serialized
   1: required binary thrift_desc_tbl
-}
+} (cpp.customostream)

@@ -17,14 +17,13 @@
 
 #include "kudu/util/spinlock_profiling.h"
 
+#include <functional>
 #include <sstream>
-#include <string>
 
-#include <glog/logging.h>
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include "kudu/gutil/atomicops.h"
-#include "kudu/gutil/bind.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/once.h"
@@ -51,6 +50,7 @@ METRIC_DEFINE_gauge_uint64(server, spinlock_contention_time,
     "Amount of time consumed by contention on internal spinlocks since the server "
     "started. If this increases rapidly, it may indicate a performance issue in Kudu "
     "internals triggered by a particular workload and warrant investigation.",
+    kudu::MetricLevel::kWarn,
     kudu::EXPOSE_AS_COUNTER);
 
 
@@ -272,7 +272,7 @@ void RegisterSpinLockContentionMetrics(const scoped_refptr<MetricEntity>& entity
   InitSpinLockContentionProfiling();
   entity->NeverRetire(
       METRIC_spinlock_contention_time.InstantiateFunctionGauge(
-          entity, Bind(&GetSpinLockContentionMicros)));
+          entity, []() { return GetSpinLockContentionMicros(); }));
 }
 
 uint64_t GetSpinLockContentionMicros() {

@@ -48,6 +48,22 @@ alter table simple set tblproperties ('kudu.master_addresses' = 'invalid_host')
 ImpalaRuntimeException: Kudu table '$DATABASE.simple' does not exist on master 'invalid_host'
 ====
 ---- QUERY
+alter table simple set owner user new_owner
+---- RESULTS
+'Updated table/view.'
+---- TYPES
+STRING
+====
+---- QUERY
+# The change to the owner should be reflected whether or not the integration between Kudu
+# and HMS is enabled.
+describe formatted simple
+----RESULTS: VERIFY_IS_SUBSET
+'Owner:              ','new_owner           ','NULL'
+---- TYPES
+STRING, STRING, STRING
+====
+---- QUERY
 alter table simple rename to simple_new;
 ---- RESULTS
 'Renaming was successful.'
@@ -145,7 +161,7 @@ show range partitions tbl_to_alter;
 # Try to insert a partition that overlaps with an existing partition
 alter table tbl_to_alter add range partition 10 < values <= 30
 ---- CATCH
-NonRecoverableException: New range partition conflicts with existing range partition: 11 <= VALUES < 31
+NonRecoverableException: new range partition conflicts with existing one: 11 <= VALUES < 31
 ====
 ---- QUERY
 # Try to insert a partition that overlaps with an existing partition, use IF NOT EXISTS
@@ -551,16 +567,16 @@ alter table kudu_tbl_to_alter alter column new_col4
   set encoding plain_encoding compression lz4 block_size 1000;
 describe kudu_tbl_to_alter;
 ---- LABELS
-NAME,TYPE,COMMENT,PRIMARY_KEY,NULLABLE,DEFAULT_VALUE,ENCODING,COMPRESSION,BLOCK_SIZE
+NAME,TYPE,COMMENT,PRIMARY_KEY,KEY_UNIQUE,NULLABLE,DEFAULT_VALUE,ENCODING,COMPRESSION,BLOCK_SIZE
 ---- RESULTS
-'id','int','','true','false','','RLE','SNAPPY','100'
-'last_name','string','','false','true','','AUTO_ENCODING','DEFAULT_COMPRESSION','0'
-'name','string','','false','true','name_default','AUTO_ENCODING','DEFAULT_COMPRESSION','0'
-'new_col1','int','','false','false','','AUTO_ENCODING','DEFAULT_COMPRESSION','0'
-'new_col2','bigint','','false','false','','AUTO_ENCODING','DEFAULT_COMPRESSION','0'
-'new_col4','int','','false','true','-1','PLAIN_ENCODING','LZ4','1000'
+'id','int','','true','true','false','','RLE','SNAPPY','100'
+'last_name','string','','false','','true','','AUTO_ENCODING','DEFAULT_COMPRESSION','0'
+'name','string','','false','','true','name_default','AUTO_ENCODING','DEFAULT_COMPRESSION','0'
+'new_col1','int','','false','','false','','AUTO_ENCODING','DEFAULT_COMPRESSION','0'
+'new_col2','bigint','','false','','false','','AUTO_ENCODING','DEFAULT_COMPRESSION','0'
+'new_col4','int','','false','','true','-1','PLAIN_ENCODING','LZ4','1000'
 ---- TYPES
-STRING,STRING,STRING,STRING,STRING,STRING,STRING,STRING,STRING
+STRING,STRING,STRING,STRING,STRING,STRING,STRING,STRING,STRING,STRING
 ====
 ---- QUERY
 # check that we can insert and scan after the storage attribute changes
@@ -623,7 +639,7 @@ show range partitions multi_range_partition_cols;
 # Try to insert a partition that overlaps with an existing partition
 alter table multi_range_partition_cols add range partition ('b', 2) <= values < ('c', 1)
 ---- CATCH
-NonRecoverableException: New range partition conflicts with existing range partition: ("b", 2) <= VALUES < ("c", 1)
+NonRecoverableException: new range partition conflicts with existing one: ("b", 2) <= VALUES < ("c", 1)
 ====
 ---- QUERY
 # Check that renaming an external Impala-Kudu table does not rename the underlying Kudu

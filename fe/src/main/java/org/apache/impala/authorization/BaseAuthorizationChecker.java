@@ -24,6 +24,8 @@ import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.authorization.Authorizable.Type;
 import org.apache.impala.catalog.FeCatalog;
 import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeIncompleteTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.util.EventSequence;
@@ -102,7 +104,8 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
    * Override this method to add custom post-authorization check.
    */
   @Override
-  public void postAuthorize(AuthorizationContext authzCtx) {
+  public void postAuthorize(AuthorizationContext authzCtx, boolean authzOk,
+      boolean analysisOk) {
     if (authzCtx.getTimeline().isPresent()) {
       EventSequence timeline = authzCtx.getTimeline().get();
       long durationMs = timeline.markEvent(String.format("Authorization finished (%s)",
@@ -179,6 +182,7 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
     // 'user_has_profile_access' flag in queryCtx_.
     for (Pair<PrivilegeRequest, String> maskedReq : analyzer.getMaskedPrivilegeReqs()) {
       try {
+        authzCtx.setRetainAudits(false);
         authorizePrivilegeRequest(authzCtx, analysisResult, catalog, maskedReq.first);
       } catch (AuthorizationException e) {
         analysisResult.setUserHasProfileAccess(false);
@@ -186,6 +190,8 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
           throw new AuthorizationException(maskedReq.second);
         }
         break;
+      } finally {
+        authzCtx.setRetainAudits(true);
       }
     }
   }
@@ -208,6 +214,22 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
     if (dbName != null && checkSystemDbAccess(catalog, dbName, request.getPrivilege())) {
       return;
     }
+    // Populate column names to check column masking policies in blocking updates.
+    if (config_.isEnabled() && request.getAuthorizable() != null
+        && request.getAuthorizable().getType() == Type.TABLE) {
+      Preconditions.checkNotNull(dbName);
+      AuthorizableTable authorizableTable = (AuthorizableTable) request.getAuthorizable();
+      FeDb db = catalog.getDb(dbName);
+      if (db != null) {
+        // 'db', 'table' could be null for an unresolved table ref. 'table' could be
+        // null for target table of a CTAS statement. Don't need to populate column
+        // names in such cases since no column masking policies will be checked.
+        FeTable table = db.getTable(authorizableTable.getTableName());
+        if (table != null && !(table instanceof FeIncompleteTable)) {
+          authorizableTable.setColumns(table.getColumnNames());
+        }
+      }
+    }
     checkAccess(authzCtx, analysisResult.getAnalyzer().getUser(), request);
   }
 
@@ -224,11 +246,11 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
       throws AuthorizationException, InternalException {
     Preconditions.checkArgument(!requests.isEmpty());
     Analyzer analyzer = analysisResult.getAnalyzer();
-    // We need to temporarily deny access when column masking or row filtering feature is
-    // enabled until Impala has full implementation of column masking and row filtering.
-    // This is to prevent data leak since we do not want Impala to show any information
-    // when Hive has column masking and row filtering enabled.
-    authorizeRowFilterAndColumnMask(analysisResult.getAnalyzer().getUser(), requests);
+    // Deny access of columns containing column masking policies when column masking
+    // feature is disabled. Deny access of the tables containing row filtering policies
+    // when row filtering feature is disabled. This is to prevent data leak since we do
+    // not want Impala to show any information when these features are disabled.
+    authorizeRowFilterAndColumnMask(analyzer.getUser(), requests);
 
     boolean hasTableSelectPriv = true;
     boolean hasColumnSelectPriv = false;

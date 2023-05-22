@@ -24,8 +24,8 @@
 #include <string>
 #include <vector>
 
-#include <boost/thread/shared_mutex.hpp>
 #include <boost/scoped_ptr.hpp>
+#include <boost/thread/pthread/shared_mutex.hpp>
 #include <boost/unordered_map.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 
@@ -36,13 +36,14 @@
 #include "gen-cpp/Types_types.h"
 #include "rpc/thrift-client.h"
 #include "runtime/client-cache.h"
-#include "runtime/timestamp-value.h"
 #include "statestore/failure-detector.h"
 #include "statestore/statestore-subscriber-client-wrapper.h"
 #include "util/aligned-new.h"
 #include "util/metrics-fwd.h"
 #include "util/thread-pool.h"
 #include "util/webserver.h"
+
+using kudu::HttpStatusCode;
 
 namespace impala {
 
@@ -154,7 +155,9 @@ class Statestore : public CacheLineAligned {
       const std::vector<TTopicRegistration>& topic_registrations,
       RegistrationId* registration_id) WARN_UNUSED_RESULT;
 
-  void RegisterWebpages(Webserver* webserver);
+  /// Registers webpages for the input webserver. If metrics_only is set then only
+  /// '/healthz' page is registered.
+  void RegisterWebpages(Webserver* webserver, bool metrics_only);
 
   /// The main processing loop. Runs infinitely.
   void MainLoop();
@@ -165,7 +168,7 @@ class Statestore : public CacheLineAligned {
   void ShutdownForTesting();
 
   /// Returns the Thrift API interface that proxies requests onto the local Statestore.
-  const boost::shared_ptr<StatestoreServiceIf>& thrift_iface() const {
+  const std::shared_ptr<StatestoreServiceIf>& thrift_iface() const {
     return thrift_iface_;
   }
 
@@ -174,9 +177,9 @@ class Statestore : public CacheLineAligned {
   /// interface for specifying prioritized topics, but for now we only have a small
   /// fixed set of topics.
   /// Topic tracking the set of live Impala daemon instances.
-  static const std::string IMPALA_MEMBERSHIP_TOPIC;
+  static const char* IMPALA_MEMBERSHIP_TOPIC;
   /// Topic tracking the state of admission control on all coordinators.
-  static const std::string IMPALA_REQUEST_QUEUE_TOPIC;
+  static const char* IMPALA_REQUEST_QUEUE_TOPIC;
 
   int32_t port() { return thrift_server_->port(); }
 
@@ -479,7 +482,7 @@ class Statestore : public CacheLineAligned {
 
     /// Lock held when adding or deleting transient entries. See class comment for lock
     /// acquisition order.
-    boost::mutex transient_entry_lock_;
+    std::mutex transient_entry_lock_;
 
     /// True once DeleteAllTransientEntries() has been called during subscriber
     /// unregisteration. Protected by 'transient_entry_lock_'
@@ -488,7 +491,7 @@ class Statestore : public CacheLineAligned {
 
   /// Protects access to subscribers_ and subscriber_uuid_generator_. See the class
   /// comment for the lock acquisition order.
-  boost::mutex subscribers_lock_;
+  std::mutex subscribers_lock_;
 
   /// Map of subscribers currently connected; upon failure their entry is removed from this
   /// map. Subscribers must only be removed by UnregisterSubscriber() which ensures that
@@ -565,8 +568,8 @@ class Statestore : public CacheLineAligned {
   /// Thread that monitors the heartbeats of all subscribers.
   std::unique_ptr<Thread> heartbeat_monitoring_thread_;
 
-  /// Flag to indicate that the statestore has been initialized.
-  bool initialized_ = false;
+  /// Indicates whether the statestore has been initialized and the service is ready.
+  std::atomic_bool service_started_{false};
 
   /// Cache of subscriber clients used for UpdateState() RPCs. Only one client per
   /// subscriber should be used, but the cache helps with the client lifecycle on failure.
@@ -585,7 +588,7 @@ class Statestore : public CacheLineAligned {
   MetricGroup* metrics_;
 
   /// Thrift API implementation which proxies requests onto this Statestore
-  boost::shared_ptr<StatestoreServiceIf> thrift_iface_;
+  std::shared_ptr<StatestoreServiceIf> thrift_iface_;
 
   /// Failure detector for subscribers. If a subscriber misses a configurable number of
   /// consecutive heartbeat messages, it is considered failed and a) its transient topic
@@ -722,6 +725,10 @@ class Statestore : public CacheLineAligned {
   /// last_heartbeat_ts_ has not been updated in that interval, it logs the subscriber's
   /// id.
   [[noreturn]] void MonitorSubscriberHeartbeat();
+
+  /// Raw callback to indicate whether the service is ready.
+  void HealthzHandler(const Webserver::WebRequest& req, std::stringstream* data,
+      HttpStatusCode* response);
 };
 
 } // namespace impala

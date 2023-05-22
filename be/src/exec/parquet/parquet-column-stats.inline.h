@@ -22,6 +22,7 @@
 #include "gen-cpp/parquet_types.h"
 #include "parquet-column-stats.h"
 #include "runtime/string-value.inline.h"
+#include "util/bit-util.h"
 
 namespace impala {
 
@@ -136,6 +137,38 @@ inline bool ColumnStats<bool>::DecodePlainValue(const std::string& buffer, void*
   return true;
 }
 
+/// Special version to decode Parquet INT32 for Impala tinyint with value range check.
+template <>
+inline bool ColumnStats<int8_t>::DecodePlainValue(const std::string& buffer, void* slot,
+    parquet::Type::type parquet_type) {
+  DCHECK_EQ(buffer.size(), sizeof(int32_t));
+  DCHECK_EQ(parquet_type, parquet::Type::INT32);
+  int8_t* result = reinterpret_cast<int8_t*>(slot);
+  int32_t data = *(int32_t*)(const_cast<char*>(buffer.data()));
+  if (UNLIKELY(data < std::numeric_limits<int8_t>::min()
+      || data > std::numeric_limits<int8_t>::max())) {
+    return false;
+  }
+  *result = data;
+  return true;
+}
+
+/// Special version to decode Parquet INT32 for Impala smallint with value range check.
+template <>
+inline bool ColumnStats<int16_t>::DecodePlainValue(const std::string& buffer, void* slot,
+    parquet::Type::type parquet_type) {
+  DCHECK_EQ(buffer.size(), sizeof(int32_t));
+  DCHECK_EQ(parquet_type, parquet::Type::INT32);
+  int16_t* result = reinterpret_cast<int16_t*>(slot);
+  int32_t data = *(int32_t*)(const_cast<char*>(buffer.data()));
+  if (UNLIKELY(data < std::numeric_limits<int16_t>::min()
+      || data > std::numeric_limits<int16_t>::max())) {
+    return false;
+  }
+  *result = data;
+  return true;
+}
+
 template <>
 inline int64_t ColumnStats<bool>::BytesNeeded(const bool& v) const {
   return 1;
@@ -147,7 +180,7 @@ namespace {
 /// any validation.
 /// Used as a helper function for decoding values that need additional custom validation.
 template <typename T, parquet::Type::type ParquetType>
-inline bool DecodePlainValueNoValidation(const string& buffer, T* result) {
+inline bool DecodePlainValueNoValidation(const std::string& buffer, T* result) {
   int size = buffer.size();
   const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer.data());
   return ParquetPlainEncoder::Decode<T, ParquetType>(
@@ -192,7 +225,7 @@ inline bool ColumnStats<DateValue>::DecodePlainValue(
 /// parquet::Statistics stores string values directly and does not use plain encoding.
 template <>
 inline void ColumnStats<StringValue>::EncodePlainValue(
-    const StringValue& v, int64_t bytes_needed, string* out) {
+    const StringValue& v, int64_t bytes_needed, std::string* out) {
   out->assign(v.ptr, v.len);
 }
 
@@ -279,6 +312,78 @@ inline Status ColumnStats<StringValue>::MaterializeStringValuesToInternalBuffers
   }
   return Status::OK();
 }
+
+template <typename T>
+inline void ColumnStats<T>::GetIcebergStats(
+    int64_t column_size, int64_t value_count, IcebergColumnStats* out) const {
+  DCHECK(out != nullptr);
+  out->has_min_max_values = has_min_max_values_;
+  if (out->has_min_max_values) {
+    SerializeIcebergSingleValue(min_value_, &out->min_binary);
+    SerializeIcebergSingleValue(max_value_, &out->max_binary);
+  }
+  out->value_count = value_count;
+  out->null_count = null_count_;
+  // Column size is not traced by ColumnStats.
+  out->column_size = column_size;
+}
+
+// Works for bool(TYPE_BOOLEAN), int32_t(TYPE_INT), int64_t(TYPE_BIGINT, TYPE_TIMESTAMP),
+// float(TYPE_FLOAT), double(TYPE_DOUBLE), DateValue (TYPE_DATE).
+// Serialize values as sizeof(T)-byte little endian.
+template <typename T>
+inline void ColumnStats<T>::SerializeIcebergSingleValue(const T& v, std::string* out) {
+  static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8);
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+  const char* data = reinterpret_cast<const char*>(&v);
+  out->assign(data, sizeof(T));
+#else
+  char little_endian[sizeof(T)] = {};
+  BitUtil::ByteSwap(little_endian, reinterpret_cast<const char*>(&v), sizeof(T));
+  out->assign(little_endian, sizeof(T));
+#endif
+}
+
+// This should never be called.
+// With iceberg timestamp values are stored as int64_t with microseconds precision
+// (HdfsParquetTableWriter::timestamp_type_ is set to INT64_MICROS).
+template <>
+inline void ColumnStats<TimestampValue>::SerializeIcebergSingleValue(
+    const TimestampValue& v, std::string* out) {
+  DCHECK(false);
+}
+
+// Serialize StringValue values as UTF-8 bytes (without length).
+template <>
+inline void ColumnStats<StringValue>::SerializeIcebergSingleValue(
+    const StringValue& v, std::string* out) {
+  // With iceberg 'v' is UTF-8 encoded (HdfsParquetTableWriter::string_utf8_ is always set
+  // to true).
+  out->assign(v.ptr, v.len);
+}
+
+// Serialize Decimal4Value / Decimal8Value / Decimal16Value: values as unscaled,
+// two’s-complement big-endian binary, using the minimum number of bytes for the value.
+#define SERIALIZE_ICEBERG_DECIMAL_SINGLE_VALUE(DecimalValue)                            \
+template <>                                                                             \
+inline void ColumnStats<DecimalValue>::SerializeIcebergSingleValue(                     \
+    const DecimalValue& v, std::string* out) {                                          \
+  const auto big_endian_val = BitUtil::ToBigEndian(v.value());                          \
+  const uint8_t* first = reinterpret_cast<const uint8_t*>(&big_endian_val);             \
+  const uint8_t* last = first + sizeof(big_endian_val) - 1;                             \
+  if ((first[0] & 0x80) != 0) {                                                         \
+    for (; first < last && first[0] == 0xFF && (first[1] & 0x80) != 0; ++first) {       \
+    }                                                                                   \
+  } else {                                                                              \
+    for (; first < last && first[0] == 0x00 && (first[1] & 0x80) == 0; ++first) {       \
+    }                                                                                   \
+  }                                                                                     \
+  out->assign(reinterpret_cast<const char*>(first), last - first + 1);                  \
+}
+
+SERIALIZE_ICEBERG_DECIMAL_SINGLE_VALUE(Decimal4Value)
+SERIALIZE_ICEBERG_DECIMAL_SINGLE_VALUE(Decimal8Value)
+SERIALIZE_ICEBERG_DECIMAL_SINGLE_VALUE(Decimal16Value)
 
 } // end ns impala
 #endif

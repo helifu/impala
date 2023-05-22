@@ -26,6 +26,8 @@
 
 '''
 
+from __future__ import absolute_import, division, print_function
+from builtins import filter, range
 import os
 from copy import deepcopy
 from logging import getLogger
@@ -109,7 +111,7 @@ class DbPopulator(object):
     hdfs = self.cluster.hdfs.create_client()
 
     table_and_generators = list()
-    for table_idx in xrange(table_count):
+    for table_idx in range(table_count):
       table = self._create_random_table(
           'table_%s' % (table_idx + 1),
           self.min_col_count,
@@ -182,9 +184,10 @@ class DbPopulator(object):
     #       doesn't actually modify the table's columns. 'table.cols' should be changed
     #       to allow access to the real columns.
     cols = table.cols
-    for col_idx in xrange(col_count):
+    for col_idx in range(col_count):
       col_type = choice(allowed_types)
-      col_type = choice(filter(lambda type_: issubclass(type_, col_type), EXACT_TYPES))
+      col_type = \
+        choice(list(filter(lambda type_: issubclass(type_, col_type), EXACT_TYPES)))
       if issubclass(col_type, VarChar) and not issubclass(col_type, String):
         col_type = get_varchar_class(randint(1, VarChar.MAX))
       elif issubclass(col_type, Char) and not issubclass(col_type, String):
@@ -217,8 +220,8 @@ class DbPopulator(object):
     reducer_count = 0
     mapper_input_data = list()
     for table_data_generator in table_data_generators:
-      reducer_count += (table_data_generator.row_count /
-          estimate_rows_per_reducer(table_data_generator, MB_PER_REDUCER)) + 1
+      reducer_count += (table_data_generator.row_count
+          // estimate_rows_per_reducer(table_data_generator, MB_PER_REDUCER)) + 1
       mapper_input_data.append(serialize(table_data_generator))
     hdfs.write(mapper_input_file, data='\n'.join(mapper_input_data))
 

@@ -22,6 +22,7 @@
 #include "exprs/scalar-expr-evaluator.h"
 #include "exprs/scalar-expr.h"
 #include "gen-cpp/PlanNodes_types.h"
+#include "runtime/fragment-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/tuple-row.h"
@@ -32,32 +33,49 @@
 
 using namespace impala;
 
-Status UnionPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+Status UnionPlanNode::Init(const TPlanNode& tnode, FragmentState* state) {
   RETURN_IF_ERROR(PlanNode::Init(tnode, state));
-  DCHECK(tnode.__isset.union_node);
+  DCHECK(tnode_->__isset.union_node);
   DCHECK_EQ(conjuncts_.size(), 0);
-  const TupleDescriptor* tuple_desc =
-      state->desc_tbl().GetTupleDescriptor(tnode.union_node.tuple_id);
-  DCHECK(tuple_desc != nullptr);
+  tuple_desc_ = state->desc_tbl().GetTupleDescriptor(tnode_->union_node.tuple_id);
+  DCHECK(tuple_desc_ != nullptr);
+  first_materialized_child_idx_ = tnode_->union_node.first_materialized_child_idx;
+  DCHECK_GT(first_materialized_child_idx_, -1);
+  const int64_t num_nonconst_scalar_expr_to_be_codegened =
+      state->NumScalarExprNeedsCodegen();
   // Create const_exprs_lists_ from thrift exprs.
-  const vector<vector<TExpr>>& const_texpr_lists = tnode.union_node.const_expr_lists;
+  const vector<vector<TExpr>>& const_texpr_lists = tnode_->union_node.const_expr_lists;
   for (const vector<TExpr>& texprs : const_texpr_lists) {
     vector<ScalarExpr*> const_exprs;
     RETURN_IF_ERROR(ScalarExpr::Create(texprs, *row_descriptor_, state, &const_exprs));
-    DCHECK_EQ(const_exprs.size(), tuple_desc->slots().size());
+    DCHECK_EQ(const_exprs.size(), tuple_desc_->slots().size());
     const_exprs_lists_.push_back(const_exprs);
   }
+  num_const_scalar_expr_to_be_codegened_ =
+      state->NumScalarExprNeedsCodegen() - num_nonconst_scalar_expr_to_be_codegened;
   // Create child_exprs_lists_ from thrift exprs.
-  const vector<vector<TExpr>>& thrift_result_exprs = tnode.union_node.result_expr_lists;
+  const vector<vector<TExpr>>& thrift_result_exprs = tnode_->union_node.result_expr_lists;
   for (int i = 0; i < thrift_result_exprs.size(); ++i) {
     const vector<TExpr>& texprs = thrift_result_exprs[i];
     vector<ScalarExpr*> child_exprs;
     RETURN_IF_ERROR(
         ScalarExpr::Create(texprs, *children_[i]->row_descriptor_, state, &child_exprs));
     child_exprs_lists_.push_back(child_exprs);
-    DCHECK_EQ(child_exprs.size(), tuple_desc->slots().size());
+    DCHECK_EQ(child_exprs.size(), tuple_desc_->slots().size());
   }
+  codegend_union_materialize_batch_fns_ =
+      std::vector<CodegenFnPtr<UnionMaterializeBatchFn>>(child_exprs_lists_.size());
   return Status::OK();
+}
+
+void UnionPlanNode::Close() {
+  for (const vector<ScalarExpr*>& const_exprs : const_exprs_lists_) {
+    ScalarExpr::Close(const_exprs);
+  }
+  for (const vector<ScalarExpr*>& child_exprs : child_exprs_lists_) {
+    ScalarExpr::Close(child_exprs);
+  }
+  PlanNode::Close();
 }
 
 Status UnionPlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const {
@@ -69,24 +87,24 @@ Status UnionPlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const
 UnionNode::UnionNode(
     ObjectPool* pool, const UnionPlanNode& pnode, const DescriptorTbl& descs)
   : ExecNode(pool, pnode, descs),
-    tuple_id_(pnode.tnode_->union_node.tuple_id),
-    tuple_desc_(descs.GetTupleDescriptor(tuple_id_)),
-    first_materialized_child_idx_(pnode.tnode_->union_node.first_materialized_child_idx),
+    tuple_desc_(pnode.tuple_desc_),
+    first_materialized_child_idx_(pnode.first_materialized_child_idx_),
+    num_const_scalar_expr_to_be_codegened_(pnode.num_const_scalar_expr_to_be_codegened_),
+    is_codegen_status_added_(pnode.is_codegen_status_added_),
+    const_exprs_lists_(pnode.const_exprs_lists_),
+    child_exprs_lists_(pnode.child_exprs_lists_),
+    codegend_union_materialize_batch_fns_(pnode.codegend_union_materialize_batch_fns_),
     child_idx_(0),
     child_batch_(nullptr),
     child_row_idx_(0),
     child_eos_(false),
     const_exprs_lists_idx_(0),
-    to_close_child_idx_(-1) {
-  const_exprs_lists_ = pnode.const_exprs_lists_;
-  child_exprs_lists_ = pnode.child_exprs_lists_;
-}
+    to_close_child_idx_(-1) {}
 
 Status UnionNode::Prepare(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecNode::Prepare(state));
   DCHECK(tuple_desc_ != nullptr);
-  codegend_union_materialize_batch_fns_.resize(child_exprs_lists_.size());
 
   // Prepare const expr lists.
   for (const vector<ScalarExpr*>& const_exprs : const_exprs_lists_) {
@@ -106,11 +124,10 @@ Status UnionNode::Prepare(RuntimeState* state) {
   return Status::OK();
 }
 
-void UnionNode::Codegen(RuntimeState* state) {
+void UnionPlanNode::Codegen(FragmentState* state){
   DCHECK(state->ShouldCodegen());
-  ExecNode::Codegen(state);
+  PlanNode::Codegen(state);
   if (IsNodeCodegenDisabled()) return;
-
   LlvmCodeGen* codegen = state->codegen();
   DCHECK(codegen != nullptr);
   std::stringstream codegen_message;
@@ -124,7 +141,7 @@ void UnionNode::Codegen(RuntimeState* state) {
     if (!codegen_status.ok()) {
       // Codegen may fail in some corner cases. If this happens, abort codegen for this
       // and the remaining children.
-      codegen_message << "Codegen failed for child: " << children_[i]->id();
+      codegen_message << "Codegen failed for child: " << children_[i]->tnode_->node_id;
       break;
     }
 
@@ -144,10 +161,10 @@ void UnionNode::Codegen(RuntimeState* state) {
 
     // Add the function to Jit and to the vector of codegened functions.
     codegen->AddFunctionToJit(union_materialize_batch_fn,
-        reinterpret_cast<void**>(&(codegend_union_materialize_batch_fns_.data()[i])));
+        &(codegend_union_materialize_batch_fns_.data()[i]));
   }
-  runtime_profile()->AddCodegenMsg(
-      codegen_status.ok(), codegen_status, codegen_message.str());
+  AddCodegenStatus(codegen_status, codegen_message.str());
+  is_codegen_status_added_ = true;
 }
 
 Status UnionNode::Open(RuntimeState* state) {
@@ -167,6 +184,10 @@ Status UnionNode::Open(RuntimeState* state) {
   // succeeded.
   if (!children_.empty()) RETURN_IF_ERROR(child(child_idx_)->Open(state));
 
+  if (is_codegen_status_added_ && num_const_scalar_expr_to_be_codegened_ == 0
+      && !const_exprs_lists_.empty()) {
+    runtime_profile_->AppendExecOption("Codegen Disabled for const scalar expressions");
+  }
   return Status::OK();
 }
 
@@ -236,10 +257,12 @@ Status UnionNode::GetNextMaterialized(RuntimeState* state, RowBatch* row_batch) 
         if (child_batch_->num_rows() == 0) continue;
       }
       DCHECK_EQ(codegend_union_materialize_batch_fns_.size(), children_.size());
-      if (codegend_union_materialize_batch_fns_[child_idx_] == nullptr) {
+      UnionPlanNode::UnionMaterializeBatchFn fn =
+          codegend_union_materialize_batch_fns_[child_idx_].load();
+      if (fn == nullptr) {
         MaterializeBatch(row_batch, &tuple_buf);
       } else {
-        codegend_union_materialize_batch_fns_[child_idx_](this, row_batch, &tuple_buf);
+        fn(this, row_batch, &tuple_buf);
       }
     }
     // It shouldn't be the case that we reached the limit because we shouldn't have
@@ -348,12 +371,6 @@ void UnionNode::Close(RuntimeState* state) {
   }
   for (const vector<ScalarExprEvaluator*>& evals : child_expr_evals_lists_) {
     ScalarExprEvaluator::Close(evals, state);
-  }
-  for (const vector<ScalarExpr*>& const_exprs : const_exprs_lists_) {
-    ScalarExpr::Close(const_exprs);
-  }
-  for (const vector<ScalarExpr*>& child_exprs : child_exprs_lists_) {
-    ScalarExpr::Close(child_exprs);
   }
   ExecNode::Close(state);
 }

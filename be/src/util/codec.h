@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_UTIL_CODEC_H
-#define IMPALA_UTIL_CODEC_H
-
-#include "common/status.h"
+#include <cstdint>
+#include <map>
+#include <string>
 
 #include <boost/scoped_ptr.hpp>
 
-#include "runtime/mem-pool.h"
+#include "common/status.h"
+#include "gen-cpp/CatalogObjects_types.h"
 
 namespace impala {
+
+class MemPool;
 
 /// Create a compression object.  This is the base class for all compression algorithms. A
 /// compression algorithm is either a compressor or a decompressor.  To add a new
@@ -104,7 +107,7 @@ class Codec {
   static Status GetHadoopCodecClassName(
       THdfsCompression::type, std::string* out_name) WARN_UNUSED_RESULT;
 
-  virtual ~Codec() {}
+  virtual ~Codec();
 
   /// Initialize the codec. This should only be called once.
   virtual Status Init() WARN_UNUSED_RESULT { return Status::OK(); }
@@ -203,6 +206,4 @@ class Codec {
   /// This is set to true for codecs that implement ProcessBlockStreaming().
   bool supports_streaming_;
 };
-
 }
-#endif

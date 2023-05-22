@@ -49,7 +49,10 @@ public class AuthorizationUtil {
       authzFactoryClassName = authzFactoryClassOption;
     } else {
       // use authorization_provider flag
-      final String authzProvider = beCfg.getAuthorizationProvider();
+      String authzProvider = beCfg.getAuthorizationProvider();
+      // If authorization_provider is empty, use the Noop policy that disables
+      // authorization.
+      if (authzProvider.equals("")) authzProvider = "noop";
       try {
         final AuthorizationProvider provider = AuthorizationProvider.valueOf(
             authzProvider.toUpperCase().trim());
@@ -84,6 +87,10 @@ public class AuthorizationUtil {
     } catch (Exception e) {
       throw new InternalException(
           "Unable to instantiate authorization provider: " + authzFactoryClassName, e);
+    }
+    if (!beCfg.isColumnMaskingEnabled() && beCfg.isRowFilteringEnabled()) {
+      throw new InternalException("Unable to enable row-filtering without column-masking."
+          + " Please set --enable_column_masking to true as well");
     }
     final AuthorizationConfig authzConfig = authzFactory.getAuthorizationConfig();
 

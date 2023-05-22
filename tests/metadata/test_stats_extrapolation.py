@@ -15,12 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from os import path
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.common.skip import SkipIfEC
 from tests.common.test_dimensions import (
-    create_exec_option_dimension,
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
+
 
 class TestStatsExtrapolation(ImpalaTestSuite):
   """Test stats extrapolation and compute stats tablesample. Stats extrapolation is
@@ -38,6 +41,7 @@ class TestStatsExtrapolation(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(
         create_uncompressed_text_dimension(cls.get_workload()))
 
+  @SkipIfEC.contain_full_explain
   def test_stats_extrapolation(self, vector, unique_database):
     vector.get_value('exec_option')['num_nodes'] = 1
     vector.get_value('exec_option')['explain_level'] = 2
@@ -130,7 +134,7 @@ class TestStatsExtrapolation(ImpalaTestSuite):
     self.client.execute("compute stats {0}{1} tablesample system ({2}) repeatable ({3})"\
       .format(tbl, cols, perc, seed))
     self.__check_table_stats(tbl, expected_tbl)
-    self.__check_column_stats(tbl, expected_tbl)
+    self.__check_column_stats(cols, tbl, expected_tbl)
 
   def __check_table_stats(self, tbl, expected_tbl):
     """Checks that the row counts reported in SHOW TABLE STATS on 'tbl' are within 2x
@@ -143,22 +147,24 @@ class TestStatsExtrapolation(ImpalaTestSuite):
     col_names = [fs.name.upper() for fs in actual.schema.fieldSchemas]
     rows_col_idx = col_names.index("#ROWS")
     extrap_rows_col_idx = col_names.index("EXTRAP #ROWS")
-    for i in xrange(0, len(actual.data)):
+    for i in range(0, len(actual.data)):
       act_cols = actual.data[i].split("\t")
       exp_cols = expected.data[i].split("\t")
       assert int(exp_cols[rows_col_idx]) >= 0
+      # The expected_tbl is expected to have valid extrapolated #rows for every partition.
+      assert int(act_cols[extrap_rows_col_idx]) >= 0
       self.appx_equals(\
-        int(act_cols[extrap_rows_col_idx]), int(exp_cols[rows_col_idx]), 2)
+        int(act_cols[extrap_rows_col_idx]), int(exp_cols[rows_col_idx]), 1.0)
       # Only the table-level row count is stored. The partition row counts
       # are extrapolated.
       if act_cols[0] == "Total":
         self.appx_equals(
-          int(act_cols[rows_col_idx]), int(exp_cols[rows_col_idx]), 2)
+          int(act_cols[rows_col_idx]), int(exp_cols[rows_col_idx]), 1.0)
       elif len(actual.data) > 1:
         # Partition row count is expected to not be set.
         assert int(act_cols[rows_col_idx]) == -1
 
-  def __check_column_stats(self, tbl, expected_tbl):
+  def __check_column_stats(self, cols, tbl, expected_tbl):
     """Checks that the NDVs in SHOW COLUMNS STATS on 'tbl' are within 2x of those
     reported for 'expected_tbl'. Assumes that COMPUTE STATS was previously run
     on 'expected_table' and that COMPUTE STATS TABLESAMPLE was run on 'tbl'."""
@@ -168,8 +174,13 @@ class TestStatsExtrapolation(ImpalaTestSuite):
     assert len(actual.schema.fieldSchemas) == len(expected.schema.fieldSchemas)
     col_names = [fs.name.upper() for fs in actual.schema.fieldSchemas]
     ndv_col_idx = col_names.index("#DISTINCT VALUES")
-    for i in xrange(0, len(actual.data)):
+    for i in range(0, len(actual.data)):
       act_cols = actual.data[i].split("\t")
       exp_cols = expected.data[i].split("\t")
       assert int(exp_cols[ndv_col_idx]) >= 0
-      self.appx_equals(int(act_cols[ndv_col_idx]), int(exp_cols[ndv_col_idx]), 2)
+      # Only compare the NDVs for columns which were included in the COMPUTE STATS.
+      # The other non partitioning columns are expected to have NDV not set, since the
+      # caller drops the stats before calling COMPUTE STATS.
+      if cols == "" or act_cols[0] in cols:
+        assert int(act_cols[ndv_col_idx]) >= 0
+        self.appx_equals(int(act_cols[ndv_col_idx]), int(exp_cols[ndv_col_idx]), 1.0)

@@ -14,16 +14,16 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_RPC_RPC_CONTEXT_H
-#define KUDU_RPC_RPC_CONTEXT_H
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
 
 #include <memory>
-#include <stddef.h>
 #include <string>
 
 #include <glog/logging.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/util/monotime.h"
@@ -69,13 +69,19 @@ class RpcContext {
   // and is not a public API.
   RpcContext(InboundCall *call,
              const google::protobuf::Message *request_pb,
-             google::protobuf::Message *response_pb,
-             scoped_refptr<ResultTracker> result_tracker);
+             google::protobuf::Message *response_pb);
 
   ~RpcContext();
 
+  // Initialize a result tracker for the RPC.
+  //
+  // This is delayed until after the constructor in order to allow for RPCs to
+  // be validated and used prior to initializing the tracking (primarily for
+  // authorization).
+  void SetResultTracker(scoped_refptr<ResultTracker> result_tracker);
+
   // Return the trace buffer for this call.
-  Trace* trace();
+  Trace* trace() const;
 
   // Send a response to the call. The service may call this method
   // before or after returning from the original handler method,
@@ -163,7 +169,7 @@ class RpcContext {
 
   // Fills 'sidecar' with a sidecar sent by the client. Returns an error if 'idx' is out
   // of bounds.
-  Status GetInboundSidecar(int idx, Slice* slice);
+  Status GetInboundSidecar(int idx, Slice* slice) const;
 
   // Return the identity of remote user who made this call.
   const RemoteUser& remote_user() const;
@@ -191,13 +197,13 @@ class RpcContext {
   std::string requestor_string() const;
 
   // Return the name of the RPC service method being called.
-  std::string method_name() const;
+  const std::string& method_name() const;
 
   // Return the name of the RPC service being called.
-  std::string service_name() const;
+  const std::string& service_name() const;
 
-  const google::protobuf::Message *request_pb() const { return request_pb_.get(); }
-  google::protobuf::Message *response_pb() const { return response_pb_.get(); }
+  const google::protobuf::Message* request_pb() const { return request_pb_; }
+  google::protobuf::Message* response_pb() const { return response_pb_; }
 
   // Return an upper bound on the client timeout deadline. This does not
   // account for transmission delays between the client and the server.
@@ -206,6 +212,9 @@ class RpcContext {
 
   // Return the time when the inbound call was received.
   MonoTime GetTimeReceived() const;
+
+  // Return the time when the inbound call was handled.
+  MonoTime GetTimeHandled() const;
 
   // Whether the results of this RPC are tracked with a ResultTracker.
   // If this returns true, both result_tracker() and request_id() should return non-null results.
@@ -218,6 +227,9 @@ class RpcContext {
 
   // Returns this call's request id, if it is set.
   const rpc::RequestIdPB* request_id() const;
+
+  // Returns this call's call_id.
+  int32_t call_id() const;
 
   // Returns the size of the transfer buffer that backs 'call_'. If the
   // transfer buffer no longer exists (e.g. GetTransferSize() is called after
@@ -235,11 +247,10 @@ class RpcContext {
  private:
   friend class ResultTracker;
   InboundCall* const call_;
-  const gscoped_ptr<const google::protobuf::Message> request_pb_;
-  const gscoped_ptr<google::protobuf::Message> response_pb_;
+  const google::protobuf::Message* const request_pb_;
+  google::protobuf::Message* const response_pb_;
   scoped_refptr<ResultTracker> result_tracker_;
 };
 
 } // namespace rpc
 } // namespace kudu
-#endif

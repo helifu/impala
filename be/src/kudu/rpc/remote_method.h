@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_RPC_REMOTE_METHOD_H_
-#define KUDU_RPC_REMOTE_METHOD_H_
+#pragma once
 
 #include <string>
 
@@ -31,8 +30,8 @@ class RemoteMethod {
  public:
   RemoteMethod() {}
   RemoteMethod(std::string service_name, std::string method_name);
-  std::string service_name() const { return service_name_; }
-  std::string method_name() const { return method_name_; }
+  const std::string& service_name() const { return service_name_; }
+  const std::string& method_name() const { return method_name_; }
 
   // Encode/decode to/from 'pb'.
   void FromPB(const RemoteMethodPB& pb);
@@ -47,5 +46,3 @@ class RemoteMethod {
 
 } // namespace rpc
 } // namespace kudu
-
-#endif // KUDU_RPC_REMOTE_METHOD_H_

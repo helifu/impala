@@ -17,6 +17,8 @@
 
 # This modules contians utility functions used to help verify query test results.
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range
 import logging
 import math
 import re
@@ -62,6 +64,11 @@ class QueryTestResult(object):
     if not isinstance(other, self.__class__):
       return False
     return self.column_types == other.column_types and self.rows == other.rows
+
+  def __hash__(self):
+    # This is not intended to be hashed. If that is happening, then something is wrong.
+    # The regexes in ResultRow make it difficult to implement this correctly.
+    assert False
 
   def __ne__(self, other):
     return not self.__eq__(other)
@@ -139,12 +146,12 @@ class ResultRow(object):
     if isinstance(key, basestring):
       for col in self.columns:
         if col.column_label == key.lower(): return col.value
-      raise IndexError, 'No column with label: ' + key
+      raise IndexError('No column with label: ' + key)
     elif isinstance(key, int):
       # If the key (column position) does not exist this will throw an IndexError when
       # indexing into the self.columns
       return str(self.columns[key])
-    raise TypeError, 'Unsupported indexing key type: ' + type(key)
+    raise TypeError('Unsupported indexing key type: ' + type(key))
 
   def __eq__(self, other):
     if not isinstance(other, self.__class__):
@@ -155,6 +162,11 @@ class ResultRow(object):
     if other.regex is not None:
       return other.regex.match(self.row_string)
     return self.columns == other.columns
+
+  def __hash__(self):
+    # This is not intended to be hashed. If that is happening, then something is wrong.
+    # The regexes make it difficult to implement this correctly.
+    assert False
 
   def __ne__(self, other):
     return not self.__eq__(other)
@@ -223,6 +235,11 @@ class ResultColumn(object):
     else:
       return self.value == other.value
 
+  def __hash__(self):
+    # This is not intended to be hashed. If that is happening, then something is wrong.
+    # The regexes make it difficult to implement this correctly.
+    assert False
+
   def __ne__(self, other):
     return not self.__eq__(other)
 
@@ -240,8 +257,8 @@ def verify_query_result_is_subset(expected_results, actual_results):
   """Check whether the results in expected_results are a subset of the results in
   actual_results. This uses set semantics, i.e. any duplicates are ignored."""
   expected_literals, expected_non_literals = expected_results.separate_rows()
-  expected_literal_strings = set([str(row) for row in expected_literals])
-  actual_literal_strings = set([str(row) for row in actual_results.rows])
+  expected_literal_strings = set([unicode(row) for row in expected_literals])
+  actual_literal_strings = set([unicode(row) for row in actual_results.rows])
   # Expected literal strings must all be present in the actual strings.
   assert expected_literal_strings <= actual_literal_strings
   # Expected patterns must be present in the actual strings.
@@ -251,18 +268,18 @@ def verify_query_result_is_subset(expected_results, actual_results):
       if actual_row == expected_row:
         matched = True
         break
-    assert matched, "Could not find expected row {0} in actual rows:\n{1}".format(
-        str(expected_row), str(actual_results))
+    assert matched, u"Could not find expected row {0} in actual rows:\n{1}".format(
+        unicode(expected_row), unicode(actual_results))
 
 def verify_query_result_is_superset(expected_results, actual_results):
   """Check whether the results in expected_results are a superset of the results in
   actual_results. This uses set semantics, i.e. any duplicates are ignored."""
   expected_literals, expected_non_literals = expected_results.separate_rows()
-  expected_literal_strings = set([str(row) for row in expected_literals])
+  expected_literal_strings = set([unicode(row) for row in expected_literals])
   # Check that all actual rows are present in either expected_literal_strings or
   # expected_non_literals.
   for actual_row in actual_results.rows:
-    if str(actual_row) in expected_literal_strings:
+    if unicode(actual_row) in expected_literal_strings:
       # Matched to a literal string
       continue
     matched = False
@@ -270,8 +287,8 @@ def verify_query_result_is_superset(expected_results, actual_results):
       if actual_row == expected_row:
         matched = True
         break
-    assert matched, "Could not find actual row {0} in expected rows:\n{1}".format(
-        str(actual_row), str(expected_results))
+    assert matched, u"Could not find actual row {0} in expected rows:\n{1}".format(
+        unicode(actual_row), unicode(expected_results))
 
 def verify_query_result_is_equal(expected_results, actual_results):
   assert_args_not_none(expected_results, actual_results)
@@ -279,8 +296,8 @@ def verify_query_result_is_equal(expected_results, actual_results):
 
 def verify_query_result_is_not_in(expected_results, actual_results):
   assert_args_not_none(expected_results, actual_results)
-  expected_set = set(map(str, expected_results.rows))
-  actual_set = set(map(str, actual_results.rows))
+  expected_set = set(map(unicode, expected_results.rows))
+  actual_set = set(map(unicode, actual_results.rows))
   assert expected_set.isdisjoint(actual_set)
 
 # Global dictionary that maps the verification type to appropriate verifier.
@@ -357,6 +374,15 @@ def verify_raw_results(test_section, exec_result, file_format, result_section,
   expected_results = None
   if result_section in test_section:
     expected_results = remove_comments(test_section[result_section])
+    if isinstance(expected_results, str):
+      # Always convert 'str' to 'unicode' since pytest will fail to report assertion
+      # failures when any 'str' values contain non-ascii bytes (IMPALA-10419).
+      try:
+        expected_results = expected_results.decode('utf-8')
+      except UnicodeDecodeError as e:
+        LOG.info("Illegal UTF-8 characters in expected results: {0}\n{1}".format(
+            expected_results, e))
+        assert False
   else:
     assert 'ERRORS' not in test_section, "'ERRORS' section must have accompanying 'RESULTS' section"
     LOG.info("No results found. Skipping verification")
@@ -442,15 +468,19 @@ def verify_raw_results(test_section, exec_result, file_format, result_section,
   if verifier and verifier.upper() == 'VERIFY_IS_EQUAL_SORTED':
     order_matters = False
   expected_results_list = []
+  is_raw_string = 'RAW_STRING' in test_section
   if 'MULTI_LINE' in test_section:
-    expected_results_list = map(lambda s: s.replace('\n', '\\n'),
-        re.findall(r'\[(.*?)\]', expected_results, flags=re.DOTALL))
+    expected_results_list = re.findall(r'\[(.*?)\]', expected_results, flags=re.DOTALL)
+    if not is_raw_string:
+      # Needs escaping
+      expected_results_list = [s.replace('\n', '\\n') for s in expected_results_list]
   else:
     expected_results_list = split_section_lines(expected_results)
   expected = QueryTestResult(expected_results_list, expected_types,
       actual_labels, order_matters)
-  actual = QueryTestResult(parse_result_rows(exec_result), actual_types,
-      actual_labels, order_matters)
+  actual = QueryTestResult(
+      parse_result_rows(exec_result, escape_strings=(not is_raw_string)),
+      actual_types, actual_labels, order_matters)
   assert verifier in VERIFIER_MAP.keys(), "Unknown verifier: " + verifier
   try:
     VERIFIER_MAP[verifier](expected, actual)
@@ -470,7 +500,8 @@ def create_query_result(exec_result, order_matters=False):
   return QueryTestResult(data, exec_result.column_types, exec_result.column_labels,
                          order_matters)
 
-def parse_result_rows(exec_result):
+
+def parse_result_rows(exec_result, escape_strings=True):
   """
   Parses a query result set and transforms it to the format used by the query test files
   """
@@ -488,11 +519,20 @@ def parse_result_rows(exec_result):
     cols = row.split('\t')
     assert len(cols) == len(col_types)
     new_cols = list()
-    for i in xrange(len(cols)):
-      if col_types[i] in ['STRING', 'CHAR', 'VARCHAR']:
-        col = cols[i].encode('unicode_escape')
-        # Escape single quotes to match .test file format.
-        col = col.replace("'", "''")
+    for i in range(len(cols)):
+      if col_types[i] in ['STRING', 'CHAR', 'VARCHAR', 'BINARY']:
+        col = cols[i]
+        if isinstance(col, str):
+          try:
+            col = col.decode('utf-8')
+          except UnicodeDecodeError as e:
+            LOG.info("Illegal UTF-8 characters in actual results: {0}\n{1}".format(
+                col, e))
+            assert False
+        if escape_strings:
+          col = col.encode('unicode_escape').decode('utf-8')
+          # Escape single quotes to match .test file format.
+          col = col.replace("'", "''")
         new_cols.append("'%s'" % col)
       else:
         new_cols.append(cols[i])
@@ -505,7 +545,7 @@ def parse_result_rows(exec_result):
 # Currently, the only implemented function is SUM and only integers are supported.
 AGGREGATION_PREFIX_PATTERN = 'aggregation\('
 AGGREGATION_PREFIX = re.compile(AGGREGATION_PREFIX_PATTERN)
-AGGREGATION_SYNTAX_MATCH_PATTERN = 'aggregation\((\w+)[ ]*,[ ]*(\w+)\):[ ]*(\d+)'
+AGGREGATION_SYNTAX_MATCH_PATTERN = 'aggregation\((\w+)[ ]*,[ ]*([^)]+)\)([:><])[ ]*(\d+)'
 
 def try_compile_aggregation(row_string):
   """
@@ -514,12 +554,13 @@ def try_compile_aggregation(row_string):
   aggregation. Otherwise, it returns None.
   """
   if row_string and AGGREGATION_PREFIX.match(row_string):
-    function, field, value = re.findall(AGGREGATION_SYNTAX_MATCH_PATTERN, row_string)[0]
+    function, field, op, value = \
+        re.findall(AGGREGATION_SYNTAX_MATCH_PATTERN, row_string)[0]
     # Validate function
     assert(function == 'SUM')
     # Validate value is integer
     expected_value = int(value)
-    return (function, field, expected_value)
+    return (function, field, op, expected_value)
   return None
 
 def compute_aggregation(function, field, runtime_profile):
@@ -563,7 +604,7 @@ def compute_aggregation(function, field, runtime_profile):
     if (field_regex_re.search(line)):
       match_list.extend(re.findall(field_regex, line))
 
-  int_match_list = map(int, match_list)
+  int_match_list = list(map(int, match_list))
   result = None
   if function == 'SUM':
     result = sum(int_match_list)
@@ -583,20 +624,29 @@ def verify_runtime_profile(expected, actual, update_section=False):
   expected_lines = remove_comments(expected).splitlines()
   matched = [False] * len(expected_lines)
   expected_regexes = []
+  unexpected_regexes = []
+  unexpected_matched_lines = []
   expected_aggregations = []
   for expected_line in expected_lines:
-    expected_regexes.append(try_compile_regex(expected_line))
+    negate_regex = expected_line and expected_line[0] == '!'
+    regex = try_compile_regex(expected_line[1:] if negate_regex else expected_line)
+    unexpected_regexes.append(regex if negate_regex else None)
+    expected_regexes.append(regex if not negate_regex else None)
     expected_aggregations.append(try_compile_aggregation(expected_line))
 
   # Check the expected and actual rows pairwise.
   for line in actual.splitlines():
-    for i in xrange(len(expected_lines)):
+    for i in range(len(expected_lines)):
       if matched[i]: continue
       if expected_regexes[i] is not None:
         match = expected_regexes[i].match(line)
       elif expected_aggregations[i] is not None:
         # Aggregations are enforced separately
         match = True
+      elif unexpected_regexes[i] is not None:
+        if unexpected_regexes[i].match(line):
+          unexpected_matched_lines.append(line)
+        match = False
       else:
         match = expected_lines[i].strip() == line.strip()
       if match:
@@ -604,28 +654,87 @@ def verify_runtime_profile(expected, actual, update_section=False):
         break
 
   unmatched_lines = []
-  for i in xrange(len(expected_lines)):
-    if not matched[i]:
+  for i in range(len(expected_lines)):
+    if not matched[i] and unexpected_regexes[i] is None:
       unmatched_lines.append(expected_lines[i])
   assert len(unmatched_lines) == 0, ("Did not find matches for lines in runtime profile:"
       "\nEXPECTED LINES:\n%s\n\nACTUAL PROFILE:\n%s" % ('\n'.join(unmatched_lines),
         actual))
+  assert len(unexpected_matched_lines) == 0, ("Found unexpected matches in "
+      "runtime profile:\n%s\n\nACTUAL PROFILE:\n%s"
+          % ('\n'.join(unexpected_matched_lines), actual))
 
   updated_aggregations = []
   # Compute the aggregations and check against values
-  for i in xrange(len(expected_aggregations)):
+  for i in range(len(expected_aggregations)):
     if (expected_aggregations[i] is None): continue
-    function, field, expected_value = expected_aggregations[i]
+    function, field, op, expected_value = expected_aggregations[i]
     actual_value = compute_aggregation(function, field, actual)
     if update_section:
-      updated_aggregations.append("aggregation(%s, %s): %d"
-                                  % (function, field, actual_value))
+      updated_aggregations.append("aggregation(%s, %s)%s %d"
+                                  % (function, field, op, actual_value))
     else:
-        assert actual_value == expected_value, ("Aggregation of %s over %s did not match "
-            "expected results.\nEXPECTED VALUE:\n%d\n\nACTUAL VALUE:\n%d"
-            "\n\nPROFILE:\n%s\n"
-            % (function, field, expected_value, actual_value, actual))
+        if op == ':' and actual_value != expected_value:
+          assert actual_value == expected_value, ("Aggregation of %s over %s did not "
+              "match expected results.\nEXPECTED VALUE:\n%d\n\n\nACTUAL VALUE:\n%d\n\n"
+              "OP:\n%s\n\n"
+              "\n\nPROFILE:\n%s\n"
+              % (function, field, expected_value, actual_value, op, actual))
+        elif op == '>' and actual_value <= expected_value:
+          assert actual_value > expected_value, ("Aggregation of %s over %s did not "
+              "match expected results.\nEXPECTED VALUE:\n%d\n\n\nACTUAL VALUE:\n%d\n\n"
+              "OP:\n%s\n\n"
+              "\n\nPROFILE:\n%s\n"
+              % (function, field, expected_value, actual_value, op, actual))
+        elif op == '<' and actual_value >= expected_value:
+          assert actual_value < expected_value, ("Aggregation of %s over %s did not "
+              "match expected results.\nEXPECTED VALUE:\n%d\n\n\nACTUAL VALUE:\n%d\n\n"
+              "OP:\n%s\n\n"
+              "\n\nPROFILE:\n%s\n"
+              % (function, field, expected_value, actual_value, op, actual))
+
   return updated_aggregations
+
+
+def extract_event_sequence(runtime_profile):
+  """ Returns a list containing the names of the events on the event sequence in the
+  provided runtime profile"""
+  # The lines corresponding to the events in the event sequence.
+  events = []
+
+  # The number of leading whitespace in the lines containing the events, used to
+  # detect the line after the last event.
+  indent_len = None
+
+  # Set to true when encountering the header before the first event. This means the
+  # following lines contain the events.
+  found_events_start = False
+
+  for line in runtime_profile.splitlines():
+    if found_events_start:
+      leading_whitespace = len(line) - len(line.lstrip())
+      if indent_len is None:
+        # This was the first event. We store the indentation of the events.
+        indent_len = leading_whitespace
+      elif leading_whitespace < indent_len:
+        # We've reached the line after the events, stop the iteration.
+        break
+
+      # If we reach here we are processing a line containing an event.
+      events.append(__extract_event_name(line))
+
+    elif 'Fragment Instance Lifecycle Event Timeline' in line:
+      found_events_start = True
+
+  return events
+
+
+def __extract_event_name(line):
+  # A typical event sequence line from which we extract the name is:
+  # "- Prepare Finished: 1.778ms (1.778ms)"
+  start = line.index('-') + 2  # There is a space after the dash.
+  end = line.index(':')
+  return line[start:end]
 
 
 def verify_lineage(expected, actual, lineage_skip_json_keys=DEFAULT_LINEAGE_SKIP_KEYS):
@@ -663,3 +772,11 @@ def assert_codegen_enabled(profile_string, exec_node_ids):
     for exec_options in get_node_exec_options(profile_string, exec_node_id):
       assert 'Codegen Enabled' in exec_options
       assert not 'Codegen Disabled' in exec_options
+
+
+def assert_codegen_cache_hit(profile_string, expect_hit):
+  assert "NumCachedFunctions" in profile_string
+  if expect_hit:
+    assert "NumCachedFunctions: 0 " not in profile_string
+  else:
+    assert "NumCachedFunctions: 0 " in profile_string

@@ -17,7 +17,11 @@
 
 package org.apache.impala.analysis;
 
+import java.util.Arrays;
 import java.util.List;
+import java.util.HashSet;
+import java.util.Optional;
+import java.util.Set;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.AggregateFunction;
@@ -29,23 +33,39 @@ import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.TreeNode;
+import org.apache.impala.service.FrontendProfile;
 import org.apache.impala.thrift.TAggregateExpr;
 import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TQueryOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
 public class FunctionCallExpr extends Expr {
+  private final static Logger LOG = LoggerFactory.getLogger(FunctionCallExpr.class);
+
   private final FunctionName fnName_;
   private final FunctionParams params_;
   private boolean isAnalyticFnCall_ = false;
   private boolean isInternalFnCall_ = false;
+
+  // cache prior shouldConvertToCNF checks to avoid repeat tree walking
+  // omitted from clone in case cloner plans to mutate the expr
+  protected Optional<Boolean> shouldConvertToCNF_ = Optional.empty();
+  private static Set<String> builtinMathScalarFunctionNames_ =
+      new HashSet<String>(Arrays.asList("abs", "acos", "asin", "atan", "atan2", "bin",
+          "ceil", "ceiling", "conv", "cos", "cosh", "cot", "dceil", "degrees", "dexp",
+          "dfloor", "dlog1", "dlog10", "dpow", "dround", "dsqrt", "dtrunc", "e", "exp",
+          "floor", "fmod", "fpow", "hex", "ln", "log", "log10", "log2", "mod", "pi",
+          "pmod", "pow", "power", "quotient", "radians", "rand", "random", "round",
+          "sign", "sin", "sinh", "sqrt", "tan", "tanh", "trunc", "truncate", "unhex"));
 
   // Non-null iff this is an aggregation function that executes the Merge() step. This
   // is an analyzed clone of the FunctionCallExpr that executes the Update() function
@@ -118,11 +138,17 @@ public class FunctionCallExpr extends Expr {
 
   /** Returns true if fnName is a built-in with given name. */
   private static boolean functionNameEqualsBuiltin(FunctionName fnName, String name) {
-    return fnName.getFnNamePath().size() == 1
-           && fnName.getFnNamePath().get(0).equalsIgnoreCase(name)
-        || fnName.getFnNamePath().size() == 2
-           && fnName.getFnNamePath().get(0).equals(BuiltinsDb.NAME)
-           && fnName.getFnNamePath().get(1).equalsIgnoreCase(name);
+    // We could either have a function path, or the function name and optional database.
+    if (fnName.getFnNamePath() != null) {
+      return fnName.getFnNamePath().size() == 1
+             && fnName.getFnNamePath().get(0).equalsIgnoreCase(name)
+          || fnName.getFnNamePath().size() == 2
+             && fnName.getFnNamePath().get(0).equals(BuiltinsDb.NAME)
+             && fnName.getFnNamePath().get(1).equalsIgnoreCase(name);
+    } else {
+      return (fnName.getDb() == null || fnName.getDb().equals(BuiltinsDb.NAME)) &&
+          fnName.getFunction().equalsIgnoreCase(name);
+    }
   }
 
   /**
@@ -155,6 +181,24 @@ public class FunctionCallExpr extends Expr {
   }
 
   /**
+   * Return true if an Expr is count star FunctionCallExpr.
+   * e.g. count(*), count(<literal>).
+   */
+  public static boolean isCountStarFunctionCallExpr(Expr expr) {
+    if (!(expr instanceof FunctionCallExpr)) return false;
+    FunctionCallExpr func = (FunctionCallExpr) expr;
+    if (!func.getFnName().getFunction().equalsIgnoreCase("count")) {
+      return false;
+    }
+    if (func.getParams().isStar()) return true;
+    if (func.getParams().isDistinct()) return false;
+    if (func.getParams().exprs().size() != 1) return false;
+    Expr child = func.getChild(0);
+    if (!Expr.IS_LITERAL.apply(child)) return false;
+    return !Expr.IS_NULL_VALUE.apply(child);
+  }
+
+  /**
    * Copy c'tor used in clone().
    */
   protected FunctionCallExpr(FunctionCallExpr other) {
@@ -181,7 +225,7 @@ public class FunctionCallExpr extends Expr {
   /**
    *  Returns true if this is a call to an Impala builtin cast function.
    */
-  private boolean isBuiltinCastFunction() {
+  public boolean isBuiltinCastFunction() {
     return fnName_.isBuiltin() &&
         fnName_.getFunction().startsWith(CastExpr.CAST_FUNCTION_PREFIX);
   }
@@ -218,12 +262,17 @@ public class FunctionCallExpr extends Expr {
     sb.append(Joiner.on(", ").join(childrenToSql(options)));
     if (params_.isIgnoreNulls()) sb.append(" IGNORE NULLS");
     sb.append(")");
+    if (fn_ != null && !fnName_.isBuiltin()) {
+      sb.append(" /* ");
+      sb.append(fn_.getBinaryType());
+      sb.append(" UDF */");
+    }
     return sb.toString();
   }
 
   @Override
   public String debugString() {
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("name", fnName_)
         .add("isStar", params_.isStar())
         .add("isDistinct", params_.isDistinct())
@@ -248,6 +297,22 @@ public class FunctionCallExpr extends Expr {
   public boolean isAggregateFunction() {
     Preconditions.checkNotNull(fn_);
     return fn_ instanceof AggregateFunction && !isAnalyticFnCall_;
+  }
+
+  /** Returns true if this is a call to an analytic aggregate function. */
+  public boolean isAnalyticFunction() {
+    Preconditions.checkNotNull(fn_);
+    return fn_ instanceof AggregateFunction && isAnalyticFnCall_;
+  }
+
+  /** Returns true if this function is a call to the built-in grouping() function. */
+  public boolean isGroupingBuiltin() {
+    return functionNameEqualsBuiltin(fnName_, "grouping");
+  }
+
+  /** Returns true if this function is a call to the built-in grouping_id() function. */
+  public boolean isGroupingIdBuiltin() {
+    return functionNameEqualsBuiltin(fnName_, "grouping_id");
   }
 
   /**
@@ -275,11 +340,6 @@ public class FunctionCallExpr extends Expr {
   public void setIsAnalyticFnCall(boolean v) { isAnalyticFnCall_ = v; }
   public void setIsInternalFnCall(boolean v) { isInternalFnCall_ = v; }
 
-  static boolean isNondeterministicBuiltinFnName(String fnName) {
-    return fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random") ||
-           fnName.equalsIgnoreCase("uuid");
-  }
-
   /**
    * Returns true if function is a non-deterministic builtin function, i.e. for a fixed
    * input, it may not always produce the same output for every invocation.
@@ -288,8 +348,31 @@ public class FunctionCallExpr extends Expr {
    * about user defined functions.
    */
   public boolean isNondeterministicBuiltinFn() {
-    String fnName = fnName_.getFunction();
-    return isNondeterministicBuiltinFnName(fnName);
+    return functionNameEqualsBuiltin(fnName_, "rand") ||
+        functionNameEqualsBuiltin(fnName_, "random") ||
+        functionNameEqualsBuiltin(fnName_, "uuid");
+  }
+
+  /**
+   * Returns true if function is a conditional builtin function
+   */
+  public boolean isConditionalBuiltinFn() {
+    return functionNameEqualsBuiltin(fnName_, "coalesce") ||
+        functionNameEqualsBuiltin(fnName_, "decode") ||
+        functionNameEqualsBuiltin(fnName_, "if") ||
+        functionNameEqualsBuiltin(fnName_, "ifnull") ||
+        functionNameEqualsBuiltin(fnName_, "isfalse") ||
+        functionNameEqualsBuiltin(fnName_, "isnotfalse") ||
+        functionNameEqualsBuiltin(fnName_, "isnottrue") ||
+        functionNameEqualsBuiltin(fnName_, "isnull") ||
+        functionNameEqualsBuiltin(fnName_, "istrue") ||
+        functionNameEqualsBuiltin(fnName_, "nonnullvalue") ||
+        functionNameEqualsBuiltin(fnName_, "nullif") ||
+        functionNameEqualsBuiltin(fnName_, "nullifzero") ||
+        functionNameEqualsBuiltin(fnName_, "nullvalue") ||
+        functionNameEqualsBuiltin(fnName_, "nvl") ||
+        functionNameEqualsBuiltin(fnName_, "nvl2") ||
+        functionNameEqualsBuiltin(fnName_, "zeroifnull");
   }
 
   @Override
@@ -321,7 +404,7 @@ public class FunctionCallExpr extends Expr {
       fnName = path.get(path.size() - 1);
     }
     // Non-deterministic functions are never constant.
-    if (isNondeterministicBuiltinFnName(fnName)) {
+    if (isNondeterministicBuiltinFn()) {
       return false;
     }
     // Sleep is a special function for testing.
@@ -471,9 +554,28 @@ public class FunctionCallExpr extends Expr {
     return ScalarType.createClippedDecimalType(digitsBefore + digitsAfter, digitsAfter);
   }
 
+  // First compute the precision as (scale + 8) and then compute
+  // the needed memory for that precision value which is 2^precision.
+  // This method must be identical to function ComputeHllLengthFromScale()
+  // defined in aggregate-functions-ir.cc.
+  private int ComputeHllLengthFromScale(int scale) { return 1 << (scale + 8); }
+
   @Override
   protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
     fnName_.analyze(analyzer);
+    if (!fnName_.isBuiltin()) {
+      FrontendProfile profile = FrontendProfile.getCurrentOrNull();
+      if (profile != null) {
+        String udfInfoStringKey = "User Defined Functions (UDFs)";
+        String functionName = fnName_.toString();
+        if (!profile.getInfoString(udfInfoStringKey).contains(functionName)) {
+          profile.appendInfoString(udfInfoStringKey, functionName);
+        }
+      }
+      analyzer.registerPrivReq(builder ->
+          builder.allOf(Privilege.SELECT)
+          .onFunction(fnName_.getDb(), fnName_.getFunction()).build());
+    }
 
     if (isMergeAggFn()) {
       // This is the function call expr after splitting up to a merge aggregation.
@@ -490,7 +592,8 @@ public class FunctionCallExpr extends Expr {
     // User needs DB access.
     FeDb db = analyzer.getDb(fnName_.getDb(), Privilege.VIEW_METADATA, true);
     if (!db.containsFunction(fnName_.getFunction())) {
-      throw new AnalysisException(fnName_ + "() unknown");
+      throw new AnalysisException(fnName_ + "() unknown for database " + db.getName()
+          + ". Currently this db has " + db.numFunctions() + " functions.");
     }
 
     if (isBuiltinCastFunction()) {
@@ -512,6 +615,15 @@ public class FunctionCallExpr extends Expr {
           uncheckedCastChild(ScalarType.BOOLEAN, i);
         }
       }
+      return;
+    }
+
+    // grouping_id() can take any set of input slot arguments. Just resolve it to the
+    // zero-argument version so it can be rewritten in MultiAggregateInfo.
+    if (isGroupingIdBuiltin()) {
+      Function searchDesc = new Function(fnName_, new Type[0], Type.INVALID, false);
+      fn_ = db.getFunction(searchDesc, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+      type_ = fn_.getReturnType();
       return;
     }
 
@@ -554,6 +666,39 @@ public class FunctionCallExpr extends Expr {
       throw new AnalysisException(getFunctionNotFoundError(argTypes));
     }
 
+    // NDV() can optionally take a second argument which must be an integer literal
+    // in the range from 1 to 10. Perform the analysis here.
+    if (fnName_.getFunction().equalsIgnoreCase("ndv") && children_.size() == 2) {
+      if (!(children_.get(1) instanceof NumericLiteral)) {
+        throw new AnalysisException(
+            "Second parameter of NDV() must be an integer literal: "
+            + children_.get(1).toSql());
+      }
+
+      NumericLiteral scale = (NumericLiteral) children_.get(1);
+
+      if (scale.getValue().scale() != 0
+          || !NumericLiteral.fitsInInt(scale.getValue())
+          || scale.getIntValue() < 1 || scale.getIntValue() > 10) {
+        throw new AnalysisException(
+            "Second parameter of NDV() must be an integer literal in [1,10]: "
+            + scale.toSql());
+      }
+      children_.set(1, scale.uncheckedCastTo(Type.INT));
+
+      // In BuiltinsDb, look for an AggregateFunction template with the correct length for
+      // the intermediate data type and use it.
+      BuiltinsDb builtinDb = (BuiltinsDb) db;
+      int size = ComputeHllLengthFromScale(scale.getIntValue());
+      fn_ = builtinDb.resolveNdvIntermediateType((AggregateFunction) fn_, size);
+
+      if (fn_ == null) {
+        throw new AnalysisException(
+            "A suitable intermediate data type cannot be found for the second parameter "
+            + children_.get(1).toSql() + " in NDV()");
+      }
+    }
+
     if (isAggregateFunction()) {
       // subexprs must not contain aggregates
       if (TreeNode.contains(children_, Expr.IS_AGGREGATE)) {
@@ -593,6 +738,10 @@ public class FunctionCallExpr extends Expr {
 
       AggregateFunction aggFn = (AggregateFunction)fn_;
       if (aggFn.ignoresDistinct()) params_.setIsDistinct(false);
+
+      if (aggFn.isUnsupported()) {
+        throw new AnalysisException(getFunctionNotFoundError(argTypes));
+      }
     }
 
     if (params_.isIgnoreNulls() && !isAnalyticFnCall_) {
@@ -669,6 +818,12 @@ public class FunctionCallExpr extends Expr {
   @Override
   public Expr clone() { return new FunctionCallExpr(this); }
 
+  // Clone method with modified params. Derived classes (such as those
+  // implemented in an external frontend) may override this method.
+  protected FunctionCallExpr cloneWithNewParams(FunctionParams params) {
+    return new FunctionCallExpr(this.getFnName(), params);
+  }
+
   @Override
   protected Expr substituteImpl(ExprSubstitutionMap smap, Analyzer analyzer) {
     Expr e = super.substituteImpl(smap, analyzer);
@@ -684,4 +839,32 @@ public class FunctionCallExpr extends Expr {
     return e;
   }
 
+  public boolean isBuiltinMathScalarFunction() {
+    return (fnName_.isBuiltin()
+        && builtinMathScalarFunctionNames_.contains(fnName_.getFunction()));
+  }
+
+  private boolean lookupShouldConvertToCNF() {
+    if (isBuiltinCastFunction() || isBuiltinMathScalarFunction()) {
+      for (int i = 0; i < children_.size(); ++i) {
+        if (!getChild(i).shouldConvertToCNF()) return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Returns true if the function call is considered inexpensive to duplicate
+   * and the arguments should also be converted.
+   */
+  @Override
+  public boolean shouldConvertToCNF() {
+    if (shouldConvertToCNF_.isPresent()) {
+      return shouldConvertToCNF_.get();
+    }
+    boolean result = lookupShouldConvertToCNF();
+    shouldConvertToCNF_ = Optional.of(result);
+    return result;
+  }
 }

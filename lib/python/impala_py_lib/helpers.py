@@ -15,13 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import fnmatch
 import logging
 import os
 import re
 import subprocess
 
-logging.basicConfig()
 LOG = logging.getLogger('impala_lib_python_helpers')
 
 

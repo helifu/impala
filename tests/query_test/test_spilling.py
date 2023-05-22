@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 from copy import deepcopy
 
@@ -22,7 +23,7 @@ from tests.common.environ import ImpalaTestClusterProperties
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIfNotHdfsMinicluster
 from tests.common.test_dimensions import (create_exec_option_dimension_from_dict,
-    create_parquet_dimension)
+    create_kudu_dimension, create_parquet_dimension)
 
 IMPALA_TEST_CLUSTER_PROPERTIES = ImpalaTestClusterProperties.get_instance()
 
@@ -57,8 +58,19 @@ class TestSpillingDebugActionDimensions(ImpalaTestSuite):
       debug_action_dims = CORE_DEBUG_ACTION_DIMS + EXHAUSTIVE_DEBUG_ACTION_DIMS
     # Tests are calibrated so that they can execute and spill with this page size.
     cls.ImpalaTestMatrix.add_dimension(
-        create_exec_option_dimension_from_dict({'default_spillable_buffer_size' : ['256k'],
-          'debug_action' : debug_action_dims}))
+        create_exec_option_dimension_from_dict({'default_spillable_buffer_size': ['256k'],
+          'debug_action': debug_action_dims, 'mt_dop': [0, 1]}))
+    # Pare down the combinations of mt_dop and debug_action that run to reduce test time.
+    # The MT code path for joins is more complex, so focus testing there.
+    if cls.exploration_strategy() == 'exhaustive':
+      debug_action_dims = CORE_DEBUG_ACTION_DIMS + EXHAUSTIVE_DEBUG_ACTION_DIMS
+      cls.ImpalaTestMatrix.add_constraint(lambda v:
+          v.get_value('exec_option')['mt_dop'] == 1 or
+          v.get_value('exec_option')['debug_action'] in CORE_DEBUG_ACTION_DIMS)
+    elif cls.exploration_strategy() == 'core':
+      cls.ImpalaTestMatrix.add_constraint(lambda v:
+          v.get_value('exec_option')['mt_dop'] == 1 or
+          v.get_value('exec_option')['debug_action'] is None)
 
   def test_spilling(self, vector):
     self.run_test_case('QueryTest/spilling', vector)
@@ -102,7 +114,8 @@ class TestSpillingNoDebugActionDimensions(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(create_parquet_dimension('tpch'))
     # Tests are calibrated so that they can execute and spill with this page size.
     cls.ImpalaTestMatrix.add_dimension(
-        create_exec_option_dimension_from_dict({'default_spillable_buffer_size' : ['256k']}))
+        create_exec_option_dimension_from_dict({'default_spillable_buffer_size': ['64k'],
+            'mt_dop': [0, 4]}))
 
   def test_spilling_naaj_no_deny_reservation(self, vector):
     """
@@ -121,3 +134,33 @@ class TestSpillingNoDebugActionDimensions(ImpalaTestSuite):
        These tests either run with no debug action set or set their own debug action."""
     self.run_test_case('QueryTest/spilling-no-debug-action', vector)
 
+
+@pytest.mark.xfail(IMPALA_TEST_CLUSTER_PROPERTIES.is_remote_cluster(),
+                   reason='Queries may not spill on larger clusters')
+class TestSpillingBroadcastJoins(ImpalaTestSuite):
+  """Tests specifically targeted at shared broadcast joins for mt_dop."""
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestSpillingBroadcastJoins, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.clear_constraints()
+    # Use Kudu because it has 9 input splits for lineitem, hence can have a
+    # higher effective dop than parquet, which only has 3 splits.
+    cls.ImpalaTestMatrix.add_dimension(create_kudu_dimension('tpch'))
+    debug_action_dims = CORE_DEBUG_ACTION_DIMS
+    if cls.exploration_strategy() == 'exhaustive':
+      debug_action_dims = CORE_DEBUG_ACTION_DIMS + EXHAUSTIVE_DEBUG_ACTION_DIMS
+    # Tests are calibrated so that they can execute and spill with this page size.
+    cls.ImpalaTestMatrix.add_dimension(
+        create_exec_option_dimension_from_dict({'default_spillable_buffer_size': ['256k'],
+          'debug_action': debug_action_dims, 'mt_dop': [3]}))
+
+  def test_spilling_broadcast_joins(self, vector):
+    # Disable bloom-filter for Kudu since the number of probe rows could be reduced
+    # if runtime bloom-filter is pushed to Kudu, hence change the spilling behavior.
+    self.execute_query("SET ENABLED_RUNTIME_FILTER_TYPES=MIN_MAX")
+
+    self.run_test_case('QueryTest/spilling-broadcast-joins', vector)

@@ -34,6 +34,7 @@ import com.google.common.collect.ImmutableMap;
  * 4) whether scanning complex types from it is supported
  * 5) whether the file format can skip complex columns in scans and just materialize
  *    scalar typed columns
+ * 6) Indicates if the given file format supports Date type.
  *
  * Important note: Always keep consistent with the classes used in Hive.
  * TODO: Kudu doesn't belong in this list. Either rename this enum or create a separate
@@ -48,6 +49,12 @@ public enum HdfsFileFormat {
       "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
       "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
       false, false, true),
+  JSON("org.apache.hadoop.mapred.TextInputFormat",
+      "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
+      "org.apache.hadoop.hive.serde2.JsonSerDe", false, false, true),
+  // LZO_TEXT is never used as an actual HdfsFileFormat. It is used only to store the
+  // input format class and match against it (e.g. in HdfsCompression). Outside of this
+  // file, tables that use the LZO input format class use HdfsFileFormat.TEXT.
   LZO_TEXT("com.hadoop.mapred.DeprecatedLzoTextInputFormat",
       "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
       "", false, false, true),
@@ -66,11 +73,16 @@ public enum HdfsFileFormat {
   ORC("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",
       "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat",
       "org.apache.hadoop.hive.ql.io.orc.OrcSerde",
-      true, true, false),
+      true, true, true),
   KUDU("org.apache.hadoop.hive.kudu.KuduInputFormat",
-       "org.apache.hadoop.hive.kudu.KuduOutputFormat",
-       "org.apache.hadoop.hive.kudu.KuduSerDe",
-       false, false, false);
+      "org.apache.hadoop.hive.kudu.KuduOutputFormat",
+      "org.apache.hadoop.hive.kudu.KuduSerDe", false, false, false),
+  HUDI_PARQUET("org.apache.hudi.hadoop.HoodieParquetInputFormat",
+      "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+      "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe", true, true, true),
+  ICEBERG("org.apache.iceberg.mr.hive.HiveIcebergInputFormat",
+      "org.apache.iceberg.mr.hive.HiveIcebergOutputFormat",
+      "org.apache.iceberg.mr.hive.HiveIcebergSerDe", false, false, false);
 
   private final String inputFormat_;
   private final String outputFormat_;
@@ -110,20 +122,24 @@ public enum HdfsFileFormat {
       "parquet.hive.MapredParquetInputFormat"
   };
 
+  private static final String JSON_SERDE = "org.apache.hadoop.hive.serde2.JsonSerDe";
+
   private static Map<String, HdfsFileFormat> VALID_INPUT_FORMATS =
       ImmutableMap.<String, HdfsFileFormat>builder()
-      .put(RC_FILE.inputFormat(), RC_FILE)
-      .put(TEXT.inputFormat(), TEXT)
-      .put(LZO_TEXT.inputFormat(), TEXT)
-      .put(SEQUENCE_FILE.inputFormat(), SEQUENCE_FILE)
-      .put(AVRO.inputFormat(), AVRO)
-      .put(PARQUET.inputFormat(), PARQUET)
-      .put(PARQUET_LEGACY_INPUT_FORMATS[0], PARQUET)
-      .put(PARQUET_LEGACY_INPUT_FORMATS[1], PARQUET)
-      .put(PARQUET_LEGACY_INPUT_FORMATS[2], PARQUET)
-      .put(KUDU.inputFormat(), KUDU)
-      .put(ORC.inputFormat(), ORC).build();
-
+          .put(RC_FILE.inputFormat(), RC_FILE)
+          .put(TEXT.inputFormat(), TEXT)
+          .put(LZO_TEXT.inputFormat(), TEXT)
+          .put(SEQUENCE_FILE.inputFormat(), SEQUENCE_FILE)
+          .put(AVRO.inputFormat(), AVRO)
+          .put(PARQUET.inputFormat(), PARQUET)
+          .put(PARQUET_LEGACY_INPUT_FORMATS[0], PARQUET)
+          .put(PARQUET_LEGACY_INPUT_FORMATS[1], PARQUET)
+          .put(PARQUET_LEGACY_INPUT_FORMATS[2], PARQUET)
+          .put(KUDU.inputFormat(), KUDU)
+          .put(ORC.inputFormat(), ORC)
+          .put(HUDI_PARQUET.inputFormat(), HUDI_PARQUET)
+          .put(ICEBERG.inputFormat(), ICEBERG)
+          .build();
 
   /**
    * Returns true if the string describes an input format class that we support.
@@ -136,8 +152,15 @@ public enum HdfsFileFormat {
    * Returns the file format associated with the input format class, or null if
    * the input format class is not supported.
    */
-  public static HdfsFileFormat fromHdfsInputFormatClass(String inputFormatClass) {
+
+  public static HdfsFileFormat fromHdfsInputFormatClass(
+      String inputFormatClass, String serDe) {
     Preconditions.checkNotNull(inputFormatClass);
+    if (serDe != null && inputFormatClass.equals(TEXT.inputFormat())) {
+      if (JSON_SERDE.equals(serDe)) {
+        return HdfsFileFormat.JSON;
+      }
+    }
     return VALID_INPUT_FORMATS.get(inputFormatClass);
   }
 
@@ -145,8 +168,14 @@ public enum HdfsFileFormat {
    * Returns the corresponding enum for a SerDe class name. If classname is not one
    * of our supported formats, throws an IllegalArgumentException like Enum.valueOf
    */
-  public static HdfsFileFormat fromJavaClassName(String className) {
+
+  public static HdfsFileFormat fromJavaClassName(String className, String serDe) {
     Preconditions.checkNotNull(className);
+    if (serDe != null && className.equals(TEXT.inputFormat())) {
+      if (JSON_SERDE.equals(serDe)) {
+        return HdfsFileFormat.JSON;
+      }
+    }
     if (isHdfsInputFormatClass(className)) return VALID_INPUT_FORMATS.get(className);
     throw new IllegalArgumentException(className);
   }
@@ -158,8 +187,11 @@ public enum HdfsFileFormat {
       case SEQUENCE_FILE: return HdfsFileFormat.SEQUENCE_FILE;
       case AVRO: return HdfsFileFormat.AVRO;
       case ORC: return HdfsFileFormat.ORC;
+      case HUDI_PARQUET: return HdfsFileFormat.HUDI_PARQUET;
       case PARQUET: return HdfsFileFormat.PARQUET;
       case KUDU: return HdfsFileFormat.KUDU;
+      case ICEBERG: return HdfsFileFormat.ICEBERG;
+      case JSON: return HdfsFileFormat.JSON;
       default:
         throw new RuntimeException("Unknown THdfsFileFormat: "
             + thriftFormat + " - should never happen!");
@@ -173,8 +205,11 @@ public enum HdfsFileFormat {
       case SEQUENCE_FILE: return THdfsFileFormat.SEQUENCE_FILE;
       case AVRO: return THdfsFileFormat.AVRO;
       case ORC: return THdfsFileFormat.ORC;
+      case HUDI_PARQUET:
       case PARQUET: return THdfsFileFormat.PARQUET;
       case KUDU: return THdfsFileFormat.KUDU;
+      case ICEBERG: return THdfsFileFormat.ICEBERG;
+      case JSON: return THdfsFileFormat.JSON;
       default:
         throw new RuntimeException("Unknown HdfsFormat: "
             + this + " - should never happen!");
@@ -188,8 +223,7 @@ public enum HdfsFileFormat {
       case TEXT:
         if (compressionType == HdfsCompression.LZO ||
             compressionType == HdfsCompression.LZO_INDEX) {
-          // TODO: Update this when we can write LZO text.
-          // It is not currently possible to create a table with LZO compressed text files
+          // It is not possible to create a table with LZO compressed text files
           // in Impala, but this is valid in Hive.
           return String.format("INPUTFORMAT '%s' OUTPUTFORMAT '%s'",
               LZO_TEXT.inputFormat(), LZO_TEXT.outputFormat());
@@ -199,6 +233,9 @@ public enum HdfsFileFormat {
       case AVRO: return "AVRO";
       case PARQUET: return "PARQUET";
       case KUDU: return "KUDU";
+      case HUDI_PARQUET: return "HUDIPARQUET";
+      case ICEBERG: return "ICEBERG";
+      case JSON: return "JSONFILE";
       default:
         throw new RuntimeException("Unknown HdfsFormat: "
             + this + " - should never happen!");
@@ -212,11 +249,14 @@ public enum HdfsFileFormat {
     switch (this) {
       case TEXT:
         return compression == HdfsCompression.NONE;
+      case JSON:
       case RC_FILE:
       case SEQUENCE_FILE:
       case AVRO:
       case PARQUET:
+      case HUDI_PARQUET:
       case ORC:
+      case ICEBERG:
         return true;
       case KUDU:
         return false;
@@ -253,5 +293,12 @@ public enum HdfsFileFormat {
       if (f.isComplexTypesSupported()) result.add(f);
     }
     return result;
+  }
+
+  /**
+   * Returns true if the format is Parquet, false otherwise.
+   */
+  public boolean isParquetBased() {
+    return this == HdfsFileFormat.PARQUET || this == HdfsFileFormat.HUDI_PARQUET;
   }
 }

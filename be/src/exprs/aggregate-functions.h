@@ -64,6 +64,38 @@ class AggregateFunctions {
   static StringVal StringValSerializeOrFinalize(
       FunctionContext* ctx, const StringVal& src);
 
+  /// Implementation of Corr()
+  static void CorrInit(FunctionContext* ctx, StringVal* dst);
+  static void CorrUpdate(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void CorrRemove(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void TimestampCorrUpdate(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void TimestampCorrRemove(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void CorrMerge(FunctionContext* ctx, const StringVal& src, StringVal* dst);
+  static DoubleVal CorrGetValue(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal CorrFinalize(FunctionContext* ctx, const StringVal& src);
+
+  /// Implementation of Covar_samp() and Covar_pop()
+  static void CovarInit(FunctionContext* ctx, StringVal* dst);
+  static void CovarUpdate(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void CovarRemove(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void TimestampCovarUpdate(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void TimestampCovarRemove(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void CovarMerge(FunctionContext* ctx, const StringVal& src, StringVal* dst);
+  static DoubleVal CovarSampleGetValue(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal CovarPopulationGetValue(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal CovarSampleFinalize(FunctionContext* ctx,
+      const StringVal& src);
+  static DoubleVal CovarPopulationFinalize(FunctionContext* ctx,
+      const StringVal& src);
+
   /// Implementation of Count and Count(*)
   static void CountUpdate(FunctionContext*, const AnyVal& src, BigIntVal* dst);
   static void CountStarUpdate(FunctionContext*, BigIntVal* dst);
@@ -193,17 +225,125 @@ class AggregateFunctions {
 
   /// This precision is the default precision from the paper. It doesn't seem to matter
   /// very much when between 6 and 12.
-  static constexpr int HLL_PRECISION = 10;
-  static constexpr int HLL_LEN = 1 << HLL_PRECISION;
+  static constexpr int DEFAULT_HLL_PRECISION = 10;
+
+  // Define the min and the max of a precision value that can be indirectly
+  // specified by the 2nd argument in NDV(<arg1>, <arg2>).
+  static constexpr int MIN_HLL_PRECISION = 9;
+  static constexpr int MAX_HLL_PRECISION = 18;
+
+  // DEFAULT_HLL_LEN is the parameter m defined in the paper.
+  static constexpr int DEFAULT_HLL_LEN = 1 << DEFAULT_HLL_PRECISION;
+
+  // Define the min and the max of parameter m.
+  static constexpr int MIN_HLL_LEN = 1 << MIN_HLL_PRECISION;
+  static constexpr int MAX_HLL_LEN = 1 << MAX_HLL_PRECISION;
+
   static void HllInit(FunctionContext*, StringVal* slot);
+
+  // The implementation for both versions of the update functions below.
+  template <typename T>
+  static void HllUpdate(FunctionContext*, const T& src, StringVal* dst, int precision);
+
+  // Update function for single input argument version of NDV(),
+  // utilizing the default precision for HLL algorithm.
   template <typename T>
   static void HllUpdate(FunctionContext*, const T& src, StringVal* dst);
+
+  // Update function for two input argument version of NDV(),
+  // utilizing the precision value indirectly specified through the
+  // 2nd argument in NDV().
+  template <typename T>
+  static void HllUpdate(
+      FunctionContext*, const T& src1, const IntVal& src2, StringVal* dst);
+
   static void HllMerge(FunctionContext*, const StringVal& src, StringVal* dst);
   static BigIntVal HllFinalize(FunctionContext*, const StringVal& src);
 
   /// Utility method to compute the final result of an HLL estimation.
-  /// Assumes HLL_LEN number of buckets.
-  static uint64_t HllFinalEstimate(const uint8_t* buckets);
+  /// Assumes hll_len number of buckets.
+  static uint64_t HllFinalEstimate(
+      const uint8_t* buckets, int hll_len = AggregateFunctions::DEFAULT_HLL_LEN);
+
+  /// These functions provide cardinality estimates similarly to ndv() but these use HLL
+  /// algorithm from Apache Datasketches.
+  static void DsHllInit(FunctionContext*, StringVal* slot);
+  template <typename T>
+  static void DsHllUpdate(FunctionContext*, const T& src, StringVal* dst);
+  static StringVal DsHllSerialize(FunctionContext*, const StringVal& src);
+  static void DsHllMerge(FunctionContext*, const StringVal& src, StringVal* dst);
+  static BigIntVal DsHllFinalize(FunctionContext*, const StringVal& src);
+  static StringVal DsHllFinalizeSketch(FunctionContext*, const StringVal& src);
+
+  /// These functions implement ds_hll_union().
+  static void DsHllUnionInit(FunctionContext*, StringVal* slot);
+  static void DsHllUnionUpdate(FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsHllUnionSerialize(FunctionContext*, const StringVal& src);
+  static void DsHllUnionMerge(FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsHllUnionFinalize(FunctionContext*, const StringVal& src);
+
+  /// These functions implement Apache DataSketches CPC support for sketching.
+  static void DsCpcInit(FunctionContext*, StringVal* slot);
+  template <typename T>
+  static void DsCpcUpdate(FunctionContext*, const T& src, StringVal* dst);
+  static StringVal DsCpcSerialize(FunctionContext*, const StringVal& src);
+  static void DsCpcMerge(FunctionContext*, const StringVal& src, StringVal* dst);
+  static BigIntVal DsCpcFinalize(FunctionContext*, const StringVal& src);
+  static StringVal DsCpcFinalizeSketch(FunctionContext*, const StringVal& src);
+
+  /// These functions implement ds_cpc_union().
+  static void DsCpcUnionInit(FunctionContext*, StringVal* dst);
+  static void DsCpcUnionUpdate(FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsCpcUnionSerialize(FunctionContext*, const StringVal& src);
+  static void DsCpcUnionMerge(FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsCpcUnionFinalize(FunctionContext*, const StringVal& src);
+
+  /// These functions implement Apache DataSketches Theta support for sketching.
+  static void DsThetaInit(FunctionContext*, StringVal* slot);
+  template <typename T>
+  static void DsThetaUpdate(FunctionContext*, const T& src, StringVal* dst);
+  static StringVal DsThetaSerialize(FunctionContext*, const StringVal& src);
+  static void DsThetaMerge(FunctionContext*, const StringVal& src, StringVal* dst);
+  static BigIntVal DsThetaFinalize(FunctionContext*, const StringVal& src);
+  static StringVal DsThetaFinalizeSketch(FunctionContext*, const StringVal& src);
+
+  /// These functions implement ds_theta_union().
+  static void DsThetaUnionInit(FunctionContext*, StringVal* dst);
+  static void DsThetaUnionUpdate(FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsThetaUnionSerialize(FunctionContext*, const StringVal& src);
+  static void DsThetaUnionMerge(FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsThetaUnionFinalize(FunctionContext*, const StringVal& src);
+
+  /// These functions implement ds_theta_intersect().
+  static void DsThetaIntersectInit(FunctionContext*, StringVal* slot);
+  static void DsThetaIntersectUpdate(
+      FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsThetaIntersectSerialize(FunctionContext*, const StringVal& src);
+  static void DsThetaIntersectMerge(
+      FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsThetaIntersectFinalize(FunctionContext*, const StringVal& src);
+
+  /// These functions implement Apache DataSketches KLL support for sketching.
+  static void DsKllInit(FunctionContext*, StringVal* slot);
+  static void DsKllUpdate(FunctionContext*, const FloatVal& src, StringVal* dst);
+  static StringVal DsKllSerialize(FunctionContext*, const StringVal& src);
+  static void DsKllMerge(FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsKllFinalizeSketch(FunctionContext*, const StringVal& src);
+
+  // Helper functions to keep common code for DataSketches KLL sketch and union
+  // operations.
+  static void DsKllInitHelper(FunctionContext* ctx, StringVal* slot);
+  static StringVal DsKllSerializeHelper(FunctionContext* ctx, const StringVal& src);
+  static void DsKllMergeHelper(FunctionContext* ctx, const StringVal& src,
+      StringVal* dst);
+  static StringVal DsKllFinalizeHelper(FunctionContext*, const StringVal& src);
+
+  /// These functions implement ds_kll_union().
+  static void DsKllUnionInit(FunctionContext*, StringVal* slot);
+  static void DsKllUnionUpdate(FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsKllUnionSerialize(FunctionContext*, const StringVal& src);
+  static void DsKllUnionMerge(FunctionContext*, const StringVal& src, StringVal* dst);
+  static StringVal DsKllUnionFinalize(FunctionContext*, const StringVal& src);
 
   /// Estimates the number of distinct values (NDV) based on a sample of data and the
   /// corresponding sampling rate. The main idea of this function is to collect several

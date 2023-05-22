@@ -15,40 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range
 import pytest
 import random
 import time
-import traceback
 
 from multiprocessing import Value
-from multiprocessing.pool import ThreadPool
 
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import SkipIfHive2, SkipIfS3
+from tests.common.skip import SkipIf, SkipIfHive2, SkipIfFS, SkipIfDockerizedCluster
+from tests.stress.stress_util import Task, run_tasks
+from tests.util.filesystem_utils import IS_OZONE
 
 NUM_OVERWRITES = 2
 NUM_INSERTS_PER_OVERWRITE = 4
-
-
-class Task:
-  """Helper class for parallel execution."""
-  def __init__(self, func, *args, **kwargs):
-    self.func = func
-    self.args = args
-    self.kwargs = kwargs
-
-  def run(self):
-    try:
-      return self.func(*self.args, **self.kwargs)
-    except Exception:
-      traceback.print_exc()
-      raise
-
-
-def run_tasks(tasks):
-  pool = ThreadPool(processes=len(tasks))
-  pool.map_async(Task.run, tasks).get(600)
 
 
 class TestAcidStress(ImpalaTestSuite):
@@ -82,7 +64,7 @@ class TestAcidInsertsBasic(TestAcidStress):
     run_max = -1
     i_list = []
     for line in result.data:
-      [run, i] = map(int, (line.split('\t')))
+      [run, i] = list(map(int, (line.split('\t'))))
       run_max = max(run_max, run)
       i_list.append(i)
     assert expected_result["run"] <= run_max  # shouldn't see data overwritten in the past
@@ -92,17 +74,18 @@ class TestAcidInsertsBasic(TestAcidStress):
       expected_result["i"] = 0
       return
     assert i_list[-1] >= expected_result["i"]
-    assert i_list == range(i_list[-1] + 1)  # 'i' should have all values from 0 to max_i
+    # 'i' should have all values from 0 to max_i
+    assert i_list == list(range(i_list[-1] + 1))
     expected_result["i"] = i_list[-1]
 
   def _hive_role_write_inserts(self, tbl_name, partitioned):
     """INSERT INTO/OVERWRITE a table several times from Hive."""
     part_expr = "partition (p=1)" if partitioned else ""
-    for run in xrange(0, NUM_OVERWRITES):
+    for run in range(0, NUM_OVERWRITES):
       OVERWRITE_SQL = """insert overwrite table %s %s values (%i, %i)
           """ % (tbl_name, part_expr, run, 0)
       self.run_stmt_in_hive(OVERWRITE_SQL)
-      for i in xrange(1, NUM_INSERTS_PER_OVERWRITE + 1):
+      for i in range(1, NUM_INSERTS_PER_OVERWRITE + 1):
         INSERT_SQL = """insert into table %s %s values (%i, %i)
             """ % (tbl_name, part_expr, run, i)
         self.run_stmt_in_hive(INSERT_SQL)
@@ -112,11 +95,11 @@ class TestAcidInsertsBasic(TestAcidStress):
     try:
       impalad_client = ImpalaTestSuite.create_impala_client()
       part_expr = "partition (p=1)" if partitioned else ""
-      for run in xrange(0, NUM_OVERWRITES + 1):
+      for run in range(0, NUM_OVERWRITES + 1):
         OVERWRITE_SQL = """insert overwrite table %s %s values (%i, %i)
             """ % (tbl_name, part_expr, run, 0)
         impalad_client.execute(OVERWRITE_SQL)
-        for i in xrange(1, NUM_INSERTS_PER_OVERWRITE + 1):
+        for i in range(1, NUM_INSERTS_PER_OVERWRITE + 1):
           INSERT_SQL = """insert into table %s %s values (%i, %i)
               """ % (tbl_name, part_expr, run, i)
           impalad_client.execute(INSERT_SQL)
@@ -180,7 +163,7 @@ class TestAcidInsertsBasic(TestAcidStress):
            sleep_seconds=0.1)])
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially
   @pytest.mark.stress
   def test_read_hive_inserts(self, unique_database):
@@ -197,6 +180,55 @@ class TestAcidInsertsBasic(TestAcidStress):
     written by Hive."""
     for is_partitioned in [False, True]:
       self._run_test_read_impala_inserts(unique_database, is_partitioned)
+
+  def _impala_role_partition_writer(self, tbl_name, partition, is_overwrite, sleep_sec):
+    insert_op = "OVERWRITE" if is_overwrite else "INTO"
+    try:
+      impalad_client = ImpalaTestSuite.create_impala_client()
+      impalad_client.execute(
+          """insert {op} table {tbl_name} partition({partition})
+             select sleep({sleep_ms})""".format(op=insert_op, tbl_name=tbl_name,
+          partition=partition, sleep_ms=sleep_sec * 1000))
+    finally:
+      impalad_client.close()
+
+  @pytest.mark.execute_serially
+  @pytest.mark.stress
+  @SkipIf.not_dfs
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  def test_partitioned_inserts(self, unique_database):
+    """Check that the different ACID write operations take appropriate locks.
+       INSERT INTO: should take a shared lock
+       INSERT OVERWRITE: should take an exclusive lock
+       Both should take PARTITION-level lock in case of static partition insert."""
+    tbl_name = "%s.test_concurrent_partitioned_inserts" % unique_database
+    self.client.set_configuration_option("SYNC_DDL", "true")
+    self.client.execute("""
+        CREATE TABLE {0} (i int) PARTITIONED BY (p INT, q INT)
+        TBLPROPERTIES(
+        'transactional_properties'='insert_only','transactional'='true')""".format(
+        tbl_name))
+    # Warmup INSERT
+    self.execute_query("alter table {0} add partition(p=0,q=0)".format(tbl_name))
+    sleep_sec = 5
+    task_insert_into = Task(self._impala_role_partition_writer, tbl_name,
+        "p=1,q=1", False, sleep_sec)
+    # INSERT INTO the same partition can run in parallel.
+    duration = run_tasks([task_insert_into, task_insert_into])
+    assert duration < 3 * sleep_sec
+    task_insert_overwrite = Task(self._impala_role_partition_writer, tbl_name,
+      "p=1,q=1", True, sleep_sec)
+    # INSERT INTO + INSERT OVERWRITE should have mutual exclusion.
+    duration = run_tasks([task_insert_into, task_insert_overwrite])
+    assert duration > 4 * sleep_sec
+    # INSERT OVERWRITEs to the same partition should have mutual exclusion.
+    duration = run_tasks([task_insert_overwrite, task_insert_overwrite])
+    assert duration > 4 * sleep_sec
+    task_insert_overwrite_2 = Task(self._impala_role_partition_writer, tbl_name,
+      "p=1,q=2", True, sleep_sec)
+    # INSERT OVERWRITEs to different partitions can run in parallel.
+    duration = run_tasks([task_insert_overwrite, task_insert_overwrite_2])
+    assert duration < 3 * sleep_sec
 
 
 class TestConcurrentAcidInserts(TestAcidStress):
@@ -232,11 +264,12 @@ class TestConcurrentAcidInserts(TestAcidStress):
     def verify_result_set(result):
       wid_to_run = dict()
       for line in result.data:
-        [wid, i] = map(int, (line.split('\t')))
+        [wid, i] = list(map(int, (line.split('\t'))))
         wid_to_run.setdefault(wid, []).append(i)
       for wid, run in wid_to_run.items():
         sorted_run = sorted(run)
-        assert sorted_run == range(sorted_run[0], sorted_run[-1] + 1), "wid: %d" % wid
+        assert sorted_run == list(range(sorted_run[0], sorted_run[-1] + 1)), \
+          "wid: %d" % wid
 
     target_impalad = cid % ImpalaTestSuite.get_impalad_cluster_size()
     impalad_client = ImpalaTestSuite.create_client_for_nth_impalad(target_impalad)
@@ -248,7 +281,9 @@ class TestConcurrentAcidInserts(TestAcidStress):
     finally:
       impalad_client.close()
 
+  @SkipIfFS.stress_insert_timeouts
   @SkipIfHive2.acid
+  @SkipIfDockerizedCluster.jira(reason="IMPALA-11189")
   @pytest.mark.execute_serially
   @pytest.mark.stress
   @UniqueDatabase.parametrize(sync_ddl=True)
@@ -268,11 +303,13 @@ class TestConcurrentAcidInserts(TestAcidStress):
     num_checkers = 3
 
     writers = [Task(self._impala_role_concurrent_writer, tbl_name, i, counter)
-               for i in xrange(0, num_writers)]
+               for i in range(0, num_writers)]
     checkers = [Task(self._impala_role_concurrent_checker, tbl_name, i, counter,
                      num_writers)
-                for i in xrange(0, num_checkers)]
-    run_tasks(writers + checkers)
+                for i in range(0, num_checkers)]
+    # HDDS-8289: Ozone listStatus is slow with lots of files
+    timeout = 900 if IS_OZONE else 600
+    run_tasks(writers + checkers, timeout_seconds=timeout)
 
 
 class TestFailingAcidInserts(TestAcidStress):
@@ -338,11 +375,13 @@ class TestFailingAcidInserts(TestAcidStress):
     num_checkers = 3
 
     writers = [Task(self._impala_role_insert, tbl_name, partitioned, i, counter)
-               for i in xrange(0, num_writers)]
+               for i in range(0, num_writers)]
     checkers = [Task(self._impala_role_checker, tbl_name, i, counter, num_writers)
-                for i in xrange(0, num_checkers)]
+                for i in range(0, num_checkers)]
     run_tasks(writers + checkers)
 
+  @SkipIfFS.stress_insert_timeouts
+  @SkipIfDockerizedCluster.jira(reason="IMPALA-11191")
   @SkipIfHive2.acid
   @pytest.mark.execute_serially
   @pytest.mark.stress

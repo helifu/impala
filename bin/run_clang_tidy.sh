@@ -30,15 +30,19 @@
 set -euo pipefail
 
 echo "Compiling"
-if ! ./buildall.sh -skiptests -tidy -so -noclean 1>/dev/null 2>/dev/null
+TMP_BUILDALL_LOG=$(mktemp)
+if ! ./buildall.sh -skiptests -tidy -so -noclean &> "${TMP_BUILDALL_LOG}"
 then
-  echo "WARNING: compile failed" >&2
+  echo "buildall.sh failed, dumping output" >&2
+  cat "${TMP_BUILDALL_LOG}"
+  exit 1
 fi
 
 DIRS=$(ls -d "${IMPALA_HOME}/be/src/"*/ | grep -v gutil | grep -v kudu |\
-  grep -v thirdparty | tr '\n' ' ')
+    grep -v thirdparty | tr '\n' ' ')
 # Include/exclude select thirdparty dirs.
-DIRS=$DIRS$(ls -d "${IMPALA_HOME}/be/src/thirdparty/"*/ | grep -v mpfit | tr '\n' ' ')
+DIRS=$DIRS$(ls -d "${IMPALA_HOME}/be/src/thirdparty/"*/ | grep -v mpfit |\
+    grep -v datasketches | grep -v murmurhash | grep -v xxhash | tr '\n' ' ')
 PIPE_DIRS=$(echo "${DIRS}" | tr ' ' '|')
 
 # Reduce the concurrency to one less than the number of cores in the system. Note than
@@ -51,8 +55,8 @@ else
   CORES=7
 fi
 
-export PATH="${IMPALA_TOOLCHAIN}/llvm-${IMPALA_LLVM_VERSION}/share/clang\
-:${IMPALA_TOOLCHAIN}/llvm-${IMPALA_LLVM_VERSION}/bin/\
+export PATH="${IMPALA_TOOLCHAIN_PACKAGES_HOME}/llvm-${IMPALA_LLVM_VERSION}/share/clang\
+:${IMPALA_TOOLCHAIN_PACKAGES_HOME}/llvm-${IMPALA_LLVM_VERSION}/bin/\
 :$PATH"
 TMP_STDERR=$(mktemp)
 trap "rm $TMP_STDERR" EXIT

@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ IMPALA_REMOTE_URL = os.environ.get("IMPALA_REMOTE_URL", "")
 
 # Default web UI URL for local test cluster
 DEFAULT_LOCAL_WEB_UI_URL = "http://localhost:25000"
+DEFAULT_LOCAL_CATALOGD_WEB_UI_URL = "http://localhost:25020"
 
 # Find the local build version. May be None if Impala wasn't built locally.
 IMPALA_LOCAL_BUILD_VERSION = None
@@ -45,13 +47,14 @@ if os.path.isfile(IMPALA_LOCAL_VERSION_INFO):
   if IMPALA_LOCAL_BUILD_VERSION is None:
     raise Exception("Could not find VERSION in {0}".format(IMPALA_LOCAL_VERSION_INFO))
 
-# Check if it is Red Hat/CentOS Linux
+# Check if it is Red Hat/CentOS/Rocky/AlmaLinux Linux
 distribution = platform.linux_distribution()
 distname = distribution[0].lower()
 version = distribution[1]
 IS_REDHAT_6_DERIVATIVE = False
 IS_REDHAT_DERIVATIVE = False
-if distname.find('centos') or distname.find('red hat'):
+if distname.find('centos') or distname.find('rocky') or \
+   distname.find('almalinux') or distname.find('red hat'):
   IS_REDHAT_DERIVATIVE = True
   if len(re.findall('^6\.*', version)) > 0:
     IS_REDHAT_6_DERIVATIVE = True
@@ -73,6 +76,13 @@ if docker_network_search_result is not None:
 IS_DOCKERIZED_TEST_CLUSTER = docker_network is not None
 
 HIVE_MAJOR_VERSION = int(os.environ.get("IMPALA_HIVE_MAJOR_VERSION"))
+if HIVE_MAJOR_VERSION > 2:
+  MANAGED_WAREHOUSE_DIR = 'test-warehouse/managed'
+else:
+  MANAGED_WAREHOUSE_DIR = 'test-warehouse'
+EXTERNAL_WAREHOUSE_DIR = 'test-warehouse'
+
+IS_APACHE_HIVE = os.environ.get("USE_APACHE_HIVE", False) == 'true'
 
 # Resolve any symlinks in the path.
 impalad_basedir = \
@@ -86,7 +96,7 @@ kernel_release = os.uname()[2]
 kernel_version_regex = re.compile(r'(\d+)\.(\d+)\.(\d+)\-(\d+).*')
 kernel_version_match = kernel_version_regex.match(kernel_release)
 if kernel_version_match is not None and len(kernel_version_match.groups()) == 4:
-  kernel_version = map(lambda x: int(x), list(kernel_version_match.groups()))
+  kernel_version = [int(x) for x in list(kernel_version_match.groups())]
 IS_BUGGY_EL6_KERNEL = 'el6' in kernel_release and kernel_version < [2, 6, 32, 674]
 
 class ImpalaBuildFlavors:
@@ -99,6 +109,8 @@ class ImpalaBuildFlavors:
   ADDRESS_SANITIZER = 'address_sanitizer'
   # ./buildall.sh
   DEBUG = 'debug'
+  # ./buildall.sh -debug_noopt
+  DEBUG_NOOPT = 'debug_noopt'
   # ./buildall.sh -release
   RELEASE = 'release'
   # ./buildall.sh -codecoverage
@@ -109,13 +121,15 @@ class ImpalaBuildFlavors:
   TIDY = 'tidy'
   # ./buildall.sh -tsan
   TSAN = 'tsan'
+  # ./buildall.sh -full_tsan
+  TSAN_FULL = 'tsan_full'
   # ./buildall.sh -ubsan
   UBSAN = 'ubsan'
   # ./buildall.sh -full_ubsan
   UBSAN_FULL = 'ubsan_full'
 
-  VALID_BUILD_TYPES = [ADDRESS_SANITIZER, DEBUG, CODE_COVERAGE_DEBUG, RELEASE,
-      CODE_COVERAGE_RELEASE, TIDY, TSAN, UBSAN, UBSAN_FULL]
+  VALID_BUILD_TYPES = [ADDRESS_SANITIZER, DEBUG, DEBUG_NOOPT, CODE_COVERAGE_DEBUG,
+       RELEASE, CODE_COVERAGE_RELEASE, TIDY, TSAN, TSAN_FULL, UBSAN, UBSAN_FULL]
 
 
 class LinkTypes:
@@ -216,12 +230,16 @@ class ImpalaTestClusterProperties(object):
   """
   Acquires and provides characteristics about the way the Impala under test was compiled
   and its likely effects on its responsiveness to automated test timings.
-  """
-  def __init__(self, build_flavor, library_link_type, web_ui_url):
+  TODO: Support remote urls for catalogd web UI."""
+
+  def __init__(self, build_flavor, library_link_type, web_ui_url,
+      catalogd_web_ui_url=DEFAULT_LOCAL_CATALOGD_WEB_UI_URL):
     self._build_flavor = build_flavor
     self._library_link_type = library_link_type
     self._web_ui_url = web_ui_url
+    self._catalogd_web_ui_url = catalogd_web_ui_url
     self._runtime_flags = None  # Lazily populated to avoid unnecessary web UI calls.
+    self._catalogd_runtime_flags = None  # Lazily populated
 
   @classmethod
   def get_instance(cls):
@@ -329,18 +347,31 @@ class ImpalaTestClusterProperties(object):
     if self._runtime_flags is None:
       response = requests.get(self._web_ui_url + "/varz?json")
       assert response.status_code == requests.codes.ok,\
-              "Offending url: " + impala_url
+              "Offending url: " + self._web_ui_url
       assert "application/json" in response.headers['Content-Type']
       self._runtime_flags = {}
       for flag_dict in json.loads(response.text)["flags"]:
         self._runtime_flags[flag_dict["name"]] = flag_dict
     return self._runtime_flags
 
+  @property
+  def catalogd_runtime_flags(self):
+    """Return the command line flags from the catalogd web UI. Returns a Python map with
+    the flag name as the key and a dictionary of flag properties as the value."""
+    if self._catalogd_runtime_flags is None:
+      response = requests.get(self._catalogd_web_ui_url + "/varz?json")
+      assert response.status_code == requests.codes.ok,\
+              "Offending url: " + self._catalogd_web_ui_url
+      assert "application/json" in response.headers['Content-Type']
+      self._catalogd_runtime_flags = {}
+      for flag_dict in json.loads(response.text)["flags"]:
+        self._catalogd_runtime_flags[flag_dict["name"]] = flag_dict
+    return self._catalogd_runtime_flags
+
   def is_catalog_v2_cluster(self):
     """Checks whether we use local catalog."""
     try:
       key = "use_local_catalog"
-      # --use_local_catalog is hidden so does not appear in JSON if disabled.
       return key in self.runtime_flags and self.runtime_flags[key]["current"] == "true"
     except Exception:
       if self.is_remote_cluster():
@@ -354,12 +385,13 @@ class ImpalaTestClusterProperties(object):
     Checks if --hms_event_polling_interval_s is set to non-zero value"""
     try:
       key = "hms_event_polling_interval_s"
-      # --use_local_catalog is hidden so does not appear in JSON if disabled.
-      return key in self.runtime_flags and int(self.runtime_flags[key]["current"]) > 0
+      return key in self.catalogd_runtime_flags and int(
+        self._catalogd_runtime_flags[key]["current"]) > 0
     except Exception:
       if self.is_remote_cluster():
         # IMPALA-8553: be more tolerant of failures on remote cluster builds.
-        LOG.exception("Failed to get flags from web UI, assuming catalog V1")
+        LOG.exception(
+          "Failed to get flags from web UI, assuming event polling is disabled")
         return False
 
 def build_flavor_timeout(default_timeout, slow_build_timeout=None,

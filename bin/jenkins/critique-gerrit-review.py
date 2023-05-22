@@ -36,6 +36,7 @@
 # TODO: generalise to other warnings
 # * clang-tidy
 
+from __future__ import absolute_import, division, print_function
 from argparse import ArgumentParser
 from collections import defaultdict
 import json
@@ -47,7 +48,7 @@ from subprocess import check_call, check_output, Popen, PIPE
 import sys
 import virtualenv
 
-FLAKE8_VERSION = "3.5.0"
+FLAKE8_VERSION = "3.9.2"
 FLAKE8_DIFF_VERSION = "0.2.2"
 
 VENV_PATH = "gerrit_critic_venv"
@@ -69,13 +70,14 @@ EXCLUDE_FILE_PATTERNS = [
     re.compile(r".*/catalog/BuiltinsDb.java"),  # Many long strings.
     re.compile(r".*/codegen/gen_ir_descriptions.py"),  # Many long strings.
     re.compile(r".*shell/ext-py/.*"),  # Third-party code.
+    re.compile(r".*be/src/thirdparty/.*"),  # Third-party code.
     re.compile(r".*/.*\.xml\.py")  # Long lines in config template files.
 ]
 
 
 def setup_virtualenv():
   """Set up virtualenv with flake8-diff."""
-  virtualenv.create_environment(VENV_PATH)
+  virtualenv.cli_run([VENV_PATH])
   check_call([PIP_PATH, "install",
               "flake8=={0}".format(FLAKE8_VERSION),
               "flake8-diff=={0}".format(FLAKE8_DIFF_VERSION)])
@@ -141,7 +143,8 @@ def get_misc_comments(revision):
   #  @@ -128 +133,2 @@ if __name__ == "__main__":
   RANGE_RE = re.compile(r"^@@ -[0-9,]* \+([0-9]*).*$")
 
-  diff = check_output(["git", "diff", "-U0", "{0}^..{0}".format(revision)])
+  diff = check_output(["git", "diff", "-U0", "{0}^..{0}".format(revision)],
+      universal_newlines=True)
   curr_file = None
   check_source_file = False
   curr_line_num = 0
@@ -179,7 +182,7 @@ def add_misc_comments_for_line(comments, line, curr_file, curr_line_num):
         {"message": "line has trailing whitespace", "line": curr_line_num})
 
   # Check for long lines. Skip .py files since flake8 already flags long lines.
-  if len(line) > 90 and os.path.splitext(curr_file)[1] != ".py":
+  if len(line) > LINE_LIMIT and os.path.splitext(curr_file)[1] != ".py":
     msg = "line too long ({0} > {1})".format(len(line), LINE_LIMIT)
     comments[curr_file].append(
         {"message": msg, "line": curr_line_num})
@@ -188,6 +191,12 @@ def add_misc_comments_for_line(comments, line, curr_file, curr_line_num):
     comments[curr_file].append(
         {"message": "tab used for whitespace", "line": curr_line_num})
 
+  if 'ThriftDebugString' in line:
+    comments[curr_file].append(
+        {"message": ("Please make sure you don't output sensitive data with "
+                     "ThriftDebugString(). If so, use impala::RedactedDebugString() "
+                     "instead."),
+         "line": curr_line_num })
 
 def post_review_to_gerrit(review_input):
   """Post a review to the gerrit patchset. 'review_input' is a ReviewInput JSON object
@@ -205,7 +214,7 @@ def post_review_to_gerrit(review_input):
 
 
 def merge_comments(a, b):
-  for k, v in b.iteritems():
+  for k, v in b.items():
     a[k].extend(v)
 
 
@@ -222,6 +231,6 @@ if __name__ == "__main__":
   comments = get_flake8_comments(revision)
   merge_comments(comments, get_misc_comments(revision))
   review_input = {"comments": comments}
-  print json.dumps(review_input, indent=True)
+  print(json.dumps(review_input, indent=True))
   if not args.dryrun:
     post_review_to_gerrit(review_input)

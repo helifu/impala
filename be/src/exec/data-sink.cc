@@ -22,37 +22,122 @@
 
 #include "common/logging.h"
 #include "exec/exec-node.h"
-#include "exec/hbase-table-sink.h"
+#include "exec/hbase/hbase-table-sink.h"
 #include "exec/hdfs-table-sink.h"
-#include "exec/kudu-table-sink.h"
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-table-sink.h"
+#include "exec/kudu/kudu-util.h"
 #include "exec/blocking-plan-root-sink.h"
 #include "exec/buffered-plan-root-sink.h"
+#include "exec/nested-loop-join-builder.h"
+#include "exec/partitioned-hash-join-builder.h"
 #include "exec/plan-root-sink.h"
 #include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
 #include "gutil/strings/substitute.h"
+#include "runtime/fragment-state.h"
 #include "runtime/krpc-data-stream-sender.h"
 #include "runtime/mem-tracker.h"
 #include "util/container-util.h"
 
 #include "common/names.h"
 
-DEFINE_int64(data_stream_sender_buffer_size, 16 * 1024,
-    "(Advanced) Max size in bytes which a row batch in a data stream sender's channel "
-    "can accumulate before the row batch is sent over the wire.");
-
 using strings::Substitute;
 
 namespace impala {
 
+void DataSinkConfig::Codegen(FragmentState* state) {
+  return;
+}
+
+void DataSinkConfig::Close() {
+  ScalarExpr::Close(output_exprs_);
+}
+
+Status DataSinkConfig::Init(
+    const TDataSink& tsink, const RowDescriptor* input_row_desc, FragmentState* state) {
+  tsink_ = &tsink;
+  input_row_desc_ = input_row_desc;
+  return ScalarExpr::Create(tsink.output_exprs, *input_row_desc_, state, &output_exprs_);
+}
+
+void DataSinkConfig::AddCodegenStatus(
+    const Status& codegen_status, const std::string& extra_label) {
+  codegen_status_msgs_.emplace_back(FragmentState::GenerateCodegenMsg(
+      codegen_status.ok(), codegen_status, extra_label));
+}
+
+Status DataSinkConfig::CreateConfig(const TDataSink& thrift_sink,
+    const RowDescriptor* row_desc, FragmentState* state,
+    DataSinkConfig** data_sink) {
+  ObjectPool* pool = state->obj_pool();
+  *data_sink = nullptr;
+  switch (thrift_sink.type) {
+    case TDataSinkType::DATA_STREAM_SINK:
+      if (!thrift_sink.__isset.stream_sink) return Status("Missing data stream sink.");
+      // TODO: figure out good buffer size based on size of output row
+      *data_sink = pool->Add(new KrpcDataStreamSenderConfig());
+      break;
+    case TDataSinkType::TABLE_SINK:
+      if (!thrift_sink.__isset.table_sink) return Status("Missing table sink.");
+      switch (thrift_sink.table_sink.type) {
+        case TTableSinkType::HDFS:
+          *data_sink = pool->Add(new HdfsTableSinkConfig());
+          break;
+        case TTableSinkType::KUDU:
+          RETURN_IF_ERROR(CheckKuduAvailability());
+          *data_sink = pool->Add(new KuduTableSinkConfig());
+          break;
+        case TTableSinkType::HBASE:
+          *data_sink = pool->Add(new HBaseTableSinkConfig());
+          break;
+        default:
+          stringstream error_msg;
+          map<int, const char*>::const_iterator i =
+              _TTableSinkType_VALUES_TO_NAMES.find(thrift_sink.table_sink.type);
+          const char* str = i != _TTableSinkType_VALUES_TO_NAMES.end() ?
+              i->second :
+              "Unknown table sink";
+          error_msg << str << " not implemented.";
+          return Status(error_msg.str());
+      }
+      break;
+    case TDataSinkType::PLAN_ROOT_SINK:
+      *data_sink = pool->Add(new PlanRootSinkConfig());
+      break;
+    case TDataSinkType::HASH_JOIN_BUILDER: {
+      *data_sink = pool->Add(new PhjBuilderConfig());
+      break;
+    }
+    case TDataSinkType::NESTED_LOOP_JOIN_BUILDER: {
+      *data_sink = pool->Add(new NljBuilderConfig());
+      break;
+    }
+    default:
+      stringstream error_msg;
+      map<int, const char*>::const_iterator i =
+          _TDataSinkType_VALUES_TO_NAMES.find(thrift_sink.type);
+      const char* str = i != _TDataSinkType_VALUES_TO_NAMES.end() ?
+          i->second :
+          "Unknown data sink type ";
+      error_msg << str << " not implemented.";
+      return Status(error_msg.str());
+  }
+  RETURN_IF_ERROR((*data_sink)->Init(thrift_sink, row_desc, state));
+  return Status::OK();
+}
+
 // Empty string
 const char* const DataSink::ROOT_PARTITION_KEY = "";
 
-DataSink::DataSink(TDataSinkId sink_id, const RowDescriptor* row_desc, const string& name,
-    RuntimeState* state)
-  : closed_(false), row_desc_(row_desc), name_(name) {
+DataSink::DataSink(TDataSinkId sink_id, const DataSinkConfig& sink_config,
+    const string& name, RuntimeState* state)
+  : sink_config_(sink_config),
+    closed_(false),
+    row_desc_(sink_config.input_row_desc_),
+    name_(name),
+    output_exprs_(sink_config.output_exprs_) {
   profile_ = RuntimeProfile::Create(state->obj_pool(), name);
   if (sink_id != -1) {
     // There is one sink per fragment so we can use the fragment index as a unique
@@ -63,77 +148,6 @@ DataSink::DataSink(TDataSinkId sink_id, const RowDescriptor* row_desc, const str
 
 DataSink::~DataSink() {
   DCHECK(closed_);
-}
-
-Status DataSink::Create(const TPlanFragmentCtx& fragment_ctx,
-    const TPlanFragmentInstanceCtx& fragment_instance_ctx, const RowDescriptor* row_desc,
-    RuntimeState* state, DataSink** sink) {
-  const TDataSink& thrift_sink = fragment_ctx.fragment.output_sink;
-  const vector<TExpr>& thrift_output_exprs = thrift_sink.output_exprs;
-  ObjectPool* pool = state->obj_pool();
-  // We have one fragment per sink, so we can use the fragment index as the sink ID.
-  TDataSinkId sink_id = fragment_ctx.fragment.idx;
-  switch (thrift_sink.type) {
-    case TDataSinkType::DATA_STREAM_SINK:
-      if (!thrift_sink.__isset.stream_sink) return Status("Missing data stream sink.");
-      // TODO: figure out good buffer size based on size of output row
-      *sink = pool->Add(new KrpcDataStreamSender(sink_id,
-          fragment_instance_ctx.sender_id, row_desc, thrift_sink.stream_sink,
-          fragment_ctx.destinations, FLAGS_data_stream_sender_buffer_size, state));
-      break;
-    case TDataSinkType::TABLE_SINK:
-      if (!thrift_sink.__isset.table_sink) return Status("Missing table sink.");
-      switch (thrift_sink.table_sink.type) {
-        case TTableSinkType::HDFS:
-          *sink =
-              pool->Add(new HdfsTableSink(sink_id, row_desc, thrift_sink, state));
-          break;
-        case TTableSinkType::HBASE:
-          *sink =
-              pool->Add(new HBaseTableSink(sink_id, row_desc, thrift_sink, state));
-          break;
-        case TTableSinkType::KUDU:
-          RETURN_IF_ERROR(CheckKuduAvailability());
-          *sink =
-              pool->Add(new KuduTableSink(sink_id, row_desc, thrift_sink, state));
-          break;
-        default:
-          stringstream error_msg;
-          map<int, const char*>::const_iterator i =
-              _TTableSinkType_VALUES_TO_NAMES.find(thrift_sink.table_sink.type);
-          const char* str = i != _TTableSinkType_VALUES_TO_NAMES.end() ?
-              i->second : "Unknown table sink";
-          error_msg << str << " not implemented.";
-          return Status(error_msg.str());
-      }
-      break;
-    case TDataSinkType::PLAN_ROOT_SINK:
-      if (state->query_options().spool_query_results) {
-        *sink = pool->Add(new BufferedPlanRootSink(sink_id, row_desc, state,
-            fragment_ctx.fragment.output_sink.plan_root_sink.resource_profile,
-            fragment_instance_ctx.debug_options));
-      } else {
-        *sink = pool->Add(new BlockingPlanRootSink(sink_id, row_desc, state));
-      }
-      break;
-    case TDataSinkType::JOIN_BUILD_SINK:
-      // IMPALA-4224 - join build sink not supported in backend execution.
-    default:
-      stringstream error_msg;
-      map<int, const char*>::const_iterator i =
-          _TDataSinkType_VALUES_TO_NAMES.find(thrift_sink.type);
-      const char* str = i != _TDataSinkType_VALUES_TO_NAMES.end() ?
-          i->second :  "Unknown data sink type ";
-      error_msg << str << " not implemented.";
-      return Status(error_msg.str());
-  }
-  RETURN_IF_ERROR((*sink)->Init(thrift_output_exprs, thrift_sink, state));
-  return Status::OK();
-}
-
-Status DataSink::Init(const vector<TExpr>& thrift_output_exprs,
-    const TDataSink& tsink, RuntimeState* state) {
-  return ScalarExpr::Create(thrift_output_exprs, *row_desc_, state, &output_exprs_);
 }
 
 Status DataSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
@@ -149,19 +163,17 @@ Status DataSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
   return Status::OK();
 }
 
-void DataSink::Codegen(LlvmCodeGen* codegen) {
-  return;
-}
-
 Status DataSink::Open(RuntimeState* state) {
   DCHECK_EQ(output_exprs_.size(), output_expr_evals_.size());
+  for (const string& codegen_msg : sink_config_.codegen_status_msgs_) {
+    profile_->AppendExecOption(codegen_msg);
+  }
   return ScalarExprEvaluator::Open(output_expr_evals_, state);
 }
 
 void DataSink::Close(RuntimeState* state) {
   if (closed_) return;
   ScalarExprEvaluator::Close(output_expr_evals_, state);
-  ScalarExpr::Close(output_exprs_);
   if (expr_perm_pool_ != nullptr) expr_perm_pool_->FreeAll();
   if (expr_results_pool_.get() != nullptr) expr_results_pool_->FreeAll();
   if (expr_mem_tracker_ != nullptr) expr_mem_tracker_->Close();

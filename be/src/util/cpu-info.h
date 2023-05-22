@@ -15,18 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_UTIL_CPU_INFO_H
-#define IMPALA_UTIL_CPU_INFO_H
-
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
-#include <boost/cstdint.hpp>
 
 #include "common/logging.h"
+#include "common/status.h"
 
 namespace impala {
+
+#ifdef __aarch64__
+#define IS_AARCH64 true
+#else
+#define IS_AARCH64 false
+#endif
 
 /// CpuInfo is an interface to query for cpu information at runtime.  The caller can
 /// ask for the sizes of the caches and what hardware features are supported.
@@ -53,14 +58,15 @@ class CpuInfo {
   /// Initialize CpuInfo.
   static void Init();
 
-  /// Determine if the CPU meets the minimum CPU requirements and if not, log an error.
-  static void VerifyCpuRequirements();
+  /// Determine if the CPU meets the minimum CPU requirements and if not, return
+  /// an error status.
+  static Status EnforceCpuRequirements();
 
-  /// Determine if the CPU scaling governor is set to 'performance' and if not, issue an
-  /// error.
+  /// Determine if the CPU scaling governor is set to 'performance' and if not, log an
+  /// error message.
   static void VerifyPerformanceGovernor();
 
-  /// Determine if CPU turbo is disabled and if not, issue an error.
+  /// Determine if CPU turbo is disabled and if not, log an error message.
   static void VerifyTurboDisabled();
 
   /// Returns all the flags for this cpu
@@ -223,4 +229,3 @@ class CpuInfo {
   static std::vector<int> numa_node_core_idx_;
 };
 }
-#endif

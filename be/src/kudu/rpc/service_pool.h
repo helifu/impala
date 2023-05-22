@@ -14,19 +14,16 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-#ifndef KUDU_SERVICE_POOL_H
-#define KUDU_SERVICE_POOL_H
+#pragma once
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/rpc_service.h"
 #include "kudu/rpc/service_queue.h"
@@ -45,14 +42,13 @@ namespace rpc {
 class InboundCall;
 class RemoteMethod;
 class ServiceIf;
-
 struct RpcMethodInfo;
 
 // A pool of threads that handle new incoming RPC calls.
 // Also includes a queue that calls get pushed onto for handling by the pool.
 class ServicePool : public RpcService {
  public:
-  ServicePool(gscoped_ptr<ServiceIf> service,
+  ServicePool(std::unique_ptr<ServiceIf> service,
               const scoped_refptr<MetricEntity>& metric_entity,
               size_t service_queue_length);
   virtual ~ServicePool();
@@ -76,7 +72,7 @@ class ServicePool : public RpcService {
 
   RpcMethodInfo* LookupMethod(const RemoteMethod& method) override;
 
-  virtual Status QueueInboundCall(gscoped_ptr<InboundCall> call) OVERRIDE;
+  Status QueueInboundCall(std::unique_ptr<InboundCall> call) override;
 
   const Counter* RpcsTimedOutInQueueMetricForTests() const {
     return rpcs_timed_out_in_queue_.get();
@@ -90,13 +86,13 @@ class ServicePool : public RpcService {
     return rpcs_queue_overflow_.get();
   }
 
-  const std::string service_name() const;
+  const std::string& service_name() const;
 
  private:
   void RunThread();
   void RejectTooBusy(InboundCall* c);
 
-  gscoped_ptr<ServiceIf> service_;
+  std::unique_ptr<ServiceIf> service_;
   std::vector<scoped_refptr<kudu::Thread> > threads_;
   LifoServiceQueue service_queue_;
   scoped_refptr<Histogram> incoming_queue_time_;
@@ -113,5 +109,3 @@ class ServicePool : public RpcService {
 
 } // namespace rpc
 } // namespace kudu
-
-#endif

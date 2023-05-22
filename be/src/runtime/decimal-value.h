@@ -21,8 +21,9 @@
 
 #include <ostream>
 
+#include "common/logging.h"
 #include "gen-cpp/Data_types.h"
-#include "runtime/multi-precision.h"
+#include "gen-cpp/data_stream_service.pb.h"
 #include "runtime/types.h"
 
 #ifndef __has_builtin
@@ -39,8 +40,13 @@ namespace impala {
 /// Overflow is handled by an output return parameter. Functions should set this
 /// to true if overflow occured and leave it *unchanged* otherwise (e.g. |= rather than =).
 /// This allows the caller to not have to check overflow after every call.
+///
+/// Values of this class may be unaligned so we mark it as "packed" so that the compiler
+/// does not assume proper alignment. If the compiler assumes that the value is aligned it
+/// may generate aligned load instructions (for example 'vmovdqa') which fail in case the
+/// value is actually misaligned.
 template<typename T>
-class DecimalValue {
+class __attribute__ ((packed)) DecimalValue {
  public:
   typedef T StorageType;
 
@@ -59,8 +65,8 @@ class DecimalValue {
     return FromDouble(t.precision, t.scale, d, round, overflow);
   }
 
-  /// Returns a new DecimalValue created from the value in 'tvalue'.
-  static inline DecimalValue FromTColumnValue(const TColumnValue& tvalue);
+  /// Returns a new DecimalValue created from the value in 'value_pb'.
+  static inline DecimalValue FromColumnValuePB(const ColumnValuePB& value_pb);
 
   static inline DecimalValue FromDouble(int precision, int scale, double d,
       bool round, bool* overflow);
@@ -104,8 +110,10 @@ class DecimalValue {
   /// Returns a new decimal scaled by from src_type to dst_type.
   /// e.g. If this value was 1100 at scale 3 and the dst_type had scale two, the
   /// result would be 110. (In both cases representing the decimal 1.1).
+  /// 'round' determines the behavior in case of scaling down, i.e. whether 11.56 should
+  /// be 11.5 or 11.6.
   inline DecimalValue ScaleTo(int src_scale, int dst_scale, int dst_precision,
-      bool* overflow) const;
+      bool round, bool* overflow) const;
 
   /// Implementations of the basic arithmetic operators. In all these functions,
   /// we take the precision and scale of both inputs. The return type is assumed
@@ -168,10 +176,17 @@ class DecimalValue {
     return Compare(this_scale, other, other_scale) < 0;
   }
 
-  /// Returns the underlying storage. For a particular storage size, there is
+  /// Returns a copy of the underlying storage. We cannot return a reference or pointer
+  /// because it may be unaligned (this class is packed) and unaligned pointers may lead
+  /// to undefined behaviour.
+  /// For a particular storage size, there is
   /// only one representation for any decimal and the storage is directly comparable.
-  inline const T& value() const { return value_; }
-  inline T& value() { return value_; }
+  inline T value() const { return value_; }
+
+  /// Sets the underlying storage to the given value.
+  inline void set_value(T value) {
+    value_ = value;
+  }
 
   /// Returns the value of the decimal before the decimal point.
   inline const T whole_part(int scale) const;
@@ -196,11 +211,10 @@ class DecimalValue {
 
   inline DecimalValue<T> Abs() const;
 
-  /// Store the binary representation of this DecimalValue in 'tvalue'.
-  void ToTColumnValue(TColumnValue* tvalue) const {
+  /// Store the binary representation of this DecimalValue in 'value_pb'.
+  void ToColumnValuePB(ColumnValuePB* value_pb) const {
     const uint8_t* data = reinterpret_cast<const uint8_t*>(&value_);
-    tvalue->decimal_val.assign(data, data + sizeof(T));
-    tvalue->__isset.decimal_val = true;
+    value_pb->mutable_decimal_val()->assign(data, data + sizeof(T));
   }
 
  private:
@@ -219,7 +233,7 @@ typedef DecimalValue<int32_t> Decimal4Value;
 typedef DecimalValue<int64_t> Decimal8Value;
 /// TODO: should we support Decimal12Value? We pad it to 16 bytes in the tuple
 /// anyway.
-typedef DecimalValue<int128_t> Decimal16Value;
+typedef DecimalValue<__int128_t> Decimal16Value;
 
 inline std::ostream& operator<<(std::ostream& os, const Decimal4Value& d) {
   return os << d.value();

@@ -17,9 +17,12 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -32,13 +35,17 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.impala.analysis.Path.PathType;
 import org.apache.impala.analysis.StmtMetadataLoader.StmtTableCache;
+import org.apache.impala.authorization.AuthorizationChecker;
 import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.authorization.AuthorizationContext;
 import org.apache.impala.authorization.AuthorizationFactory;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.PrivilegeRequest;
 import org.apache.impala.authorization.PrivilegeRequestBuilder;
+import org.apache.impala.authorization.TableMask;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.DatabaseNotFoundException;
@@ -47,33 +54,52 @@ import org.apache.impala.catalog.FeDataSourceTable;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeIncompleteTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.IcebergTimeTravelTable;
 import org.apache.impala.catalog.KuduTable;
+import org.apache.impala.catalog.MaterializedViewHdfsTable;
+import org.apache.impala.catalog.StructField;
+import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.Type;
-import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.catalog.VirtualColumn;
+import org.apache.impala.catalog.VirtualTable;
+import org.apache.impala.catalog.iceberg.IcebergMetadataTable;
+import org.apache.impala.catalog.local.LocalKuduTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.IdGenerator;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.planner.JoinNode;
 import org.apache.impala.planner.PlanNode;
 import org.apache.impala.rewrite.BetweenToCompoundRule;
+import org.apache.impala.rewrite.CountStarToConstRule;
+import org.apache.impala.rewrite.SimplifyCastExprRule;
+import org.apache.impala.rewrite.ConvertToCNFRule;
 import org.apache.impala.rewrite.EqualityDisjunctsToInRule;
 import org.apache.impala.rewrite.ExprRewriteRule;
 import org.apache.impala.rewrite.ExprRewriter;
 import org.apache.impala.rewrite.ExtractCommonConjunctRule;
+import org.apache.impala.rewrite.ExtractCompoundVerticalBarExprRule;
 import org.apache.impala.rewrite.FoldConstantsRule;
 import org.apache.impala.rewrite.NormalizeBinaryPredicatesRule;
 import org.apache.impala.rewrite.NormalizeCountStarRule;
 import org.apache.impala.rewrite.NormalizeExprsRule;
+import org.apache.impala.rewrite.SimplifyCastStringToTimestamp;
 import org.apache.impala.rewrite.SimplifyConditionalsRule;
 import org.apache.impala.rewrite.SimplifyDistinctFromRule;
+import org.apache.impala.rewrite.CountDistinctToNdvRule;
+import org.apache.impala.rewrite.DefaultNdvScaleRule;
 import org.apache.impala.service.FeSupport;
+import org.apache.impala.thrift.QueryConstants;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TLineageGraph;
@@ -82,13 +108,16 @@ import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.DisjointSet;
+import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.apache.impala.util.Graph.RandomAccessibleGraph;
 import org.apache.impala.util.Graph.SccCondensedGraph;
 import org.apache.impala.util.Graph.WritableGraph;
 import org.apache.impala.util.IntIterator;
+import org.apache.impala.util.KuduUtil;
 import org.apache.impala.util.ListMap;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.impala.util.TSessionStateUtil;
+import org.apache.kudu.client.KuduClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -130,22 +159,23 @@ public class Analyzer {
   public static final byte ACCESSTYPE_READ = (byte)2;
   public static final byte ACCESSTYPE_WRITE = (byte)4;
   public static final byte ACCESSTYPE_READWRITE = (byte)8;
+
   // Common analysis error messages
   public final static String DB_DOES_NOT_EXIST_ERROR_MSG = "Database does not exist: ";
   public final static String DB_ALREADY_EXISTS_ERROR_MSG = "Database already exists: ";
   public final static String TBL_DOES_NOT_EXIST_ERROR_MSG = "Table does not exist: ";
   public final static String TBL_ALREADY_EXISTS_ERROR_MSG = "Table already exists: ";
+  public final static String VIEW_ALREADY_EXISTS_ERROR_MSG = "View already exists: ";
   public final static String FN_DOES_NOT_EXIST_ERROR_MSG = "Function does not exist: ";
   public final static String FN_ALREADY_EXISTS_ERROR_MSG = "Function already exists: ";
   public final static String DATA_SRC_DOES_NOT_EXIST_ERROR_MSG =
       "Data source does not exist: ";
   public final static String DATA_SRC_ALREADY_EXISTS_ERROR_MSG =
       "Data source already exists: ";
-  private static final String INSERT_ONLY_ACID_TABLE_SUPPORTED_ERROR_MSG =
-      "Table %s not supported. Transactional (ACID) tables are " +
-      "only supported when they are configured as insert_only.";
   private static final String TRANSACTIONAL_TABLE_NOT_SUPPORTED =
-      "%s not supported on transactional (ACID) table: %s" ;
+      "%s not supported on transactional (ACID) table: %s";
+  private static final String FULL_TRANSACTIONAL_TABLE_NOT_SUPPORTED =
+      "%s not supported on full transactional (ACID) table: %s";
   private static final String BUCKETED_TABLE_NOT_SUPPORTED =
       "%s is a bucketed table. Only read operations are supported on such tables.";
   private static final String TABLE_NOT_SUPPORTED =
@@ -172,6 +202,15 @@ public class Analyzer {
   // Flag indicating if this analyzer instance belongs to a subquery.
   private boolean isSubquery_ = false;
 
+  // Tracks the simple LIMIT status of this query block. First item of the
+  // pair indicates whether a simple limit exists or not, second item is
+  // the actual limit value if it does exist. We use a pair instead of just
+  // a single nullable field because a query block may not have a LIMIT but
+  // if it is an inline view it may be eligible for limit pushdown from an
+  // outer query, so for such case the simpleLimitStatus_ will be non-null
+  // but the pair will be <false, null>.
+  private Pair<Boolean, Long>  simpleLimitStatus_ = null;
+
   // Flag indicating whether this analyzer belongs to a WITH clause view.
   private boolean hasWithClause_ = false;
 
@@ -194,6 +233,60 @@ public class Analyzer {
   // except its own. Therefore, only a single semi-joined tuple can be visible at a time.
   private TupleId visibleSemiJoinedTupleId_ = null;
 
+  // During analysis if a materialized view table ref is encountered, we check
+  // authorization on its source tables and set the field below to non-null if
+  // if an exception was encountered.
+  private String mvAuthExceptionMsg_ = null;
+
+  // Total records num V1 is calculated by all DataFiles of the Iceberg V1 table.
+  private long totalRecordsNumV1_;
+
+  // Total records num V2 is calculated by all DataFiles without corresponding DeleteFiles
+  // to be applied of the Iceberg V2 table.
+  private long totalRecordsNumV2_;
+
+  // The method 'registerSlotRef()' is called recursively for complex types (structs and
+  // collections). When creating new 'SlotDescriptor's it is important that they are
+  // inserted into the correct 'TupleDescriptor'. This stack is used to keep track of the
+  // current (most nested) 'TupleDescriptor' at each step.
+  //
+  // When a new top-level path is registered, the root descriptor of the path is pushed on
+  // the stack. When registering a complex type, we push its item tuple desc on the stack
+  // before analysing the children, and pop it afterwards. New 'SlotDescriptor's are
+  // always added to the 'TupleDescriptor' at the top of the stack.
+  //
+  // To ensure that every push operation has a corresponding pop operation, these should
+  // not be called manually. Instead, use 'TupleStackGuard' objects in try-with-resources
+  // blocks; see more in its documentation.
+  private Deque<TupleDescriptor> tupleStack_ = new ArrayDeque<>();
+
+  // When created, pushes the provided TupleDescriptor to the enclosing Analyzer object's
+  // 'tupleStack_' and pops it in the close() method. Implements the AutoCloseable
+  // interface so it can be used in try-with-resources blocks.
+  private class TupleStackGuard implements AutoCloseable {
+    private final TupleDescriptor tupleDesc_;
+    private boolean isClosed_ = false;
+    private final int stackLen_;
+
+    public TupleStackGuard(TupleDescriptor tupleDesc) {
+      Preconditions.checkNotNull(tupleStack_);
+      Preconditions.checkNotNull(tupleDesc);
+      tupleDesc_ = tupleDesc;
+      stackLen_ = tupleStack_.size();
+      tupleStack_.push(tupleDesc_);
+    }
+
+    @Override
+    public void close() {
+      if (!isClosed_) {
+        Preconditions.checkState(tupleStack_.peek() == tupleDesc_);
+        tupleStack_.pop();
+        Preconditions.checkState(tupleStack_.size() == stackLen_);
+        isClosed_ = true;
+      }
+    }
+  }
+
   // Required Operation type: Read, write, any(read or write).
   public enum OperationType {
     READ,
@@ -205,34 +298,40 @@ public class Analyzer {
     isSubquery_ = true;
     globalState_.containsSubquery = true;
   }
+
+  public void setSimpleLimitStatus(Pair<Boolean, Long> simpleLimitStatus) {
+    simpleLimitStatus_ = simpleLimitStatus;
+  }
+
+  public Pair<Boolean, Long> getSimpleLimitStatus() {
+    return simpleLimitStatus_;
+  }
+
+  public void setHasTopLevelAcidCollectionTableRef() {
+    globalState_.hasTopLevelAcidCollectionTableRef = true;
+  }
+
+  public boolean hasTopLevelAcidCollectionTableRef() {
+    return globalState_.hasTopLevelAcidCollectionTableRef;
+  }
+
   public boolean setHasPlanHints() { return globalState_.hasPlanHints = true; }
   public boolean hasPlanHints() { return globalState_.hasPlanHints; }
   public void setHasWithClause() { hasWithClause_ = true; }
   public boolean hasWithClause() { return hasWithClause_; }
-
-
-  /**
-   * @param tblProperties Table properties that are used to check transactional nature
-   * @param tableName Table name to be reported in exception message
-   * @throws AnalysisException If table is full acid table.
-   */
-  public static void ensureTableNotFullAcid(Map<String, String> tblProperties,
-                                            String tableName)
-      throws AnalysisException {
-    if (AcidUtils.isFullAcidTable(tblProperties)) {
-      throw new AnalysisException(String.format(
-          INSERT_ONLY_ACID_TABLE_SUPPORTED_ERROR_MSG, tableName));
-    }
-  }
+  public void setSetOpNeedsRewrite() { globalState_.setOperationNeedsRewrite = true; }
 
   /**
    * @param table Table whose properties need to be checked.
+   * @param operationStr The unsupported operation.
    * @throws AnalysisException If table is full acid table.
    */
-  public static void ensureTableNotFullAcid(FeTable table)
+  public static void ensureTableNotFullAcid(FeTable table, String operationStr)
       throws AnalysisException {
-    ensureTableNotFullAcid(table.getMetaStoreTable().getParameters(),
-        table.getFullName());
+    if (AcidUtils.isFullAcidTable(table.getMetaStoreTable().getParameters())) {
+      throw new AnalysisException(String.format(FULL_TRANSACTIONAL_TABLE_NOT_SUPPORTED,
+          operationStr, table.getFullName()));
+    }
   }
 
   public static void ensureTableNotTransactional(FeTable table, String operationStr)
@@ -258,7 +357,7 @@ public class Analyzer {
   /**
    * Check if the table supports the operation
    * @param table Table need to check
-   * @param operationType The type of operation
+   * @param type The type of operation
    * @throws AnalysisException If the table does not support the operation
    */
   public static void checkTableCapability(FeTable table, OperationType type)
@@ -291,7 +390,6 @@ public class Analyzer {
       if (KuduTable.isKuduTable(table.getMetaStoreTable())) return;
       if (!MetastoreShim.hasTableCapability(table.getMetaStoreTable(), writeRequires)) {
         // Error messages with explanations.
-        ensureTableNotFullAcid(table);
         throw new AnalysisException(String.format(TABLE_NOT_SUPPORTED, "Write",
             table.getFullName(),
             MetastoreShim.getTableAccessType(table.getMetaStoreTable())));
@@ -315,7 +413,6 @@ public class Analyzer {
         // TODO: After Hive provides API calls to send back hints on why
         // the operations are not supported, we will generate error messages
         // accordingly.
-        ensureTableNotFullAcid(table);
         throw new AnalysisException(String.format(TABLE_NOT_SUPPORTED, "Operations",
             table.getFullName(),
             MetastoreShim.getTableAccessType(table.getMetaStoreTable())));
@@ -334,6 +431,7 @@ public class Analyzer {
   private static class GlobalState {
     public final TQueryCtx queryCtx;
     public final AuthorizationFactory authzFactory;
+    public final AuthorizationContext authzCtx;
     public final DescriptorTable descTbl = new DescriptorTable();
     public final IdGenerator<ExprId> conjunctIdGenerator = ExprId.createGenerator();
     public final ColumnLineageGraph lineageGraph;
@@ -348,9 +446,22 @@ public class Analyzer {
     // True if at least one of the analyzers belongs to a subquery.
     public boolean containsSubquery = false;
 
+    // True if one of the analyzers belongs to a set operand of type EXCEPT or INTERSECT
+    // which needs to be rewritten using joins.
+    public boolean setOperationNeedsRewrite = false;
+
+    // True when the query directly scans collection items, e.g.:
+    // select item from complextypestbl.int_array;
+    public boolean hasTopLevelAcidCollectionTableRef = false;
+
     // all registered conjuncts (map from expr id to conjunct). We use a LinkedHashMap to
     // preserve the order in which conjuncts are added.
     public final Map<ExprId, Expr> conjuncts = new LinkedHashMap<>();
+
+    // all registered conjuncts without auxiliary predicate. This additional map is used
+    // for performance reasons of getUnassignedConjuncts(List<TupleId> tupleIds,
+    // boolean inclOjConjuncts).
+    public final Map<ExprId, Expr> conjunctsFromQuery = new LinkedHashMap<>();
 
     // all registered inferred conjuncts (map from tuple id to conjuncts). This map is
     // used to make sure that slot equivalences are not enforced multiple times (e.g.
@@ -460,10 +571,37 @@ public class Analyzer {
     // require analysis (e.g. some literal expressions).
     private int numStmtExprs_ = 0;
 
+    // When set to a value > -1, it represents the number of executors for current
+    // iteration of compilation. Used by auto scaling to pass the info to the planner in
+    // place of ExecutorMembershipSnapshot.numExecutors(). ExecutorMembershipSnapshot is a
+    // singleton.
+    private int numExecutorsForPlanning_ = -1;
+
+    private int availableCoresPerNode_ = -1;
+
+    // Cache of KuduTables opened for this query. (map from table name to kudu table)
+    // This cache prevent multiple openTable calls for a given table in the same query.
+    public final Map<String, org.apache.kudu.client.KuduTable> kuduTables =
+        new HashMap<>();
+
+    // This holds the nullable side slot ids from the outer join's equi-join conjuncts
+    // e.g. t1 left join t2 on t1.id = t2.id, the slot id of t2.id will be added to
+    // this set.
+    public Set<SlotId> ojNullableSlotsInEquiPreds = new HashSet<>();
+
+    // This holds the tuple id's of the arrays that are given as a zipping unnest table
+    // ref. If the table ref is originated from a view then also add the tuple IDs for the
+    // respective table refs from the view.
+    public Set<TupleId> zippingUnnestTupleIds = new HashSet<>();
+
+    // Shows how many zipping unnests were in the query;
+    public int numZippingUnnests = 0;
+
     public GlobalState(StmtTableCache stmtTableCache, TQueryCtx queryCtx,
-        AuthorizationFactory authzFactory) {
+        AuthorizationFactory authzFactory, AuthorizationContext authzCtx) {
       this.stmtTableCache = stmtTableCache;
       this.queryCtx = queryCtx;
+      this.authzCtx = authzCtx;
       this.authzFactory = authzFactory;
       this.lineageGraph = new ColumnLineageGraph();
       List<ExprRewriteRule> rules = new ArrayList<>();
@@ -474,16 +612,26 @@ public class Analyzer {
       // Binary predicates must be rewritten to a canonical form for both Kudu predicate
       // pushdown and Parquet row group pruning based on min/max statistics.
       rules.add(NormalizeBinaryPredicatesRule.INSTANCE);
+      rules.add(ExtractCompoundVerticalBarExprRule.INSTANCE);
       if (queryCtx.getClient_request().getQuery_options().enable_expr_rewrites) {
         rules.add(FoldConstantsRule.INSTANCE);
         rules.add(NormalizeExprsRule.INSTANCE);
         rules.add(ExtractCommonConjunctRule.INSTANCE);
+        if (queryCtx.getClient_request().getQuery_options().isEnable_cnf_rewrites()) {
+          rules.add(new ConvertToCNFRule(queryCtx.getClient_request().getQuery_options()
+              .getMax_cnf_exprs(),true));
+        }
         // Relies on FoldConstantsRule and NormalizeExprsRule.
         rules.add(SimplifyConditionalsRule.INSTANCE);
         rules.add(EqualityDisjunctsToInRule.INSTANCE);
         rules.add(NormalizeCountStarRule.INSTANCE);
         rules.add(SimplifyDistinctFromRule.INSTANCE);
+        rules.add(SimplifyCastStringToTimestamp.INSTANCE);
+        rules.add(CountDistinctToNdvRule.INSTANCE);
+        rules.add(DefaultNdvScaleRule.INSTANCE);
+        rules.add(SimplifyCastExprRule.INSTANCE);
       }
+      rules.add(CountStarToConstRule.INSTANCE);
       exprRewriter_ = new ExprRewriter(rules);
     }
   };
@@ -491,6 +639,47 @@ public class Analyzer {
   private final GlobalState globalState_;
 
   public boolean containsSubquery() { return globalState_.containsSubquery; }
+  public boolean containsSetOperation() { return globalState_.setOperationNeedsRewrite; }
+
+  public int numExecutorsForPlanning() {
+    return (globalState_.numExecutorsForPlanning_ >= 0) ?
+        globalState_.numExecutorsForPlanning_ :
+        ExecutorMembershipSnapshot.getCluster().numExecutors();
+  }
+  public void setNumExecutorsForPlanning(int x) {
+    globalState_.numExecutorsForPlanning_ = x;
+  }
+
+  public int getAvailableCoresPerNode() {
+    Preconditions.checkState(globalState_.availableCoresPerNode_ > 0);
+    return globalState_.availableCoresPerNode_;
+  }
+
+  public void setAvailableCoresPerNode(int x) {
+    Preconditions.checkArgument(x > 0);
+    globalState_.availableCoresPerNode_ =
+        Math.min(QueryConstants.MAX_FRAGMENT_INSTANCES_PER_NODE, x);
+  }
+
+  public int getMinParallelismPerNode() {
+    if (getQueryOptions().isCompute_processing_cost()) {
+      return getQueryOptions().getProcessing_cost_min_threads();
+    } else {
+      return 1;
+    }
+  }
+
+  public int getMaxParallelismPerNode() {
+    if (getQueryOptions().isCompute_processing_cost()) {
+      return Math.max(getMinParallelismPerNode(),
+          Math.min(getQueryOptions().getMax_fragment_instances_per_node(),
+              getAvailableCoresPerNode()));
+    } else if (getQueryOptions().getMt_dop() > 0) {
+      return getQueryOptions().getMt_dop();
+    } else {
+      return 1;
+    }
+  }
 
   // An analyzer stores analysis state for a single select block. A select block can be
   // a top level select statement, or an inline view select block.
@@ -511,12 +700,17 @@ public class Analyzer {
   // Map from tuple id to its corresponding table ref.
   private final Map<TupleId, TableRef> tableRefMap_ = new HashMap<>();
 
+  // This is populated by UnnestExpr during analysis. Each UnnestExpr creates a
+  // CollectionTableRef and adds it to this set. Later on SelectStmt will add these table
+  // refs to the table refs in the FROM clause.
+  private final Set<CollectionTableRef> tableRefsFromUnnestExpr_ = new HashSet<>();
+
   // Set of lowercase ambiguous implicit table aliases.
   private final Set<String> ambiguousAliases_ = new HashSet<>();
 
   // Map from lowercase fully-qualified path to its slot descriptor. Only contains paths
-  // that have a scalar type as destination (see registerSlotRef()).
-  private final Map<String, SlotDescriptor> slotPathMap_ = new HashMap<>();
+  // that have a scalar or struct type as destination (see registerSlotRef()).
+  private final Map<List<String>, SlotDescriptor> slotPathMap_ = new HashMap<>();
 
   // Indicates whether this analyzer/block is guaranteed to have an empty result set
   // due to a limit 0 or constant conjunct evaluating to false.
@@ -528,9 +722,9 @@ public class Analyzer {
   private boolean hasEmptySpjResultSet_ = false;
 
   public Analyzer(StmtTableCache stmtTableCache, TQueryCtx queryCtx,
-      AuthorizationFactory authzFactory) {
+      AuthorizationFactory authzFactory, AuthorizationContext authzCtx) {
     ancestors_ = new ArrayList<>();
-    globalState_ = new GlobalState(stmtTableCache, queryCtx, authzFactory);
+    globalState_ = new GlobalState(stmtTableCache, queryCtx, authzFactory, authzCtx);
     user_ = new User(TSessionStateUtil.getEffectiveUser(queryCtx.session));
   }
 
@@ -563,7 +757,8 @@ public class Analyzer {
    */
   public static Analyzer createWithNewGlobalState(Analyzer parentAnalyzer) {
     GlobalState globalState = new GlobalState(parentAnalyzer.globalState_.stmtTableCache,
-        parentAnalyzer.getQueryCtx(), parentAnalyzer.getAuthzFactory());
+        parentAnalyzer.getQueryCtx(), parentAnalyzer.getAuthzFactory(),
+        parentAnalyzer.getAuthzCtx());
     return new Analyzer(parentAnalyzer, globalState);
   }
 
@@ -638,6 +833,18 @@ public class Analyzer {
   }
 
   /**
+   * Checks if a table ref has already been registered in this analyzer and returns it.
+   * Uses the unique alias from the table ref for the check. Returns null if the table
+   * ref has not been registered.
+   */
+  public TableRef getRegisteredTableRef(String uniqueAlias) {
+    if (uniqueAlias == null) return null;
+    TupleDescriptor tupleDesc = aliasMap_.get(uniqueAlias);
+    if (tupleDesc == null) return null;
+    return tableRefMap_.get(tupleDesc.getId());
+  }
+
+  /**
    * Creates an returns an empty TupleDescriptor for the given table ref and registers
    * it against all its legal aliases. For tables refs with an explicit alias, only the
    * explicit alias is legal. For tables refs with no explicit alias, the fully-qualified
@@ -678,8 +885,23 @@ public class Analyzer {
     for (String alias: aliases) {
       aliasMap_.put(alias, result);
     }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Register aliases {} to tuple {}", aliases, result.debugString());
+    }
     tableRefMap_.put(result.getId(), ref);
     return result;
+  }
+
+  // Registers a CollectionTableRef with given alias and tuple descriptor.
+  // Used to register collections that come from a view and are used in the from clause.
+  public void addCollectionTableRef(
+      String alias, CollectionTableRef ref, TupleDescriptor desc) {
+    aliasMap_.put(alias, desc);
+    tableRefMap_.put(desc.getId(), ref);
+  }
+
+  public void addAlias(String alias, TupleDescriptor desc) {
+    aliasMap_.put(alias, desc);
   }
 
   /**
@@ -691,9 +913,14 @@ public class Analyzer {
    * an AuthorizationException is preferred over an AnalysisException so as not to
    * accidentally reveal the non-existence of tables/databases.
    */
-  public TableRef resolveTableRef(TableRef tableRef) throws AnalysisException {
-    // Return the table if it is already resolved.
+  public TableRef resolveTableRef(TableRef tableRef)
+      throws AnalysisException {
+    // Return the table if it is already resolved. This also avoids the table being
+    // masked again.
     if (tableRef.isResolved()) return tableRef;
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Resolving TableRef {}", ToSqlUtils.getPathSql(tableRef.getPath()));
+    }
     // Try to find a matching local view.
     if (tableRef.getPath().size() == 1) {
       // Searches the hierarchy of analyzers bottom-up for a registered local view with
@@ -712,30 +939,13 @@ public class Analyzer {
     List<String> rawPath = tableRef.getPath();
     Path resolvedPath = null;
     try {
-      resolvedPath = resolvePath(tableRef.getPath(), PathType.TABLE_REF);
+      resolvedPath =
+          resolvePathWithMasking(rawPath, PathType.TABLE_REF, tableRef.timeTravelSpec_);
     } catch (AnalysisException e) {
       // Register privilege requests to prefer reporting an authorization error over
       // an analysis error. We should not accidentally reveal the non-existence of a
       // table/database if the user is not authorized.
-      if (rawPath.size() > 1) {
-        registerPrivReq(builder -> {
-          builder.onTableUnknownOwner(
-              rawPath.get(0), rawPath.get(1)).allOf(tableRef.getPrivilege());
-          if (tableRef.requireGrantOption()) {
-            builder.grantOption();
-          }
-          return builder.build();
-        });
-      }
-
-      registerPrivReq(builder -> {
-        builder.onTableUnknownOwner(
-            getDefaultDb(), rawPath.get(0)).allOf(tableRef.getPrivilege());
-        if (tableRef.requireGrantOption()) {
-          builder.grantOption();
-        }
-        return builder.build();
-      });
+      registerPrivReqOnRawPath(tableRef, rawPath);
       throw e;
     } catch (TableLoadingException e) {
       throw new AnalysisException(String.format(
@@ -746,6 +956,9 @@ public class Analyzer {
     if (resolvedPath.destTable() != null) {
       FeTable table = resolvedPath.destTable();
       if (table instanceof FeView) return new InlineViewRef((FeView) table, tableRef);
+      if (table instanceof IcebergMetadataTable) {
+        return new IcebergMetadataTableRef(tableRef, resolvedPath);
+      }
       // The table must be a base table.
       Preconditions.checkState(table instanceof FeFsTable ||
           table instanceof FeKuduTable ||
@@ -753,9 +966,143 @@ public class Analyzer {
           table instanceof FeDataSourceTable);
       return new BaseTableRef(tableRef, resolvedPath);
     } else {
-      return new CollectionTableRef(tableRef, resolvedPath);
+      return new CollectionTableRef(tableRef, resolvedPath, false);
     }
   }
+
+  /**
+   * Register privilege requests based on the 'tableRawPath'. Only used when we fail to
+   * resolve the TableRef. With these requests we can prefer reporting an authorization
+   * error over an analysis error. See more in resolveTableRef().
+   */
+  private void registerPrivReqOnRawPath(TableRef tableRef, List<String> tableRawPath) {
+    if (tableRawPath.size() > 1) {
+      registerPrivReq(builder -> {
+        builder.onTableUnknownOwner(
+            tableRawPath.get(0), tableRawPath.get(1)).allOf(tableRef.getPrivilege());
+        if (tableRef.requireGrantOption()) {
+          builder.grantOption();
+        }
+        return builder.build();
+      });
+    } else {
+      registerPrivReq(builder -> {
+        builder.onTableUnknownOwner(
+            getDefaultDb(), tableRawPath.get(0)).allOf(tableRef.getPrivilege());
+        if (tableRef.requireGrantOption()) {
+          builder.grantOption();
+        }
+        return builder.build();
+      });
+    }
+  }
+
+  /**
+   * Resolves column-masking/row-filtering policies on the given table. Returns a table
+   * masking view if any of these policies exist. The TableRef should be resolved first
+   * so we know the target table/view/collection.
+   *
+   * @param resolvedTableRef A resolved TableRef for table masking
+   */
+  public TableRef resolveTableMask(TableRef resolvedTableRef) throws AnalysisException {
+    Preconditions.checkState(resolvedTableRef.isResolved(), "Table should be resolved");
+    // Only do table masking when authorization is enabled and the authorization
+    // factory supports column-masking/row-filtering. If both of these are false,
+    // return the unmasked table ref.
+    if (!getAuthzFactory().getAuthorizationConfig().isEnabled()
+        || !getAuthzFactory().supportsTableMasking()) {
+      return resolvedTableRef;
+    }
+    // Performing table masking.
+    AuthorizationChecker authChecker = getAuthzFactory().newAuthorizationChecker(
+        getCatalog().getAuthPolicy());
+    String dbName;
+    String tblName;
+    if (resolvedTableRef instanceof InlineViewRef) {
+      FeView view = ((InlineViewRef) resolvedTableRef).getView();
+      dbName = view.getDb().getName();
+      tblName = view.getName();
+    } else if (resolvedTableRef instanceof CollectionTableRef
+        && resolvedTableRef.isRelative()) {
+       // Relative table refs don't need masking. Its base table will be masked.
+       return resolvedTableRef;
+    } else {
+      dbName = resolvedTableRef.getTable().getDb().getName();
+      tblName = resolvedTableRef.getTable().getName();
+    }
+    // The selected columns should be in the same relative order as they are in the
+    // corresponding Hive table so that the order of the SelectListItem's in the
+    // table mask view (if needs masking or filtering) would be correct.
+    List<Column> columns = resolvedTableRef.getSelectedColumnsInHiveOrder();
+    TableMask tableMask = new TableMask(authChecker, dbName, tblName, columns, user_);
+    try {
+      if (resolvedTableRef instanceof CollectionTableRef) {
+        if (tableMask.needsRowFiltering()) {
+          // The table ref is a non-relative CollectionTableRef, e.g. the table ref in
+          // "select item from functional_parquet.complextypestbl.int_array". We can't
+          // replace "complextypestbl" with a table masking view here.
+          // TODO: Support this in IMPALA-10484 by rewriting it to relative ref, e.g.
+          //  select a.item from functional_parquet.complextypestbl t, t.int_array a;
+          throw new AnalysisException(String.format("Using non-relative collection " +
+              "column %s of table %s.%s is not supported since there are row-filtering " +
+              "policies on this table (IMPALA-10484). Rewrite query to use relative " +
+              "reference.",
+              String.join(".", resolvedTableRef.getResolvedPath().getRawPath()),
+              dbName, tblName));
+        }
+      } else if (!(resolvedTableRef instanceof InlineViewRef) &&
+          resolvedTableRef.getTable() instanceof MaterializedViewHdfsTable &&
+          ((MaterializedViewHdfsTable) resolvedTableRef.getTable())
+            .isReferencesMaskedTables(authChecker, getCatalog(), getUser())) {
+        // If a materialized view definition references tables that have table masking
+        // policies defined, we set a flag indicating that this is an authorization
+        // exception instead of throwing an AnalysisException here. Later, during the
+        // AnalysisContext.analyzeAndAuthorize() we throw the AuthorizationException.
+        mvAuthExceptionMsg_ = String.format("Materialized view %s.%s " +
+            "references tables with column masking or " +
+            "row filtering policies.", dbName, tblName);
+      } else if (tableMask.needsMaskingOrFiltering()) {
+        return InlineViewRef.createTableMaskView(resolvedTableRef, tableMask,
+            getAuthzCtx());
+      }
+      return resolvedTableRef;
+    } catch (InternalException e) {
+      String msg = "Error resolving table mask on " + dbName + "." + tblName;
+      LOG.error(msg, e);
+      throw new AnalysisException(msg, e);
+    }
+  }
+
+  public boolean encounteredMVAuthException() {
+    return mvAuthExceptionMsg_ != null;
+  }
+
+  public String getMVAuthExceptionMsg() {
+    return mvAuthExceptionMsg_;
+  }
+
+  public void setTotalRecordsNumV1(long totalRecordsNumV1) {
+    totalRecordsNumV1_ = totalRecordsNumV1;
+  }
+
+  public long getTotalRecordsNumV1() { return totalRecordsNumV1_; }
+
+  public void setTotalRecordsNumV2(long totalRecordsNumV2) {
+    totalRecordsNumV2_ = totalRecordsNumV2;
+  }
+
+  public long getTotalRecordsNumV2() {
+    return totalRecordsNumV2_;
+  }
+
+  /**
+   * Check if 'count(*)' FunctionCallExpr can be rewritten as LiteralExpr. When
+   * totalRecordsNum_ is 0, no optimization 'count(*)' is still very fast, so return true
+   * only if totalRecordsNum_ is greater than 0.
+   */
+  public boolean canRewriteCountStarForV1() { return totalRecordsNumV1_ > 0; }
+
+  public boolean canRewriteCountStartForV2() { return totalRecordsNumV2_ > 0; }
 
   /**
    * Register conjuncts that are outer joined by a full outer join. For a given
@@ -815,6 +1162,38 @@ public class Analyzer {
     globalState_.semiJoinedTupleIds.put(tid, rhsRef);
   }
 
+  public void addZippingUnnestTupleId(CollectionTableRef tblRef) {
+    Expr collExpr = tblRef.getCollectionExpr();
+    addZippingUnnestTupleId(collExpr);
+  }
+
+  public void addZippingUnnestTupleId(Expr collExpr) {
+    if (collExpr == null) return;
+    if (!(collExpr instanceof SlotRef)) return;
+    SlotRef slotCollExpr = (SlotRef)collExpr;
+    SlotDescriptor collSlotDesc = slotCollExpr.getDesc();
+    Preconditions.checkNotNull(collSlotDesc);
+    TupleDescriptor collTupleDesc = collSlotDesc.getItemTupleDesc();
+    Preconditions.checkNotNull(collTupleDesc);
+    globalState_.zippingUnnestTupleIds.add(collTupleDesc.getId());
+  }
+
+  public void addZippingUnnestTupleId(TupleId tid) {
+    globalState_.zippingUnnestTupleIds.add(tid);
+  }
+
+  public Set<TupleId> getZippingUnnestTupleIds() {
+    return globalState_.zippingUnnestTupleIds;
+  }
+
+  public void increaseZippingUnnestCount() {
+    ++globalState_.numZippingUnnests;
+  }
+
+  public int getNumZippingUnnests() {
+    return globalState_.numZippingUnnests;
+  }
+
   /**
    * Returns the descriptor of the given explicit or implicit table alias or null if no
    * such alias has been registered.
@@ -837,21 +1216,40 @@ public class Analyzer {
     return globalState_.descTbl.getSlotDesc(id);
   }
 
+  /**
+   * Helper to get all slot descriptors in list.
+   */
+  public List<SlotDescriptor> getSlotDescs(List<SlotId> ids) {
+    List<SlotDescriptor> result = new ArrayList<>(ids.size());
+    for (SlotId id : ids) {
+      result.add(getSlotDesc(id));
+    }
+    return result;
+  }
+
   public int getNumTableRefs() { return tableRefMap_.size(); }
   public TableRef getTableRef(TupleId tid) { return tableRefMap_.get(tid); }
+  public Map<TupleId, TableRef> getTableRefs() { return tableRefMap_; }
   public ExprRewriter getConstantFolder() { return globalState_.constantFolder_; }
   public ExprRewriter getExprRewriter() { return globalState_.exprRewriter_; }
 
+  public Set<CollectionTableRef> getTableRefsFromUnnestExpr() {
+    return tableRefsFromUnnestExpr_;
+  }
+  public void addTableRefFromUnnestExpr(CollectionTableRef ref) {
+    tableRefsFromUnnestExpr_.add(ref);
+  }
+
   /**
-   * Given a "table alias"."column alias", return the SlotDescriptor
+   * Given a list of {"table alias", "column alias"}, return the SlotDescriptor.
    */
-  public SlotDescriptor getSlotDescriptor(String qualifiedColumnName) {
+  public SlotDescriptor getSlotDescriptor(List<String> qualifiedColumnName) {
     return slotPathMap_.get(qualifiedColumnName);
   }
 
   /**
    * Return true if this analyzer has no ancestors. (i.e. false for the analyzer created
-   * for inline views/ union operands, etc.)
+   * for inline views/ set operands (except/intersect/union), etc.)
    */
   public boolean isRootAnalyzer() { return ancestors_.isEmpty(); }
 
@@ -868,6 +1266,62 @@ public class Analyzer {
    * an empty result set.
    */
   public boolean hasEmptySpjResultSet() { return hasEmptySpjResultSet_; }
+
+  /**
+   * Resolves 'rawPath' according to the given path type. Deal with paths that got
+   * resolved to nested columns of table masking views.
+   */
+  public Path resolvePathWithMasking(List<String> rawPath, PathType pathType)
+      throws AnalysisException, TableLoadingException {
+    return this.resolvePathWithMasking(rawPath, pathType, null);
+  }
+
+  public Path resolvePathWithMasking(List<String> rawPath, PathType pathType,
+      TimeTravelSpec timeTravelSpec) throws AnalysisException, TableLoadingException {
+    Path resolvedPath = resolvePath(rawPath, pathType, timeTravelSpec);
+    // Skip normal resolution cases that don't relate to nested types.
+    if (pathType == PathType.TABLE_REF) {
+      if (resolvedPath.destTable() != null || !resolvedPath.isRootedAtTuple()) {
+        return resolvedPath;
+      }
+    } else if (pathType == PathType.SLOT_REF) {
+      if (!resolvedPath.getMatchedTypes().get(0).isStructType()) {
+        return resolvedPath;
+      }
+    } else if (pathType == PathType.STAR) {
+      // For "v.*", return directly if "v" is a table/view.
+      // If it's a struct column, we need to further resolve it if it's now resolved on a
+      // table masking view.
+      if (resolvedPath.getMatchedTypes().isEmpty()) return resolvedPath;
+      Preconditions.checkState(resolvedPath.destType().isStructType());
+    }
+    // In this case, resolvedPath is resolved on a nested column. Check if it's resolved
+    // on a table masking view. The root TableRef(table/view) could be at a parent query
+    // block (correlated case, e.g. "t.int_array" in query
+    // "SELECT ... FROM tbl t, (SELECT * FROM t.int_array) a" roots at "tbl t" which is
+    // in the parent block), so we should find the parent block first then we can find
+    // the root TableRef.
+    TupleId rootTupleId = resolvedPath.getRootDesc().getId();
+    Analyzer parentAnalyzer = findAnalyzer(rootTupleId);
+    TableRef rootTblRef = parentAnalyzer.getTableRef(rootTupleId);
+    Preconditions.checkNotNull(rootTblRef);
+    if (!rootTblRef.isTableMaskingView()) return resolvedPath;
+    // resolvedPath is resolved on a nested column of a table masking view. The view
+    // won't produce results of nested columns. It just exposes the nested columns of the
+    // underlying BaseTableRef in the fields of its output type. (See more in
+    // InlineViewRef#createTupleDescriptor()). We need to resolve 'rawPath' inside the
+    // view as if the underlying table is not masked. So the resolved path can point to
+    // the real table and be used to create materialized slot in the TupleDescriptor of
+    // the real table.
+    InlineViewRef tableMaskingView = (InlineViewRef) rootTblRef;
+    Preconditions.checkState(
+        tableMaskingView.getUnMaskedTableRef() instanceof BaseTableRef);
+    // Resolve rawPath inside the table masking view to point to the real table.
+    Path maskedPath = tableMaskingView.inlineViewAnalyzer_.resolvePath(
+        rawPath, pathType, timeTravelSpec);
+    maskedPath.setPathBeforeMasking(resolvedPath);
+    return maskedPath;
+  }
 
   /**
    * Resolves the given raw path according to the given path type, as follows:
@@ -894,6 +1348,11 @@ public class Analyzer {
    */
   public Path resolvePath(List<String> rawPath, PathType pathType)
       throws AnalysisException, TableLoadingException {
+    return this.resolvePath(rawPath, pathType, null);
+  }
+
+  public Path resolvePath(List<String> rawPath, PathType pathType,
+      TimeTravelSpec timeTravelSpec) throws AnalysisException, TableLoadingException {
     // We only allow correlated references in predicates of a subquery.
     boolean resolveInAncestors = false;
     if (pathType == PathType.TABLE_REF || pathType == PathType.ANY) {
@@ -904,19 +1363,24 @@ public class Analyzer {
     // Convert all path elements to lower case.
     List<String> lcRawPath = Lists.newArrayListWithCapacity(rawPath.size());
     for (String s: rawPath) lcRawPath.add(s.toLowerCase());
-    return resolvePath(lcRawPath, pathType, resolveInAncestors);
+    return resolvePath(lcRawPath, pathType, resolveInAncestors, timeTravelSpec);
   }
 
   private Path resolvePath(List<String> rawPath, PathType pathType,
-      boolean resolveInAncestors) throws AnalysisException, TableLoadingException {
+      boolean resolveInAncestors, TimeTravelSpec timeTravelSpec)
+      throws AnalysisException, TableLoadingException {
     // List of all candidate paths with different roots. Paths in this list are initially
     // unresolved and may be illegal with respect to the pathType.
     List<Path> candidates = getTupleDescPaths(rawPath);
-
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Candidates for {} {}: {}", pathType, ToSqlUtils.getPathSql(rawPath),
+          candidates);
+    }
     LinkedList<String> errors = Lists.newLinkedList();
     if (pathType == PathType.SLOT_REF || pathType == PathType.STAR) {
       // Paths rooted at all of the unique registered tuple descriptors.
       for (TableRef tblRef: tableRefMap_.values()) {
+        if (tblRef.isHidden()) continue;
         candidates.add(new Path(tblRef.getDesc(), rawPath));
       }
     } else {
@@ -933,23 +1397,45 @@ public class Analyzer {
         TableName tblName = candidateTbls.get(tblNameIdx);
         FeTable tbl = null;
         try {
-          tbl = getTable(tblName.getDb(), tblName.getTbl());
+          tbl = getTable(tblName, /* must_exist */ false);
         } catch (AnalysisException e) {
           // Ignore to allow path resolution to continue.
         }
         if (tbl != null) {
-          candidates.add(new Path(tbl, rawPath.subList(tblNameIdx + 1, rawPath.size())));
+          if (timeTravelSpec != null) {
+            if (!(tbl instanceof FeIcebergTable)) {
+              throw new AnalysisException(String.format(
+                  "FOR %s AS OF clause is only supported for Iceberg tables. "
+                      + "%s is not an Iceberg table.",
+                  timeTravelSpec.getKind() == TimeTravelSpec.Kind.TIME_AS_OF ?
+                      "SYSTEM_TIME" :
+                      "SYSTEM_VERSION",
+                  tbl.getFullName()));
+            }
+            timeTravelSpec.analyze(this);
+
+            FeIcebergTable rootTable = (FeIcebergTable) tbl;
+            tbl = new IcebergTimeTravelTable(rootTable, timeTravelSpec);
+          }
+          int offset = tblNameIdx + (tbl instanceof IcebergMetadataTable ? 2 : 1);
+          candidates.add(new Path(tbl, rawPath.subList(offset, rawPath.size())));
         }
       }
+      LOG.trace("Replace candidates with {}", candidates);
     }
 
     Path result = resolvePaths(rawPath, candidates, pathType, errors);
     if (result == null && resolveInAncestors && hasAncestors()) {
-      result = getParentAnalyzer().resolvePath(rawPath, pathType, true);
+      LOG.trace("Resolve in ancestors");
+      result = getParentAnalyzer().resolvePath(rawPath, pathType, true, timeTravelSpec);
     }
     if (result == null) {
       Preconditions.checkState(!errors.isEmpty());
       throw new AnalysisException(errors.getFirst());
+    }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Resolved {} {} to {}", pathType, ToSqlUtils.getPathSql(rawPath),
+          result.debugString());
     }
     return result;
   }
@@ -964,14 +1450,14 @@ public class Analyzer {
 
     // Path rooted at a tuple desc with an explicit or implicit unqualified alias.
     TupleDescriptor rootDesc = getDescriptor(rawPath.get(0));
-    if (rootDesc != null) {
+    if (rootDesc != null && !rootDesc.isHidden()) {
       result.add(new Path(rootDesc, rawPath.subList(1, rawPath.size())));
     }
 
     // Path rooted at a tuple desc with an implicit qualified alias.
     if (rawPath.size() > 1) {
       rootDesc = getDescriptor(rawPath.get(0) + "." + rawPath.get(1));
-      if (rootDesc != null) {
+      if (rootDesc != null && !rootDesc.isHidden()) {
         result.add(new Path(rootDesc, rawPath.subList(2, rawPath.size())));
       }
     }
@@ -981,7 +1467,7 @@ public class Analyzer {
   /**
    * Resolves the given paths and checks them for legality and ambiguity. Returns the
    * single legal path resolution if it exists, null otherwise.
-   * Populates 'errors' with a a prioritized list of error messages starting with the
+   * Populates 'errors' with a prioritized list of error messages starting with the
    * most relevant one. The list contains at least one error message if null is returned.
    */
   private Path resolvePaths(List<String> rawPath, List<Path> paths, PathType pathType,
@@ -1003,7 +1489,10 @@ public class Analyzer {
 
     List<Path> legalPaths = new ArrayList<>();
     for (Path p: paths) {
-      if (!p.resolve()) continue;
+      if (!p.resolve()) {
+        LOG.trace("Can't resolve path {}", p);
+        continue;
+      }
 
       // Check legality of the resolved path.
       if (p.isRootedAtTuple() && !isVisible(p.getRootDesc().getId())) {
@@ -1081,35 +1570,185 @@ public class Analyzer {
       }
       return null;
     }
+    if (LOG.isTraceEnabled()) LOG.trace("Legal candidate: {}", legalPaths.get(0));
     return legalPaths.get(0);
   }
 
-  /**
-   * Returns an existing or new SlotDescriptor for the given path. Always returns
-   * a new empty SlotDescriptor for paths with a collection-typed destination.
-   */
   public SlotDescriptor registerSlotRef(Path slotPath) throws AnalysisException {
+    return registerSlotRef(slotPath, true);
+  }
+
+  /**
+   * Returns an existing or new SlotDescriptor for the given path.
+   * If 'duplicateIfCollections' is true, then always returns a new empty SlotDescriptor
+   * for paths with a collection-typed destination.
+   */
+  public SlotDescriptor registerSlotRef(Path slotPath,
+      boolean duplicateIfCollections) throws AnalysisException {
     Preconditions.checkState(slotPath.isRootedAtTuple());
-    // Always register a new slot descriptor for collection types. The BE currently
-    // relies on this behavior for setting unnested collection slots to NULL.
+    // If 'tupleStack_' is empty then this is a top level call to this function (not a
+    // recursive call) and we push the root TupleDescriptor to 'tupleStack_'.
+    try (TupleStackGuard guard = tupleStack_.isEmpty()
+        ? new TupleStackGuard(slotPath.getRootDesc()) : null) {
+      if (slotPath.destType().isCollectionType() && duplicateIfCollections) {
+        // Register a new slot descriptor for collection types. The BE currently
+        // relies on this behavior for setting unnested collection slots to NULL.
+        return createAndRegisterRawSlotDesc(slotPath, false);
+      }
+      // SlotRefs with scalar or struct types are registered against the slot's
+      // fully-qualified lowercase path.
+      List<String> key = slotPath.getFullyQualifiedRawPath();
+      Preconditions.checkState(key.stream().allMatch(s -> s.equals(s.toLowerCase())),
+          "Slot paths should be lower case: " + key);
+      SlotDescriptor existingSlotDesc = slotPathMap_.get(key);
+      if (existingSlotDesc != null) return existingSlotDesc;
+
+      return createAndRegisterSlotDesc(slotPath);
+    }
+  }
+
+  private SlotDescriptor createAndRegisterSlotDesc(Path slotPath)
+      throws AnalysisException {
     if (slotPath.destType().isCollectionType()) {
-      SlotDescriptor result = addSlotDescriptor(slotPath.getRootDesc());
-      result.setPath(slotPath);
-      registerColumnPrivReq(result);
+      SlotDescriptor result = registerCollectionSlotRef(slotPath);
+      registerSlotDesc(slotPath, result, true);
       return result;
     }
-    // SlotRefs with a scalar type are registered against the slot's
-    // fully-qualified lowercase path.
-    String key = slotPath.toString();
-    Preconditions.checkState(key.equals(key.toLowerCase()),
-        "Slot paths should be lower case: " + key);
-    SlotDescriptor existingSlotDesc = slotPathMap_.get(key);
-    if (existingSlotDesc != null) return existingSlotDesc;
-    SlotDescriptor result = addSlotDescriptor(slotPath.getRootDesc());
-    result.setPath(slotPath);
-    slotPathMap_.put(key, result);
-    registerColumnPrivReq(result);
+
+    SlotDescriptor result = createAndRegisterRawSlotDesc(slotPath, true);
+    if (slotPath.destType().isStructType()) {
+      createStructTuplesAndSlotDescs(result);
+    }
     return result;
+  }
+
+  /**
+   * Creates a new SlotDescriptor with path 'slotPath' in the tuple at the top of
+   * 'tupleStack_'. Does not create SlotDescriptors for children of complex types. If
+   * 'insertIntoSlotPath' is true, inserts the new SlotDescriptor into 'slotPathMap_'.
+   * Also registers a column-level privilege request for the new SlotDescriptor.
+   */
+  private SlotDescriptor createAndRegisterRawSlotDesc(Path slotPath,
+      boolean insertIntoSlotPathMap) {
+    final SlotDescriptor result = addSlotDescriptorAtCurrentLevel();
+    registerSlotDesc(slotPath, result, insertIntoSlotPathMap);
+    return result;
+  }
+
+  /**
+   *  Sets 'slotPath' as the path of 'desc' and registers a column-level privilege request
+   *  for it. If 'insertIntoSlotPath' is true, inserts the new SlotDescriptor into
+   *  'slotPathMap_'.
+   */
+  private void registerSlotDesc(Path slotPath, SlotDescriptor desc,
+      boolean insertIntoSlotPathMap) {
+    Preconditions.checkState(slotPath.isRootedAtTuple());
+    desc.setPath(slotPath);
+    if (insertIntoSlotPathMap) {
+      slotPathMap_.put(slotPath.getFullyQualifiedRawPath(), desc);
+    }
+    registerColumnPrivReq(desc);
+  }
+
+  public void createStructTuplesAndSlotDescs(SlotDescriptor desc)
+      throws AnalysisException {
+    Preconditions.checkState(desc.getType().isStructType());
+    TupleDescriptor structTuple = getDescTbl().createTupleDescriptor("struct_tuple");
+    Path slotPath = desc.getPath();
+    if (slotPath != null) structTuple.setPath(slotPath);
+    final StructType type = (StructType) desc.getType();
+    structTuple.setType(type);
+    structTuple.setParentSlotDesc(desc);
+    desc.setItemTupleDesc(structTuple);
+
+    try (TupleStackGuard guard = new TupleStackGuard(structTuple)) {
+      for (StructField structField : type.getFields()) {
+        // 'slotPath' could be null e.g. when the query has an order by clause and
+        // this is the sorting tuple.
+        // TODO: IMPALA-10939: When we enable collections in sorting tuples we need to
+        // revisit this. Currently collection SlotDescriptors cannot be created without a
+        // path. Maybe descriptors should have a path even in the sorting tuple.
+        if (slotPath == null) {
+          createStructTuplesAndSlotDescsWithoutPath(slotPath, structField);
+        } else {
+          Path childRelPath = Path.createRelPath(slotPath, structField.getName());
+          childRelPath.resolve();
+          SlotDescriptor childDesc = createAndRegisterSlotDesc(childRelPath);
+        }
+      }
+    }
+  }
+
+  private void createStructTuplesAndSlotDescsWithoutPath(Path slotPath,
+      StructField structField) throws AnalysisException {
+    Preconditions.checkState(slotPath == null);
+    Preconditions.checkState(!structField.getType().isCollectionType());
+
+    SlotDescriptor childDesc = addSlotDescriptorAtCurrentLevel();
+    childDesc.setType(structField.getType());
+
+    if (childDesc.getType().isStructType()) {
+      createStructTuplesAndSlotDescs(childDesc);
+    }
+  }
+
+  /**
+   * Registers a collection and its descendants.
+   * Creates a CollectionTableRef for all collections on the path.
+   */
+  private SlotDescriptor registerCollectionSlotRef(Path slotPath)
+      throws AnalysisException {
+    Preconditions.checkState(slotPath.isResolved());
+    Preconditions.checkState(slotPath.destType().isCollectionType());
+    List<String> rawPath = slotPath.getRawPath();
+    List<String> collectionTableRawPath = new ArrayList<>();
+    TupleDescriptor rootDesc = slotPath.getRootDesc();
+    Preconditions.checkNotNull(rootDesc);
+    if (rootDesc.hasExplicitAlias()) {
+      collectionTableRawPath.add(rootDesc.getAlias());
+    } else {
+      collectionTableRawPath.addAll(Arrays.asList(rootDesc.getAlias().split("\\.")));
+    }
+    collectionTableRawPath.addAll(rawPath);
+
+    TableRef tblRef = new TableRef(collectionTableRawPath, null);
+    CollectionTableRef collTblRef = new CollectionTableRef(tblRef, slotPath, true);
+    collTblRef.analyze(this);
+
+    Preconditions.checkState(collTblRef.getCollectionExpr() instanceof SlotRef);
+    SlotDescriptor desc = ((SlotRef) collTblRef.getCollectionExpr()).getDesc();
+    desc.setIsMaterializedRecursively(true);
+
+    try (TupleStackGuard guard = new TupleStackGuard(desc.getItemTupleDesc())) {
+      if (slotPath.destType().isArrayType()) {
+        // Resolve path
+        List<String> rawPathToItem = Arrays.asList(Path.ARRAY_ITEM_FIELD_NAME);
+        resolveAndRegisterDescendantPath(collTblRef, rawPathToItem);
+      } else {
+        Preconditions.checkState(slotPath.destType().isMapType());
+
+        List<String> rawPathToKey = Arrays.asList(Path.MAP_KEY_FIELD_NAME);
+        resolveAndRegisterDescendantPath(collTblRef, rawPathToKey);
+
+        List<String> rawPathToValue = Arrays.asList(Path.MAP_VALUE_FIELD_NAME);
+        resolveAndRegisterDescendantPath(collTblRef, rawPathToValue);
+      }
+    }
+
+    return desc;
+  }
+
+  private void resolveAndRegisterDescendantPath(CollectionTableRef collTblRef,
+      List<String> rawPath) throws AnalysisException {
+    Path resolvedPath = new Path(collTblRef.getDesc(), rawPath);
+    boolean isResolved = resolvedPath.resolve();
+    Preconditions.checkState(isResolved);
+
+    if (resolvedPath.destType().isBinary()) {
+      throw new AnalysisException(
+          "Binary type inside collection types is not supported (IMPALA-11491).");
+    }
+    registerSlotRef(resolvedPath, false);
   }
 
   /**
@@ -1132,12 +1771,54 @@ public class Analyzer {
   }
 
   /**
+   * Register columns for resolving column mask. The order in which columns are registered
+   * is not necessarily the same as the relative order of those columns in the
+   * corresponding Hive table.
+   */
+  public void registerColumnForMasking(SlotDescriptor slotDesc) {
+    Preconditions.checkNotNull(slotDesc.getPath());
+    TupleDescriptor tupleDesc = slotDesc.getParent();
+    // Pass the full path for nested types even though these are ignore currently.
+    // TODO: RANGER-3525: Clarify handling of column masks on nested types
+    Column column;
+    if (slotDesc.isVirtualColumn()) {
+      column = VirtualColumn.getVirtualColumn(slotDesc.getVirtualColumnType());
+    }
+    else {
+      column = new Column(
+          String.join(".", slotDesc.getPath().getRawPath()), slotDesc.getType(),
+            /*position*/-1);
+    }
+    Analyzer analyzer = this;
+    TableRef tblRef;
+    do {
+      tblRef = analyzer.tableRefMap_.get(tupleDesc.getId());
+      // Search in parent query block for correlative reference.
+      analyzer = analyzer.getParentAnalyzer();
+    } while (tblRef == null && analyzer != null);
+    if (tblRef == null) return;
+    Preconditions.checkNotNull(tblRef,
+        "Failed to find TableRef of tuple {}", tupleDesc);
+    tblRef.registerColumn(column);
+  }
+
+  /**
    * Creates a new slot descriptor and related state in globalState.
    */
   public SlotDescriptor addSlotDescriptor(TupleDescriptor tupleDesc) {
     SlotDescriptor result = globalState_.descTbl.addSlotDescriptor(tupleDesc);
     globalState_.blockBySlot.put(result.getId(), this);
     return result;
+  }
+
+  /**
+   * Creates a new slot descriptor and related state in globalState. The new slot
+   * descriptor will be created in the tuple at the top of 'tupleStack_'.
+   */
+  private SlotDescriptor addSlotDescriptorAtCurrentLevel() {
+    TupleDescriptor tupleDesc = tupleStack_.peek();
+    Preconditions.checkNotNull(tupleDesc);
+    return addSlotDescriptor(tupleDesc);
   }
 
   /**
@@ -1261,6 +1942,10 @@ public class Analyzer {
     e.setId(globalState_.conjunctIdGenerator.getNextId());
     globalState_.conjuncts.put(e.getId(), e);
 
+    if (!e.isAuxExpr()) {
+      globalState_.conjunctsFromQuery.put(e.getId(), e);
+    }
+
     List<TupleId> tupleIds = new ArrayList<>();
     List<SlotId> slotIds = new ArrayList<>();
     e.getIds(tupleIds, slotIds);
@@ -1352,9 +2037,8 @@ public class Analyzer {
   public List<Expr> getUnassignedConjuncts(
       List<TupleId> tupleIds, boolean inclOjConjuncts) {
     List<Expr> result = new ArrayList<>();
-    for (Expr e: globalState_.conjuncts.values()) {
+    for (Expr e: globalState_.conjunctsFromQuery.values()) {
       if (e.isBoundByTupleIds(tupleIds)
-          && !e.isAuxExpr()
           && !globalState_.assignedConjuncts.contains(e.getId())
           && ((inclOjConjuncts && !e.isConstant())
               || !globalState_.ojClauseByConjunct.containsKey(e.getId()))) {
@@ -1392,8 +2076,24 @@ public class Analyzer {
    * Return all unassigned registered conjuncts for node's table ref ids.
    * Wrapper around getUnassignedConjuncts(List<TupleId> tupleIds).
    */
-  public List<Expr> getUnassignedConjuncts(PlanNode node) {
-    return getUnassignedConjuncts(node.getTblRefIds());
+  public final List<Expr> getUnassignedConjuncts(PlanNode node) {
+    List<TupleId> tupleIds = Lists.newCopyOnWriteArrayList(node.getTblRefIds());
+    if (node instanceof JoinNode) {
+      for (TupleId tid : node.getTblRefIds()) {
+        // Pick up TupleId of the masked table since the table masking view and the masked
+        // table are the same in the original query. SlotRefs of table's nested columns
+        // are resolved into table's tuple, but not the table masking view's tuple. As a
+        // result, predicates referencing such nested columns also reference the masked
+        // table's tuple id.
+        TupleDescriptor tuple = getTupleDesc(tid);
+        Preconditions.checkNotNull(tuple);
+        BaseTableRef maskedTable = tuple.getMaskedTable();
+        if (maskedTable != null && maskedTable.exposeNestedColumnsByTableMaskView()) {
+          tupleIds.add(maskedTable.getId());
+        }
+      }
+    }
+    return getUnassignedConjuncts(tupleIds);
   }
 
   /**
@@ -1478,6 +2178,7 @@ public class Analyzer {
   public FeCatalog getCatalog() { return globalState_.stmtTableCache.catalog; }
   public StmtTableCache getStmtTableCache() { return globalState_.stmtTableCache; }
   public Set<String> getAliases() { return aliasMap_.keySet(); }
+  public void removeAlias(String alias) { aliasMap_.remove(alias); }
 
   /**
    * Returns list of candidate equi-join conjuncts to be evaluated by the join node
@@ -1555,21 +2256,7 @@ public class Analyzer {
    * Returns true if predicate 'e' can be correctly evaluated by a tree materializing
    * 'tupleIds', otherwise false:
    * - The predicate needs to be bound by tupleIds.
-   * - For On-clause predicates:
-   *   - If the predicate is from an anti-join On-clause it must be evaluated by the
-   *     corresponding anti-join node.
-   *   - Predicates from the On-clause of an inner or semi join are evaluated at the
-   *     node that materializes the required tuple ids, unless they reference outer
-   *     joined tuple ids. In that case, the predicates are evaluated at the join node
-   *     of the corresponding On-clause.
-   *   - Predicates referencing full-outer joined tuples are assigned at the originating
-   *     join if it is a full-outer join, otherwise at the last full-outer join that does
-   *     not materialize the table ref ids of the originating join.
-   *   - Predicates from the On-clause of a left/right outer join are assigned at
-   *     the corresponding outer join node with the exception of simple predicates
-   *     that only reference a single tuple id. Those may be assigned below the
-   *     outer join node if they are from the same On-clause that makes the tuple id
-   *     nullable.
+   * - For On-clause predicates, see canEvalOnClauseConjunct() for more info.
    * - Otherwise, a predicate can only be correctly evaluated if for all outer-joined
    *   referenced tids the last join to outer-join this tid has been materialized.
    */
@@ -1580,38 +2267,18 @@ public class Analyzer {
     if (tids.isEmpty()) return true;
 
     if (e.isOnClauseConjunct()) {
-      if (isAntiJoinedConjunct(e)) return canEvalAntiJoinedConjunct(e, tupleIds);
-
-      if (isIjConjunct(e) || isSjConjunct(e)) {
-        if (!containsOuterJoinedTid(tids)) return true;
-        // If the predicate references an outer-joined tuple, then evaluate it at
-        // the join that the On-clause belongs to.
-        TableRef onClauseTableRef = null;
-        if (isIjConjunct(e)) {
-          onClauseTableRef = globalState_.ijClauseByConjunct.get(e.getId());
-        } else {
-          onClauseTableRef = globalState_.sjClauseByConjunct.get(e.getId());
-        }
-        Preconditions.checkNotNull(onClauseTableRef);
-        return tupleIds.containsAll(onClauseTableRef.getAllTableRefIds());
-      }
-
-      if (isFullOuterJoined(e)) return canEvalFullOuterJoinedConjunct(e, tupleIds);
-      if (isOjConjunct(e)) {
-        // Force this predicate to be evaluated by the corresponding outer join node.
-        // The join node will pick up the predicate later via getUnassignedOjConjuncts().
-        if (tids.size() > 1) return false;
-        // Optimization for single-tid predicates: Legal to assign below the outer join
-        // if the predicate is from the same On-clause that makes tid nullable
-        // (otherwise e needn't be true when that tuple is set).
-        TupleId tid = tids.get(0);
-        return globalState_.ojClauseByConjunct.get(e.getId()) == getLastOjClause(tid);
-      }
-
-      // Should have returned in one of the cases above.
-      Preconditions.checkState(false);
+      return canEvalOnClauseConjunct(tupleIds, e);
     }
+    return isLastOjMaterializedByTupleIds(tupleIds, e);
+  }
 
+  /**
+   * Checks if for all outer-joined referenced tids of the predicate the last join
+   * to outer-join this tid has been materialized by tupleIds.
+   */
+  public boolean isLastOjMaterializedByTupleIds(List<TupleId> tupleIds, Expr e) {
+    List<TupleId> tids = new ArrayList<>();
+    e.getIds(tids, null);
     for (TupleId tid: tids) {
       TableRef rhsRef = getLastOjClause(tid);
       // Ignore 'tid' because it is not outer-joined.
@@ -1620,6 +2287,62 @@ public class Analyzer {
       if (!tupleIds.containsAll(rhsRef.getAllTableRefIds())) return false;
     }
     return true;
+  }
+
+  /**
+   * Checks if a conjunct from the On-clause can be evaluated in a node that materializes
+   * a given list of tuple ids.
+   * - If the predicate is from an anti-join On-clause it must be evaluated by the
+   * corresponding anti-join node.
+   * - Predicates from the On-clause of an inner or semi join are evaluated at the node
+   * that materializes the required tuple ids, unless they reference outer joined tuple
+   * ids. In that case, the predicates are evaluated at the join node of the corresponding
+   * On-clause.
+   * - Predicates referencing full-outer joined tuples are assigned at the originating
+   * join if it is a full-outer join, otherwise at the last full-outer join that does not
+   * materialize the table ref ids of the originating join.
+   * - Predicates from the On-clause of a left/right outer join are assigned at the
+   * corresponding outer join node with the exception of simple predicates that only
+   * reference a single tuple id. Those may be assigned below the outer join node if they
+   * are from the same On-clause that makes the tuple id nullable.
+   */
+  public boolean canEvalOnClauseConjunct(List<TupleId> tupleIds, Expr e) {
+    Preconditions.checkState(e.isOnClauseConjunct());
+    if (isAntiJoinedConjunct(e)) return canEvalAntiJoinedConjunct(e, tupleIds);
+
+    List<TupleId> exprTids = new ArrayList<>();
+    e.getIds(exprTids, null);
+    if (exprTids.isEmpty()) return true;
+
+    if (isIjConjunct(e) || isSjConjunct(e)) {
+      if (!containsOuterJoinedTid(exprTids)) return true;
+      // If the predicate references an outer-joined tuple, then evaluate it at
+      // the join that the On-clause belongs to.
+      TableRef onClauseTableRef = null;
+      if (isIjConjunct(e)) {
+        onClauseTableRef = globalState_.ijClauseByConjunct.get(e.getId());
+      } else {
+        onClauseTableRef = globalState_.sjClauseByConjunct.get(e.getId());
+      }
+      Preconditions.checkNotNull(onClauseTableRef);
+      return tupleIds.containsAll(onClauseTableRef.getAllTableRefIds());
+    }
+
+    if (isFullOuterJoined(e)) return canEvalFullOuterJoinedConjunct(e, tupleIds);
+    if (isOjConjunct(e)) {
+      // Force this predicate to be evaluated by the corresponding outer join node.
+      // The join node will pick up the predicate later via getUnassignedOjConjuncts().
+      if (exprTids.size() > 1) return false;
+      // Optimization for single-tid predicates: Legal to assign below the outer join
+      // if the predicate is from the same On-clause that makes tid nullable
+      // (otherwise e needn't be true when that tuple is set).
+      TupleId tid = exprTids.get(0);
+      return globalState_.ojClauseByConjunct.get(e.getId()) == getLastOjClause(tid);
+    }
+
+    // Should have returned in one of the cases above.
+    Preconditions.checkState(false);
+    return false;
   }
 
   /**
@@ -1728,14 +2451,38 @@ public class Analyzer {
         if (srcSids.containsAll(destSids)) {
           p = srcConjunct;
         } else {
+          // It is incorrect to propagate predicates inferred from equi-join conjuncts
+          // into a plan subtree that is on the nullable side of an outer join if the
+          // predicate is not null-filtering.
+          // For example:
+          // select * from (select id is not null and col is null as a from (select A.id,
+          // B.col from A left join B on A.id = B.id) t ) t where a = 1
+          // In this query the inferred predicate (B.id is not null and B.col is null = 1)
+          // should not be evaluated at the scanner of B.
+          // We use 'ojmap' to save the mapping from src to the outer join equal slot,
+          // eg. B.id. We substitue the non-outer-join slots first and use
+          // 'isNullableConjunct' to do a more strict check on the conjunct before the
+          // final substitution.
           ExprSubstitutionMap smap = new ExprSubstitutionMap();
+          ExprSubstitutionMap ojSmap = new ExprSubstitutionMap();
           for (int i = 0; i < srcSids.size(); ++i) {
-            smap.put(
+            if (globalState_.ojNullableSlotsInEquiPreds.contains(destSids.get(i))) {
+              ojSmap.put(
                 new SlotRef(globalState_.descTbl.getSlotDesc(srcSids.get(i))),
                 new SlotRef(globalState_.descTbl.getSlotDesc(destSids.get(i))));
+            } else {
+              smap.put(
+                  new SlotRef(globalState_.descTbl.getSlotDesc(srcSids.get(i))),
+                  new SlotRef(globalState_.descTbl.getSlotDesc(destSids.get(i))));
+            }
           }
           try {
             p = srcConjunct.trySubstitute(smap, this, false);
+            if (hasOuterJoinedTuple &&
+                isNullableConjunct(p, Arrays.asList(destTid))) continue;
+            if (ojSmap.size() != 0) {
+              p = p.trySubstitute(ojSmap, this, false);
+            }
           } catch (ImpalaException exc) {
             // not an executable predicate; ignore
             continue;
@@ -2068,7 +2815,7 @@ public class Analyzer {
       // columns because mappings to non-partition columns do not provide
       // a performance benefit.
       SlotId srcSid = srcSids.get(0);
-      for (SlotDescriptor destSlot: destTupleDesc.getSlots()) {
+      for (SlotDescriptor destSlot: destTupleDesc.getSlotsRecursively()) {
         if (ignoreSlots.contains(destSlot.getId())) continue;
         if (hasValueTransfer(srcSid, destSlot.getId())) {
           allDestSids.add(Lists.newArrayList(destSlot.getId()));
@@ -2090,7 +2837,7 @@ public class Analyzer {
       // The limitations are show in predicate-propagation.test.
       List<SlotId> destSids = new ArrayList<>();
       for (SlotId srcSid: srcSids) {
-        for (SlotDescriptor destSlot: destTupleDesc.getSlots()) {
+        for (SlotDescriptor destSlot: destTupleDesc.getSlotsRecursively()) {
           if (ignoreSlots.contains(destSlot.getId())) continue;
           if (hasValueTransfer(srcSid, destSlot.getId())
               && !destSids.contains(destSlot.getId())) {
@@ -2109,6 +2856,29 @@ public class Analyzer {
    * returns false otherwise. Throws if backend expression evaluation fails.
    */
   public boolean isTrueWithNullSlots(Expr p) throws InternalException {
+    Expr nullTuplePred = substituteNullSlots(p);
+    return FeSupport.EvalPredicate(nullTuplePred, getQueryCtx());
+  }
+
+  /**
+   * Try to evaluate 'p' with all NULL slots into a literal.
+   * @return null if it could not be evaluated successfully, the literal otherwise.
+   * @throws AnalysisException
+   */
+  public LiteralExpr evalWithNullSlots(Expr p) throws AnalysisException {
+    Expr nullTuplePred = substituteNullSlots(p);
+    // can't evaluate an expression that isn't constant.
+    if (!nullTuplePred.isConstant()) {
+      return null;
+    }
+    return LiteralExpr.createBounded(
+            nullTuplePred, getQueryCtx(), StringLiteral.MAX_STRING_LEN);
+  }
+
+  /**
+   * Replace all the SlotRefs in 'p' with null literals
+   */
+  private Expr substituteNullSlots(Expr p) {
     // Construct predicate with all SlotRefs substituted by NullLiterals.
     List<SlotRef> slotRefs = new ArrayList<>();
     p.collect(Predicates.instanceOf(SlotRef.class), slotRefs);
@@ -2121,8 +2891,7 @@ public class Analyzer {
         // function signature as in the original predicate.
         nullSmap.put(slotRef.clone(), NullLiteral.create(slotRef.getType()));
     }
-    Expr nullTuplePred = p.substitute(nullSmap, this, false);
-    return FeSupport.EvalPredicate(nullTuplePred, getQueryCtx());
+    return p.substitute(nullSmap, this, false);
   }
 
   public TupleId getTupleId(SlotId slotId) {
@@ -2290,6 +3059,10 @@ public class Analyzer {
           || tblRef.getJoinOp() == JoinOperator.RIGHT_ANTI_JOIN) {
         g.addEdge(innerSlot.asInt(), outerSlot.asInt());
       }
+      if (tblRef.getJoinOp() == JoinOperator.LEFT_OUTER_JOIN ||
+          tblRef.getJoinOp() == JoinOperator.RIGHT_OUTER_JOIN) {
+        globalState_.ojNullableSlotsInEquiPreds.add(innerSlot);
+      }
     }
   }
 
@@ -2451,21 +3224,22 @@ public class Analyzer {
 
   /**
    * Mark all slots that are referenced in exprs as materialized.
+   * Return the affected Tuples.
    */
-  public void materializeSlots(List<Expr> exprs) {
+  public Set<TupleDescriptor> materializeSlots(List<Expr> exprs) {
     List<SlotId> slotIds = new ArrayList<>();
     for (Expr e: exprs) {
       Preconditions.checkState(e.isAnalyzed());
       e.getIds(null, slotIds);
     }
-    globalState_.descTbl.markSlotsMaterialized(slotIds);
+    return globalState_.descTbl.markSlotsMaterialized(slotIds);
   }
 
-  public void materializeSlots(Expr e) {
+  public Set<TupleDescriptor> materializeSlots(Expr e) {
     List<SlotId> slotIds = new ArrayList<>();
     Preconditions.checkState(e.isAnalyzed());
     e.getIds(null, slotIds);
-    globalState_.descTbl.markSlotsMaterialized(slotIds);
+    return globalState_.descTbl.markSlotsMaterialized(slotIds);
   }
 
   /**
@@ -2545,7 +3319,7 @@ public class Analyzer {
    * Returns null if an empty expression list or null is passed to it.
    * Throw an AnalysisException if the types are incompatible.
    */
-  public List<Expr> castToUnionCompatibleTypes(List<List<Expr>> exprLists)
+  public List<Expr> castToSetOpCompatibleTypes(List<List<Expr>> exprLists)
       throws AnalysisException {
     if (exprLists == null || exprLists.size() == 0) return null;
     if (exprLists.size() == 1) return exprLists.get(0);
@@ -2557,6 +3331,12 @@ public class Analyzer {
       // Type compatible with the i-th exprs of all expr lists.
       // Initialize with type of i-th expr in first list.
       Type compatibleType = firstList.get(i).getType();
+      if (firstList.get(i) instanceof SlotRef &&
+          compatibleType.isStructType()) {
+        throw new AnalysisException(String.format(
+            "Set operations don't support STRUCT type. %s in %s", compatibleType.toSql(),
+            firstList.get(i).toSql()));
+      }
       widestExprs.add(firstList.get(i));
       for (int j = 1; j < exprLists.size(); ++j) {
         Preconditions.checkState(exprLists.get(j).size() == firstList.size());
@@ -2568,6 +3348,10 @@ public class Analyzer {
       }
       // Now that we've found a compatible type, add implicit casts if necessary.
       for (int j = 0; j < exprLists.size(); ++j) {
+        // Checking compatibility with every expression
+        Type commonType = getCompatibleType(compatibleType,
+            widestExprs.get(i), exprLists.get(j).get(i));
+        Preconditions.checkState(commonType.equals(compatibleType));
         if (!exprLists.get(j).get(i).getType().equals(compatibleType)) {
           Expr castExpr = exprLists.get(j).get(i).castTo(compatibleType);
           exprLists.get(j).set(i, castExpr);
@@ -2578,6 +3362,14 @@ public class Analyzer {
   }
 
   public String getDefaultDb() { return globalState_.queryCtx.session.database; }
+
+  public String getFallbackDbForFunctions() {
+    return getQueryCtx()
+        .getClient_request()
+        .getQuery_options()
+        .getFallback_db_for_functions();
+  }
+
   public User getUser() { return user_; }
   public String getUserShortName() throws AnalysisException {
     try {
@@ -2597,6 +3389,7 @@ public class Analyzer {
   public AuthorizationConfig getAuthzConfig() {
     return getAuthzFactory().getAuthorizationConfig();
   }
+  public AuthorizationContext getAuthzCtx() { return globalState_.authzCtx; }
   public boolean isAuthzEnabled() { return getAuthzConfig().isEnabled(); }
   public ListMap<TNetworkAddress> getHostIndex() { return globalState_.hostIndex; }
   public ColumnLineageGraph getColumnLineageGraph() { return globalState_.lineageGraph; }
@@ -2620,21 +3413,27 @@ public class Analyzer {
    */
   public Set<TAccessEvent> getAccessEvents() { return globalState_.accessEvents; }
   public void addAccessEvent(TAccessEvent event) {
+    // We convert 'event.name' to lowercase to avoid duplicate access events since a
+    // statement could possibly result in two calls to addAccessEvent(), e.g.,
+    // COMPUTE STATS.
+    event.name = event.name.toLowerCase();
     globalState_.accessEvents.add(event);
   }
 
   /**
-   * Returns the Table for the given database and table name from the 'stmtTableCache'
-   * in the global analysis state.
+   * Returns the Table for the given TableName from the 'stmtTableCache' in the global
+   * analysis state.
    * Throws an AnalysisException if the database or table does not exist.
    * Throws a TableLoadingException if the registered table failed to load.
    * Does not register authorization requests or access events.
    */
-  public FeTable getTable(String dbName, String tableName)
+  public FeTable getTable(TableName tblName, boolean mustExist)
       throws AnalysisException, TableLoadingException {
-    TableName tblName = new TableName(dbName, tableName);
     FeTable table = globalState_.stmtTableCache.tables.get(tblName);
     if (table == null) {
+      if (!mustExist) {
+        return null;
+      }
       if (!globalState_.stmtTableCache.dbs.contains(tblName.getDb())) {
         throw new AnalysisException(DB_DOES_NOT_EXIST_ERROR_MSG + tblName.getDb());
       } else {
@@ -2647,9 +3446,85 @@ public class Analyzer {
       // when it is accessed.
       ImpalaException cause = ((FeIncompleteTable) table).getCause();
       if (cause instanceof TableLoadingException) throw (TableLoadingException) cause;
-      throw new TableLoadingException("Missing metadata for table: " + tableName, cause);
+      throw new TableLoadingException("Missing metadata for table: " + tblName, cause);
     }
     return table;
+  }
+
+  /**
+   * Wrapper around {@link #getTable(TableName tblName, boolean mustExist)}.
+   */
+  public FeTable getTable(String dbName, String tableName, boolean mustExist)
+      throws AnalysisException, TableLoadingException {
+    TableName tblName = new TableName(dbName, tableName);
+    return getTable(tblName, mustExist);
+  }
+
+  /**
+   * Adds auxiliary virtual table for a query.
+   */
+  public void addVirtualTable(VirtualTable virtTable) {
+    TableName tblName = virtTable.getTableName();
+    globalState_.stmtTableCache.tables.put(tblName, virtTable);
+  }
+
+  /**
+   * Adds a new Iceberg metadata table to the stmt table cache. At this point it is
+   * unknown if the base table is loaded for scanning as well, therefore the original
+   * table is kept. The metadata table will have its vTbl field filled, while the original
+   * table gets a new key without the vTbl field.
+   * 'tblRefPath' parameter has to be an IcebergMetadataTable reference path.
+   */
+  public void addMetadataVirtualTable(List<String> tblRefPath) throws AnalysisException {
+    Preconditions.checkArgument(IcebergMetadataTable.isIcebergMetadataTable(tblRefPath));
+    try {
+      TableName catalogTableName = new TableName(tblRefPath.get(0),
+          tblRefPath.get(1));
+      TableName virtualTableName = new TableName(tblRefPath.get(0),
+          tblRefPath.get(1), tblRefPath.get(2));
+      // The catalog table (the base of the virtual table) has been loaded and cached
+      // under the name of the virtual table.
+      FeTable catalogTable = getStmtTableCache().tables.get(virtualTableName);
+      if (catalogTable instanceof IcebergMetadataTable) return;
+      IcebergMetadataTable virtualTable =
+          new IcebergMetadataTable(catalogTable, tblRefPath.get(2));
+      getStmtTableCache().tables.put(catalogTableName, catalogTable);
+      getStmtTableCache().tables.put(virtualTableName, virtualTable);
+    } catch (ImpalaRuntimeException e) {
+      throw new AnalysisException("Could not create metadata table for table "
+          + "reference: " + StringUtils.join(tblRefPath, "."), e);
+    }
+  }
+
+  public org.apache.kudu.client.KuduTable getKuduTable(FeKuduTable feKuduTable)
+      throws AnalysisException {
+    String tableName = feKuduTable.getFullName();
+
+    // Use the kuduTable from the global state cache if it exists.
+    org.apache.kudu.client.KuduTable kuduTable = globalState_.kuduTables.get(tableName);
+
+    // Otherwise try use the KuduTable from the FeKuduTable if it exists and
+    // add it to the global state state cache future use.
+    if (kuduTable == null &&
+        feKuduTable instanceof LocalKuduTable &&
+        ((LocalKuduTable) feKuduTable).getKuduTable() != null) {
+      kuduTable = ((LocalKuduTable) feKuduTable).getKuduTable();
+      globalState_.kuduTables.put(tableName, kuduTable);
+    }
+
+    // Last, get the KuduTable via a request to the Kudu server using openTable and
+    // add it to the global state state cache for future use.
+    if (kuduTable == null) {
+      try {
+        KuduClient client = KuduUtil.getKuduClient(feKuduTable.getKuduMasterHosts());
+        kuduTable = client.openTable(feKuduTable.getKuduTableName());
+        globalState_.kuduTables.put(tableName, kuduTable);
+      } catch (Exception ex) {
+        throw new AnalysisException("Unable to open the Kudu table: " + tableName, ex);
+      }
+    }
+
+    return kuduTable;
   }
 
   /**
@@ -2716,15 +3591,15 @@ public class Analyzer {
       }
     }
     // Propagate the AnalysisException if the table/db does not exist.
-    table = getTable(fqTableName.getDb(), fqTableName.getTbl());
+    table = getTable(fqTableName.getDb(), fqTableName.getTbl(), /* must_exist */ true);
     Preconditions.checkNotNull(table);
     if (addAccessEvent) {
       // Add an audit event for this access
       TCatalogObjectType objectType = TCatalogObjectType.TABLE;
       if (table instanceof FeView) objectType = TCatalogObjectType.VIEW;
       for (Privilege priv : privilege) {
-        globalState_.accessEvents.add(new TAccessEvent(
-            fqTableName.toString(), objectType, priv.toString()));
+        addAccessEvent(new TAccessEvent(fqTableName.toString(), objectType,
+            priv.toString()));
       }
     }
     return table;
@@ -2807,8 +3682,8 @@ public class Analyzer {
     });
     // Propagate the exception if needed.
     FeDb retDb = getDb(dbName, throwIfDoesNotExist);
-    globalState_.accessEvents.add(new TAccessEvent(
-        dbName, TCatalogObjectType.DATABASE, privilege.toString()));
+    addAccessEvent(new TAccessEvent(dbName, TCatalogObjectType.DATABASE,
+        privilege.toString()));
     return retDb;
   }
 
@@ -2846,8 +3721,8 @@ public class Analyzer {
                 .build());
       } else if (privilege == Privilege.CREATE) {
         // Table does not exist and hence the owner information cannot be deduced.
-        // For creating something under this db, we translate the db ownership into having
-        // CREATE privilege on tables under it.
+        // For creating something under this db, we translate the db ownership into
+        // having CREATE privilege on tables under it.
         String dbOwnerUser = db == null? null : db.getOwnerUser();
         registerPrivReq(builder ->
           builder.allOf(privilege)
@@ -2874,6 +3749,10 @@ public class Analyzer {
    */
   public String getTargetDbName(TableName tableName) {
     return tableName.isFullyQualified() ? tableName.getDb() : getDefaultDb();
+  }
+
+  public String getTargetDbName(FunctionName functionName) {
+    return functionName.isFullyQualified() ? functionName.getDb() : getDefaultDb();
   }
 
   /**
@@ -2940,11 +3819,26 @@ public class Analyzer {
    * getWarnings() has been called, no warning may be added to the Analyzer anymore.
    */
   public void addWarning(String msg) {
-    Preconditions.checkState(!globalState_.warningsRetrieved);
+    if (checkWarningsRetrieved(msg)) return;
+
     if (msg == null) return;
     Integer count = globalState_.warnings.get(msg);
     if (count == null) count = 0;
     globalState_.warnings.put(msg, count + 1);
+  }
+
+  /**
+   * 'addWarning' method may be called after the warnings are retrieved, e.g. in
+   * analyzing some substituted/cloned predicates (IMPALA-11021). We need to make sure
+   * no new warnings are added after retrieved.
+   */
+  private boolean checkWarningsRetrieved(String msg) {
+    if (globalState_.warningsRetrieved) {
+      // Make sure that substituted/cloned predicates' warnings already exists in map.
+      Preconditions.checkState(globalState_.warnings.containsKey(msg));
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -3012,5 +3906,401 @@ public class Analyzer {
    */
   public String getServerName() {
     return isAuthzEnabled() ? getAuthzConfig().getServerName().intern() : null;
+  }
+
+  /**
+   * Get the where or having conjuncts of the specified table from globalState_.conjuncts
+   */
+  private List<Expr> getTableConjuncts(TupleId id) {
+    List<Expr> result = new ArrayList<>();
+    for (Map.Entry<ExprId, Expr> conjunct : globalState_.conjuncts.entrySet()) {
+      Expr expr = conjunct.getValue();
+      if (expr != null && !expr.isOnClauseConjunct() && !expr.isAuxExpr()) {
+        List<TupleId> tids = new ArrayList<>();
+        expr.getIds(tids, null);
+        if (tids.contains(id)) {
+          result.add(expr);
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Collect the tuple id of the disjunctive conjunct's children which is not disjunctive
+   * eg. a > 10 and b > 10 or d < 20, one inner set is the tuple id of 'a > 10
+   * and b > 10' and another is the tuple id of 'd < 20'
+   */
+  private Set<Set<TupleId>> collectTupleIdForDisjunctiveConjuncts(Expr e) {
+    Set<Set<TupleId>> set = new HashSet<Set<TupleId>>();
+    if (Expr.IS_OR_PREDICATE.apply(e)) {
+      set.addAll(collectTupleIdForDisjunctiveConjuncts(e.getChild(0)));
+      set.addAll(collectTupleIdForDisjunctiveConjuncts(e.getChild(1)));
+    } else {
+      List<TupleId> tids = new ArrayList<>();
+      e.getIds(tids, null);
+      set.add(new HashSet<TupleId>(tids));
+    }
+    return set;
+  }
+
+  /**
+   * Return true if the result can have null values when apply e on tupleIds
+   */
+  private boolean isNullableConjunct(Expr e, List<TupleId> tupleIds) {
+    // A clause like "t1.v1 IS NOT NULL OR t2.v2 IS NOT NULL" and t1 in 'tupleIds' does
+    // not prove that t1.v1 can't be NULL, because when t2.v2 IS NOT NULL, t1.v1 can be
+    // null. But a clause like "t1.v1 IS NOT NULL OR t1.v2 IS NOT NULL" proves that the
+    // t1 row as a whole can't be all-NULL.
+    List<Expr> orConjuncts = new ArrayList<>();
+    e.collectAll(Expr.IS_OR_PREDICATE, orConjuncts);
+    for (Expr expr : orConjuncts) {
+      Set<Set<TupleId>> childrenTis = collectTupleIdForDisjunctiveConjuncts(expr);
+      for (Set<TupleId> tids : childrenTis) {
+        tids.retainAll(tupleIds);
+        if (tids.isEmpty()) {
+          return true;
+        }
+      }
+    }
+
+    // Simply assume that a conjunct contains a UDF, is distinct from/ is not distinct
+    // from operator, nondeterministic buitin functions or is null operator, it is not
+    // null-rejecting predicate.
+    if (e.contains(Predicates.or(Expr.IS_DISTINCT_FROM_OR_NOT_DISTINCT_PREDICATE,
+        Expr.IS_NONDETERMINISTIC_BUILTIN_FN_PREDICATE,
+        Expr.IS_UDF_PREDICATE, Expr.IS_IS_NULL_PREDICATE))) {
+      return true;
+    }
+
+    // Predicate contains conditional function, case expr may not null-rejecting.
+    List<Expr> maybeNullableExprs = new ArrayList<>();
+    e.collectAll(Predicates.or(Expr.IS_CONDITIONAL_BUILTIN_FN_PREDICATE,
+        Expr.IS_CASE_EXPR_PREDICATE), maybeNullableExprs);
+    if (!maybeNullableExprs.isEmpty()) {
+      if (!Expr.IS_BINARY_PREDICATE.apply(e)) return true;
+      // For t1 left join t2 on t1.a = t2.a where t2.b > coalesce(t1.c, t2.c) can
+      // simplify to an inner join. Simply support the case that one child does not
+      // contain conditional builtin function or case expr and has tuple id in outer
+      // joined tuples.
+      for (Expr operand : e.getChildren()) {
+        if (operand instanceof ArithmeticExpr) {
+          // 't1.id + coalesce(t1.c, t2.c) > coalesce(t2.c, t1.c)' is null-rejecting
+          // predicate for t1
+          for (Expr expr : operand.getChildren()) {
+            if (noConditionalBuiltinFnOrCaseExpr(expr, tupleIds)) return false;
+          }
+        } else {
+          if (noConditionalBuiltinFnOrCaseExpr(operand, tupleIds)) return false;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * If the 'e' does not contain conditional builtin function or case expr and has
+   * tupleId in 'tupleIds', return true, return false otherwise.
+   */
+  private boolean noConditionalBuiltinFnOrCaseExpr(Expr e, List<TupleId> tupleIds) {
+    List<Expr> nullableExprs = new ArrayList<>();
+    e.collectAll(Predicates.or(Expr.IS_CONDITIONAL_BUILTIN_FN_PREDICATE,
+        Expr.IS_CASE_EXPR_PREDICATE), nullableExprs);
+    if (!nullableExprs.isEmpty()) return false;
+    List<TupleId> tids = new ArrayList<>();
+    e.getIds(tids, null);
+    if (TupleId.intersect(tupleIds, new HashSet<>(tids))) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Returns true if at least one of the conjuncts of the tuple 'tupleIds' evaluates to
+   * false when all its referenced slots are NULL, returns false otherwise.
+   * This method identifies null-rejecting predicates which are the requirements to
+   * convert an outer-join to an inner join.
+   * For example, t1 left join t2 on t1.id=t2.id where t2.v2>10, 't2.v2>10' is the
+   * null-rejecting predicate.
+   */
+  private boolean hasNullRejectingConjucts(List<TupleId> tupleIds) {
+    for (TupleId id : tupleIds) {
+      List<Expr> conjuncts = getTableConjuncts(id);
+      for (Expr e : conjuncts) {
+        // Skip not null-rejecting conjunct
+        if (isNullableConjunct(e, tupleIds)) continue;
+
+        try {
+          // Check whether 'e' evaluates to true when all its referenced slots are NULL,
+          // The false result indicates that 'e' is null-rejecting conjunct.
+          if (!isTrueWithNullSlots(e)) {
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Tuple " + id + " has null rejecting conjunct: "
+                  + e.debugString());
+            }
+            return true;
+          }
+        } catch (InternalException ex) {
+          // Expr evaluation failed in the backend. Skip 'e' since we cannot
+          // determine whether it is null-rejecting conjunct.
+          LOG.warn("Skipping to check whether the conjunct is null-rejecting because"
+              + "backend evaluation failed: " + e.toSql(), ex);
+        }
+      }
+    }
+    return false;
+  }
+
+  private void removeOuterJoinedTupleIds(List<TupleId> ids) {
+    for (TupleId id : ids) {
+      globalState_.outerJoinedTupleIds.remove(id);
+    }
+  }
+
+  /**
+   * When transforming an outer join to an inner join is feasible, we need to re-register
+   * conjunct to its containing join On clause.
+   */
+  private void ojToIjOnClauseConjucts(TableRef tblRef) {
+    List<ExprId> ojConjuncts = globalState_.conjunctsByOjClause.get(tblRef.getId());
+    for (ExprId eid : ojConjuncts) {
+      globalState_.ojClauseByConjunct.remove(eid);
+      globalState_.ijClauseByConjunct.put(eid, tblRef);
+    }
+    globalState_.conjunctsByOjClause.remove(tblRef.getId());
+  }
+
+  /**
+   * When transforming an outer join to a left/right/inner join is feasible,
+   * we need to remove outer joined tuple id from globalState_.fullOuterJoinedTupleIds
+   * and the conjunct of the last full outer join table from
+   * globalState_.fullOuterJoinedConjuncts.
+   */
+  private void removeFullOuterJoinedTupleIdsAndConjuncts(List<TupleId> ids) {
+    for (TupleId id : ids) {
+      TableRef ref = globalState_.fullOuterJoinedTupleIds.get(id);
+      Iterator<Map.Entry<ExprId, TableRef>> it =
+          globalState_.fullOuterJoinedConjuncts.entrySet().iterator();
+      while(it.hasNext()){
+          Map.Entry<ExprId, TableRef> entry = it.next();
+          if(entry.getValue() == ref) it.remove();
+      }
+      globalState_.fullOuterJoinedTupleIds.remove(id);
+    }
+  }
+
+  /**
+   * When transforming an outer join to an inner join is feasible, we need re-register
+   * !empty() predicates for CollectionTableRef.
+   * For more info see SelectStmt.registerIsNotEmptyPredicates().
+   */
+  private void reRegisterIsNotEmptyPredicates(TableRef tblRef) {
+    Preconditions.checkState(tblRef.getJoinOp().isInnerJoin());
+    if (hasWithClause()) return;
+    if (!(tblRef instanceof CollectionTableRef)) return;
+    CollectionTableRef ref = (CollectionTableRef) tblRef;
+    if (!ref.isRelative() || ref.isCorrelated()) return;
+    // Do not generate a predicate if the parent tuple is outer joined.
+    if (isOuterJoined(ref.getResolvedPath().getRootDesc().getId())) return;
+
+    try {
+      IsNotEmptyPredicate isNotEmptyPred =
+          new IsNotEmptyPredicate(ref.getCollectionExpr().clone());
+      isNotEmptyPred.analyze(this);
+      registerOnClauseConjuncts(Lists.<Expr>newArrayList(isNotEmptyPred), ref);
+    } catch (AnalysisException ex) {
+      LOG.warn("Re-register the !empty() predicates failed.", ex);
+    }
+  }
+
+  public boolean hasOuterJoined(List<TableRef> tableRefs) {
+    for (TableRef tblRef : tableRefs) {
+      if (tblRef.getJoinOp().isOuterJoin()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Get the outer joined tuple ids that satisfy null-rejecting from the inner join on
+   * clause.
+   * TODO: Use value transfer graph to get the base table tuple id of the slot is not null
+   * and register in globalState_. We use this to simplify outer joins of inline view.
+   * eg: t1, (select t3.id c from t2 left join t3 on t1.id = t2.id) t4 where t1.id = t4.c
+   */
+  private void getNullRejectingOjTidsFromIjOnClause(TableRef tblRef,
+      Set<TupleId> nullRejectingTids) {
+    List<Expr> onConjuncts = new ArrayList<>();
+    for (Map.Entry<ExprId, TableRef> entry : globalState_.ijClauseByConjunct.entrySet()) {
+      if (entry.getValue() == tblRef) {
+        Expr e = globalState_.conjuncts.get(entry.getKey());
+        if (e.isOnClauseConjunct()) {
+          onConjuncts.add(e);
+        }
+      }
+    }
+    List<TupleId> tids = tblRef.getLeftTblRef().getAllTableRefIds();
+    for (Expr e : onConjuncts) {
+      if (isNullableConjunct(e, tids)) continue;
+      try {
+        // Check whether 'e' evaluates to true when all its referenced slots are NULL,
+        // The false result indicates that 'e' is null-rejecting conjunct.
+        if (!isTrueWithNullSlots(e)) {
+          List<TupleId> ids = new ArrayList<>();
+          e.getIds(ids, null);
+          for (TupleId id : ids) {
+            if (isOuterJoined(id)) nullRejectingTids.add(id);
+          }
+        }
+      } catch (InternalException ex) {
+        LOG.warn("Skipping the conjunct of on clause because backend evaluation failed: "
+            + e.toSql(), ex);
+      }
+    }
+  }
+
+  /**
+   * Simplify outer join executing before inner joined table by inner join on clause.
+   * For example, t1 left join t2 on t1.id = t2.id join t3 on t2.id = t3.id, we can
+   * convert this as t1 join t2 on t1.id = t2.id join t3 on t2.id =  t3.id
+   */
+  private boolean simplifyOuterJoinsByIjOnClause(List<TableRef> tableRefs,
+      TableRef ijTableRef) {
+    Set<TupleId> nullRejectingTidSet = new HashSet<>();
+    getNullRejectingOjTidsFromIjOnClause(ijTableRef, nullRejectingTidSet);
+    if (!nullRejectingTidSet.isEmpty()) {
+      return simplifyOuterJoins(tableRefs, nullRejectingTidSet);
+    }
+    return false;
+  }
+
+  /**
+   * Attempt to transform outer joins into inner joins.
+   * Return true, if has outer join simplification.
+   *
+   * As a general rule, an outer join can be converted to an inner join if there is a
+   * condition on the null-filling table that filters out non‑matching rows. In a left
+   * outer join, the right table is the null-filling table, while it is the left table
+   * in a right outer join.
+   * In a full outer join, both tables are null-filling tables. Conditions that are FALSE
+   * for nulls are referred to as null rejecting conditions, and these are the conditions
+   * that enable the outer‑to‑inner join conversion to be made.
+   *
+   * An outer join can be converted to an inner join if the WHERE clause contains at
+   * least one null rejecting condition on the inner table.
+   */
+  public boolean simplifyOuterJoins(List<TableRef> tableRefs,
+      Set<TupleId> nullRejectingTids) {
+    boolean isSimplified = false;
+    List<TableRef> processedTblRefs = new ArrayList<>();
+    for (TableRef tableRef : tableRefs) {
+      switch (tableRef.getJoinOp()) {
+        case INNER_JOIN: {
+          if (tableRef.getLeftTblRef() != null) {
+            boolean ret = simplifyOuterJoinsByIjOnClause(processedTblRefs, tableRef);
+            isSimplified = isSimplified ? true : ret;
+          }
+          break;
+        }
+        case LEFT_OUTER_JOIN: {
+          TupleId id = tableRef.getId();
+          if (nullRejectingTids.contains(id) || hasNullRejectingConjucts(id.asList())) {
+            tableRef.setJoinOp(JoinOperator.INNER_JOIN);
+            removeOuterJoinedTupleIds(id.asList());
+            ojToIjOnClauseConjucts(tableRef);
+            reRegisterIsNotEmptyPredicates(tableRef);
+            simplifyOuterJoinsByIjOnClause(processedTblRefs, tableRef);
+            isSimplified = true;
+          }
+          break;
+        }
+        case RIGHT_OUTER_JOIN: {
+          List<TupleId> ids = tableRef.getLeftTblRef().getAllTableRefIds();
+          // find out all null-rejecting TupleIds in 'ids'
+          boolean hasNullRejectingTid = gatherNullRejectingTids(ids, nullRejectingTids);
+          if (hasNullRejectingTid || TupleId.intersect(ids, nullRejectingTids) ||
+              hasNullRejectingConjucts(ids)) {
+            tableRef.setJoinOp(JoinOperator.INNER_JOIN);
+            removeOuterJoinedTupleIds(new ArrayList<TupleId>(nullRejectingTids));
+            ojToIjOnClauseConjucts(tableRef);
+            reRegisterIsNotEmptyPredicates(tableRef);
+            simplifyOuterJoinsByIjOnClause(processedTblRefs, tableRef);
+            isSimplified = true;
+          }
+          break;
+        }
+        case FULL_OUTER_JOIN: {
+          List<TupleId> ids = tableRef.getLeftTblRef().getAllTableRefIds();
+          // find out all null-rejecting TupleIds in 'ids'
+          boolean hasNullRejectingTid = gatherNullRejectingTids(ids, nullRejectingTids);
+          if (hasNullRejectingTid || TupleId.intersect(ids, nullRejectingTids) ||
+              hasNullRejectingConjucts(ids)) {
+            removeFullOuterJoinedTupleIdsAndConjuncts(ids);
+            removeFullOuterJoinedTupleIdsAndConjuncts(tableRef.getId().asList());
+            if (nullRejectingTids.contains(tableRef.getId()) ||
+                hasNullRejectingConjucts(tableRef.getId().asList())) {
+              tableRef.setJoinOp(JoinOperator.INNER_JOIN);
+              nullRejectingTids.add(tableRef.getId());
+              removeOuterJoinedTupleIds(new ArrayList<TupleId>(nullRejectingTids));
+              ojToIjOnClauseConjucts(tableRef);
+              reRegisterIsNotEmptyPredicates(tableRef);
+              simplifyOuterJoinsByIjOnClause(processedTblRefs, tableRef);
+            } else {
+              tableRef.setJoinOp(JoinOperator.LEFT_OUTER_JOIN);
+              removeOuterJoinedTupleIds(new ArrayList<TupleId>(nullRejectingTids));
+            }
+            isSimplified = true;
+          } else if (nullRejectingTids.contains(tableRef.getId()) ||
+              hasNullRejectingConjucts(tableRef.getId().asList())) {
+            tableRef.setJoinOp(JoinOperator.RIGHT_OUTER_JOIN);
+            removeOuterJoinedTupleIds(tableRef.getId().asList());
+            isSimplified = true;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      processedTblRefs.add(tableRef);
+    }
+    return isSimplified;
+  }
+
+   /**
+   * Get the tuple ids that satisfy null-rejecting from the where or having onjuncts.
+   * Return true if has null rejecting tid in tupleIds.
+   */
+  private boolean gatherNullRejectingTids(List<TupleId> tupleIds,
+      Set<TupleId> nullRejectingTids) {
+    boolean hasNullRejectingTid = false;
+    for (TupleId id : tupleIds) {
+      List<Expr> conjuncts = getTableConjuncts(id);
+      for (Expr e : conjuncts) {
+        // Skip not null-rejecting conjunct
+        if (isNullableConjunct(e, tupleIds)) continue;
+
+        try {
+          // Check whether 'e' evaluates to true when all its referenced slots are NULL,
+          // The false result indicates that 'e' is null-rejecting conjunct.
+          if (!isTrueWithNullSlots(e)) {
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Tuple " + id + " has null rejecting conjunct: "
+                  + e.debugString());
+            }
+            nullRejectingTids.add(id);
+            hasNullRejectingTid = true;
+            break;
+          }
+        } catch (InternalException ex) {
+          // Expr evaluation failed in the backend. Skip 'e' since we cannot
+          // determine whether it is null-rejecting conjunct.
+          LOG.warn("Fail to verify " + e.toSql() + " being null-rejecting because of the"
+              + " backend evaluation failure", ex);
+        }
+      }
+    }
+    return hasNullRejectingTid;
   }
 }

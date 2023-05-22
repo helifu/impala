@@ -32,14 +32,18 @@ import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.QueryFixture;
 import org.apache.impala.common.SqlCastException;
 import org.apache.impala.rewrite.BetweenToCompoundRule;
+import org.apache.impala.rewrite.SimplifyCastExprRule;
+import org.apache.impala.rewrite.ConvertToCNFRule;
 import org.apache.impala.rewrite.EqualityDisjunctsToInRule;
 import org.apache.impala.rewrite.ExprRewriteRule;
 import org.apache.impala.rewrite.ExprRewriter;
 import org.apache.impala.rewrite.ExtractCommonConjunctRule;
+import org.apache.impala.rewrite.ExtractCompoundVerticalBarExprRule;
 import org.apache.impala.rewrite.FoldConstantsRule;
 import org.apache.impala.rewrite.NormalizeBinaryPredicatesRule;
 import org.apache.impala.rewrite.NormalizeCountStarRule;
 import org.apache.impala.rewrite.NormalizeExprsRule;
+import org.apache.impala.rewrite.SimplifyCastStringToTimestamp;
 import org.apache.impala.rewrite.SimplifyConditionalsRule;
 import org.apache.impala.rewrite.SimplifyDistinctFromRule;
 import org.junit.BeforeClass;
@@ -174,6 +178,19 @@ public class ExprRewriteRulesTest extends FrontendTestBase {
     return RewritesOk(tableName, exprStr, Lists.newArrayList(rule), expectedExprStr);
   }
 
+  /**
+   * Given a list of `rule`, this function checks whether the rewritten <expr> is as
+   * expected.
+   *
+   * If no rule in `rules` is expected to be fired, callers should set expectedExprStr
+   * to null or "NULL". Otherwise, this function would throw an exception like
+   * "Rule xxx didn't fire"
+   *
+   * @param exprStr: origin expr
+   * @param rules: list of rewrite rules
+   * @param expectedExprStr: expected expr
+   * @return: Expr: rewritten expr
+   */
   public Expr RewritesOk(String exprStr, List<ExprRewriteRule> rules,
       String expectedExprStr)
       throws ImpalaException {
@@ -388,6 +405,8 @@ public class ExprRewriteRulesTest extends FrontendTestBase {
     RewritesOk("repeat('A', 65536)", rule, repeat("A", 65_536));
     RewritesOk("repeat('A', 4294967296)", rule, null);
 
+    // Check that constant folding can handle binary results.
+    RewritesOk("cast(concat('a', 'b') as binary)", rule, "'ab'");
   }
 
   @Test
@@ -423,8 +442,8 @@ public class ExprRewriteRulesTest extends FrontendTestBase {
   public void testCompoundPredicate() throws ImpalaException {
     ExprRewriteRule rule = SimplifyConditionalsRule.INSTANCE;
 
-    RewritesOk("false || id = 0", rule, "id = 0");
-    RewritesOk("true || id = 0", rule, "TRUE");
+    RewritesOk("false OR id = 0", rule, "id = 0");
+    RewritesOk("true OR id = 0", rule, "TRUE");
     RewritesOk("false && id = 0", rule, "FALSE");
     RewritesOk("true && id = 0", rule, "id = 0");
   }
@@ -770,6 +789,68 @@ public class ExprRewriteRulesTest extends FrontendTestBase {
     RewritesOk("if(bool_col <=> NULL, 1, 2)", rules, null);
   }
 
+  @Test
+  public void testCountDistinctToNdvRule() throws ImpalaException {
+    List<ExprRewriteRule> rules = Lists.newArrayList(
+            org.apache.impala.rewrite.CountDistinctToNdvRule.INSTANCE
+    );
+    session.options().setAppx_count_distinct(true);
+    RewritesOk("count(distinct bool_col)", rules, "ndv(bool_col)");
+  }
+
+  @Test
+  public void testDefaultNdvScaleRule() throws ImpalaException {
+    List<ExprRewriteRule> rules = Lists.newArrayList(
+            org.apache.impala.rewrite.DefaultNdvScaleRule.INSTANCE
+    );
+    session.options().setDefault_ndv_scale(10);
+    RewritesOk("ndv(bool_col)", rules, "ndv(bool_col, 10)");
+  }
+
+  @Test
+  public void testDefaultNdvScaleRuleNotSet() throws ImpalaException {
+    List<ExprRewriteRule> rules = Lists.newArrayList(
+            org.apache.impala.rewrite.DefaultNdvScaleRule.INSTANCE
+    );
+    RewritesOk("ndv(bool_col)", rules, null);
+  }
+
+  @Test
+  public void testDefaultNdvScaleRuleSetDefault() throws ImpalaException {
+    List<ExprRewriteRule> rules = Lists.newArrayList(
+            org.apache.impala.rewrite.DefaultNdvScaleRule.INSTANCE
+    );
+    session.options().setDefault_ndv_scale(2);
+    RewritesOk("ndv(bool_col)", rules, null);
+  }
+
+
+  @Test
+  public void testCountDistinctToNdvAndDefaultNdvScaleRule() throws ImpalaException {
+    List<ExprRewriteRule> rules = Lists.newArrayList(
+            org.apache.impala.rewrite.CountDistinctToNdvRule.INSTANCE,
+            org.apache.impala.rewrite.DefaultNdvScaleRule.INSTANCE
+    );
+    session.options().setAppx_count_distinct(true);
+    session.options().setDefault_ndv_scale(10);
+    RewritesOk("count(distinct bool_col)", rules, "ndv(bool_col, 10)");
+  }
+
+  @Test
+  public void testSimplifyCastStringToTimestamp() throws ImpalaException {
+    ExprRewriteRule rule = SimplifyCastStringToTimestamp.INSTANCE;
+
+    // Can be simplified
+    RewritesOk("cast(unix_timestamp(date_string_col) as timestamp)", rule,
+        "CAST(date_string_col AS TIMESTAMP)");
+    RewritesOk("cast(unix_timestamp(date_string_col, 'yyyy-MM-dd') as timestamp)", rule,
+        "to_timestamp(date_string_col, 'yyyy-MM-dd')");
+
+    // Verify nothing happens
+    RewritesOk("cast(unix_timestamp(timestamp_col) as timestamp)", rule, null);
+    RewritesOk("cast(unix_timestamp() as timestamp)", rule, null);
+  }
+
   /**
    * NULLIF gets converted to an IF, and has cases where
    * it can be further simplified via SimplifyDistinctFromRule.
@@ -787,5 +868,133 @@ public class ExprRewriteRulesTest extends FrontendTestBase {
     // more complicated things like nullif(int_col + 1, 1 + int_col)
     // are not simplified
     RewritesOk("nullif(1 + int_col, 1 + int_col)", rules, "NULL");
+  }
+
+  @Test
+  public void testConvertToCNFRule() throws ImpalaException {
+    ExprRewriteRule rule = new ConvertToCNFRule(-1, false);
+
+    RewritesOk("(int_col > 10 AND int_col < 20) OR float_col < 5.0", rule,
+            "int_col < 20 OR float_col < 5.0 AND int_col > 10 OR float_col < 5.0");
+    RewritesOk("float_col < 5.0 OR (int_col > 10 AND int_col < 20)", rule,
+            "float_col < 5.0 OR int_col < 20 AND float_col < 5.0 OR int_col > 10");
+    RewritesOk("(int_col > 10 AND float_col < 5.0) OR " +
+            "(int_col < 20 AND float_col > 15.0)", rule,
+            "float_col < 5.0 OR float_col > 15.0 AND " +
+                    "float_col < 5.0 OR int_col < 20 " +
+                    "AND int_col > 10 OR float_col > 15.0 AND int_col > 10 " +
+                    "OR int_col < 20");
+    RewritesOk("NOT(int_col > 10 OR int_col < 20)", rule,
+            "NOT int_col < 20 AND NOT int_col > 10");
+  }
+
+  @Test
+  public void testExtractCompoundVerticalBarExprRule() throws ImpalaException {
+    ExprRewriteRule extractCompoundVerticalBarExprRule =
+        ExtractCompoundVerticalBarExprRule.INSTANCE;
+    ExprRewriteRule simplifyConditionalsRule = SimplifyConditionalsRule.INSTANCE;
+    List<ExprRewriteRule> rules = new ArrayList<>();
+    rules.add(extractCompoundVerticalBarExprRule);
+    rules.add(simplifyConditionalsRule);
+
+    RewritesOk("string_col || string_col", extractCompoundVerticalBarExprRule,
+        "concat(string_col, string_col)");
+
+    RewritesOk("bool_col || bool_col", extractCompoundVerticalBarExprRule,
+        "bool_col OR bool_col");
+
+    RewritesOk("string_col || 'TEST'", extractCompoundVerticalBarExprRule,
+        "concat(string_col, 'TEST')");
+
+    RewritesOk("functional.chars_tiny", "cl || cs", extractCompoundVerticalBarExprRule,
+        "concat(cl, cs)");
+
+    RewritesOk("FALSE || id = 0", extractCompoundVerticalBarExprRule, "FALSE OR id = 0");
+
+    RewritesOk("FALSE || id = 0", rules, "id = 0");
+
+    RewritesOk("'' || ''", extractCompoundVerticalBarExprRule, "concat('', '')");
+
+    RewritesOk(
+        "NULL || bool_col", extractCompoundVerticalBarExprRule, "NULL OR bool_col");
+  }
+
+  @Test
+  public void testSimplifyCastExprRule() throws ImpalaException {
+    ExprRewriteRule rule = SimplifyCastExprRule.INSTANCE;
+
+    //Inner expr is a column
+    RewritesOk("functional.alltypes", "CAST(int_col AS INT)", rule, "int_col");
+    RewritesOk("functional.alltypes", "CAST(date_string_col AS STRING)", rule,
+        "date_string_col");
+    RewritesOk("functional.alltypes", "CAST(timestamp_col AS TIMESTAMP)", rule,
+        "timestamp_col");
+    //Multi-layer cast
+    RewritesOk("functional.alltypes", "CAST(CAST(int_col AS INT) AS INT)", rule,
+        "int_col");
+    //No rewrite
+    RewritesOk("functional.alltypes", "CAST(int_col AS BIGINT)", rule, null);
+
+    //Inner expr is an arithmetic expr
+    RewritesOk("functional.alltypes", "CAST(bigint_col+bigint_col AS BIGINT)", rule,
+        "bigint_col + bigint_col");
+    //Multi-layer cast
+    RewritesOk("functional.alltypes", "SUM(CAST(bigint_col+bigint_col AS BIGINT))", rule,
+        "sum(bigint_col + bigint_col)");
+    //No rewrite
+    RewritesOk("functional.alltypes", "CAST(bigint_col+bigint_col AS DOUBLE)", rule,
+        null);
+
+    //Inner expr is also a cast expr
+    RewritesOk("functional.alltypes", "CAST(CAST(int_col AS BIGINT) AS BIGINT)", rule,
+        "CAST(int_col AS BIGINT)");
+    //Multi-layer cast
+    RewritesOk("functional.alltypes",
+        "CAST(CAST(CAST(int_col AS BIGINT) AS BIGINT) AS BIGINT)", rule,
+        "CAST(int_col AS BIGINT)");
+    //No rewrite
+    RewritesOk("functional.alltypes", "CAST(CAST(int_col AS BIGINT) AS INT)", rule, null);
+
+    //Decimal type, d3 type is DECIMAL(20,10)
+    RewritesOk("functional.decimal_tbl", "CAST(d3 AS DECIMAL(20,10))", rule, "d3");
+    RewritesOk("functional.decimal_tbl",
+        "CAST(CAST(d3 AS DECIMAL(10,5)) AS DECIMAL(10,5))", rule,
+        "CAST(d3 AS DECIMAL(10,5))");
+    //No rewrite
+    RewritesOk("functional.decimal_tbl", "CAST(d3 AS DECIMAL(10,5))", rule, null);
+    RewritesOk("functional.decimal_tbl", "CAST(d3 AS DECIMAL(25,15))", rule, null);
+    RewritesOk("functional.decimal_tbl",
+        "CAST(CAST(d3 AS DECIMAL(10,5)) AS DECIMAL(15,5))", rule, null);
+
+    //Varchar type, vc type is VARCHAR(32)
+    RewritesOk("functional.chars_formats", "CAST(vc AS VARCHAR(32))", rule, "vc");
+    RewritesOk("functional.chars_formats",
+        "CAST(CAST(vc AS VARCHAR(16)) AS VARCHAR(16))", rule, "CAST(vc AS VARCHAR(16))");
+    //No rewrite
+    RewritesOk("functional.chars_formats", "CAST(vc AS VARCHAR(16))", rule, null);
+    RewritesOk("functional.chars_formats", "CAST(vc AS VARCHAR(48))", rule, null);
+    RewritesOk("functional.chars_formats",
+        "CAST(CAST(vc AS VARCHAR(48)) AS VARCHAR(16))", rule, null);
+
+    //Array type
+    RewritesOk("functional.allcomplextypes.int_array_col",
+        "CAST(int_array_col.item AS INT)", rule, "int_array_col.item");
+    RewritesOk("functional.allcomplextypes.int_array_col",
+        "CAST(CAST(int_array_col.item AS BIGINT) AS BIGINT)", rule,
+        "CAST(int_array_col.item AS BIGINT)");
+
+    //Map type
+    RewritesOk("functional.allcomplextypes.int_map_col",
+        "CAST(int_map_col.key AS STRING)", rule, "int_map_col.`key`");
+    RewritesOk("functional.allcomplextypes.int_map_col",
+        "CAST(CAST(int_map_col.value AS STRING) AS STRING)", rule,
+        "CAST(int_map_col.value AS STRING)");
+
+    //Struct type
+    RewritesOk("functional.allcomplextypes", "CAST(int_struct_col.f1 AS INT)", rule,
+        "int_struct_col.f1");
+    RewritesOk("functional.allcomplextypes",
+        "CAST(CAST(int_struct_col.f1 AS BIGINT) AS BIGINT)", rule,
+        "CAST(int_struct_col.f1 AS BIGINT)");
   }
 }

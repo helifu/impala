@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/thread/mutex.hpp>
+#include <mutex>
 
 #include "runtime/io/disk-io-mgr-stress.h"
 
@@ -62,7 +62,7 @@ string DiskIoMgrStress::GenerateRandomData() {
 }
 
 struct DiskIoMgrStress::Client {
-  boost::mutex lock;
+  std::mutex lock;
   /// Pool for objects that is cleared when the client is (re-)initialized in NewClient().
   ObjectPool obj_pool;
   unique_ptr<RequestContext> reader;
@@ -111,7 +111,7 @@ void DiskIoMgrStress::ClientThread(int client_id) {
   Status status;
   char read_buffer[MAX_FILE_LEN];
 
-  while (!shutdown_) {
+  while (!shutdown_.Load()) {
     bool eos = false;
     int bytes_read = 0;
 
@@ -193,7 +193,7 @@ void DiskIoMgrStress::CancelRandomReader() {
 }
 
 void DiskIoMgrStress::Run(int sec) {
-  shutdown_ = false;
+  shutdown_.Store(false);
   for (int i = 0; i < num_clients_; ++i) {
     readers_.add_thread(
         new thread(&DiskIoMgrStress::ClientThread, this, i));
@@ -210,7 +210,7 @@ void DiskIoMgrStress::Run(int sec) {
   }
 
   // Signal shutdown for the client threads
-  shutdown_ = true;
+  shutdown_.Store(true);
 
   for (int i = 0; i < num_clients_; ++i) {
     unique_lock<mutex> lock(clients_[i].lock);
@@ -261,8 +261,8 @@ void DiskIoMgrStress::NewClient(int i) {
     range_len = min(range_len, file_len - assigned_len);
 
     ScanRange* range = client.obj_pool.Add(new ScanRange);
-    range->Reset(NULL, files_[client.file_idx].filename.c_str(), range_len, assigned_len,
-        0, false, false, ScanRange::INVALID_MTIME, BufferOpts::Uncached());
+    range->Reset(ScanRange::FileInfo{files_[client.file_idx].filename.c_str()},
+        range_len, assigned_len, 0, false, BufferOpts::Uncached());
     client.scan_ranges.push_back(range);
     assigned_len += range_len;
   }

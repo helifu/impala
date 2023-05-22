@@ -28,13 +28,17 @@ import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.thrift.TSlotDescriptor;
+import org.apache.impala.thrift.TVirtualColumnType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
 public class SlotDescriptor {
+  private final static Logger LOG = LoggerFactory.getLogger(SlotDescriptor.class);
   private final SlotId id_;
   private final TupleDescriptor parent_;
 
@@ -43,7 +47,7 @@ public class SlotDescriptor {
   private Path path_;
   private Type type_;
 
-  // Tuple descriptor for collection items. Only set if type_ is an array or map.
+  // Tuple descriptor for nested items. Set if type_ is an array, map or struct.
   private TupleDescriptor itemTupleDesc_;
 
   // for SlotRef.toSql() in the absence of a path
@@ -56,6 +60,9 @@ public class SlotDescriptor {
   // if false, this slot doesn't need to be materialized in parent tuple
   // (and physical layout parameters are invalid)
   private boolean isMaterialized_ = false;
+
+  // If true, then computeMemLayout() should be recursively called for itemTupleDesc_.
+  private boolean materializeRecursively_ = false;
 
   // if false, this slot cannot be NULL
   // Note: it is still possible that a SlotRef pointing to this descriptor could have a
@@ -86,6 +93,7 @@ public class SlotDescriptor {
     parent_ = parent;
     type_ = src.type_;
     itemTupleDesc_ = src.itemTupleDesc_;
+    if (itemTupleDesc_ != null) itemTupleDesc_.setParentSlotDesc(this);
     path_ = src.path_;
     label_ = src.label_;
     sourceExprs_ = src.sourceExprs_;
@@ -117,8 +125,25 @@ public class SlotDescriptor {
         itemTupleDesc_ == null, "Item tuple descriptor already set.");
     itemTupleDesc_ = t;
   }
+  public void clearItemTupleDesc() {
+    Preconditions.checkState(itemTupleDesc_ != null);
+    itemTupleDesc_ = null;
+  }
   public boolean isMaterialized() { return isMaterialized_; }
-  public void setIsMaterialized(boolean value) { isMaterialized_ = value; }
+  public void setIsMaterialized(boolean value) {
+    if (isMaterialized_ == value) return;
+    isMaterialized_ = value;
+    LOG.trace("Mark slot(sid={}) of tuple(tid={}) as {}materialized",
+        id_, parent_.getId(), isMaterialized_ ? "" : "non-");
+    if (materializeRecursively_) {
+      Preconditions.checkState(itemTupleDesc_ != null);
+      itemTupleDesc_.materializeSlots();
+    }
+  }
+  public boolean isMaterializedRecursively() { return materializeRecursively_; }
+  public void setIsMaterializedRecursively(boolean value) {
+    materializeRecursively_ = value;
+  }
   public boolean getIsNullable() { return isNullable_; }
   public void setIsNullable(boolean value) { isNullable_ = value; }
   public int getByteSize() { return byteSize_; }
@@ -137,7 +162,8 @@ public class SlotDescriptor {
   public void setPath(Path path) {
     Preconditions.checkNotNull(path);
     Preconditions.checkState(path.isRootedAtTuple());
-    Preconditions.checkState(path.getRootDesc() == parent_);
+    Preconditions.checkState(path.getRootDesc() == parent_ ||
+        parent_.getType().isStructType());
     path_ = path;
     type_ = path_.destType();
     label_ = Joiner.on(".").join(path.getRawPath());
@@ -153,6 +179,16 @@ public class SlotDescriptor {
   public boolean isScanSlot() { return path_ != null && path_.isRootedAtTable(); }
   public Column getColumn() { return !isScanSlot() ? null : path_.destColumn(); }
 
+  public boolean isVirtualColumn() {
+    if (path_ == null) return false;
+    return path_.getVirtualColumnType() != TVirtualColumnType.NONE;
+  }
+
+  public TVirtualColumnType getVirtualColumnType() {
+    if (path_ == null) return TVirtualColumnType.NONE;
+    return path_.getVirtualColumnType();
+  }
+
   public ColumnStats getStats() {
     if (stats_ == null) {
       Column c = getColumn();
@@ -163,6 +199,88 @@ public class SlotDescriptor {
       }
     }
     return stats_;
+  }
+
+  private void getEnclosingStructSlotAndTupleDescs(List<SlotDescriptor> slotDescs,
+      List<TupleDescriptor> tupleDescs) {
+    TupleDescriptor tupleDesc = getParent();
+    while (tupleDesc != null) {
+      if (tupleDescs != null) tupleDescs.add(tupleDesc);
+
+      final SlotDescriptor parentStructSlotDesc = tupleDesc.getParentSlotDesc();
+      if (parentStructSlotDesc != null && slotDescs != null) {
+        slotDescs.add(parentStructSlotDesc);
+      }
+
+      tupleDesc = parentStructSlotDesc != null ? parentStructSlotDesc.getParent() : null;
+    }
+  }
+
+  /**
+   * Returns the slot descs of the structs that contain this slot desc, recursively; stops
+   * at collection items, does not continue to the parent collection.
+   * For an example struct 'outer: <middle: <inner: <i: int>>>', called for the slot desc
+   * of 'i', the returned list will contain the slot descs of 'inner', 'middle' and
+   * 'outer'.
+   */
+  public List<SlotDescriptor> getEnclosingStructSlotDescs() {
+    List<SlotDescriptor> result = new ArrayList<>();
+    getEnclosingStructSlotAndTupleDescs(result, null);
+    return result;
+  }
+
+  /**
+   * Returns the tuple descs enclosing this slot desc, recursively; stops at collection
+   * items, does not continue to the parent collection.
+   * For an example struct 'outer: <middle: <inner: <i: int>>>', called for the slot desc
+   * of 'i', the returned list will contain the 'itemTupleDesc_'s of 'inner', 'middle'
+   * and 'outer' as well as the tuple desc of the main tuple (the 'parent_' of the slot
+   * desc of 'outer').
+   */
+  public List<TupleDescriptor> getEnclosingTupleDescs() {
+    List<TupleDescriptor> result = new ArrayList<>();
+    getEnclosingStructSlotAndTupleDescs(null, result);
+    return result;
+  }
+
+  /**
+   * Climbs up the struct hierarchy and returns the tuple desc that holds the top level
+   * struct that contains this slot desc; stops at collection items, does not continue to
+   * the parent collection.
+   * For a slot desc that is not within a struct, simply returns 'parent_'.
+   * For an example struct 'outer: <middle: <inner: <i: int>>>', called for the slot desc
+   * of 'i', returns the tuple desc of the main tuple (the 'parent_' of the slot desc of
+   * 'outer').
+   */
+  public TupleDescriptor getTopEnclosingTupleDesc() {
+    List<TupleDescriptor> enclosingTuples = getEnclosingTupleDescs();
+    if (enclosingTuples.isEmpty()) {
+      Preconditions.checkState(getParent() == null);
+      return null;
+    }
+
+    // Return the last enclosing tuple, going upward.
+    return enclosingTuples.get(enclosingTuples.size() - 1);
+  }
+
+  /**
+   * Returns the size of the slot without null indicators.
+   *
+   * Takes materialisation into account: returns 0 for non-materialised slots. This is
+   * most relevant for structs as it is possible that only a subset of the fields are
+   * materialised and the size of the struct varies according to this.
+   */
+  public int getMaterializedSlotSize() {
+    if (!isMaterialized()) return 0;
+    if (!getType().isStructType()) return getType().getSlotSize();
+
+    Preconditions.checkNotNull(itemTupleDesc_);
+    int size = 0;
+    for (SlotDescriptor d : itemTupleDesc_.getSlots()) {
+      size += d.getMaterializedSlotSize();
+    }
+
+    return size;
   }
 
   /**
@@ -231,8 +349,8 @@ public class SlotDescriptor {
     Preconditions.checkState(path_.isResolved());
 
     List<Integer> materializedPath = Lists.newArrayList(path_.getAbsolutePath());
-    // For scalar types, the materialized path is the same as path_
-    if (type_.isScalarType()) return materializedPath;
+    // For scalar types and structs the materialized path is the same as path_
+    if (type_.isScalarType() || type_.isStructType()) return materializedPath;
     Preconditions.checkState(type_.isCollectionType());
     Preconditions.checkState(path_.getFirstCollectionIndex() != -1);
     // Truncate materializedPath after first collection element
@@ -277,7 +395,7 @@ public class SlotDescriptor {
     TSlotDescriptor result = new TSlotDescriptor(
         id_.asInt(), parent_.getId().asInt(), type_.toThrift(),
         materializedPath, byteOffset_, nullIndicatorByte_, nullIndicatorBit_,
-        slotIdx_);
+        slotIdx_, getVirtualColumnType());
     if (itemTupleDesc_ != null) {
       // Check for recursive or otherwise invalid item tuple descriptors. Since we assign
       // tuple ids globally in increasing order, the id of an item tuple descriptor must
@@ -303,12 +421,15 @@ public class SlotDescriptor {
   public String debugString() {
     String pathStr = (path_ == null) ? "null" : path_.toString();
     String typeStr = (type_ == null ? "null" : type_.toString());
-    return Objects.toStringHelper(this)
+    String parentTupleId = parent_ == null ?
+        "null" : String.valueOf(parent_.getId().asInt());
+    return MoreObjects.toStringHelper(this)
         .add("id", id_.asInt())
         .add("path", pathStr)
         .add("label", label_)
         .add("type", typeStr)
         .add("materialized", isMaterialized_)
+        .add("materializeRecursively", materializeRecursively_)
         .add("byteSize", byteSize_)
         .add("byteOffset", byteOffset_)
         .add("nullable", isNullable_)
@@ -316,6 +437,8 @@ public class SlotDescriptor {
         .add("nullIndicatorBit", nullIndicatorBit_)
         .add("slotIdx", slotIdx_)
         .add("stats", stats_)
+        .add("itemTupleDesc", itemTupleDesc_)
+        .add("parent_tuple_id", parentTupleId)
         .toString();
   }
 

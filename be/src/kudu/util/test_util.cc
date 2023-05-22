@@ -17,12 +17,11 @@
 
 #include "kudu/util/test_util.h"
 
-#include <errno.h>
 #include <limits.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdlib>
-#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
@@ -36,7 +35,6 @@
 #include <sys/param.h> // for MAXPATHLEN
 #endif
 
-#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest-spi.h>
@@ -51,6 +49,8 @@
 #include "kudu/gutil/walltime.h"
 #include "kudu/util/env.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/flags.h"
+#include "kudu/util/oid_generator.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/slice.h"
@@ -65,15 +65,23 @@ DEFINE_string(test_leave_files, "on_failure",
 
 DEFINE_int32(test_random_seed, 0, "Random seed to use for randomized tests");
 
-using boost::optional;
+DECLARE_string(time_source);
+DECLARE_bool(encrypt_data_at_rest);
+
 using std::string;
 using std::vector;
 using strings::Substitute;
 
+namespace {
+int testIteration = 0;
+} // namespace
+
 namespace kudu {
 
 const char* kInvalidPath = "/dev/invalid-path-for-kudu-tests";
-static const char* const kSlowTestsEnvVariable = "KUDU_ALLOW_SLOW_TESTS";
+static const char* const kSlowTestsEnvVar = "KUDU_ALLOW_SLOW_TESTS";
+static const char* const kLargeKeysEnvVar = "KUDU_USE_LARGE_KEYS_IN_TESTS";
+static const char* const kEncryptDataInTests = "KUDU_ENCRYPT_DATA_IN_TESTS";
 
 static const uint64_t kTestBeganAtMicros = Env::Default()->NowMicros();
 
@@ -84,40 +92,61 @@ static const uint64_t kTestBeganAtMicros = Env::Default()->NowMicros();
 // This can be checked using the 'IsGTest()' function from test_util_prod.cc.
 bool g_is_gtest = true;
 
+void KuduTestEventListener::OnTestIterationStart(const testing::UnitTest& /*unit_test*/,
+                                                 int iteration) {
+  testIteration = iteration;
+}
+
 ///////////////////////////////////////////////////
 // KuduTest
 ///////////////////////////////////////////////////
 
 KuduTest::KuduTest()
-  : env_(Env::Default()),
-    flag_saver_(new google::FlagSaver()),
-    test_dir_(GetTestDataDirectory()) {
+    : env_(Env::Default()),
+      flag_saver_(new google::FlagSaver()),
+      test_dir_(GetTestDataDirectory()) {
   std::map<const char*, const char*> flags_for_tests = {
     // Disabling fsync() speeds up tests dramatically, and it's safe to do as no
     // tests rely on cutting power to a machine or equivalent.
     {"never_fsync", "true"},
     // Disable redaction.
     {"redact", "none"},
+    // For a generic Kudu test, the local wall-clock time is good enough even
+    // if it's not synchronized by NTP. All test components are run at the same
+    // node, so there aren't multiple time sources to synchronize.
+    {"time_source", "system_unsync"},
+  };
+  if (!UseLargeKeys()) {
     // Reduce default RSA key length for faster tests. We are using strong/high
     // TLS v1.2 cipher suites, so minimum possible for TLS-related RSA keys is
-    // 768 bits. However, for the external mini cluster we use 1024 bits because
-    // Java default security policies require at least 1024 bits for RSA keys
-    // used in certificates. For uniformity, here 1024 RSA bit keys are used
-    // as well. As for the TSK keys, 512 bits is the minimum since the SHA256
-    // digest is used for token signing/verification.
-    {"ipki_server_key_size", "1024"},
-    {"ipki_ca_key_size", "1024"},
-    {"tsk_num_rsa_bits", "512"},
-  };
+    // 768 bits. Java security policies in tests tweaked appropriately to allow
+    // for using smaller RSA keys in certificates. As for the TSK keys, 512 bits
+    // is the minimum since the SHA256 digest is used for token
+    // signing/verification.
+    flags_for_tests.emplace("ipki_server_key_size", "768");
+    flags_for_tests.emplace("ipki_ca_key_size", "768");
+    flags_for_tests.emplace("tsk_num_rsa_bits", "512");
+    // Some OS distros set the default security level higher than 0, so it's
+    // necessary to override it to use the key length specified above (which are
+    // considered lax and don't work in case of security level 2 or higher).
+    flags_for_tests.emplace("openssl_security_level_override", "0");
+  }
   for (const auto& e : flags_for_tests) {
     // We don't check for errors here, because we have some default flags that
-    // only apply to certain tests.
+    // only apply to certain tests. If a flag is defined in a library which
+    // the test binary isn't linked with, then SetCommandLineOptionWithMode()
+    // reports an error since the flag is unknown to the gflags runtime.
     google::SetCommandLineOptionWithMode(e.first, e.second, google::SET_FLAGS_DEFAULT);
   }
+
+  if (EnableEncryption()) {
+    FLAGS_encrypt_data_at_rest = true;
+  }
+
   // If the TEST_TMPDIR variable has been set, then glog will automatically use that
   // as its default log directory. We would prefer that the default log directory
   // instead be the test-case-specific subdirectory.
-  FLAGS_log_dir = GetTestDataDirectory();
+  FLAGS_log_dir = test_dir_;
 }
 
 KuduTest::~KuduTest() {
@@ -169,23 +198,11 @@ void KuduTest::OverrideKrb5Environment() {
 // Test utility functions
 ///////////////////////////////////////////////////
 
-bool AllowSlowTests() {
-  char *e = getenv(kSlowTestsEnvVariable);
-  if ((e == nullptr) ||
-      (strlen(e) == 0) ||
-      (strcasecmp(e, "false") == 0) ||
-      (strcasecmp(e, "0") == 0) ||
-      (strcasecmp(e, "no") == 0)) {
-    return false;
-  }
-  if ((strcasecmp(e, "true") == 0) ||
-      (strcasecmp(e, "1") == 0) ||
-      (strcasecmp(e, "yes") == 0)) {
-    return true;
-  }
-  LOG(FATAL) << "Unrecognized value for " << kSlowTestsEnvVariable << ": " << e;
-  return false;
-}
+bool AllowSlowTests() { return GetBooleanEnvironmentVariable(kSlowTestsEnvVar); }
+
+bool UseLargeKeys() { return GetBooleanEnvironmentVariable(kLargeKeysEnvVar); }
+
+bool EnableEncryption() { return GetBooleanEnvironmentVariable(kEncryptDataInTests); }
 
 void OverrideFlagForSlowTests(const std::string& flag_name,
                               const std::string& new_value) {
@@ -224,8 +241,9 @@ string GetTestDataDirectory() {
   // The directory name includes some strings for specific reasons:
   // - program name: identifies the directory to the test invoker
   // - timestamp and pid: disambiguates with prior runs of the same test
+  // - iteration: identifies the iteration when using --gtest_repeat
   //
-  // e.g. "env-test.TestEnv.TestReadFully.1409169025392361-23600"
+  // e.g. "env-test.TestEnv.TestReadFully.1409169025392361-23600-0"
   //
   // If the test is sharded, the shard index is also included so that the test
   // invoker can more easily identify all directories belonging to each shard.
@@ -234,13 +252,14 @@ string GetTestDataDirectory() {
   if (shard_index && shard_index[0] != '\0') {
     shard_index_infix = Substitute("$0.", shard_index);
   }
-  dir += Substitute("/$0.$1$2.$3.$4-$5",
+  dir += Substitute("/$0.$1$2.$3.$4-$5-$6",
     StringReplace(google::ProgramInvocationShortName(), "/", "_", true),
     shard_index_infix,
     StringReplace(test_info->test_case_name(), "/", "_", true),
     StringReplace(test_info->name(), "/", "_", true),
     kTestBeganAtMicros,
-    getpid());
+    getpid(),
+    testIteration);
   Status s = Env::Default()->CreateDir(dir);
   CHECK(s.IsAlreadyPresent() || s.ok())
     << "Could not create directory " << dir << ": " << s.ToString();
@@ -262,6 +281,14 @@ string GetTestDataDirectory() {
   return dir;
 }
 
+string GetTestSocketPath(const string& name) {
+  string dir;
+  CHECK_OK(Env::Default()->GetTestDirectory(&dir));
+  ObjectIdGenerator generator;
+  string uuid = generator.Next();
+  return JoinPathSegments(dir, Substitute("$0-$1.sock", name, uuid));
+}
+
 string GetTestExecutableDirectory() {
   string exec;
   CHECK_OK(Env::Default()->GetExecutablePath(&exec));
@@ -273,14 +300,17 @@ void AssertEventually(const std::function<void(void)>& f,
                       AssertBackoff backoff) {
   const MonoTime deadline = MonoTime::Now() + timeout;
   {
-    // Disable --gtest_break_on_failure, or else the assertion failures
-    // inside our attempts will cause the test to SEGV even though we
-    // would like to retry.
+    // Disable gtest's "on failure" behavior, or else the assertion failures
+    // inside our attempts will cause the test to end even though we would
+    // like to retry.
     bool old_break_on_failure = testing::FLAGS_gtest_break_on_failure;
-    auto c = MakeScopedCleanup([old_break_on_failure]() {
+    bool old_throw_on_failure = testing::FLAGS_gtest_throw_on_failure;
+    auto c = MakeScopedCleanup([old_break_on_failure, old_throw_on_failure]() {
       testing::FLAGS_gtest_break_on_failure = old_break_on_failure;
+      testing::FLAGS_gtest_throw_on_failure = old_throw_on_failure;
     });
     testing::FLAGS_gtest_break_on_failure = false;
+    testing::FLAGS_gtest_throw_on_failure = false;
 
     for (int attempts = 0; MonoTime::Now() < deadline; attempts++) {
       // Capture any assertion failures within this scope (i.e. from their function)
@@ -383,8 +413,11 @@ int CountOpenFds(Env* env, const string& path_pattern) {
 
 namespace {
 Status WaitForBind(pid_t pid, uint16_t* port,
-                   const optional<const string&>& addr,
-                   const char* kind, MonoDelta timeout) {
+                   const vector<string>& addresses,
+                   const char* kind,
+                   MonoDelta timeout) {
+  static const vector<string> kWildcard = { "0.0.0.0" };
+
   // In general, processes do not expose the port they bind to, and
   // reimplementing lsof involves parsing a lot of files in /proc/. So,
   // requiring lsof for tests and parsing its output seems more
@@ -419,59 +452,63 @@ Status WaitForBind(pid_t pid, uint16_t* port,
   // to be the primary service port. When searching, we use the provided bind
   // address if there is any, otherwise we use '*' (same as '0.0.0.0') which
   // matches all addresses on the local machine.
-  string addr_pattern = Substitute("n$0:", (!addr || *addr == "0.0.0.0") ? "*" : *addr);
-  MonoTime deadline = MonoTime::Now() + timeout;
-  string lsof_out;
-  int32_t p = -1;
+  const MonoTime deadline = MonoTime::Now() + timeout;
+  const auto& addresses_to_check = addresses.empty() ? kWildcard : addresses;
+  for (int64_t i = 1; ; ++i) {
+    for (const auto& addr : addresses_to_check) {
+      string addr_pattern = Substitute("n$0:", addr == "0.0.0.0" ? "*" : addr);
+      string lsof_out;
+      int32_t p = -1;
+      Status s = Subprocess::Call(cmd, "", &lsof_out).AndThen([&] () {
+        StripTrailingNewline(&lsof_out);
+        vector<string> lines = strings::Split(lsof_out, "\n");
+        for (int index = 2; index < lines.size(); index += 2) {
+          StringPiece cur_line(lines[index]);
+          if (HasPrefixString(cur_line.ToString(), addr_pattern) &&
+              !cur_line.contains("->")) {
+            cur_line.remove_prefix(addr_pattern.size());
+            if (!safe_strto32(cur_line.data(), cur_line.size(), &p)) {
+              return Status::RuntimeError("unexpected lsof output", lsof_out);
+            }
 
-  for (int64_t i = 1; ; i++) {
-    lsof_out.clear();
-    Status s = Subprocess::Call(cmd, "", &lsof_out).AndThen([&] () {
-      StripTrailingNewline(&lsof_out);
-      vector<string> lines = strings::Split(lsof_out, "\n");
-      for (int index = 2; index < lines.size(); index += 2) {
-        StringPiece cur_line(lines[index]);
-        if (HasPrefixString(cur_line.ToString(), addr_pattern) &&
-            !cur_line.contains("->")) {
-          cur_line.remove_prefix(addr_pattern.size());
-          if (!safe_strto32(cur_line.data(), cur_line.size(), &p)) {
-            return Status::RuntimeError("unexpected lsof output", lsof_out);
+            return Status::OK();
           }
-
-          return Status::OK();
         }
+
+        return Status::RuntimeError("unexpected lsof output", lsof_out);
+      });
+
+      if (s.ok()) {
+        CHECK(p > 0 && p < std::numeric_limits<uint16_t>::max())
+            << "parsed invalid port: " << p;
+        VLOG(1) << "Determined bound port: " << p;
+        *port = static_cast<uint16_t>(p);
+
+        return Status::OK();
       }
-
-      return Status::RuntimeError("unexpected lsof output", lsof_out);
-    });
-
-    if (s.ok()) {
-      break;
+      if (deadline < MonoTime::Now()) {
+        return s;
+      }
     }
-    if (deadline < MonoTime::Now()) {
-      return s;
-    }
-
     SleepFor(MonoDelta::FromMilliseconds(i * 10));
   }
 
-  CHECK(p > 0 && p < std::numeric_limits<uint16_t>::max()) << "parsed invalid port: " << p;
-  VLOG(1) << "Determined bound port: " << p;
-  *port = p;
-  return Status::OK();
+  // Should not reach here.
+  LOG(FATAL) << "could not determine bound port the process";
+  __builtin_unreachable();
 }
 } // anonymous namespace
 
 Status WaitForTcpBind(pid_t pid, uint16_t* port,
-                      const optional<const string&>& addr,
+                      const vector<string>& addresses,
                       MonoDelta timeout) {
-  return WaitForBind(pid, port, addr, "4TCP", timeout);
+  return WaitForBind(pid, port, addresses, "4TCP", timeout);
 }
 
 Status WaitForUdpBind(pid_t pid, uint16_t* port,
-                      const optional<const string&>& addr,
+                      const vector<string>& addresses,
                       MonoDelta timeout) {
-  return WaitForBind(pid, port, addr, "4UDP", timeout);
+  return WaitForBind(pid, port, addresses, "4UDP", timeout);
 }
 
 Status FindHomeDir(const string& name, const string& bin_dir, string* home_dir) {

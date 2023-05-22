@@ -20,13 +20,28 @@
 #include <sstream>
 #include <string.h>
 
+#include "common/logging.h"
+#include "kudu/util/path_util.h"
+#include "runtime/exec-env.h"
 #include "util/error-util.h"
 
 #include "common/names.h"
-#include "runtime/exec-env.h"
-#include "kudu/util/path_util.h"
 
 namespace impala {
+
+const char* FILESYS_PREFIX_HDFS = "hdfs://";
+const char* FILESYS_PREFIX_S3 = "s3a://";
+const char* FILESYS_PREFIX_ABFS = "abfs://";
+const char* FILESYS_PREFIX_ABFS_SEC = "abfss://";
+const char* FILESYS_PREFIX_ADL = "adl://";
+const char* FILESYS_PREFIX_GCS = "gs://";
+const char* FILESYS_PREFIX_COS = "cosn://";
+const char* FILESYS_PREFIX_OZONE = "o3fs://";
+const char* FILESYS_PREFIX_OFS = "ofs://";
+const char* FILESYS_PREFIX_SFS = "sfs+";
+const char* FILESYS_PREFIX_OSS = "oss://";
+const char* FILESYS_PREFIX_JINDOFS = "jfs://";
+const char* FILESYS_PREFIX_OBS = "obs://";
 
 string GetHdfsErrorMsg(const string& prefix, const string& file) {
   string error_msg = GetStrErrMsg();
@@ -72,33 +87,60 @@ Status CopyHdfsFile(const hdfsFS& src_conn, const string& src_path,
   return Status::OK();
 }
 
-bool IsHdfsPath(const char* path) {
-  if (strstr(path, ":/") == NULL) {
-    return ExecEnv::GetInstance()->default_fs().compare(0, 7, "hdfs://") == 0;
+static bool IsSpecificPath(
+    const char* path, const char* specific_prefix, bool check_default_fs) {
+  size_t prefix_len = strlen(specific_prefix);
+  if (check_default_fs && strstr(path, ":/") == NULL) {
+    return strncmp(
+               ExecEnv::GetInstance()->default_fs().c_str(), specific_prefix, prefix_len)
+        == 0;
   }
-  return strncmp(path, "hdfs://", 7) == 0;
+  return strncmp(path, specific_prefix, prefix_len) == 0;
 }
 
-bool IsS3APath(const char* path) {
-  if (strstr(path, ":/") == NULL) {
-    return ExecEnv::GetInstance()->default_fs().compare(0, 6, "s3a://") == 0;
-  }
-  return strncmp(path, "s3a://", 6) == 0;
+bool IsHdfsPath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_HDFS, check_default_fs);
 }
 
-bool IsABFSPath(const char* path) {
-  if (strstr(path, ":/") == NULL) {
-    return ExecEnv::GetInstance()->default_fs().compare(0, 7, "abfs://") == 0 ||
-        ExecEnv::GetInstance()->default_fs().compare(0, 8, "abfss://") == 0;
-  }
-  return strncmp(path, "abfs://", 7) == 0 || strncmp(path, "abfss://", 8) == 0;
+bool IsS3APath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_S3, check_default_fs);
 }
 
-bool IsADLSPath(const char* path) {
-  if (strstr(path, ":/") == NULL) {
-    return ExecEnv::GetInstance()->default_fs().compare(0, 6, "adl://") == 0;
-  }
-  return strncmp(path, "adl://", 6) == 0;
+bool IsABFSPath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_ABFS, check_default_fs)
+      || IsSpecificPath(path, FILESYS_PREFIX_ABFS_SEC, check_default_fs);
+}
+
+bool IsADLSPath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_ADL, check_default_fs);
+}
+
+bool IsOSSPath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_OSS, check_default_fs)
+      || IsSpecificPath(path, FILESYS_PREFIX_JINDOFS, check_default_fs);
+}
+
+bool IsGcsPath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_GCS, check_default_fs);
+}
+
+// o3fs and ofs uses the same transport implementation, so they should share
+// the same thread pool.
+bool IsCosPath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_COS, check_default_fs);
+}
+
+bool IsOzonePath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_OZONE, check_default_fs)
+      || IsSpecificPath(path, FILESYS_PREFIX_OFS, check_default_fs);
+}
+
+bool IsSFSPath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_SFS, check_default_fs);
+}
+
+bool IsOBSPath(const char* path, bool check_default_fs) {
+  return IsSpecificPath(path, FILESYS_PREFIX_OBS, check_default_fs);
 }
 
 // Returns the length of the filesystem name in 'path' which is the length of the
@@ -117,7 +159,7 @@ static int GetFilesystemNameLength(const char* path) {
   return after_authority - path;
 }
 
-bool FilesystemsMatch(const char* path_a, const char* path_b) {
+static bool FilesystemsMatch(const char* path_a, const char* path_b) {
   int fs_a_name_length = GetFilesystemNameLength(path_a);
   int fs_b_name_length = GetFilesystemNameLength(path_b);
 
@@ -140,6 +182,39 @@ bool FilesystemsMatch(const char* path_a, const char* path_b) {
   // Both fully qualified: check the filesystem prefix.
   if (fs_a_name_length != fs_b_name_length) return false;
   return strncmp(path_a, path_b, fs_a_name_length) == 0;
+}
+
+static int VolumeBucketLength(const char* path) {
+  if (*path == '\0') return 0;
+  const char* afterVolume = strstr(path, "/");
+  if (afterVolume == nullptr) return strlen(path);
+  const char* afterBucket = strstr(afterVolume + 1, "/");
+  if (afterBucket == nullptr) return strlen(path);
+  return afterBucket - path;
+}
+
+static bool OfsBucketsMatch(const char* path_a, const char* path_b) {
+  // Examine only the path elements.
+  path_a = path_a + GetFilesystemNameLength(path_a);
+  path_b = path_b + GetFilesystemNameLength(path_b);
+  // Skip past starting slash for comparison to unqualified paths.
+  if (*path_a == '/') ++path_a;
+  if (*path_b == '/') ++path_b;
+
+  int vba_len = VolumeBucketLength(path_a);
+  int vbb_len = VolumeBucketLength(path_b);
+  if (vba_len != vbb_len) return false;
+  return strncmp(path_a, path_b, vba_len) == 0;
+}
+
+bool FilesystemsAndBucketsMatch(const char* path_a, const char* path_b) {
+  if (!FilesystemsMatch(path_a, path_b)) return false;
+
+  // path_a and path_b are in the same filesystem, so we just need to check one prefix.
+  if (IsSpecificPath(path_a, FILESYS_PREFIX_OFS, true)) {
+    return OfsBucketsMatch(path_a, path_b);
+  }
+  return true;
 }
 
 string GetBaseName(const char* path) {

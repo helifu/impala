@@ -24,14 +24,19 @@ import java.util.Map;
 import org.apache.avro.SchemaParseException;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.serde2.avro.AvroSerdeUtils;
+import org.apache.iceberg.DataFile;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.IcebergTable;
 import org.apache.impala.catalog.KuduTable;
+import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.thrift.TCompressionCodec;
 import org.apache.impala.thrift.TAlterTableParams;
 import org.apache.impala.thrift.TAlterTableSetTblPropertiesParams;
 import org.apache.impala.thrift.TAlterTableType;
@@ -39,12 +44,14 @@ import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.thrift.TTablePropertyType;
 import org.apache.impala.util.AvroSchemaParser;
 import org.apache.impala.util.AvroSchemaUtils;
+import org.apache.impala.util.IcebergUtil;
 import org.apache.impala.util.MetaStoreUtil;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
+import com.google.common.primitives.Longs;
 
 /**
 * Represents an ALTER TABLE SET [PARTITION ('k1'='a', 'k2'='b'...)]
@@ -93,7 +100,11 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
           hive_metastoreConstants.META_TABLE_STORAGE));
     }
 
-    if (getTargetTable() instanceof FeKuduTable) analyzeKuduTable(analyzer);
+    if (getTargetTable() instanceof FeKuduTable) {
+      analyzeKuduTable(analyzer);
+    } else if (getTargetTable() instanceof FeIcebergTable) {
+      analyzeIcebergTable(analyzer);
+    }
 
     // Check avro schema when it is set in avro.schema.url or avro.schema.literal to
     // avoid potential metadata corruption (see IMPALA-2042).
@@ -136,6 +147,60 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
         Preconditions.checkNotNull(authzServer);
         analyzer.registerPrivReq(builder -> builder.onServer(authzServer).all().build());
       }
+    }
+  }
+
+  private void analyzeIcebergTable(Analyzer analyzer) throws AnalysisException {
+    //Cannot set these properties related to metadata
+    icebergPropertyCheck(IcebergTable.ICEBERG_CATALOG);
+    icebergPropertyCheck(IcebergTable.ICEBERG_CATALOG_LOCATION);
+    icebergPropertyCheck(IcebergTable.ICEBERG_TABLE_IDENTIFIER);
+    icebergPropertyCheck(IcebergTable.METADATA_LOCATION);
+    if (tblProperties_.containsKey(IcebergTable.ICEBERG_FILE_FORMAT)) {
+      icebergTableFormatCheck(tblProperties_.get(IcebergTable.ICEBERG_FILE_FORMAT));
+    }
+    icebergParquetCompressionCodecCheck();
+    icebergParquetRowGroupSizeCheck();
+    icebergParquetPageSizeCheck(IcebergTable.PARQUET_PLAIN_PAGE_SIZE, "page size");
+    icebergParquetPageSizeCheck(IcebergTable.PARQUET_DICT_PAGE_SIZE,
+        "dictionary page size");
+  }
+
+  private void icebergPropertyCheck(String property) throws AnalysisException {
+    if (tblProperties_.containsKey(property)) {
+      throw new AnalysisException(String.format("Changing the '%s' table property is " +
+          "not supported for Iceberg table.", property));
+    }
+  }
+
+  private void icebergTableFormatCheck(String fileformat) throws AnalysisException {
+    Preconditions.checkState(getTargetTable() instanceof FeIcebergTable);
+    Preconditions.checkState(fileformat != null);
+    if (IcebergUtil.getIcebergFileFormat(fileformat) == null) {
+      throw new AnalysisException("Invalid fileformat for Iceberg table: " + fileformat);
+    }
+  }
+
+  private void icebergParquetCompressionCodecCheck() throws AnalysisException {
+    StringBuilder errMsg = new StringBuilder();
+    if (IcebergUtil.parseParquetCompressionCodec(false, tblProperties_, errMsg) == null) {
+      throw new AnalysisException(errMsg.toString());
+    }
+  }
+
+  private void icebergParquetRowGroupSizeCheck() throws AnalysisException {
+    StringBuilder errMsg = new StringBuilder();
+    if (IcebergUtil.parseParquetRowGroupSize(tblProperties_, errMsg) == null) {
+      throw new AnalysisException(errMsg.toString());
+    }
+  }
+
+  private void icebergParquetPageSizeCheck(String property, String descr)
+      throws AnalysisException {
+    StringBuilder errMsg = new StringBuilder();
+    if (IcebergUtil.parseParquetPageSize(getTblProperties(), property, descr,
+        errMsg) == null) {
+      throw new AnalysisException(errMsg.toString());
     }
   }
 

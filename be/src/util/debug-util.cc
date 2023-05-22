@@ -17,25 +17,34 @@
 
 #include "util/debug-util.h"
 
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
-#include <random>
 #include <sstream>
-#include <boost/algorithm/string.hpp>
+#include <utility>
+
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/constants.hpp>
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/split.hpp>
 #include <boost/tokenizer.hpp>
+#include <gflags/gflags.h>
 
 #include "common/version.h"
 #include "runtime/collection-value.h"
 #include "runtime/descriptors.h"
-#include "runtime/exec-env.h"
-#include "runtime/raw-value.inline.h"
-#include "runtime/tuple-row.h"
+#include "runtime/raw-value.h"
 #include "runtime/row-batch.h"
-#include "util/cpu-info.h"
+#include "runtime/tuple-row.h"
+#include "runtime/tuple.h"
+#include "runtime/types.h"
 #include "util/impalad-metrics.h"
 #include "util/metrics.h"
 #include "util/string-parser.h"
-#include "util/uid-util.h"
 #include "util/time.h"
+
+#include "common/names.h"
 
 // / WARNING this uses a private API of GLog: DumpStackTraceToString().
 namespace google {
@@ -55,47 +64,37 @@ using boost::tokenizer;
 using namespace beeswax;
 using namespace parquet;
 
-DECLARE_int32(be_port);
+DECLARE_int32(krpc_port);
 DECLARE_string(hostname);
 
 namespace impala {
-
-#define PRINT_THRIFT_ENUM_IMPL(T) \
-  string PrintThriftEnum(const T::type& value) { \
-    map<int, const char*>::const_iterator it = _##T##_VALUES_TO_NAMES.find(value); \
-    return it == _##T##_VALUES_TO_NAMES.end() ? std::to_string(value) : it->second; \
-  }
-
-PRINT_THRIFT_ENUM_IMPL(QueryState)
-PRINT_THRIFT_ENUM_IMPL(Encoding)
-PRINT_THRIFT_ENUM_IMPL(TCatalogObjectType)
-PRINT_THRIFT_ENUM_IMPL(TCatalogOpType)
-PRINT_THRIFT_ENUM_IMPL(TDdlType)
-PRINT_THRIFT_ENUM_IMPL(TExplainLevel)
-PRINT_THRIFT_ENUM_IMPL(THdfsCompression)
-PRINT_THRIFT_ENUM_IMPL(THdfsFileFormat)
-PRINT_THRIFT_ENUM_IMPL(THdfsSeqCompressionMode)
-PRINT_THRIFT_ENUM_IMPL(TImpalaQueryOptions)
-PRINT_THRIFT_ENUM_IMPL(TJoinDistributionMode)
-PRINT_THRIFT_ENUM_IMPL(TKuduReadMode)
-PRINT_THRIFT_ENUM_IMPL(TMetricKind)
-PRINT_THRIFT_ENUM_IMPL(TParquetArrayResolution)
-PRINT_THRIFT_ENUM_IMPL(TParquetFallbackSchemaResolution)
-PRINT_THRIFT_ENUM_IMPL(TPlanNodeType)
-PRINT_THRIFT_ENUM_IMPL(TPrefetchMode)
-PRINT_THRIFT_ENUM_IMPL(TReplicaPreference)
-PRINT_THRIFT_ENUM_IMPL(TRuntimeFilterMode)
-PRINT_THRIFT_ENUM_IMPL(TSessionType)
-PRINT_THRIFT_ENUM_IMPL(TStmtType)
-PRINT_THRIFT_ENUM_IMPL(TUnit)
-PRINT_THRIFT_ENUM_IMPL(TParquetTimestampType)
-PRINT_THRIFT_ENUM_IMPL(TTransactionalType)
 
 string PrintId(const TUniqueId& id, const string& separator) {
   stringstream out;
   // Outputting the separator string resets the stream width.
   out << hex << setfill('0') << setw(16) << id.hi << separator << setw(16) << id.lo;
   return out.str();
+}
+
+string PrintId(const UniqueIdPB& id, const string& separator) {
+  stringstream out;
+  // Outputting the separator string resets the stream width.
+  out << hex << setfill('0') << setw(16) << id.hi() << separator << setw(16) << id.lo();
+  return out.str();
+}
+
+static void my_i64tohex(int64_t w, char out[16]) {
+  static const char* digits = "0123456789abcdef";
+  for (size_t i = 0, j=60; i < 16; ++i, j -= 4) {
+    out[i] = digits[(w>>j) & 0x0f];
+  }
+}
+
+void PrintIdCompromised(const TUniqueId& id, char out[TUniqueIdBufferSize],
+    const char separator) {
+  my_i64tohex(id.hi, out);
+  out[16] = separator;
+  my_i64tohex(id.lo, out+17);
 }
 
 bool ParseId(const string& s, TUniqueId* id) {
@@ -158,7 +157,7 @@ string PrintTuple(const Tuple* t, const TupleDescriptor& d) {
     if (t->IsNull(slot_d->null_indicator_offset())) {
       out << "null";
     } else if (slot_d->type().IsCollectionType()) {
-      const TupleDescriptor* item_d = slot_d->collection_item_descriptor();
+      const TupleDescriptor* item_d = slot_d->children_tuple_descriptor();
       const CollectionValue* coll_value =
           reinterpret_cast<const CollectionValue*>(t->GetSlot(slot_d->tuple_offset()));
       uint8_t* coll_buf = coll_value->ptr;
@@ -238,8 +237,9 @@ string PrintPath(const TableDescriptor& tbl_desc, const SchemaPath& path) {
         type = &type->children[path[i]];
         break;
       default:
-        DCHECK(false) << PrintNumericPath(path) << " " << i << " " << type->DebugString();
-        return PrintNumericPath(path);
+        DCHECK_EQ(path.size() - 1, i) << PrintNumericPath(path) << " "
+                                      << i <<" " << type->DebugString();
+        ss << "(" << type->DebugString() << ")";
     }
   }
   return ss.str();
@@ -295,12 +295,12 @@ string GetStackTrace() {
 }
 
 string GetBackendString() {
-  return Substitute("$0:$1", FLAGS_hostname, FLAGS_be_port);
+  return Substitute("$0:$1", FLAGS_hostname, FLAGS_krpc_port);
 }
 
 DebugActionTokens TokenizeDebugActions(const string& debug_actions) {
   DebugActionTokens results;
-  list<string> actions;
+  vector<string> actions;
   split(actions, debug_actions, is_any_of("|"), token_compress_on);
   for (const string& a : actions) {
     vector<string> components;
@@ -332,6 +332,10 @@ static bool ParseProbability(const string& prob_str, bool* should_execute) {
   return true;
 }
 
+/// The catalog java code also implements a equivalent method for processing the debug
+/// actions in the Java code. See DebugUtils.java for more details. Any changes to the
+/// implementation logic here like adding a new type of action, should make changes in
+/// the DebugUtils.java too.
 Status DebugActionImpl(
     const string& debug_action, const char* label, const std::vector<string>& args) {
   const DebugActionTokens& action_list = TokenizeDebugActions(debug_action);
@@ -401,6 +405,20 @@ Status DebugActionImpl(
         ImpaladMetrics::DEBUG_ACTION_NUM_FAIL->Increment(1l);
       }
       return Status(TErrorCode::INTERNAL_ERROR, error_msg);
+    } else if (iequals(cmd, "EXCEPTION")) {
+      //EXCEPTION@<exception_type>
+      if (tokens.size() != 2) {
+        return Status(Substitute(ERROR_MSG, components[0], action_str,
+            "expected EXCEPTION@<exception_type>"));
+      }
+      static const auto end = EXCEPTION_STR_MAP.end();
+      auto it = EXCEPTION_STR_MAP.find(tokens[1]);
+      if (it != end) {
+        it->second();
+      } else {
+        return Status(
+            Substitute(ERROR_MSG, components[0], action_str, "Invalid exception type"));
+      }
     } else {
       DCHECK(false) << "Invalid debug action";
       return Status(Substitute(ERROR_MSG, components[0], action_str, "invalid command"));

@@ -30,9 +30,6 @@ import java.util.TreeMap;
 import org.apache.avro.Schema;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-import org.apache.hadoop.hive.metastore.api.Partition;
-import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
-import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.serde.serdeConstants;
@@ -46,8 +43,12 @@ import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.HdfsFileFormat;
+import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.HdfsStorageDescriptor;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.PrunablePartition;
+import org.apache.impala.catalog.SqlConstraints;
+import org.apache.impala.catalog.VirtualColumn;
 import org.apache.impala.catalog.local.MetaProvider.PartitionMetadata;
 import org.apache.impala.catalog.local.MetaProvider.PartitionRef;
 import org.apache.impala.catalog.local.MetaProvider.TableMetaRef;
@@ -60,6 +61,8 @@ import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableType;
+import org.apache.impala.thrift.TValidWriteIdList;
+import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.AvroSchemaConverter;
 import org.apache.impala.util.AvroSchemaUtils;
 import org.apache.impala.util.ListMap;
@@ -106,6 +109,12 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
    */
   private final ListMap<TNetworkAddress> hostIndex_ = new ListMap<>();
 
+
+  /**
+   * SQL constraints associated with the table.
+   */
+  private SqlConstraints sqlConstraints_;
+
   /**
    * The Avro schema for this table. Non-null if this table is an Avro table.
    * If this table is not an Avro table, this is usually null, but may be
@@ -113,7 +122,14 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
    * as a table property. Such a schema is used when querying Avro partitions
    * of non-Avro tables.
    */
-  private final String avroSchema_;
+  private String avroSchema_;
+
+  /**
+   * True if this table is marked as cached by hdfs caching. Does not necessarily mean
+   * the data is cached or that all/any partitions are cached. Only used in analyzing
+   * DDLs.
+   */
+  private final boolean isMarkedCached_;
 
   public static LocalFsTable load(LocalDb db, Table msTbl, TableMetaRef ref) {
     String fullName = msTbl.getDbName() + "." + msTbl.getTableName();
@@ -166,6 +182,8 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
         FeFsTable.DEFAULT_NULL_COLUMN_VALUE;
 
     avroSchema_ = explicitAvroSchema;
+    isMarkedCached_ = (ref != null && ref.isMarkedCached());
+    if (ref != null) addVirtualColumns(ref.getVirtualColumns());
   }
 
   private static String loadAvroSchema(Table msTbl) throws AnalysisException {
@@ -189,23 +207,33 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
         /*explicitAvroSchema=*/null);
   }
 
-
-  @Override
+  @Override // FeFsTable
   public boolean isCacheable() {
-    // TODO Auto-generated method stub
-    return false;
+    if (!isLocationCacheable()) return false;
+    if (!isMarkedCached() && getNumClusteringCols() > 0) {
+      // Check if all partitions are cacheable.
+      // TODO: Currently we load all partitions including their file metadata in order to
+      //  detect whether they are cacheable. This is inefficient since only the partition
+      //  locations are needed. Consider decoupling msPartition and file descriptors in
+      //  LocalFsPartition so we can load the msPartition part individually.
+      loadPartitionSpecs();
+      for (FeFsPartition partition : loadPartitions(partitionSpecs_.keySet())) {
+        if (!partition.isCacheable()) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
-  @Override
+  @Override // FeFsTable
   public boolean isLocationCacheable() {
-    // TODO Auto-generated method stub
-    return false;
+    return FileSystemUtil.isPathCacheable(new Path(getLocation()));
   }
 
   @Override
   public boolean isMarkedCached() {
-    // TODO Auto-generated method stub
-    return false;
+    return isMarkedCached_;
   }
 
   @Override
@@ -314,17 +342,28 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
       hdfsTable.setAvroSchema(AvroSchemaConverter.convertFieldSchemas(
           getMetaStoreTable().getSd().getCols(), getFullName()).toString());
     }
+    if (AcidUtils.isFullAcidTable(getMetaStoreTable().getParameters())) {
+      hdfsTable.setIs_full_acid(true);
+    }
 
     TTableDescriptor tableDesc = new TTableDescriptor(tableId, TTableType.HDFS_TABLE,
         FeCatalogUtils.getTColumnDescriptors(this),
         getNumClusteringCols(), name_, db_.getName());
+    // 'ref_' can be null when this table is the target of a CTAS statement.
+    if (ref_ != null) {
+      TValidWriteIdList validWriteIdList =
+          db_.getCatalog().getMetaProvider().getValidWriteIdList(ref_);
+      if (validWriteIdList != null) hdfsTable.setValid_write_ids(validWriteIdList);
+      hdfsTable.setPartition_prefixes(ref_.getPartitionPrefixes());
+    }
     tableDesc.setHdfsTable(hdfsTable);
     return tableDesc;
   }
 
   private static boolean isAvroFormat(Table msTbl) {
     String inputFormat = msTbl.getSd().getInputFormat();
-    return HdfsFileFormat.fromJavaClassName(inputFormat) == HdfsFileFormat.AVRO;
+    String serDeLib = msTbl.getSd().getSerdeInfo().getSerializationLib();
+    return HdfsFileFormat.fromJavaClassName(inputFormat, serDeLib) == HdfsFileFormat.AVRO;
   }
 
   private static boolean hasAnyAvroPartition(List<? extends FeFsPartition> partitions) {
@@ -334,23 +373,39 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
     return false;
   }
 
-  private LocalFsPartition createPrototypePartition() {
-    Partition protoMsPartition = new Partition();
+  protected void setAvroSchema(Table msTbl) {
+    if (avroSchema_ == null) {
+      // No Avro schema was explicitly set in the table metadata, so infer the Avro
+      // schema from the column definitions.
+      Schema inferredSchema = AvroSchemaConverter.convertFieldSchemas(
+          msTbl.getSd().getCols(), msTbl.getDbName() + "." + msTbl.getTableName());
+      avroSchema_ = inferredSchema.toString();
+    }
+  }
 
+  protected String getAvroSchema() {
+    return avroSchema_;
+  }
+
+  public LocalFsPartition createPrototypePartition() {
     // The prototype partition should not have a location set in its storage
     // descriptor, or else all inserted files will end up written into the
     // table directory instead of the new partition directories.
     StorageDescriptor sd = getMetaStoreTable().getSd().deepCopy();
     sd.unsetLocation();
-    protoMsPartition.setSd(sd);
-
-    protoMsPartition.setParameters(Collections.<String, String>emptyMap());
+    HdfsStorageDescriptor hdfsStorageDescriptor = null;
+    try {
+      hdfsStorageDescriptor = HdfsStorageDescriptor.fromStorageDescriptor(name_, sd);
+    } catch (HdfsStorageDescriptor.InvalidStorageDescriptorException e) {
+      Preconditions.checkState(false, "Failed to create prototype partition " +
+          "HdfsStorageDescriptor using sd of table");
+    }
     LocalPartitionSpec spec = new LocalPartitionSpec(
         this, CatalogObjectsConstants.PROTOTYPE_PARTITION_ID);
-    LocalFsPartition prototypePartition = new LocalFsPartition(
-        this, spec, protoMsPartition, /*fileDescriptors=*/null, /*partitionStats=*/null,
-        /*hasIncrementalStats=*/false);
-    return prototypePartition;
+    return new LocalFsPartition(this, spec, Collections.emptyMap(), /*writeId=*/-1,
+        hdfsStorageDescriptor, /*fileDescriptors=*/null, /*insertFileDescriptors=*/null,
+        /*deleteFileDescriptors=*/null, /*partitionStats=*/null,
+        /*hasIncrementalStats=*/false, /*isMarkedCached=*/false, /*location*/null);
   }
 
   @Override
@@ -406,7 +461,7 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
     try {
       partsByName = db_.getCatalog().getMetaProvider().loadPartitionsByRefs(
           ref_, getClusteringColumnNames(), hostIndex_, refs);
-    } catch (TException e) {
+    } catch (CatalogException | TException e) {
       throw new LocalCatalogException(
           "Could not load partitions for table " + getFullName(), e);
     }
@@ -423,8 +478,12 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
             "' (perhaps it was concurrently dropped by another process)");
       }
 
-      LocalFsPartition part = new LocalFsPartition(this, spec, p.getHmsPartition(),
-          p.getFileDescriptors(), p.getPartitionStats(), p.hasIncrementalStats());
+      ImmutableList<FileDescriptor> fds = p.getInsertFileDescriptors().isEmpty() ?
+          p.getFileDescriptors() : ImmutableList.of();
+      LocalFsPartition part = new LocalFsPartition(this, spec, p.getHmsParameters(),
+          p.getWriteId(), p.getInputFormatDescriptor(), fds, p.getInsertFileDescriptors(),
+          p.getDeleteFileDescriptors(), p.getPartitionStats(), p.hasIncrementalStats(),
+          p.isMarkedCached(), p.getLocation());
       ret.add(part);
     }
     return ret;
@@ -496,6 +555,13 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
   }
 
   /**
+   * Populate constraint information by making a request to MetaProvider.
+   */
+  private void loadConstraints() throws TException {
+    sqlConstraints_ = db_.getCatalog().getMetaProvider().loadConstraints(ref_, msTable_);
+  }
+
+  /**
    * Override base implementation to populate column stats for
    * clustering columns based on the partition map.
    */
@@ -522,5 +588,20 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
   @Override
   public ListMap<TNetworkAddress> getHostIndex() {
     return hostIndex_;
+  }
+
+  @Override
+  public SqlConstraints getSqlConstraints() {
+    try {
+      loadConstraints();
+    } catch (TException e) {
+      throw new LocalCatalogException("Failed to load primary keys/foreign keys for "
+          + "table " + getFullName(), e);
+    }
+    return sqlConstraints_;
+  }
+
+  public List<String> getPartitionPrefixes() {
+    return ref_ == null ? Collections.emptyList() : ref_.getPartitionPrefixes();
   }
 }

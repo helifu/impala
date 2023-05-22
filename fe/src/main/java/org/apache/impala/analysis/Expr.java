@@ -50,7 +50,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Iterables;
@@ -83,7 +83,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   public static final float ARITHMETIC_OP_COST = 1;
   public static final float BINARY_PREDICATE_COST = 1;
   public static final float VAR_LEN_BINARY_PREDICATE_COST = 5;
-  public static final float CAST_COST = 1;
   public static final float COMPOUND_PREDICATE_COST = 1;
   public static final float FUNCTION_CALL_COST = 10;
   public static final float IS_NOT_EMPTY_COST = 1;
@@ -137,6 +136,18 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         @Override
         public boolean apply(Expr arg) {
           return arg.isScalarSubquery();
+        }
+      };
+
+  // Returns true if an Expr has a subquery as a direct child.
+  public static final com.google.common.base.Predicate<Expr> HAS_SUBQUERY_CHILD =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          for (Expr child : arg.getChildren()) {
+            if (child instanceof Subquery) return true;
+          }
+          return false;
         }
       };
 
@@ -305,6 +316,65 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       }
     };
 
+  public static final com.google.common.base.Predicate<Expr>
+    IS_CONDITIONAL_BUILTIN_FN_PREDICATE =
+    new com.google.common.base.Predicate<Expr>() {
+      @Override
+      public boolean apply(Expr arg) {
+        return arg instanceof FunctionCallExpr
+            && ((FunctionCallExpr) arg).isConditionalBuiltinFn();
+      }
+    };
+
+  public static final com.google.common.base.Predicate<Expr> IS_IS_NULL_PREDICATE =
+    new com.google.common.base.Predicate<Expr>() {
+      @Override
+      public boolean apply(Expr arg) {
+        return arg instanceof IsNullPredicate
+            && !((IsNullPredicate) arg).isNotNull();
+      }
+    };
+
+  public static final com.google.common.base.Predicate<Expr>
+    IS_DISTINCT_FROM_OR_NOT_DISTINCT_PREDICATE =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          return arg instanceof BinaryPredicate
+              && (((BinaryPredicate) arg).getOp() == Operator.DISTINCT_FROM
+              || ((BinaryPredicate) arg).getOp() == Operator.NOT_DISTINCT);
+        }
+      };
+
+  public static final com.google.common.base.Predicate<Expr> IS_CASE_EXPR_PREDICATE =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          return arg instanceof CaseExpr;
+        }
+      };
+
+  public static final com.google.common.base.Predicate<Expr> IS_ALWAYS_TRUE_PREDICATE =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          return arg instanceof Predicate
+              && ((Predicate) arg).hasAlwaysTrueHint();
+        }
+      };
+
+  // Returns true if an Expr is a builtin sleep function.
+  public static final com.google.common.base.Predicate<Expr> IS_FN_SLEEP =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          return arg instanceof FunctionCallExpr
+              && ((FunctionCallExpr) arg).getFnName().isBuiltin()
+              && ((FunctionCallExpr) arg).getFnName().getFunction() != null
+              && ((FunctionCallExpr) arg).getFnName().getFunction().equals("sleep");
+        }
+      };
+
   // id that's unique across the entire query statement and is assigned by
   // Analyzer.registerConjuncts(); only assigned for the top-level terms of a
   // conjunction, and therefore null for most Exprs
@@ -348,9 +418,17 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   // True after analysis successfully completed. Protected by accessors isAnalyzed() and
   // analysisDone().
   private boolean isAnalyzed_ = false;
+  private boolean isRewritten_ = false;
+
 
   // True if this has already been counted towards the number of statement expressions
   private boolean isCountedForNumStmtExprs_ = false;
+
+  // For exprs of type Predicate, this keeps track of predicate hints
+  protected List<PlanHint> predicateHints_;
+
+  // Is codegen disabled for this expression ?
+  private boolean isCodegenDisabled_ = false;
 
   protected Expr() {
     type_ = Type.INVALID;
@@ -367,6 +445,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     isAuxExpr_ = other.isAuxExpr_;
     type_ = other.type_;
     isAnalyzed_ = other.isAnalyzed_;
+    isRewritten_ = other.isRewritten_;
     isOnClauseConjunct_ = other.isOnClauseConjunct_;
     printSqlInParens_ = other.printSqlInParens_;
     selectivity_ = other.selectivity_;
@@ -376,9 +455,16 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     fn_ = other.fn_;
     isCountedForNumStmtExprs_ = other.isCountedForNumStmtExprs_;
     children_ = Expr.cloneList(other.children_);
+    if (other.predicateHints_ != null) {
+      predicateHints_ = new ArrayList<>();
+      predicateHints_.addAll(other.predicateHints_);
+    }
+    isCodegenDisabled_ = other.isCodegenDisabled_;
   }
 
   public boolean isAnalyzed() { return isAnalyzed_; }
+  public boolean isRewritten() { return isRewritten_; }
+  public void setRewritten(boolean isRewritten) { isRewritten_ = isRewritten; }
   public ExprId getId() { return id_; }
   protected void setId(ExprId id) { id_ = id; }
   public Type getType() { return type_; }
@@ -397,6 +483,12 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   public boolean isAuxExpr() { return isAuxExpr_; }
   public void setIsAuxExpr() { isAuxExpr_ = true; }
   public Function getFn() { return fn_; }
+  public void disableCodegen() {
+    isCodegenDisabled_ = true;
+    for (Expr child : children_) {
+      child.disableCodegen();
+    }
+  }
 
   /**
    * Perform semantic analysis of node and all of its children.
@@ -438,6 +530,29 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     analyzeImpl(analyzer);
     evalCost_ = computeEvalCost();
     analysisDone();
+  }
+
+  protected void analyzeHints(Analyzer analyzer) throws AnalysisException {
+    if (predicateHints_ != null && !predicateHints_.isEmpty()) {
+      if (!(this instanceof Predicate)) {
+        throw new AnalysisException("Expr hints are only supported for predicates");
+      }
+      for (PlanHint hint : predicateHints_) {
+        if (hint.is("ALWAYS_TRUE")) {
+          ((Predicate) this).setHasAlwaysTrueHint(true);
+          // If the top level expr has always_true hint, its conjuncts must
+          // also have the same hint (note that there's a TODO in the parser
+          // grammar to allow hints on a per expr basis).
+          List<Expr> conjuncts = getConjuncts();
+          if (conjuncts.size() > 1) {
+            for (Expr e : conjuncts) ((Predicate) e).setHasAlwaysTrueHint(true);
+          }
+          analyzer.setHasPlanHints();
+        } else {
+          analyzer.addWarning("Predicate hint not recognized: " + hint);
+        }
+      }
+    }
   }
 
   /**
@@ -768,6 +883,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     msg.type = type_.toThrift();
     msg.is_constant = isConstant_;
     msg.num_children = children_.size();
+    msg.setIs_codegen_disabled(isCodegenDisabled_);
     if (fn_ != null) {
       TFunction thriftFn = fn_.toThrift();
       thriftFn.setLast_modified_time(fn_.getLastModifiedTime());
@@ -932,7 +1048,8 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   @Override
   public int hashCode() {
     if (id_ == null) {
-      throw new UnsupportedOperationException("Expr.hashCode() is not implemented");
+      throw new UnsupportedOperationException(
+          "Expr.hashCode() is not implemented in " + this.getClass().getName());
     } else {
       return id_.asInt();
     }
@@ -959,6 +1076,17 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       list.add(this);
     }
     return list;
+  }
+
+  /**
+   * Returns true if this expression is trivially true. Currently we only check if
+   * it is comprised of conjuncts that are all TRUE literals.
+   */
+  public boolean isTriviallyTrue() {
+    for (Expr conjunct : getConjuncts()) {
+      if (!Expr.IS_TRUE_LITERAL.apply(conjunct)) return false;
+    }
+    return true;
   }
 
   /**
@@ -1032,14 +1160,16 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       Expr substExpr = smap.get(this);
       if (substExpr != null) return substExpr.clone();
     }
+    substituteImplOnChildren(smap, analyzer);
+    resetAnalysisState();
+    return this;
+  }
+
+  protected final void substituteImplOnChildren(ExprSubstitutionMap smap,
+      Analyzer analyzer) {
     for (int i = 0; i < children_.size(); ++i) {
       children_.set(i, children_.get(i).substituteImpl(smap, analyzer));
     }
-    // SlotRefs must remain analyzed to support substitution across query blocks. All
-    // other exprs must be analyzed again after the substitution to add implicit casts
-    // and for resolving their correct function signature.
-    if (!(this instanceof SlotRef)) resetAnalysisState();
-    return this;
   }
 
   /**
@@ -1099,6 +1229,38 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
+   * Create a deep copy of 'ls'. The elements of the returned list are of the same
+   * type as the input list.
+   */
+  public static <C extends Expr> List<List<C>> deepCopy(List<List<C>> ls) {
+    Preconditions.checkNotNull(ls);
+    List<List<C>> result = new ArrayList<>(ls.size());
+    for (List<C> l : ls) {
+      if (l == null) {
+        result.add(null);
+        continue;
+      }
+      List<C> l2 = new ArrayList<>(l.size());
+      for (Expr element : l) {
+        l2.add((C) element.clone());
+      }
+      result.add(l2);
+    }
+    return result;
+  }
+
+  /**
+   * Create a clone of the expression including analysis state with a different
+   * selectivity.
+   */
+  public Expr cloneAndOverrideSelectivity(double selectivity) {
+    Preconditions.checkArgument(selectivity >= 0.0 && selectivity <= 1.0, selectivity);
+    Expr e = clone();
+    e.selectivity_ = selectivity;
+    return e;
+  }
+
+  /**
    * Removes duplicate exprs (according to equals()).
    */
   public static <C extends Expr> void removeDuplicates(List<C> l) {
@@ -1140,36 +1302,28 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
-   * Propagates constant expressions of the form <slot ref> = <constant> to
+   * Propagates constant expressions of the form <slot ref> = <constant> or,
+   * for certain data types, <slot ref> range_operator <constant> to
    * other uses of slot ref in the given conjuncts; returns a BitSet with
    * bits set to true in all changed indices.  Only one round of substitution
    * is performed.  The candidates BitSet is used to determine which members of
-   * conjuncts are considered for propagation.
+   * conjuncts are considered for propagation. The keepConjuncts list is
+   * populated in specific cases (e.g for date/time range predicate propagation)
+   * with the original conjuncts that need to be preserved even after rewrite.
    */
   private static BitSet propagateConstants(List<Expr> conjuncts, BitSet candidates,
-      Analyzer analyzer) {
+      List<Expr> keepConjuncts, Analyzer analyzer) {
     Preconditions.checkState(conjuncts.size() <= candidates.size());
+
+    // first pass: gather the constant predicates into separate buckets
+    // for range and equality predicates
+    ConstantPredicateHandler handler = new ConstantPredicateHandler();
+    handler.classifyPredicates(conjuncts, candidates);
+
+    // second pass: propagate constants to the other predicates and keep track
+    // of which other predicates have been changed
     BitSet changed = new BitSet(conjuncts.size());
-    for (int i = candidates.nextSetBit(0); i >= 0; i = candidates.nextSetBit(i+1)) {
-      if (!(conjuncts.get(i) instanceof BinaryPredicate)) continue;
-      BinaryPredicate bp = (BinaryPredicate) conjuncts.get(i);
-      if (bp.getOp() != BinaryPredicate.Operator.EQ) continue;
-      SlotRef slotRef = bp.getBoundSlot();
-      if (slotRef == null || !bp.getChild(1).isConstant()) continue;
-      Expr subst = bp.getSlotBinding(slotRef.getSlotId());
-      ExprSubstitutionMap smap = new ExprSubstitutionMap();
-      smap.put(slotRef, subst);
-      for (int j = 0; j < conjuncts.size(); ++j) {
-        // Don't rewrite with our own substitution!
-        if (j == i) continue;
-        Expr toRewrite = conjuncts.get(j);
-        Expr rewritten = toRewrite.substitute(smap, analyzer, true);
-        if (!rewritten.equals(toRewrite)) {
-          conjuncts.set(j, rewritten);
-          changed.set(j, true);
-        }
-      }
-    }
+    handler.propagateConstantPreds(conjuncts, changed, keepConjuncts, analyzer);
     return changed;
   }
 
@@ -1183,6 +1337,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   public static boolean optimizeConjuncts(List<Expr> conjuncts, Analyzer analyzer) {
     Preconditions.checkNotNull(conjuncts);
     List<Expr> tmpConjuncts = new ArrayList<>();
+    List<Expr> keepConjuncts = new ArrayList<>();
     try {
       BitSet candidates = new BitSet(conjuncts.size());
       candidates.set(0, Math.min(conjuncts.size(), CONST_PROPAGATION_EXPR_LIMIT));
@@ -1195,7 +1350,8 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         // change the content of the first input param. We do not want to
         // change the expr in conjucts before make sure the constant propagation
         // does not cause analysis failures.
-        BitSet changed = propagateConstants(tmpConjuncts, candidates, analyzer);
+        BitSet changed = propagateConstants(tmpConjuncts, candidates, keepConjuncts,
+            analyzer);
         candidates.clear();
         int pruned = 0;
         for (int i = changed.nextSetBit(0); i >= 0; i = changed.nextSetBit(i+1)) {
@@ -1235,6 +1391,8 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       LOG.warn("Not able to analyze after rewrite: " + e.toString() + " conjuncts: " +
           Expr.debugString(conjuncts));
     }
+    // add the conjuncts that need to be preserved
+    conjuncts.addAll(keepConjuncts);
     Expr.removeDuplicates(conjuncts);
     return true;
   }
@@ -1273,6 +1431,11 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     return null;
   }
 
+  /**
+   * Find all unique slot and/or tuple ids referenced by this expr tree.
+   * @param tupleIds unique tuple IDs from this expr tree are appended here.
+   * @param slotIds unique slot IDs from this expr tree are appended here.
+   */
   public void getIds(List<TupleId> tupleIds, List<SlotId> slotIds) {
     Set<TupleId> tupleIdSet = new HashSet<>();
     Set<SlotId> slotIdSet = new HashSet<>();
@@ -1293,6 +1456,19 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     for (Expr e: exprs) {
       e.getIds(tupleIds, slotIds);
     }
+  }
+
+  /**
+   * Returns true if this expression tree references a slot in the tuple identified
+   * by tid.
+   */
+  public boolean referencesTuple(TupleId tid) {
+    // This is the default implementation. Expr subclasses that reference slots in
+    // tuples, i.e. SlotRef, must override this.
+    for (Expr child: children_) {
+      if (child.referencesTuple(tid)) return true;
+    }
+    return false;
   }
 
   /**
@@ -1343,7 +1519,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     if (!(this instanceof Subquery)) return false;
     Subquery subq = (Subquery) this;
     SelectStmt stmt = (SelectStmt) subq.getStatement();
-    return stmt.returnsSingleRow() && getType().isScalarType();
+    return stmt.returnsAtMostOneRow() && getType().isScalarType();
   }
 
   /**
@@ -1449,7 +1625,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this.getClass())
+    return MoreObjects.toStringHelper(this.getClass())
         .add("id", id_)
         .add("type", type_)
         .add("toSql", toSql(ToSqlOptions.SHOW_IMPLICIT_CASTS))
@@ -1470,14 +1646,41 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
-   * Returns the first child if this Expr is a CastExpr. Otherwise, returns 'this'.
+   * Returns the first child if this Expr is a CastExpr or builtin cast
+   * function. Otherwise, returns 'this'.
    */
   public Expr unwrapExpr(boolean implicitOnly) {
-    if (this instanceof CastExpr
-        && (!implicitOnly || ((CastExpr) this).isImplicit())) {
+    if ((this instanceof CastExpr
+        && (!implicitOnly || ((CastExpr) this).isImplicit()))
+        || (this instanceof FunctionCallExpr
+            && ((FunctionCallExpr) this).isBuiltinCastFunction())) {
       return children_.get(0);
     }
     return this;
+  }
+
+  /**
+   * Returns the source expression for this expression. Traverses the source
+   * exprs of intermediate slot descriptors to resolve materialization points
+   * (e.g., aggregations). Returns null if there are multiple source Exprs
+   * mapped to the expression at any given point.
+   */
+  public Expr findSrcExpr() {
+    // If the source expression is a constant expression, it won't have a scanSlotRef
+    // and we can return this.
+    if (isConstant()) {
+      return this;
+    }
+    SlotRef slotRef = unwrapSlotRef(false);
+    if (slotRef == null) return null;
+    SlotDescriptor slotDesc = slotRef.getDesc();
+    if (slotDesc.isScanSlot()) return slotRef;
+    if (slotDesc.getSourceExprs().size() == 1) {
+      return slotDesc.getSourceExprs().get(0).findSrcExpr();
+    }
+    // No known source expr, or there are several source exprs meaning the slot is
+    // has no single source table.
+    return null;
   }
 
   /**
@@ -1487,16 +1690,15 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    * Returns null if 'e' or any source expr of 'e' is not a SlotRef or cast SlotRef.
    */
   public SlotDescriptor findSrcScanSlot() {
-    SlotRef slotRef = unwrapSlotRef(false);
-    if (slotRef == null) return null;
-    SlotDescriptor slotDesc = slotRef.getDesc();
-    if (slotDesc.isScanSlot()) return slotDesc;
-    if (slotDesc.getSourceExprs().size() == 1) {
-      return slotDesc.getSourceExprs().get(0).findSrcScanSlot();
+    Expr sourceExpr = findSrcExpr();
+    if (sourceExpr == null) {
+      return null;
     }
-    // No known source expr, or there are several source exprs meaning the slot is
-    // has no single source table.
-    return null;
+    SlotRef slotRef = sourceExpr.unwrapSlotRef(false);
+    if (slotRef == null) {
+      return null;
+    }
+    return slotRef.getDesc();
   }
 
   /**
@@ -1682,5 +1884,51 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
           toSql() + " = " + value);
     }
     return value;
+  }
+
+  public void setPredicateHints(List<PlanHint> hints) {
+    Preconditions.checkNotNull(hints);
+    predicateHints_ = hints;
+  }
+
+  public List<PlanHint> getPredicateHints() { return predicateHints_; }
+
+  // A wrapper method to create null literal. This can be overriden
+  // in a derived class
+  protected Expr createNullLiteral() {
+    return new NullLiteral();
+  }
+
+  /**
+   * Subclass that contains query statements, e.g SubQuery, should override this.
+   */
+  public boolean resolveTableMask(Analyzer analyzer) throws AnalysisException {
+    boolean hasChanges = false;
+    for (Expr child : children_) {
+      hasChanges |= child.resolveTableMask(analyzer);
+    }
+    return hasChanges;
+  }
+
+  /**
+   * A slot descriptor may be associated with more than 1 source expression.
+   * This method returns the first source expr in that case or null if there
+   * are no source exprs.
+   */
+  public Expr getSlotDescFirstSourceExpr() {
+    SlotRef slotRef = unwrapSlotRef(false);
+    if (slotRef == null) return null;
+    SlotDescriptor slotDesc = slotRef.getDesc();
+    if (slotDesc.getSourceExprs().size() >= 1) {
+      return slotDesc.getSourceExprs().get(0);
+    }
+    return null;
+  }
+
+  /**
+   * Returns true if 'this' is a constant.
+   */
+  public boolean shouldConvertToCNF() {
+    return isConstant();
   }
 }

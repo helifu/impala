@@ -19,6 +19,9 @@
 # The top-level CMakeLists sets a ${KRB5_REALM_OVERRIDE} variable which should
 # be linked first into all Kudu binaries.
 
+# Target including all protobuf-generated code.
+add_custom_target(kudu-security-proto-deps)
+
 ##############################
 # krb5_realm_override
 ##############################
@@ -28,6 +31,8 @@ target_link_libraries(krb5_realm_override glog)
 if(NOT APPLE)
   target_link_libraries(krb5_realm_override dl)
 endif()
+
+add_definitions(-DKUDU_HEADERS_USE_SHORT_STATUS_MACROS)
 
 ##############################
 # token_proto
@@ -44,6 +49,7 @@ ADD_EXPORTABLE_LIBRARY(token_proto
   DEPS ${TOKEN_PROTO_LIBS}
   NONLINK_DEPS ${TOKEN_PROTO_TGTS})
 
+add_dependencies(kudu-security-proto-deps ${TOKEN_PROTO_TGTS})
 
 ##############################
 # security
@@ -70,7 +76,6 @@ set(SECURITY_SRCS
   kerberos_util.cc
   gssapi.cc
   init.cc
-  openssl_util.cc
   ${PORTED_X509_CHECK_HOST_CC}
   security_flags.cc
   simple_acl.cc
@@ -136,11 +141,10 @@ if (NOT NO_TESTS)
     security)
 
   # Tests
-  set(KUDU_TEST_LINK_LIBS
+  SET_KUDU_TEST_LINK_LIBS(
     mini_kdc
     security
-    security_test_util
-    ${KUDU_MIN_TEST_LIBS})
+    security_test_util)
 
   ADD_KUDU_TEST(ca/cert_management-test)
   ADD_KUDU_TEST(cert-test)

@@ -17,15 +17,21 @@
 
 #include "exec/partitioned-hash-join-builder.h"
 
-#include "codegen/impala-ir.h"
+#include "common/compiler-util.h"
+#include "common/logging.h"
+#include "common/status.h"
+#include "exec/filter-context.h"
+#include "exec/hash-table.h"
 #include "exec/hash-table.inline.h"
-#include "runtime/buffered-tuple-stream.inline.h"
-#include "runtime/raw-value.inline.h"
+#include "gen-cpp/Types_types.h"
+#include "runtime/buffered-tuple-stream.h"
 #include "runtime/row-batch.h"
-#include "runtime/runtime-filter.h"
-#include "util/bloom-filter.h"
 
 #include "common/names.h"
+
+namespace impala {
+class TupleRow;
+}
 
 using namespace impala;
 
@@ -57,11 +63,11 @@ Status PhjBuilder::ProcessBuildBatch(
     if (build_filters) {
       DCHECK_EQ(ctx->level(), 0)
           << "Runtime filters should not be built during repartitioning.";
-      InsertRuntimeFilters(build_row);
+      InsertRuntimeFilters(filter_ctxs_.data(), build_row);
     }
     const uint32_t hash = expr_vals_cache->CurExprValuesHash();
     const uint32_t partition_idx = hash >> (32 - NUM_PARTITIONING_BITS);
-    Partition* partition = hash_partitions_[partition_idx].get();
+    PhjBuilderPartition* partition = hash_partitions_[partition_idx].get();
     if (UNLIKELY(!AppendRow(partition->build_rows(), build_row, &status))) {
       return status;
     }
@@ -70,7 +76,7 @@ Status PhjBuilder::ProcessBuildBatch(
   return Status::OK();
 }
 
-bool PhjBuilder::Partition::InsertBatch(TPrefetchMode::type prefetch_mode,
+bool PhjBuilderPartition::InsertBatch(TPrefetchMode::type prefetch_mode,
     HashTableCtx* ht_ctx, RowBatch* batch,
     const vector<BufferedTupleStream::FlatRowPtr>& flat_rows, Status* status) {
   // Compute the hash values and prefetch the hash table buckets.

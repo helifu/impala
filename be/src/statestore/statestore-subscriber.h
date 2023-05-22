@@ -15,15 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef STATESTORE_STATESTORE_SUBSCRIBER_H
-#define STATESTORE_STATESTORE_SUBSCRIBER_H
-
+#include <mutex>
 #include <string>
 
 #include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
-#include <boost/thread/mutex.hpp>
 #include <boost/thread/shared_mutex.hpp>
 
 #include "gen-cpp/StatestoreService.h"
@@ -141,7 +139,7 @@ class StatestoreSubscriber {
 
   /// Implementation of the heartbeat thrift interface, which proxies
   /// calls onto this object.
-  boost::shared_ptr<StatestoreSubscriberIf> thrift_iface_;
+  std::shared_ptr<StatestoreSubscriberIf> thrift_iface_;
 
   /// Container for the heartbeat server.
   std::shared_ptr<ThriftServer> heartbeat_server_;
@@ -153,6 +151,10 @@ class StatestoreSubscriber {
   std::unique_ptr<Thread> recovery_mode_thread_;
 
   /// statestore client cache - only one client is ever used. Initialized in constructor.
+  /// The StatestoreClientCache is created with num_retries = 1 and wait_ms = 0.
+  /// Connections are still retried, but the retry mechanism is driven by DoRpcWithRetry.
+  /// Clients should always use DoRpcWithRetry rather than DoRpc to ensure that both RPCs
+  /// and connections are retried.
   boost::scoped_ptr<StatestoreClientCache> client_cache_;
 
   /// MetricGroup instance that all metrics are registered in. Not owned by this class.
@@ -182,8 +184,9 @@ class StatestoreSubscriber {
   StatsMetric<double>* heartbeat_interval_metric_;
 
   /// Tracks the time between heartbeat messages. Only updated by Heartbeat(), which
-  /// should not run concurrently with itself.
-  MonotonicStopWatch heartbeat_interval_timer_;
+  /// should not run concurrently with itself. Use a ConcurrentStopWatch because the
+  /// watch is started in one thread, but read in another.
+  ConcurrentStopWatch heartbeat_interval_timer_;
 
   /// Current registration ID, in string form.
   StringProperty* registration_id_metric_;
@@ -208,7 +211,7 @@ class StatestoreSubscriber {
 
   /// Protects registration_id_. Must be taken after lock_ if both are to be taken
   /// together.
-  boost::mutex registration_id_lock_;
+  std::mutex registration_id_lock_;
 
   /// Set during Register(), this is the unique ID of the current registration with the
   /// statestore. If this subscriber must recover, or disconnects and then reconnects, the
@@ -224,7 +227,7 @@ class StatestoreSubscriber {
     /// Held when processing a topic update. 'StatestoreSubscriber::lock_' must be held in
     /// shared mode before acquiring this lock. If taking multiple update locks, they must
     /// be acquired in ascending order of topic name.
-    boost::mutex update_lock;
+    std::mutex update_lock;
 
     /// Whether the subscriber considers this topic to be "transient", that is any updates
     /// it makes will be deleted upon failure or disconnection.
@@ -235,7 +238,7 @@ class StatestoreSubscriber {
     bool populate_min_subscriber_topic_version = false;
 
     /// Only subscribe to keys with the provided prefix.
-    string filter_prefix;
+    std::string filter_prefix;
 
     /// The last version of the topic this subscriber processed.
     /// -1 if no updates have been processed yet.
@@ -315,7 +318,4 @@ class StatestoreSubscriber {
     return MonotonicMillis() - last_registration_ms_.Load();
   }
 };
-
 }
-
-#endif

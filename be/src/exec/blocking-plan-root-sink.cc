@@ -21,20 +21,22 @@
 #include "runtime/row-batch.h"
 #include "runtime/tuple-row.h"
 #include "service/query-result-set.h"
+#include "util/debug-util.h"
 #include "util/pretty-printer.h"
+#include "util/runtime-profile-counters.h"
 
 #include <memory>
-#include <boost/thread/mutex.hpp>
+#include <mutex>
 
 using namespace std;
-using boost::unique_lock;
-using boost::mutex;
+using std::mutex;
+using std::unique_lock;
 
 namespace impala {
 
 BlockingPlanRootSink::BlockingPlanRootSink(
-    TDataSinkId sink_id, const RowDescriptor* row_desc, RuntimeState* state)
-  : PlanRootSink(sink_id, row_desc, state) {}
+    TDataSinkId sink_id, const DataSinkConfig& sink_config, RuntimeState* state)
+  : PlanRootSink(sink_id, sink_config, state) {}
 
 Status BlockingPlanRootSink::Prepare(
     RuntimeState* state, MemTracker* parent_mem_tracker) {
@@ -43,7 +45,6 @@ Status BlockingPlanRootSink::Prepare(
 
 Status BlockingPlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
   SCOPED_TIMER(profile()->total_time_counter());
-  PlanRootSink::ValidateCollectionSlots(*row_desc_, batch);
   RETURN_IF_ERROR(PlanRootSink::UpdateAndCheckRowsProducedLimit(state, batch));
   int current_batch_row = 0;
 
@@ -66,8 +67,8 @@ Status BlockingPlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
     if (num_rows_requested_ > 0) num_to_fetch = min(num_to_fetch, num_rows_requested_);
     // Debug action before AddBatch is called.
     RETURN_IF_ERROR(DebugAction(state->query_options(), "BPRS_BEFORE_ADD_ROWS"));
-    RETURN_IF_ERROR(
-        results_->AddRows(output_expr_evals_, batch, current_batch_row, num_to_fetch));
+    RETURN_IF_ERROR(results_->AddRows(
+        output_expr_evals_, batch, current_batch_row, num_to_fetch));
     current_batch_row += num_to_fetch;
     // Prevent expr result allocations from accumulating.
     expr_results_pool_->Clear();

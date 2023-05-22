@@ -17,13 +17,18 @@
 
 #pragma once
 
-#include "gen-cpp/StatestoreService_types.h"
 #include <string>
 
 namespace impala {
+
+class BackendDescriptorPB;
 class ExecutorGroup;
+class ExecutorGroupDescPB;
 
 namespace test {
+
+static const int64_t MEGABYTE = 1024L * 1024L;
+static const int64_t GIGABYTE = 1024L * MEGABYTE;
 
 /// Convert a host index to a hostname.
 std::string HostIdxToHostname(int host_idx);
@@ -37,15 +42,18 @@ std::string HostIdxToIpAddr(int host_idx);
 /// To create backends on the same host, an optional port offset can be specified.
 ///
 /// Make a backend descriptor for group 'group_desc'.
-TBackendDescriptor MakeBackendDescriptor(
-    int idx, const TExecutorGroupDesc& group_desc, int port_offset = 0);
+BackendDescriptorPB MakeBackendDescriptor(
+    int idx, const ExecutorGroupDescPB& group_desc, int port_offset = 0,
+    int64_t admit_mem_limit = 4L * MEGABYTE);
 
 /// Make a backend descriptor for 'group'.
-TBackendDescriptor MakeBackendDescriptor(
-    int idx, const ExecutorGroup& group, int port_offset = 0);
+BackendDescriptorPB MakeBackendDescriptor(
+    int idx, const ExecutorGroup& group, int port_offset = 0,
+    int64_t admit_mem_limit = 4L * MEGABYTE);
 
 /// Make a backend descriptor for the default executor group.
-TBackendDescriptor MakeBackendDescriptor(int idx, int port_offset = 0);
+BackendDescriptorPB MakeBackendDescriptor(int idx, int port_offset = 0,
+    int64_t admit_mem_limit = 4L * MEGABYTE);
 
 }  // end namespace test
 }  // end namespace impala

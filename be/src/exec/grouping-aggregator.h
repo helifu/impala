@@ -22,6 +22,7 @@
 #include <memory>
 #include <vector>
 
+#include "codegen/codegen-fn-ptr.h"
 #include "exec/aggregator.h"
 #include "exec/hash-table.h"
 #include "runtime/buffered-tuple-stream.h"
@@ -33,10 +34,13 @@
 namespace impala {
 
 class AggFnEvaluator;
+class GroupingAggregator;
 class PlanNode;
 class LlvmCodeGen;
+class QueryState;
 class RowBatch;
 class RuntimeState;
+struct ScalarExprsResultsRowLayout;
 class TAggregator;
 class Tuple;
 
@@ -117,10 +121,12 @@ class Tuple;
 class GroupingAggregatorConfig : public AggregatorConfig {
  public:
   GroupingAggregatorConfig(
-      const TAggregator& taggregator, RuntimeState* state, PlanNode* pnode);
-  virtual Status Init(
-      const TAggregator& taggregator, RuntimeState* state, PlanNode* pnode) override;
-  ~GroupingAggregatorConfig() {}
+      const TAggregator& taggregator, FragmentState* state, PlanNode* pnode, int agg_idx);
+  Status Init(
+      const TAggregator& taggregator, FragmentState* state, PlanNode* pnode) override;
+  void Close() override;
+  void Codegen(FragmentState* state) override;
+  ~GroupingAggregatorConfig() override {}
 
   /// Row with the intermediate tuple as its only tuple.
   /// Construct a new row desc for preparing the build exprs because neither the child's
@@ -143,20 +149,53 @@ class GroupingAggregatorConfig : public AggregatorConfig {
   /// All the exprs are simply SlotRefs for the intermediate tuple.
   std::vector<ScalarExpr*> build_exprs_;
 
+  /// Exprs used to evaluate input rows
+  std::vector<ScalarExpr*> grouping_exprs_;
+
   /// Indices of grouping exprs with var-len string types in grouping_exprs_.
   /// We need to do more work for var-len expressions when allocating and spilling rows.
   /// All var-len grouping exprs have type string.
   std::vector<int> string_grouping_exprs_;
+
+  /// Used for codegening hash table specific methods and to create the corresponding
+  /// instance of HashTableCtx.
+  const HashTableConfig* hash_table_config_;
+
+  typedef Status (*AddBatchImplFn)(
+      GroupingAggregator*, RowBatch*, TPrefetchMode::type, HashTableCtx*, bool);
+  /// Jitted AddBatchImpl function pointer. Null if codegen is disabled.
+  CodegenFnPtr<AddBatchImplFn> add_batch_impl_fn_;
+
+  typedef Status (*AddBatchStreamingImplFn)(GroupingAggregator*, int, bool,
+      TPrefetchMode::type, RowBatch*, RowBatch*, HashTableCtx*, int[]);
+  /// Jitted AddBatchStreamingImpl function pointer. Null if codegen is disabled.
+  CodegenFnPtr<AddBatchStreamingImplFn> add_batch_streaming_impl_fn_;
+
+  int GetNumGroupingExprs() const override { return grouping_exprs_.size(); }
+
+ private:
+  /// Codegen the non-streaming add row batch loop. The loop has already been compiled to
+  /// IR and loaded into the codegen object. UpdateAggTuple has also been codegen'd to IR.
+  /// This function will modify the loop subsituting the statically compiled functions
+  /// with codegen'd ones. 'add_batch_impl_fn_' will be updated with the codegened
+  /// function.
+  /// Assumes AGGREGATED_ROWS = false.
+  Status CodegenAddBatchImpl(
+      LlvmCodeGen* codegen, TPrefetchMode::type prefetch_mode) WARN_UNUSED_RESULT;
+
+  /// Codegen the materialization loop for streaming preaggregations.
+  /// 'add_batch_streaming_impl_fn_' will be updated with the codegened function.
+  Status CodegenAddBatchStreamingImpl(
+      LlvmCodeGen* codegen, TPrefetchMode::type prefetch_mode) WARN_UNUSED_RESULT;
 };
 
 class GroupingAggregator : public Aggregator {
  public:
   GroupingAggregator(ExecNode* exec_node, ObjectPool* pool,
       const GroupingAggregatorConfig& config, int64_t estimated_input_cardinality,
-      int agg_idx);
+      bool needUnsetLimit);
 
   virtual Status Prepare(RuntimeState* state) override;
-  virtual void Codegen(RuntimeState* state) override;
   virtual Status Open(RuntimeState* state) override;
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) override;
   virtual Status Reset(RuntimeState* state, RowBatch* row_batch) override;
@@ -174,8 +213,17 @@ class GroupingAggregator : public Aggregator {
   virtual std::string DebugString(int indentation_level = 0) const override;
   virtual void DebugString(int indentation_level, std::stringstream* out) const override;
 
+  virtual int64_t GetNumKeys() const override;
+
+  void UnsetLimit() { limit_ = -1; }
+
  private:
   struct Partition;
+
+  /// Reference to the hash table config which is a part of the GroupingAggregatorConfig
+  /// that was used to create this object. Its used to create an instance of the
+  /// HashTableCtx in Prepare(). Not Owned.
+  const HashTableConfig& hash_table_config_;
 
   /// Number of initial partitions to create. Must be a power of 2.
   static const int PARTITION_FANOUT = 16;
@@ -221,11 +269,11 @@ class GroupingAggregator : public Aggregator {
   bool needs_serialize_ = false;
 
   /// Exprs used to evaluate input rows
-  std::vector<ScalarExpr*> grouping_exprs_;
+  const std::vector<ScalarExpr*>& grouping_exprs_;
 
   /// Exprs used to insert constructed aggregation tuple into the hash table.
   /// All the exprs are simply SlotRefs for the intermediate tuple.
-  std::vector<ScalarExpr*> build_exprs_;
+  const std::vector<ScalarExpr*>& build_exprs_;
 
   /// Indices of grouping exprs with var-len string types in grouping_exprs_.
   /// We need to do more work for var-len expressions when allocating and spilling rows.
@@ -236,6 +284,15 @@ class GroupingAggregator : public Aggregator {
 
   /// Allocator for hash table memory.
   std::unique_ptr<Suballocator> ht_allocator_;
+  /// Saved reservation for writing a large page to a spilled stream or writing the last
+  /// large row to a pinned partition when building/repartitioning a spilled partition.
+  /// ('max_page_len' - 'default_page_len') reservation is saved when claiming the initial
+  /// min reservation.
+  BufferPool::SubReservation large_write_page_reservation_;
+  /// Saved reservation for reading a large page from a spilled stream.
+  /// ('max_page_len' - 'default_page_len') reservation is saved when claiming the initial
+  /// min reservation.
+  BufferPool::SubReservation large_read_page_reservation_;
 
   /// MemPool used to allocate memory during Close() when creating new output tuples. The
   /// pool should not be Reset() to allow amortizing memory allocation over a series of
@@ -264,15 +321,12 @@ class GroupingAggregator : public Aggregator {
   int64_t limit_; // -1: no limit
   bool ReachedLimit() { return limit_ != -1 && num_rows_returned_ >= limit_; }
 
-  typedef Status (*AddBatchImplFn)(
-      GroupingAggregator*, RowBatch*, TPrefetchMode::type, HashTableCtx*);
   /// Jitted AddBatchImpl function pointer. Null if codegen is disabled.
-  AddBatchImplFn add_batch_impl_fn_ = nullptr;
+  const CodegenFnPtr<GroupingAggregatorConfig::AddBatchImplFn>& add_batch_impl_fn_;
 
-  typedef Status (*AddBatchStreamingImplFn)(GroupingAggregator*, int, bool,
-      TPrefetchMode::type, RowBatch*, RowBatch*, HashTableCtx*, int[PARTITION_FANOUT]);
-  /// Jitted AddBatchStreamingImpl function pointer.  Null if codegen is disabled.
-  AddBatchStreamingImplFn add_batch_streaming_impl_fn_ = nullptr;
+  /// Jitted AddBatchStreamingImpl function pointer. Null if codegen is disabled.
+  const CodegenFnPtr<GroupingAggregatorConfig::AddBatchStreamingImplFn>&
+      add_batch_streaming_impl_fn_;
 
   /// Total time spent resizing hash tables.
   RuntimeProfile::Counter* ht_resize_timer_ = nullptr;
@@ -381,8 +435,7 @@ class GroupingAggregator : public Aggregator {
 
     /// Initializes the hash table. 'aggregated_row_stream' must be non-NULL.
     /// Sets 'got_memory' to true if the hash table was initialised or false on OOM.
-    /// After returning, 'hash_tbl' will be non-null iff 'got_memory' is true and the
-    /// returned status is OK.
+    /// After returning, 'hash_tbl' will be non-null iff the returned status is OK.
     Status InitHashTable(bool* got_memory) WARN_UNUSED_RESULT;
 
     /// Called in case we need to serialize aggregated rows. This step effectively does
@@ -401,6 +454,8 @@ class GroupingAggregator : public Aggregator {
     Status Spill(bool more_aggregate_rows) WARN_UNUSED_RESULT;
 
     bool is_spilled() const { return hash_tbl.get() == nullptr; }
+
+    std::string DebugString() const;
 
     GroupingAggregator* parent;
 
@@ -488,12 +543,15 @@ class GroupingAggregator : public Aggregator {
   /// 'prefetch_mode' specifies the prefetching mode in use. If it's not PREFETCH_NONE,
   ///     hash table buckets will be prefetched based on the hash values computed. Note
   ///     that 'prefetch_mode' will be substituted with constants during codegen time.
-  //
+  /// 'has_more_rows' is used in building/repartitioning a spilled partition, to indicate
+  ///     whether there are more rows after the given 'batch' in the input. We may restore
+  ///     the 'large_write_page_reservation_' when adding the last row.
+  ///
   /// This function is replaced by codegen. We pass in ht_ctx_.get() as an argument for
   /// performance.
   template <bool AGGREGATED_ROWS>
   Status IR_ALWAYS_INLINE AddBatchImpl(RowBatch* batch, TPrefetchMode::type prefetch_mode,
-      HashTableCtx* ht_ctx) WARN_UNUSED_RESULT;
+      HashTableCtx* ht_ctx, bool has_more_rows) WARN_UNUSED_RESULT;
 
   /// Evaluates the rows in 'batch' starting at 'start_row_idx' and stores the results in
   /// the expression values cache in 'ht_ctx'. The number of rows evaluated depends on
@@ -509,7 +567,7 @@ class GroupingAggregator : public Aggregator {
   /// May spill partitions if not enough memory is available.
   template <bool AGGREGATED_ROWS>
   Status IR_ALWAYS_INLINE ProcessRow(
-      TupleRow* row, HashTableCtx* ht_ctx) WARN_UNUSED_RESULT;
+      TupleRow* row, HashTableCtx* ht_ctx, bool has_more_rows) WARN_UNUSED_RESULT;
 
   /// Create a new intermediate tuple in partition, initialized with row. ht_ctx is
   /// the context for the partition's hash table and hash is the precomputed hash of
@@ -520,7 +578,8 @@ class GroupingAggregator : public Aggregator {
   /// for insertion returned from HashTable::FindBuildRowBucket().
   template <bool AGGREGATED_ROWS>
   Status IR_ALWAYS_INLINE AddIntermediateTuple(Partition* partition, TupleRow* row,
-      uint32_t hash, HashTable::Iterator insert_it) WARN_UNUSED_RESULT;
+      uint32_t hash, HashTable::Iterator insert_it, bool has_more_rows)
+      WARN_UNUSED_RESULT;
 
   /// Append a row to a spilled partition. The row may be aggregated or unaggregated
   /// according to AGGREGATED_ROWS. May spill partitions if needed to append the row
@@ -531,7 +590,8 @@ class GroupingAggregator : public Aggregator {
 
   /// Reads all the rows from input_stream and process them by calling AddBatchImpl().
   template <bool AGGREGATED_ROWS>
-  Status ProcessStream(BufferedTupleStream* input_stream) WARN_UNUSED_RESULT;
+  Status ProcessStream(BufferedTupleStream* input_stream, bool has_more_streams)
+      WARN_UNUSED_RESULT;
 
   /// Get rows for the next rowbatch from the next partition. Sets 'partition_eos_' to
   /// true if all rows from all partitions have been returned or the limit is reached.
@@ -583,7 +643,7 @@ class GroupingAggregator : public Aggregator {
   /// resize the hash tables, may spill partitions. 'aggregated_rows' is true if
   /// we're currently partitioning aggregated rows.
   Status CheckAndResizeHashPartitions(
-      bool aggregated_rows, int num_rows, const HashTableCtx* ht_ctx) WARN_UNUSED_RESULT;
+      bool aggregated_rows, int num_rows, HashTableCtx* ht_ctx) WARN_UNUSED_RESULT;
 
   /// Prepares the next partition to return results from. On return, this function
   /// initializes output_iterator_ and output_partition_. This either removes
@@ -632,20 +692,6 @@ class GroupingAggregator : public Aggregator {
   void CleanupHashTbl(
       const std::vector<AggFnEvaluator*>& agg_fn_evals, HashTable::Iterator it);
 
-  /// Codegen the non-streaming add row batch loop. The loop has already been compiled to
-  /// IR and loaded into the codegen object. UpdateAggTuple has also been codegen'd to IR.
-  /// This function will modify the loop subsituting the statically compiled functions
-  /// with codegen'd ones. 'add_batch_impl_fn_' will be updated with the codegened
-  // function.
-  /// Assumes AGGREGATED_ROWS = false.
-  Status CodegenAddBatchImpl(
-      LlvmCodeGen* codegen, TPrefetchMode::type prefetch_mode) WARN_UNUSED_RESULT;
-
-  /// Codegen the materialization loop for streaming preaggregations.
-  /// 'add_batch_streaming_impl_fn_' will be updated with the codegened function.
-  Status CodegenAddBatchStreamingImpl(
-      LlvmCodeGen* codegen, TPrefetchMode::type prefetch_mode) WARN_UNUSED_RESULT;
-
   /// Compute minimum buffer reservation for grouping aggregations.
   /// We need one buffer per partition, which is used either as the write buffer for the
   /// aggregated stream or the unaggregated stream. We need an additional buffer to read
@@ -657,6 +703,39 @@ class GroupingAggregator : public Aggregator {
   /// as the partitions aggregate stream needs to be serialized and rewritten.
   /// We do not spill streaming preaggregations, so we do not need to reserve any buffers.
   int64_t MinReservation() const;
+
+  /// Try to save the extra reservation ('max_row_buffer_size' - 'spillable_buffer_size')
+  /// for a large write page to 'large_write_page_reservation_'. Do nothing if there are
+  /// not enough unused reservation. Return true if succeeds.
+  bool TrySaveLargeWritePageReservation();
+
+  /// Similar to above but for the large read page.
+  bool TrySaveLargeReadPageReservation();
+
+  /// Same as TrySaveLargeWritePageReservation() but make sure it succeeds.
+  void SaveLargeWritePageReservation();
+
+  /// Same as TrySaveLargeReadPageReservation() but make sure it succeeds.
+  void SaveLargeReadPageReservation();
+
+  /// Restore the extra reservation we saved in 'large_write_page_reservation_' for a
+  /// large write page. 'large_write_page_reservation_' must not be used.
+  void RestoreLargeWritePageReservation();
+
+  /// Similar to above but for the large read page.
+  void RestoreLargeReadPageReservation();
+
+  /// A wrapper of 'stream->AddRow()' to add 'row' to a spilled 'stream'. When it fails to
+  /// add a large row due to run out of unused reservation and fails to increase the
+  /// reservation, retry it after restoring the large write page reservation when we don't
+  /// need to save this reservation for spilling partitions. If succeeds, returns true and
+  /// save back the large write page reservation. Otherwise, returns false with a non-ok
+  /// status.
+  bool AddRowToSpilledStream(BufferedTupleStream* stream, TupleRow* __restrict__ row,
+      Status* status);
+
+  /// Gets current number of pinned partitions.
+  int GetNumPinnedPartitions();
 };
 } // namespace impala
 

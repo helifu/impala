@@ -92,6 +92,20 @@ ScannerContext::Stream* ScannerContext::AddStream(ScanRange* range, int64_t rese
   return streams_.back().get();
 }
 
+Status ScannerContext::AddAndStartStream(
+    ScanRange* range, int64_t reservation, ScannerContext::Stream** stream) {
+  DCHECK(stream != nullptr);
+  DiskIoMgr* io_mgr = ExecEnv::GetInstance()->disk_io_mgr();
+  bool needs_buffers;
+  RETURN_IF_ERROR(scan_node_->reader_context()->StartScanRange(range, &needs_buffers));
+  if (needs_buffers) {
+    RETURN_IF_ERROR(io_mgr->AllocateBuffersForRange(bp_client(), range, reservation));
+  }
+  *stream = AddStream(range, reservation);
+  DCHECK(*stream != nullptr);
+  return Status::OK();
+}
+
 void ScannerContext::Stream::ReleaseCompletedResources(bool done) {
   if (done) {
     // Cancel the underlying scan range to clean up any queued buffers there
@@ -158,9 +172,8 @@ Status ScannerContext::Stream::GetNextBuffer(int64_t read_past_size) {
     // Disable HDFS caching as we are reading past the end.
     int cache_options = scan_range_->cache_options() & ~BufferOpts::USE_HDFS_CACHE;
     ScanRange* range = parent_->scan_node_->AllocateScanRange(
-        scan_range_->fs(), filename(), read_past_buffer_size, offset, partition_id,
-        scan_range_->disk_id(), expected_local, scan_range_->is_erasure_coded(),
-        scan_range_->mtime(), BufferOpts(cache_options));
+        scan_range_->GetFileInfo(), read_past_buffer_size, offset, partition_id,
+        scan_range_->disk_id(), expected_local, BufferOpts(cache_options));
     bool needs_buffers;
     RETURN_IF_ERROR(
         parent_->scan_node_->reader_context()->StartScanRange(range, &needs_buffers));

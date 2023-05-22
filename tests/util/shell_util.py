@@ -17,17 +17,23 @@
 #
 # Utility functions related to executing shell commands.
 
+from __future__ import absolute_import, division, print_function
 import logging
 import os
 import shlex
 from select import select
-from subprocess import PIPE, Popen, STDOUT
+from subprocess import PIPE, Popen, STDOUT, call
 from textwrap import dedent
 from time import sleep, time
 
 from tests.common.errors import Timeout
 
 LOG = logging.getLogger('shell_util')
+
+
+def dump_server_stacktraces():
+  LOG.debug('Dumping stacktraces of running servers')
+  call([os.path.join(os.environ['IMPALA_HOME'], "bin/dump-stacktraces.sh")])
 
 def exec_process(cmd):
   """Executes a subprocess, waiting for completion. The process exit code, stdout and

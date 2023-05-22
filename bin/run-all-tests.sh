@@ -28,7 +28,7 @@ setup_report_build_error
 # Allow picking up strategy from environment
 : ${EXPLORATION_STRATEGY:=core}
 : ${NUM_TEST_ITERATIONS:=1}
-: ${MAX_PYTEST_FAILURES:=10}
+: ${MAX_PYTEST_FAILURES:=100}
 : ${TIMEOUT_FOR_RUN_ALL_TESTS_MINS:=1200}
 KERB_ARGS=""
 
@@ -46,10 +46,12 @@ fi
 # Run End-to-end Tests
 : ${EE_TEST:=true}
 : ${EE_TEST_FILES:=}
+: ${EE_TEST_SHARDS:=1}
 # Run JDBC Test
 : ${JDBC_TEST:=true}
 # Run Cluster Tests
 : ${CLUSTER_TEST:=true}
+: ${CLUSTER_TEST_FILES:=}
 # Extra arguments passed to start-impala-cluster for tests. These do not apply to custom
 # cluster tests.
 : ${TEST_START_CLUSTER_ARGS:=}
@@ -61,6 +63,10 @@ fi
 : ${DATA_CACHE_DIR:=}
 # Data cache size.
 : ${DATA_CACHE_SIZE:=}
+# Data cache eviction policy
+: ${DATA_CACHE_EVICTION_POLICY:=}
+# Number of data cache async write threads.
+: ${DATA_CACHE_NUM_ASYNC_WRITE_THREADS:=}
 if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
   # TODO: Remove abort_on_config_error flag from here and create-load-data.sh once
   # checkConfiguration() accepts the local filesystem (see IMPALA-1850).
@@ -74,7 +80,15 @@ fi
 # Enable data cache if configured.
 if [[ -n "${DATA_CACHE_DIR}" && -n "${DATA_CACHE_SIZE}" ]]; then
    TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
-       `"--data_cache_dir=${DATA_CACHE_DIR} --data_cache_size=${DATA_CACHE_SIZE}"
+       `"--data_cache_dir=${DATA_CACHE_DIR} --data_cache_size=${DATA_CACHE_SIZE} "
+   if [[ -n "${DATA_CACHE_EVICTION_POLICY}" ]]; then
+       TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
+           `"--data_cache_eviction_policy=${DATA_CACHE_EVICTION_POLICY}"
+   fi
+   if [[ -n "${DATA_CACHE_NUM_ASYNC_WRITE_THREADS}" ]]; then
+       TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
+           `"--data_cache_num_async_write_threads=${DATA_CACHE_NUM_ASYNC_WRITE_THREADS}"
+   fi
    # Force use of data cache for HDFS. Data cache is only enabled for remote reads.
    if [[ "${TARGET_FILESYSTEM}" == "hdfs" ]]; then
       TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
@@ -86,8 +100,6 @@ if [[ "${ERASURE_CODING}" = true ]]; then
   # We do not run FE tests when erasure coding is enabled because planner tests
   # would fail.
   FE_TEST=false
-  TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} \
-    --impalad_args=--default_query_options=allow_erasure_coded_files=true"
 fi
 
 # Indicates whether code coverage reports should be generated.
@@ -158,13 +170,50 @@ LOG_DIR="${IMPALA_EE_TEST_LOGS_DIR}"
 # Enable core dumps
 ulimit -c unlimited || true
 
+TEST_RET_CODE=0
+
+# Helper function to start Impala cluster.
+start_impala_cluster() {
+  run-step "Starting Impala cluster" start-impala-cluster.log \
+      "${IMPALA_HOME}/bin/start-impala-cluster.py" \
+      --log_dir="${IMPALA_EE_TEST_LOGS_DIR}" \
+      ${TEST_START_CLUSTER_ARGS}
+}
+
+run_ee_tests() {
+  if [[ $# -gt 0 ]]; then
+    EXTRA_ARGS=${1}
+  else
+    EXTRA_ARGS=""
+  fi
+  # Run end-to-end tests.
+  # KERBEROS TODO - this will need to deal with ${KERB_ARGS}
+  if ! "${IMPALA_HOME}/tests/run-tests.py" ${COMMON_PYTEST_ARGS} \
+      ${RUN_TESTS_ARGS} ${EXTRA_ARGS} ${EE_TEST_FILES}; then
+    #${KERB_ARGS};
+    TEST_RET_CODE=1
+  fi
+}
+
 for i in $(seq 1 $NUM_TEST_ITERATIONS)
 do
+  echo "Test iteration $i"
   TEST_RET_CODE=0
 
-  run-step "Starting Impala cluster" start-impala-cluster.log \
-      "${IMPALA_HOME}/bin/start-impala-cluster.py" --log_dir="${IMPALA_EE_TEST_LOGS_DIR}" \
-      ${TEST_START_CLUSTER_ARGS}
+  # Store a list of the files at the beginning of each iteration.
+  hdfs dfs -ls -R ${FILESYSTEM_PREFIX}/test-warehouse \
+      > ${IMPALA_LOGS_DIR}/file-list-begin-${i}.log 2>&1
+
+  # Try not restarting the cluster to save time. BE, FE, JDBC and EE tests require
+  # running on a cluster with default flags. We just need to restart the cluster when
+  # there are custom-cluster tests which will leave the cluster running with specifit
+  # flags.
+  if [[ "$BE_TEST" == true || "$FE_TEST" == true || "$EE_TEST" == true
+      || "$JDBC_TEST" == true || "$CLUSTER_TEST" == true ]]; then
+    if [[ $i == 1 || "$CLUSTER_TEST" == true ]]; then
+      start_impala_cluster
+    fi
+  fi
 
   if [[ "$BE_TEST" == true ]]; then
     if [[ "$TARGET_FILESYSTEM" == "local" ]]; then
@@ -199,22 +248,52 @@ do
     if [[ "$CODE_COVERAGE" == true ]]; then
       MVN_ARGS+="-DcodeCoverage"
     fi
-    # Don't run the FE custom cluster/service tests here since they restart Impala. We'll
-    # run them with the other custom cluster/service tests below.
+    # Run the FE tests first. We run the FE custom cluster tests below since they
+    # restart Impala.
+    MVN_ARGS_TEMP=$MVN_ARGS
     MVN_ARGS+=" -Dtest=!org.apache.impala.custom*.*Test"
     if ! "${IMPALA_HOME}/bin/mvn-quiet.sh" -fae test ${MVN_ARGS}; then
       TEST_RET_CODE=1
+    fi
+
+    # Run the FE custom cluster tests only if not running against S3
+    if [[ "${TARGET_FILESYSTEM}" != "s3" ]]; then
+      MVN_ARGS=$MVN_ARGS_TEMP
+      MVN_ARGS+=" -Dtest=org.apache.impala.custom*.*Test"
+      if ! "${IMPALA_HOME}/bin/mvn-quiet.sh" -fae test ${MVN_ARGS}; then
+        TEST_RET_CODE=1
+      fi
+      # Restart the minicluster after running the FE custom cluster tests.
+      start_impala_cluster
     fi
     popd
   fi
 
   if [[ "$EE_TEST" == true ]]; then
-    # Run end-to-end tests.
-    # KERBEROS TODO - this will need to deal with ${KERB_ARGS}
-    if ! "${IMPALA_HOME}/tests/run-tests.py" ${COMMON_PYTEST_ARGS} \
-        ${RUN_TESTS_ARGS} ${EE_TEST_FILES}; then
-      #${KERB_ARGS};
-      TEST_RET_CODE=1
+    if [[ ${EE_TEST_SHARDS} -lt 2 ]]; then
+      # For runs without sharding, avoid adding the "--shard_tests" parameter.
+      # Some test frameworks (e.g. the docker-based tests) use this.
+      run_ee_tests
+    else
+      # Increase the maximum number of log files so that the logs from the shards
+      # don't get aged out. Multiply the default number by the number of shards.
+      IMPALA_MAX_LOG_FILES_SAVE="${IMPALA_MAX_LOG_FILES:-10}"
+      export IMPALA_MAX_LOG_FILES="$((${EE_TEST_SHARDS} * ${IMPALA_MAX_LOG_FILES_SAVE}))"
+      # When the EE tests are sharded, it runs 1/Nth of the tests at a time, restarting
+      # Impala between the shards. There are two benefits:
+      # 1. It isolates errors so that if Impala crashes, the next shards will still run
+      #    with a fresh Impala.
+      # 2. For ASAN runs, resources accumulate over test execution, so tests get slower
+      #    over time (see IMPALA-9887). Running shards with regular restarts
+      #    substantially speeds up execution time.
+      #
+      # Shards are 1 indexed (i.e. 1/N through N/N). This shards both serial and
+      # parallel tests.
+      for (( shard_idx=1 ; shard_idx <= ${EE_TEST_SHARDS} ; shard_idx++ )); do
+        run_ee_tests "--shard_tests=$shard_idx/${EE_TEST_SHARDS}"
+        start_impala_cluster
+      done
+      export IMPALA_MAX_LOG_FILES="${IMPALA_MAX_LOG_FILES_SAVE}"
     fi
   fi
 
@@ -249,16 +328,6 @@ do
       TEST_RET_CODE=1
     fi
     export IMPALA_MAX_LOG_FILES="${IMPALA_MAX_LOG_FILES_SAVE}"
-
-    # Run the FE custom cluster tests only if not running against S3.
-    if [[ "$FE_TEST" == true && "${TARGET_FILESYSTEM}" != "s3" ]]; then
-      pushd "${IMPALA_FE_DIR}"
-      MVN_ARGS=" -Dtest=org.apache.impala.custom*.*Test "
-      if ! "${IMPALA_HOME}/bin/mvn-quiet.sh" -fae test ${MVN_ARGS}; then
-        TEST_RET_CODE=1
-      fi
-      popd
-    fi
   fi
 
   # Run the process failure tests.
@@ -266,12 +335,27 @@ do
   # succeed.
   # ${IMPALA_HOME}/tests/run-process-failure-tests.sh
 
-  # Finally, kill the spawned timeout process and its child sleep process.
-  # There may not be a sleep process, so ignore failure.
-  pkill -P $TIMEOUT_PID || true
-  kill $TIMEOUT_PID
+  # Store a list of the files at the end of each iteration. This can be compared
+  # to the file-list-begin*.log from the beginning of the iteration to see if files
+  # are not being cleaned up. This is most useful on the first iteration, when
+  # the list of files is from dataload.
+  if [[ "${TARGET_FILESYSTEM}" = "ozone" ]]; then
+    # Clean up trash to avoid HDDS-4974 causing the next command to fail.
+    ozone fs -rm -r -skipTrash ${FILESYSTEM_PREFIX}/test-warehouse/.Trash
+  fi
+  hdfs dfs -ls -R ${FILESYSTEM_PREFIX}/test-warehouse \
+      > ${IMPALA_LOGS_DIR}/file-list-end-${i}.log 2>&1
 
   if [[ $TEST_RET_CODE == 1 ]]; then
-    exit $TEST_RET_CODE
+    break
   fi
 done
+
+# Finally, kill the spawned timeout process and its child sleep process.
+# There may not be a sleep process, so ignore failure.
+pkill -P $TIMEOUT_PID || true
+kill $TIMEOUT_PID
+
+if [[ $TEST_RET_CODE == 1 ]]; then
+  exit $TEST_RET_CODE
+fi

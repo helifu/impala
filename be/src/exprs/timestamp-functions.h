@@ -100,27 +100,29 @@ class TimestampFunctions {
   static const std::map<std::string, int> DAYNAME_MAP;
 
   /// Parse and initialize format string if it is a constant. Raise error if invalid.
-  static void UnixAndFromUnixPrepare(FunctionContext* context,
-      FunctionContext::FunctionStateScope scope);
   static void UnixAndFromUnixClose(FunctionContext* context,
+      FunctionContext::FunctionStateScope scope);
+  static void ToUnixPrepare(FunctionContext* context,
+      FunctionContext::FunctionStateScope scope);
+  static void FromUnixPrepare(FunctionContext* context,
       FunctionContext::FunctionStateScope scope);
 
   /// Parses 'string_val' based on the format 'fmt'.
   /// The time zone interpretation of the parsed timestamp is determined by
-  /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
+  /// query option use_local_tz_for_unix_timestamp_conversions. If it is true, the
   /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   static BigIntVal Unix(FunctionContext* context, const StringVal& string_val,
       const StringVal& fmt);
 
   /// Converts 'tv_val' to a unix time_t.
   /// The time zone interpretation of the specified timestamp is determined by
-  /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
+  /// query option use_local_tz_for_unix_timestamp_conversions. If it is true, the
   /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   static BigIntVal Unix(FunctionContext* context, const TimestampVal& tv_val);
 
   /// Returns the current time.
   /// The time zone interpretation of the current time is determined by
-  /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
+  /// query option use_local_tz_for_unix_timestamp_conversions. If it is true, the
   /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   static BigIntVal Unix(FunctionContext* context);
 
@@ -166,9 +168,13 @@ class TimestampFunctions {
   static IntVal DayOfYear(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal WeekOfYear(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal Hour(FunctionContext* context, const TimestampVal& ts_val);
+  static IntVal Hour(FunctionContext* context, const StringVal& str_val);
   static IntVal Minute(FunctionContext* context, const TimestampVal& ts_val);
+  static IntVal Minute(FunctionContext* context, const StringVal& str_val);
   static IntVal Second(FunctionContext* context, const TimestampVal& ts_val);
+  static IntVal Second(FunctionContext* context, const StringVal& str_val);
   static IntVal Millisecond(FunctionContext* context, const TimestampVal& ts_val);
+  static IntVal Millisecond(FunctionContext* context, const StringVal& str_val);
 
   /// Date/time functions.
   static TimestampVal Now(FunctionContext* context);

@@ -15,11 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.environ import ImpalaTestClusterFlagsDetector
 from tests.common.file_utils import grep_dir
-from tests.common.skip import SkipIfBuildType
+from tests.common.skip import SkipIfBuildType, SkipIfDockerizedCluster
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
+from datetime import datetime
 import itertools
 import json
 import os
@@ -29,9 +31,7 @@ import requests
 
 
 class TestWebPage(ImpalaTestSuite):
-
   ROOT_URL = "http://localhost:{0}/"
-  GET_JAVA_LOGLEVEL_URL = "http://localhost:{0}/get_java_loglevel"
   SET_JAVA_LOGLEVEL_URL = "http://localhost:{0}/set_java_loglevel"
   RESET_JAVA_LOGLEVEL_URL = "http://localhost:{0}/reset_java_loglevel"
   SET_GLOG_LOGLEVEL_URL = "http://localhost:{0}/set_glog_level"
@@ -50,6 +50,8 @@ class TestWebPage(ImpalaTestSuite):
   RESET_RESOURCE_POOL_STATS_URL = "http://localhost:{0}/resource_pool_reset"
   BACKENDS_URL = "http://localhost:{0}/backends"
   PROMETHEUS_METRICS_URL = "http://localhost:{0}/metrics_prometheus"
+  QUERIES_URL = "http://localhost:{0}/queries"
+  HEALTHZ_URL = "http://localhost:{0}/healthz"
 
   # log4j changes do not apply to the statestore since it doesn't
   # have an embedded JVM. So we make two sets of ports to test the
@@ -75,8 +77,8 @@ class TestWebPage(ImpalaTestSuite):
       assert build_flags["is_ndebug"] in ["true", "false"]
       assert "cmake_build_type" in build_flags
       assert build_flags["cmake_build_type"] in ["debug", "release", "address_sanitizer",
-          "tidy", "ubsan", "ubsan_full", "tsan", "code_coverage_release",
-          "code_coverage_debug"]
+          "tidy", "ubsan", "ubsan_full", "tsan", "tsan_full", "code_coverage_release",
+          "code_coverage_debug", "debug_noopt"]
       assert "library_link_type" in build_flags
       assert build_flags["library_link_type"] in ["dynamic", "static"]
 
@@ -113,6 +115,12 @@ class TestWebPage(ImpalaTestSuite):
     page = requests.get("http://localhost:25010/memz")
     assert page.status_code == requests.codes.ok
     page = requests.get("http://localhost:25020/memz")
+    assert page.status_code == requests.codes.ok
+    page = requests.head("http://localhost:25000/memz")
+    assert page.status_code == requests.codes.ok
+    page = requests.head("http://localhost:25010/memz")
+    assert page.status_code == requests.codes.ok
+    page = requests.head("http://localhost:25020/memz")
     assert page.status_code == requests.codes.ok
 
   def test_memz_shows_fragment_instance_id(self):
@@ -160,6 +168,9 @@ class TestWebPage(ImpalaTestSuite):
     responses = []
     for port in ports_to_test:
       input_url = url.format(port)
+      response = requests.head(input_url, headers=headers)
+      assert response.status_code == requests.codes.ok, "URL: {0} Str:'{1}'\nResp:{2}"\
+        .format(input_url, string_to_search, response.text)
       response = requests.get(input_url, headers=headers)
       assert response.status_code == requests.codes.ok, "URL: {0} Str:'{1}'\nResp:{2}"\
         .format(input_url, string_to_search, response.text)
@@ -170,6 +181,28 @@ class TestWebPage(ImpalaTestSuite):
         assert string_to_search in response.text, "URL: {0} Str:'{1}'\nResp:{2}".format(
           input_url, string_to_search, response.text)
       responses.append(response)
+      assert 'Content-Security-Policy' in response.headers, "CSP header missing"
+    return responses
+
+  def post_and_check_status(self, url, data={}, string_to_search="", ports_to_test=None):
+    """Helper method that posts to a given url, then asserts the return code is ok and
+    the response contains the expected string."""
+    if ports_to_test is None:
+      ports_to_test = self.TEST_PORTS_WITH_SS
+
+    responses = []
+    for port in ports_to_test:
+      input_url = url.format(port)
+      response = requests.head(input_url)
+      assert response.status_code == requests.codes.ok, "URL: {0} Str:'{1}'\nResp:{2}"\
+        .format(input_url, string_to_search, response.text)
+      response = requests.post(input_url, data=data)
+      assert response.status_code == requests.codes.ok, "URL: {0} Str:'{1}'\nResp:{2}"\
+        .format(input_url, string_to_search, response.text)
+      assert string_to_search in response.text, "URL: {0} Str:'{1}'\nResp:{2}".format(
+        input_url, string_to_search, response.text)
+      responses.append(response)
+      assert 'Content-Security-Policy' in response.headers, "CSP header missing"
     return responses
 
   def get_debug_page(self, page_url, port=25000):
@@ -182,6 +215,11 @@ class TestWebPage(ImpalaTestSuite):
   def get_and_check_status_jvm(self, url, string_to_search=""):
     """Calls get_and_check_status() for impalad and catalogd only"""
     return self.get_and_check_status(url, string_to_search,
+                              ports_to_test=self.TEST_PORTS_WITHOUT_SS)
+
+  def post_and_check_status_jvm(self, url, data={}, string_to_search=""):
+    """Calls post_and_check_status() for impalad and catalogd only"""
+    return self.post_and_check_status(url, data, string_to_search,
                               ports_to_test=self.TEST_PORTS_WITHOUT_SS)
 
   def test_content_type(self):
@@ -200,68 +238,46 @@ class TestWebPage(ImpalaTestSuite):
     malformed inputs. This however does not test that the log level changes are actually
     in effect."""
     # Check that the log_level end points are accessible.
-    self.get_and_check_status_jvm(self.GET_JAVA_LOGLEVEL_URL)
-    self.get_and_check_status_jvm(self.SET_JAVA_LOGLEVEL_URL)
-    self.get_and_check_status_jvm(self.RESET_JAVA_LOGLEVEL_URL)
-    self.get_and_check_status(self.SET_GLOG_LOGLEVEL_URL)
-    self.get_and_check_status(self.RESET_GLOG_LOGLEVEL_URL)
-    # Try getting log level of a class.
-    get_loglevel_url = (self.GET_JAVA_LOGLEVEL_URL + "?class" +
-        "=org.apache.impala.catalog.HdfsTable")
-    self.get_and_check_status_jvm(get_loglevel_url, "DEBUG")
+    self.post_and_check_status_jvm(self.SET_JAVA_LOGLEVEL_URL)
+    self.post_and_check_status_jvm(self.RESET_JAVA_LOGLEVEL_URL)
+    self.post_and_check_status(self.SET_GLOG_LOGLEVEL_URL)
+    self.post_and_check_status(self.RESET_GLOG_LOGLEVEL_URL)
 
     # Set the log level of a class to TRACE and confirm the setting is in place
-    set_loglevel_url = (self.SET_JAVA_LOGLEVEL_URL + "?class" +
-        "=org.apache.impala.catalog.HdfsTable&level=trace")
-    self.get_and_check_status_jvm(set_loglevel_url, "Effective log level: TRACE")
+    self.post_and_check_status_jvm(self.SET_JAVA_LOGLEVEL_URL,
+        {"class": "org.apache.impala.catalog.HdfsTable", "level": "trace"},
+        "org.apache.impala.catalog.HdfsTable : TRACE")
 
-    get_loglevel_url = (self.GET_JAVA_LOGLEVEL_URL + "?class" +
-        "=org.apache.impala.catalog.HdfsTable")
-    self.get_and_check_status_jvm(get_loglevel_url, "TRACE")
-    # Check the log level of a different class and confirm it is still DEBUG
-    get_loglevel_url = (self.GET_JAVA_LOGLEVEL_URL + "?class" +
-        "=org.apache.impala.catalog.HdfsPartition")
-    self.get_and_check_status_jvm(get_loglevel_url, "DEBUG")
-
-    # Reset Java logging levels and check the logging level of the class again
-    self.get_and_check_status_jvm(self.RESET_JAVA_LOGLEVEL_URL, "Java log levels reset.")
-    get_loglevel_url = (self.GET_JAVA_LOGLEVEL_URL + "?class" +
-        "=org.apache.impala.catalog.HdfsTable")
-    self.get_and_check_status_jvm(get_loglevel_url, "DEBUG")
+    # Reset Java logging levels
+    self.post_and_check_status_jvm(self.RESET_JAVA_LOGLEVEL_URL, {},
+        "Java log levels reset.")
 
     # Set a new glog level and make sure the setting has been applied.
-    set_glog_url = (self.SET_GLOG_LOGLEVEL_URL + "?glog=3")
-    self.get_and_check_status(set_glog_url, "v set to 3")
+    self.post_and_check_status(self.SET_GLOG_LOGLEVEL_URL, {"glog": 3}, "val(3)")
 
     # Try resetting the glog logging defaults again.
-    self.get_and_check_status(self.RESET_GLOG_LOGLEVEL_URL, "v set to ")
+    self.post_and_check_status(self.RESET_GLOG_LOGLEVEL_URL, {},
+        "Current backend log level: ")
 
-    # Try to get the log level of an empty class input
-    get_loglevel_url = (self.GET_JAVA_LOGLEVEL_URL + "?class=")
-    self.get_and_check_status_jvm(get_loglevel_url)
-
-    # Same as above, for set log level request
-    set_loglevel_url = (self.SET_JAVA_LOGLEVEL_URL + "?class=")
-    self.get_and_check_status_jvm(get_loglevel_url)
+    # Try to set the log level with an empty class input
+    self.post_and_check_status_jvm(self.SET_JAVA_LOGLEVEL_URL, {"class": ""})
 
     # Empty input for setting a glog level request
-    set_glog_url = (self.SET_GLOG_LOGLEVEL_URL + "?glog=")
-    self.get_and_check_status(set_glog_url)
+    self.post_and_check_status(self.SET_GLOG_LOGLEVEL_URL, {"glog": ""})
 
     # Try setting a non-existent log level on a valid class. In such cases,
     # log4j automatically sets it as DEBUG. This is the behavior of
     # Level.toLevel() method.
-    set_loglevel_url = (self.SET_JAVA_LOGLEVEL_URL + "?class" +
-        "=org.apache.impala.catalog.HdfsTable&level=foo&")
-    self.get_and_check_status_jvm(set_loglevel_url, "Effective log level: DEBUG")
+    self.post_and_check_status_jvm(self.SET_JAVA_LOGLEVEL_URL,
+        {"class": "org.apache.impala.catalog.HdfsTable", "level": "foo"},
+        "org.apache.impala.catalog.HdfsTable : DEBUG")
 
     # Try setting an invalid glog level.
-    set_glog_url = self.SET_GLOG_LOGLEVEL_URL + "?glog=foo"
-    self.get_and_check_status(set_glog_url, "Bad glog level input")
+    self.post_and_check_status(self.SET_GLOG_LOGLEVEL_URL, {"glog": "foo"},
+        "Bad glog level input")
 
     # Try a non-existent endpoint on log_level URL.
-    bad_loglevel_url = self.SET_GLOG_LOGLEVEL_URL + "?badurl=foo"
-    self.get_and_check_status(bad_loglevel_url)
+    self.post_and_check_status(self.SET_GLOG_LOGLEVEL_URL, {"badurl": "foo"})
 
   @pytest.mark.execute_serially
   def test_uda_with_log_level(self):
@@ -269,15 +285,15 @@ class TestWebPage(ImpalaTestSuite):
     to 3. Running this test serially not to interfere with other tests setting the log
     level."""
     # Check that the log_level end points are accessible.
-    self.get_and_check_status(self.SET_GLOG_LOGLEVEL_URL)
-    self.get_and_check_status(self.RESET_GLOG_LOGLEVEL_URL)
+    self.post_and_check_status(self.SET_GLOG_LOGLEVEL_URL)
+    self.post_and_check_status(self.RESET_GLOG_LOGLEVEL_URL)
     # Set log level to 3.
-    set_glog_url = (self.SET_GLOG_LOGLEVEL_URL + "?glog=3")
-    self.get_and_check_status(set_glog_url, "v set to 3")
+    self.post_and_check_status(self.SET_GLOG_LOGLEVEL_URL, {"glog": 3}, "val(3)")
     # Check that Impala doesn't crash when running a query that aggregates.
     self.client.execute("select avg(int_col) from functional.alltypessmall")
     # Reset log level.
-    self.get_and_check_status(self.RESET_GLOG_LOGLEVEL_URL, "v set to ")
+    self.post_and_check_status(self.RESET_GLOG_LOGLEVEL_URL, {},
+        "Current backend log level: ")
 
   def test_catalog(self, cluster_properties, unique_database):
     """Tests the /catalog and /catalog_object endpoints."""
@@ -314,6 +330,10 @@ class TestWebPage(ImpalaTestSuite):
     self.__test_catalog_object(unique_database, "foo_kudu", cluster_properties)
     self.__test_catalog_object(unique_database, "foo_part_parquet", cluster_properties)
     self.__test_catalog_object(unique_database, "foo", cluster_properties)
+    self.__test_json_db_object(unique_database)
+    self.__test_json_table_object(unique_database, "foo")
+    self.__test_json_table_object(unique_database, "foo_part")
+    self.__test_json_table_object(unique_database, "foo_part_parquet")
     self.__test_table_metrics(unique_database, "foo_part", "total-file-size-bytes")
     self.__test_table_metrics(unique_database, "foo_part", "num-files")
     self.__test_table_metrics(unique_database, "foo_part", "alter-duration")
@@ -350,12 +370,61 @@ class TestWebPage(ImpalaTestSuite):
       self.get_and_check_status(obj_url, impalad_expected_str,
           ports_to_test=self.IMPALAD_TEST_PORT)
 
+  def __test_json_db_object(self, db_name):
+    """Tests the /catalog_object?json endpoint of catalogd for the given db."""
+    obj_url = self.CATALOG_OBJECT_URL + \
+              "?json&object_type=DATABASE&object_name={0}".format(db_name)
+    responses = self.get_and_check_status(obj_url, ports_to_test=self.CATALOG_TEST_PORT)
+    obj = json.loads(json.loads(responses[0].text)["json_string"])
+    assert obj["type"] == 2, "type should be DATABASE"
+    assert "catalog_version" in obj, "TCatalogObject should have catalog_version"
+    db_obj = obj["db"]
+    assert db_obj["db_name"] == db_name
+    assert "metastore_db" in db_obj, "Loaded database should have metastore_db"
+
+  def __test_json_table_object(self, db_name, tbl_name):
+    """Tests the /catalog_object?json endpoint of catalogd for the given db/table. Runs
+    against an unloaded as well as a loaded table."""
+    obj_url = self.CATALOG_OBJECT_URL + \
+              "?json&object_type=TABLE&object_name={0}.{1}".format(db_name, tbl_name)
+    self.client.execute("invalidate metadata %s.%s" % (db_name, tbl_name))
+    responses = self.get_and_check_status(obj_url, ports_to_test=self.CATALOG_TEST_PORT)
+    obj = json.loads(json.loads(responses[0].text)["json_string"])
+    assert obj["type"] == 3, "type should be TABLE"
+    assert "catalog_version" in obj, "TCatalogObject should have catalog_version"
+    tbl_obj = obj["table"]
+    assert tbl_obj["db_name"] == db_name
+    assert tbl_obj["tbl_name"] == tbl_name
+    assert "hdfs_table" not in tbl_obj, "Unloaded table should not have hdfs_table"
+
+    self.client.execute("refresh %s.%s" % (db_name, tbl_name))
+    responses = self.get_and_check_status(obj_url, ports_to_test=self.CATALOG_TEST_PORT)
+    obj = json.loads(json.loads(responses[0].text)["json_string"])
+    assert obj["type"] == 3, "type should be TABLE"
+    assert "catalog_version" in obj, "TCatalogObject should have catalog_version"
+    tbl_obj = obj["table"]
+    assert tbl_obj["db_name"] == db_name
+    assert tbl_obj["tbl_name"] == tbl_name
+    assert "columns" in tbl_obj, "Loaded TTable should have columns"
+    assert tbl_obj["table_type"] == 0, "table_type should be HDFS_TABLE"
+    assert "metastore_table" in tbl_obj
+    hdfs_tbl_obj = tbl_obj["hdfs_table"]
+    assert "hdfsBaseDir" in hdfs_tbl_obj
+    assert "colNames" in hdfs_tbl_obj
+    assert "nullPartitionKeyValue" in hdfs_tbl_obj
+    assert "nullColumnValue" in hdfs_tbl_obj
+    assert "partitions" in hdfs_tbl_obj
+    assert "prototype_partition" in hdfs_tbl_obj
+
   def check_endpoint_is_disabled(self, url, string_to_search="", ports_to_test=None):
     """Helper method that verifies the given url does not exist."""
     if ports_to_test is None:
       ports_to_test = self.TEST_PORTS_WITH_SS
     for port in ports_to_test:
       input_url = url.format(port)
+      response = requests.head(input_url)
+      assert response.status_code == requests.codes.not_found, "URL: {0} Str:'{" \
+        "1}'\nResp:{2}".format(input_url, string_to_search, response.text)
       response = requests.get(input_url)
       assert response.status_code == requests.codes.not_found, "URL: {0} Str:'{" \
         "1}'\nResp:{2}".format(input_url, string_to_search, response.text)
@@ -415,6 +484,27 @@ class TestWebPage(ImpalaTestSuite):
     for tblinfo in high_filecount_tbls:
       if tblinfo["name"] == tbl_fname:
         assert tblinfo["num_files"] == int(numfiles)
+
+  def test_query_stmt(self):
+    """Create a long select query then check if it is truncated in the response json."""
+    # The imput query is a select + 450 "x " long, which is long enough to get truncated.
+    query = "select \"{0}\"".format("x " * 450)
+    # The expected result query should be 253 long and contains the first 250
+    # chars + "..."
+    expected_result = "select \"{0}...".format("x " * 121)
+    check_if_contains = False
+    response_json = self.__run_query_and_get_debug_page(
+      query, self.QUERIES_URL, expected_state=self.client.QUERY_STATES["FINISHED"])
+    # Search the json for the expected value.
+    # The query can be in in_filght_queries even though it is in FINISHED state.
+    for json_part in itertools.chain(
+      response_json['completed_queries'], response_json['in_flight_queries']):
+      if expected_result in json_part['stmt']:
+        check_if_contains = True
+        break
+
+    assert check_if_contains, "No matching statement found in the jsons at {}: {}".format(
+        datetime.now(), json.dumps(response_json, sort_keys=True, indent=4))
 
   def __run_query_and_get_debug_page(self, query, page_url, query_options=None,
                                      expected_state=None):
@@ -530,6 +620,10 @@ class TestWebPage(ImpalaTestSuite):
         functional.alltypestiny join functional.alltypessmall c2"
     SVC_NAME = 'impala.DataStreamService'
 
+    def is_krpc_use_unix_domain_socket():
+      rpcz = self.get_debug_page(self.RPCZ_URL)
+      return rpcz['rpc_use_unix_domain_socket']
+
     def get_per_conn_metrics(inbound):
       """Get inbound or outbound per-connection metrics"""
       rpcz = self.get_debug_page(self.RPCZ_URL)
@@ -549,6 +643,8 @@ class TestWebPage(ImpalaTestSuite):
           return sorted(s['rpc_method_metrics'], key=lambda m: m['method_name'])
       assert False, 'Could not find metrics for %s' % svc_name
 
+    krpc_use_uds = is_krpc_use_unix_domain_socket()
+
     svc_before = get_svc_metrics(SVC_NAME)
     inbound_before = get_per_conn_metrics(True)
     outbound_before = get_per_conn_metrics(False)
@@ -558,23 +654,26 @@ class TestWebPage(ImpalaTestSuite):
     outbound_after = get_per_conn_metrics(False)
 
     assert svc_before != svc_after
-    assert inbound_before != inbound_after
-    assert outbound_before != outbound_after
+    if not krpc_use_uds:
+      assert inbound_before != inbound_after
+      assert outbound_before != outbound_after
 
     # Some connections should have metrics after executing query
     assert len(inbound_after) > 0
     assert len(outbound_after) > 0
     # Spot-check some fields, including socket stats.
     for conn in itertools.chain(inbound_after, outbound_after):
-      assert conn["remote_ip"] != ""
+      assert conn["remote_addr"] != ""
       assert conn["num_calls_in_flight"] >= 0
       assert conn["num_calls_in_flight"] == len(conn["calls_in_flight"])
       # Check rtt, which should be present in 'struct tcp_info' even in old kernels
       # like 2.6.32.
-      assert conn["socket_stats"]["rtt"] > 0, conn
-      # send_queue_bytes uses TIOCOUTQ, which is also present in 2.6.32 and even older
-      # kernels.
-      assert conn["socket_stats"]["send_queue_bytes"] >= 0, conn
+      # Skip these checking if using UDS.
+      if not krpc_use_uds:
+        assert conn["socket_stats"]["rtt"] > 0, conn
+        # send_queue_bytes uses TIOCOUTQ, which is also present in 2.6.32 and even older
+        # kernels.
+        assert conn["socket_stats"]["send_queue_bytes"] >= 0, conn
 
   @pytest.mark.execute_serially
   def test_admission_page(self):
@@ -620,12 +719,7 @@ class TestWebPage(ImpalaTestSuite):
     # check that metrics exist
     assert 'max_query_mem_limit' in pool_config
     assert 'min_query_mem_limit' in pool_config
-    assert 'max_running_queries_multiple' in pool_config
-    assert 'max_memory_multiple' in pool_config
     assert 'clamp_mem_limit_query_option' in pool_config
-    assert 'max_running_queries_derived' in pool_config
-    assert 'max_queued_queries_derived' in pool_config
-    assert 'max_memory_derived' in pool_config
 
   def __fetch_resource_pools_json(self, pool_name=None):
     """Helper method used to fetch the resource pool json from the admission debug page.
@@ -651,6 +745,9 @@ class TestWebPage(ImpalaTestSuite):
     assert 'backends' in response_json
     # When this test runs, all impalads would have already started.
     assert len(response_json['backends']) == 3
+    assert response_json['num_active_backends'] == 3
+    assert 'num_quiescing_backends' not in response_json
+    assert 'num_blacklisted_backends' not in response_json
 
     # Look at results for a single backend - they are not sorted.
     backend_row = response_json['backends'][0]
@@ -661,8 +758,8 @@ class TestWebPage(ImpalaTestSuite):
 
     # The 'address' column is the backend port of the impalad.
     assert len(backend_row['address']) > 0
-    be_ports = ('22000', '22001', '22002')
-    assert backend_row['address'].endswith(be_ports)
+    krpc_ports = ('27000', '27001', '27002')
+    assert backend_row['address'].endswith(krpc_ports)
 
     # The 'krpc_address' is the krpc address of the impalad.
     assert len(backend_row['krpc_address']) > 0
@@ -672,6 +769,7 @@ class TestWebPage(ImpalaTestSuite):
     assert backend_row['is_coordinator']
     assert backend_row['is_executor']
     assert not backend_row['is_quiescing']
+    assert not backend_row['is_blacklisted']
     assert len(backend_row['admit_mem_limit']) > 0
 
   def test_download_profile(self):
@@ -725,8 +823,11 @@ class TestWebPage(ImpalaTestSuite):
 
   def test_healthz_endpoint(self):
     """Test to check that the /healthz endpoint returns 200 OK."""
-    page = requests.get("http://localhost:25000/healthz")
-    assert page.status_code == requests.codes.ok
+    for port in self.TEST_PORTS_WITH_SS:
+      page = requests.get(self.HEALTHZ_URL.format(port))
+      assert page.status_code == requests.codes.ok
+      page = requests.head(self.HEALTHZ_URL.format(port))
+      assert page.status_code == requests.codes.ok
 
   def test_knox_compatibility(self):
     """Checks that the template files conform to the requirements for compatibility with
@@ -758,3 +859,37 @@ class TestWebPage(ImpalaTestSuite):
     self.get_and_check_status(self.ROOT_URL,
         "href='http://.*:%s/'" % self.IMPALAD_TEST_PORT[0], self.IMPALAD_TEST_PORT,
         regex=True, headers={'X-Forwarded-Context': '/gateway'})
+
+  @SkipIfDockerizedCluster.daemon_logs_not_exposed
+  def test_display_src_socket_in_query_cause(self):
+    # Execute a long running query then cancel it from the WebUI.
+    # Check the runtime profile and the INFO logs for the cause message.
+    query = "select sleep(10000)"
+    query_id = self.execute_query_async(query).get_handle().id
+    cancel_query_url = "{0}cancel_query?query_id={1}".format(self.ROOT_URL.format
+      ("25000"), query_id)
+    text_profile_url = "{0}query_profile_plain_text?query_id={1}".format(self.ROOT_URL
+      .format("25000"), query_id)
+    requests.get(cancel_query_url)
+    response = requests.get(text_profile_url)
+    cancel_status = "Cancelled from Impala&apos;s debug web interface by user: " \
+                    "&apos;anonymous&apos; at"
+    assert cancel_status in response.text
+    self.assert_impalad_log_contains("INFO", "Cancelled from Impala\'s debug web "
+      "interface by user: 'anonymous' at", expected_count=-1)
+    # Session closing from the WebUI does not produce the cause message in the profile,
+    # so we will skip checking the runtime profile.
+    results = self.execute_query("select current_session()")
+    session_id = results.data[0]
+    close_session_url = "{0}close_session?session_id={1}".format(self.ROOT_URL.format
+      ("25000"), session_id)
+    requests.get(close_session_url)
+    self.assert_impalad_log_contains("INFO", "Session closed from Impala\'s debug "
+      "web interface by user: 'anonymous' at", expected_count=-1)
+
+  def test_catalog_operations_endpoint(self):
+    """Test to check that the /operations endpoint returns 200 OK."""
+    page = requests.get("http://localhost:25020/operations")
+    assert page.status_code == requests.codes.ok
+    page = requests.head("http://localhost:25020/operations")
+    assert page.status_code == requests.codes.ok

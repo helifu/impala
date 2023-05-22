@@ -16,7 +16,7 @@
 // under the License.
 package org.apache.impala.catalog;
 
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
@@ -33,9 +33,9 @@ import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.Reference;
-import org.apache.impala.compat.HdfsShim;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.util.AcidUtils;
+import org.apache.impala.util.HudiUtil;
 import org.apache.impala.util.ListMap;
 import org.apache.impala.util.ThreadNameAnnotator;
 import org.slf4j.Logger;
@@ -54,19 +54,24 @@ public class FileMetadataLoader {
   private final static Logger LOG = LoggerFactory.getLogger(FileMetadataLoader.class);
   private static final Configuration CONF = new Configuration();
 
-  private final Path partDir_;
-  private final boolean recursive_;
-  private final ImmutableMap<String, FileDescriptor> oldFdsByRelPath_;
+  protected final Path partDir_;
+  protected final boolean recursive_;
+  protected final ImmutableMap<String, FileDescriptor> oldFdsByPath_;
   private final ListMap<TNetworkAddress> hostIndex_;
   @Nullable
   private final ValidWriteIdList writeIds_;
   @Nullable
   private final ValidTxnList validTxnList_;
+  @Nullable
+  private final HdfsFileFormat fileFormat_;
 
-  private boolean forceRefreshLocations = false;
+  protected boolean forceRefreshLocations = false;
 
   private List<FileDescriptor> loadedFds_;
-  private LoadStats loadStats_;
+  private List<FileDescriptor> loadedInsertDeltaFds_;
+  private List<FileDescriptor> loadedDeleteDeltaFds_;
+  protected LoadStats loadStats_;
+  protected String debugAction_;
 
   /**
    * @param partDir the dir for which to fetch file metadata
@@ -79,23 +84,32 @@ public class FileMetadataLoader {
    *   compactions.
    * @param writeIds if non-null, a write-id list which will filter the returned
    *   file descriptors to only include those indicated to be valid.
+   * @param fileFormat if non-null and equal to HdfsFileFormat.HUDI_PARQUET,
+   *   this loader will filter files based on Hudi's HoodieROTablePathFilter method
    */
   public FileMetadataLoader(Path partDir, boolean recursive, List<FileDescriptor> oldFds,
       ListMap<TNetworkAddress> hostIndex, @Nullable ValidTxnList validTxnList,
-      @Nullable ValidWriteIdList writeIds) {
+      @Nullable ValidWriteIdList writeIds, @Nullable HdfsFileFormat fileFormat) {
     // Either both validTxnList and writeIds are null, or none of them.
-    Preconditions.checkState((validTxnList == null && writeIds == null) ||
-                             (validTxnList != null && writeIds != null));
+    Preconditions.checkState((validTxnList == null && writeIds == null)
+        || (validTxnList != null && writeIds != null));
     partDir_ = Preconditions.checkNotNull(partDir);
     recursive_ = recursive;
     hostIndex_ = Preconditions.checkNotNull(hostIndex);
-    oldFdsByRelPath_ = Maps.uniqueIndex(oldFds, FileDescriptor::getRelativePath);
+    oldFdsByPath_ = Maps.uniqueIndex(oldFds, FileDescriptor::getPath);
     writeIds_ = writeIds;
     validTxnList_ = validTxnList;
+    fileFormat_ = fileFormat;
 
     if (writeIds_ != null) {
       Preconditions.checkArgument(recursive_, "ACID tables must be listed recursively");
     }
+  }
+
+  public FileMetadataLoader(Path partDir, boolean recursive, List<FileDescriptor> oldFds,
+      ListMap<TNetworkAddress> hostIndex, @Nullable ValidTxnList validTxnList,
+      @Nullable ValidWriteIdList writeIds) {
+    this(partDir, recursive, oldFds, hostIndex, validTxnList, writeIds, null);
   }
 
   /**
@@ -113,6 +127,14 @@ public class FileMetadataLoader {
     Preconditions.checkState(loadedFds_ != null,
         "Must have successfully loaded first");
     return loadedFds_;
+  }
+
+  public List<FileDescriptor> getLoadedInsertDeltaFds() {
+    return loadedInsertDeltaFds_;
+  }
+
+  public List<FileDescriptor> getLoadedDeleteDeltaFds() {
+    return loadedDeleteDeltaFds_;
   }
 
   /**
@@ -135,10 +157,12 @@ public class FileMetadataLoader {
    * descriptors.
    *
    * @throws IOException if listing fails.
+   * @throws CatalogException on ACID errors. TODO: remove this once IMPALA-9042 is
+   * resolved.
    */
-  public void load() throws IOException {
+  public void load() throws CatalogException, IOException {
     Preconditions.checkState(loadStats_ == null, "already loaded");
-    loadStats_ = new LoadStats();
+    loadStats_ = new LoadStats(partDir_);
     FileSystem fs = partDir_.getFileSystem(CONF);
 
     // If we don't have any prior FDs from which we could re-use old block location info,
@@ -149,40 +173,30 @@ public class FileMetadataLoader {
     // assume that most _can_ be reused, in which case it's faster to _not_ prefetch
     // the locations.
     boolean listWithLocations = FileSystemUtil.supportsStorageIds(fs) &&
-        (oldFdsByRelPath_.isEmpty() || forceRefreshLocations);
+        (oldFdsByPath_.isEmpty() || forceRefreshLocations);
 
     String msg = String.format("%s file metadata%s from path %s",
-          oldFdsByRelPath_.isEmpty() ? "Loading" : "Refreshing",
-          listWithLocations ? " with eager location-fetching" : "",
-          partDir_);
+        oldFdsByPath_.isEmpty() ? "Loading" : "Refreshing",
+        listWithLocations ? " with eager location-fetching" : "", partDir_);
     LOG.trace(msg);
     try (ThreadNameAnnotator tna = new ThreadNameAnnotator(msg)) {
-      RemoteIterator<? extends FileStatus> fileStatuses;
-      if (listWithLocations) {
-        fileStatuses = FileSystemUtil.listFiles(fs, partDir_, recursive_);
-      } else {
-        fileStatuses = FileSystemUtil.listStatus(fs, partDir_, recursive_);
+      List<FileStatus> fileStatuses = getFileStatuses(fs, listWithLocations);
 
-        // TODO(todd): we could look at the result of listing without locations, and if
-        // we see that a substantial number of the files have changed, it may be better
-        // to go back and re-list with locations vs doing an RPC per file.
-      }
       loadedFds_ = new ArrayList<>();
       if (fileStatuses == null) return;
 
-      Reference<Long> numUnknownDiskIds = new Reference<Long>(Long.valueOf(0));
-
-      List<FileStatus> stats = new ArrayList<>();
-      while (fileStatuses.hasNext()) {
-        stats.add(fileStatuses.next());
-      }
+      Reference<Long> numUnknownDiskIds = new Reference<>(0L);
 
       if (writeIds_ != null) {
-        stats = AcidUtils.filterFilesForAcidState(stats, partDir_, validTxnList_,
-            writeIds_, loadStats_);
+        fileStatuses = AcidUtils.filterFilesForAcidState(fileStatuses, partDir_,
+            validTxnList_, writeIds_, loadStats_);
       }
 
-      for (FileStatus fileStatus : stats) {
+      if (fileFormat_ == HdfsFileFormat.HUDI_PARQUET) {
+        fileStatuses = HudiUtil.filterFilesForHudiROPath(fileStatuses);
+      }
+
+      for (FileStatus fileStatus : fileStatuses) {
         if (fileStatus.isDirectory()) {
           continue;
         }
@@ -191,16 +205,21 @@ public class FileMetadataLoader {
           ++loadStats_.hiddenFiles;
           continue;
         }
-        String relPath = FileSystemUtil.relativizePath(fileStatus.getPath(), partDir_);
-        FileDescriptor fd = oldFdsByRelPath_.get(relPath);
-        if (listWithLocations || forceRefreshLocations ||
-            hasFileChanged(fd, fileStatus)) {
-          fd = createFd(fs, fileStatus, relPath, numUnknownDiskIds);
-          ++loadStats_.loadedFiles;
-        } else {
-          ++loadStats_.skippedFiles;
+
+        FileDescriptor fd = getFileDescriptor(fs, listWithLocations, numUnknownDiskIds,
+            fileStatus);
+        loadedFds_.add(Preconditions.checkNotNull(fd));
+      }
+      if (writeIds_ != null) {
+        loadedInsertDeltaFds_ = new ArrayList<>();
+        loadedDeleteDeltaFds_ = new ArrayList<>();
+        for (FileDescriptor fd : loadedFds_) {
+          if (AcidUtils.isDeleteDeltaFd(fd)) {
+            loadedDeleteDeltaFds_.add(fd);
+          } else {
+            loadedInsertDeltaFds_.add(fd);
+          }
         }
-        loadedFds_.add(Preconditions.checkNotNull(fd));;
       }
       loadStats_.unknownDiskIds += numUnknownDiskIds.getRef();
       if (LOG.isTraceEnabled()) {
@@ -210,46 +229,113 @@ public class FileMetadataLoader {
   }
 
   /**
+   * Return fd created by the given fileStatus or from the cache(oldFdsByPath_).
+   */
+  protected FileDescriptor getFileDescriptor(FileSystem fs, boolean listWithLocations,
+      Reference<Long> numUnknownDiskIds, FileStatus fileStatus) throws IOException {
+    String relPath = FileSystemUtil.relativizePath(fileStatus.getPath(), partDir_);
+    FileDescriptor fd = oldFdsByPath_.get(relPath);
+    if (listWithLocations || forceRefreshLocations || fd == null ||
+        fd.isChanged(fileStatus)) {
+      fd = createFd(fs, fileStatus, relPath, numUnknownDiskIds);
+      ++loadStats_.loadedFiles;
+    } else {
+      ++loadStats_.skippedFiles;
+    }
+    return fd;
+  }
+
+  /**
+   * Return located file status list when listWithLocations is true.
+   */
+  protected List<FileStatus> getFileStatuses(FileSystem fs, boolean listWithLocations)
+      throws IOException {
+    RemoteIterator<? extends FileStatus> fileStatuses;
+    if (listWithLocations) {
+      fileStatuses = FileSystemUtil
+          .listFiles(fs, partDir_, recursive_, debugAction_);
+    } else {
+      fileStatuses = FileSystemUtil
+          .listStatus(fs, partDir_, recursive_, debugAction_);
+      // TODO(todd): we could look at the result of listing without locations, and if
+      // we see that a substantial number of the files have changed, it may be better
+      // to go back and re-list with locations vs doing an RPC per file.
+    }
+    if (fileStatuses == null) return null;
+    List<FileStatus> stats = new ArrayList<>();
+    while (fileStatuses.hasNext()) {
+      stats.add(fileStatuses.next());
+    }
+    return stats;
+  }
+
+  /**
    * Create a FileDescriptor for the given FileStatus. If the FS supports block locations,
    * and FileStatus is a LocatedFileStatus (i.e. the location was prefetched) this uses
    * the already-loaded information; otherwise, this may have to remotely look up the
    * locations.
+   * 'absPath' is null except for the Iceberg tables, because datafiles of the
+   * Iceberg tables may not be in the table location.
    */
-  private FileDescriptor createFd(FileSystem fs, FileStatus fileStatus,
-      String relPath, Reference<Long> numUnknownDiskIds) throws IOException {
+  protected FileDescriptor createFd(FileSystem fs, FileStatus fileStatus,
+      String relPath, Reference<Long> numUnknownDiskIds, String absPath)
+      throws IOException {
     if (!FileSystemUtil.supportsStorageIds(fs)) {
-      return FileDescriptor.createWithNoBlocks(fileStatus, relPath);
+      return FileDescriptor.createWithNoBlocks(fileStatus, relPath, absPath);
     }
     BlockLocation[] locations;
     if (fileStatus instanceof LocatedFileStatus) {
-      locations = ((LocatedFileStatus)fileStatus).getBlockLocations();
+      locations = ((LocatedFileStatus) fileStatus).getBlockLocations();
     } else {
       locations = fs.getFileBlockLocations(fileStatus, 0, fileStatus.getLen());
     }
     return FileDescriptor.create(fileStatus, relPath, locations, hostIndex_,
-        HdfsShim.isErasureCoded(fileStatus), numUnknownDiskIds);
+        fileStatus.isEncrypted(), fileStatus.isErasureCoded(), numUnknownDiskIds,
+        absPath);
+  }
+
+  private FileDescriptor createFd(FileSystem fs, FileStatus fileStatus,
+      String relPath, Reference<Long> numUnknownDiskIds) throws IOException {
+    return createFd(fs, fileStatus, relPath, numUnknownDiskIds, null);
   }
 
   /**
-   * Compares the modification time and file size between the FileDescriptor and the
-   * FileStatus to determine if the file has changed. Returns true if the file has changed
-   * and false otherwise.
+   * Given a file descriptor list 'oldFds', returns true if the loaded file descriptors
+   * are the same as them.
    */
-  private static boolean hasFileChanged(FileDescriptor fd, FileStatus status) {
-    return (fd == null) || (fd.getFileLength() != status.getLen()) ||
-      (fd.getModificationTime() != status.getModificationTime());
+  public boolean hasFilesChangedCompareTo(List<FileDescriptor> oldFds) {
+    if (oldFds.size() != loadedFds_.size()) return true;
+    ImmutableMap<String, FileDescriptor> oldFdsByRelPath =
+        Maps.uniqueIndex(oldFds, FileDescriptor::getPath);
+    for (FileDescriptor fd : loadedFds_) {
+      FileDescriptor oldFd = oldFdsByRelPath.get(fd.getPath());
+      if (fd.isChanged(oldFd)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Enables injection of a debug actions to introduce delays in HDFS listStatus or
+   * listFiles call during the file-metadata loading.
+   */
+  public void setDebugAction(String debugAction) {
+    this.debugAction_ = debugAction;
   }
 
   // File/Block metadata loading stats for a single HDFS path.
-  public class LoadStats {
+  public static class LoadStats {
+    private final Path partDir_;
+    LoadStats(Path partDir) {
+      this.partDir_ = Preconditions.checkNotNull(partDir);
+    }
     /** Number of files skipped because they pertain to an uncommitted ACID transaction */
     public int uncommittedAcidFilesSkipped = 0;
 
     /**
-     * Number of files skipped because they pertain to ACID directories superceded
-     * by later base data.
+     * Number of files skipped because they pertain to ACID directories superseded
+     * by compaction or newer base.
      */
-    public int filesSupercededByNewerBase = 0;
+    public int filesSupersededByAcidState = 0;
 
     // Number of files for which the metadata was loaded.
     public int loadedFiles = 0;
@@ -269,13 +355,13 @@ public class FileMetadataLoader {
     public int unknownDiskIds = 0;
 
     public String debugString() {
-      return Objects.toStringHelper("")
+      return MoreObjects.toStringHelper("")
         .add("path", partDir_)
         .add("loaded files", loadedFiles)
         .add("hidden files", nullIfZero(hiddenFiles))
         .add("skipped files", nullIfZero(skippedFiles))
         .add("uncommited files", nullIfZero(uncommittedAcidFilesSkipped))
-        .add("superceded files", nullIfZero(filesSupercededByNewerBase))
+        .add("superceded files", nullIfZero(filesSupersededByAcidState))
         .add("unknown diskIds", nullIfZero(unknownDiskIds))
         .omitNullValues()
         .toString();

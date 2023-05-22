@@ -17,18 +17,27 @@
 
 # Tests queries with the MT_DOP query option.
 
+from __future__ import absolute_import, division, print_function
 import pytest
+import logging
 
 from copy import deepcopy
-from tests.common.environ import ImpalaTestClusterProperties
+from tests.common.environ import ImpalaTestClusterProperties, build_flavor_timeout
+from tests.common.environ import HIVE_MAJOR_VERSION
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.kudu_test_suite import KuduTestSuite
-from tests.common.skip import SkipIfEC, SkipIfNotHdfsMinicluster
+from tests.common.skip import SkipIfFS, SkipIfEC, SkipIfNotHdfsMinicluster
 from tests.common.test_vector import ImpalaTestDimension
+from tests.util.filesystem_utils import IS_HDFS
+
+LOG = logging.getLogger('test_mt_dop')
+
+WAIT_TIME_MS = build_flavor_timeout(60000, slow_build_timeout=100000)
 
 # COMPUTE STATS on Parquet tables automatically sets MT_DOP=4, so include
 # the value 0 to cover the non-MT path as well.
 MT_DOP_VALUES = [0, 1, 2, 8]
+
 
 class TestMtDop(ImpalaTestSuite):
   @classmethod
@@ -64,6 +73,16 @@ class TestMtDop(ImpalaTestSuite):
       self.execute_query(
         "create external table %s like functional_hbase.alltypes" % fq_table_name)
       expected_results = "Updated 1 partition(s) and 13 column(s)."
+    elif HIVE_MAJOR_VERSION == 3 and file_format == 'orc':
+      # TODO: Enable this test on non-HDFS filesystems once IMPALA-9365 is resolved.
+      if not IS_HDFS: pytest.skip()
+      self.run_stmt_in_hive(
+          "create table %s like functional_orc_def.alltypes" % fq_table_name)
+      self.run_stmt_in_hive(
+          "insert into %s select * from functional_orc_def.alltypes" % fq_table_name)
+      self.execute_query_using_client(self.client,
+          "invalidate metadata %s" % fq_table_name, vector)
+      expected_results = "Updated 24 partition(s) and 11 column(s)."
     else:
       # Create a second table in the same format pointing to the same data files.
       # This function switches to the format-specific DB in 'vector'.
@@ -78,6 +97,7 @@ class TestMtDop(ImpalaTestSuite):
     results = self.execute_query("compute stats %s" % fq_table_name,
       vector.get_value('exec_option'))
     assert expected_results in results.data
+
 
 class TestMtDopParquet(ImpalaTestSuite):
   @classmethod
@@ -101,14 +121,36 @@ class TestMtDopParquet(ImpalaTestSuite):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/mt-dop-parquet-nested', vector)
 
-  # Impala scans fewer row groups than it should with erasure coding.
-  @SkipIfEC.fix_later
+  @SkipIfEC.parquet_file_size
   def test_parquet_filtering(self, vector):
     """IMPALA-4624: Test that dictionary filtering eliminates row groups correctly."""
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     # Disable min-max stats to prevent interference with directionary filtering.
     vector.get_value('exec_option')['parquet_read_statistics'] = '0'
     self.run_test_case('QueryTest/parquet-filtering', vector)
+
+  @pytest.mark.execute_serially
+  @SkipIfFS.file_or_folder_name_ends_with_period
+  def test_mt_dop_insert(self, vector, unique_database):
+    """Basic tests for inserts with mt_dop > 0"""
+    mt_dop = vector.get_value('mt_dop')
+    if mt_dop == 0:
+      pytest.skip("Non-mt inserts tested elsewhere")
+    self.run_test_case('QueryTest/insert', vector, unique_database,
+        test_file_vars={'$ORIGINAL_DB': ImpalaTestSuite
+        .get_db_name_from_format(vector.get_value('table_format'))})
+
+  def test_mt_dop_only_joins(self, vector, unique_database):
+    """MT_DOP specific tests for joins."""
+    mt_dop = vector.get_value('mt_dop')
+    if mt_dop == 0:
+      pytest.skip("Test requires mt_dop > 0")
+    vector = deepcopy(vector)
+    # Allow test to override num_nodes.
+    del vector.get_value('exec_option')['num_nodes']
+    self.run_test_case('QueryTest/joins_mt_dop', vector,
+       test_file_vars={'$RUNTIME_FILTER_WAIT_TIME_MS': str(WAIT_TIME_MS)})
+
 
 class TestMtDopKudu(KuduTestSuite):
   @classmethod
@@ -141,4 +183,3 @@ class TestMtDopScheduling(ImpalaTestSuite):
   def test_scheduling(self, vector):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/mt-dop-parquet-scheduling', vector)
-

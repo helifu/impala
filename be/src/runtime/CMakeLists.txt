@@ -27,6 +27,15 @@ set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime")
 # Mark the protobuf file as generated
 set_source_files_properties(${ROW_BATCH_PROTO_SRCS} PROPERTIES GENERATED TRUE)
 
+add_library(RuntimeIr
+  krpc-data-stream-sender-ir.cc
+  raw-value-ir.cc
+  runtime-filter-ir.cc
+  sorter-ir.cc
+  tuple-ir.cc
+)
+add_dependencies(RuntimeIr gen-deps)
+
 add_library(Runtime
   blocking-row-batch-queue.cc
   buffered-tuple-stream.cc
@@ -45,6 +54,7 @@ add_library(Runtime
   descriptors.cc
   dml-exec-state.cc
   exec-env.cc
+  fragment-state.cc
   fragment-instance-state.cc
   hbase-table.cc
   hbase-table-factory.cc
@@ -53,35 +63,32 @@ add_library(Runtime
   krpc-data-stream-mgr.cc
   krpc-data-stream-recvr.cc
   krpc-data-stream-sender.cc
-  krpc-data-stream-sender-ir.cc
   lib-cache.cc
   mem-tracker.cc
   mem-pool.cc
-  multi-precision.cc
+  query-driver.cc
   query-exec-mgr.cc
+  query-exec-params.cc
   query-state.cc
   test-env.cc
   types.cc
   raw-value.cc
-  raw-value-ir.cc
   reservation-manager.cc
   row-batch.cc
   ${ROW_BATCH_PROTO_SRCS}
   runtime-filter.cc
   runtime-filter-bank.cc
-  runtime-filter-ir.cc
   runtime-state.cc
   scanner-mem-limiter.cc
   sorted-run-merger.cc
+  sorted-run-merger-ir.cc
   sorter.cc
-  sorter-ir.cc
   spillable-row-batch-queue.cc
   string-value.cc
   thread-resource-mgr.cc
   timestamp-parse-util.cc
   timestamp-value.cc
   tuple.cc
-  tuple-ir.cc
   tuple-row.cc
   tmp-file-mgr.cc
 )
@@ -98,6 +105,7 @@ add_library(RuntimeTests STATIC
   multi-precision-test.cc
   raw-value-test.cc
   row-batch-serialize-test.cc
+  runtime-filter-test.cc
   string-buffer-test.cc
   string-compare-test.cc
   string-search-test.cc
@@ -110,6 +118,7 @@ add_dependencies(RuntimeTests gen-deps)
 
 ADD_UNIFIED_BE_LSAN_TEST(coordinator-backend-state-test CoordinatorBackendStateTest.*)
 ADD_UNIFIED_BE_LSAN_TEST(mem-pool-test MemPoolTest.*)
+ADD_BE_TEST(client-cache-test)
 ADD_UNIFIED_BE_LSAN_TEST(free-pool-test FreePoolTest.*)
 ADD_UNIFIED_BE_LSAN_TEST(string-buffer-test StringBufferTest.*)
 # Exception to unified be tests: Custom main function (initializes LLVM)
@@ -131,6 +140,7 @@ ADD_UNIFIED_BE_LSAN_TEST(hdfs-fs-cache-test "HdfsFsCacheTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(tmp-file-mgr-test "TmpFileMgrTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(row-batch-serialize-test "RowBatchSerializeTest.*")
 # Exception to unified be tests: Custom main function with global Frontend object
+ADD_UNIFIED_BE_LSAN_TEST(runtime-filter-test "RuntimeFilterTest.*")
 ADD_BE_LSAN_TEST(row-batch-test)
 # Exception to unified be tests: Custom main function with global Frontend object
 ADD_BE_LSAN_TEST(collection-value-builder-test)

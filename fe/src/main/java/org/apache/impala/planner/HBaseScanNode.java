@@ -38,6 +38,7 @@ import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeHBaseTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HBaseColumn;
@@ -58,11 +59,10 @@ import org.apache.impala.thrift.TScanRangeLocation;
 import org.apache.impala.thrift.TScanRangeLocationList;
 import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.util.BitUtil;
-import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Objects;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -130,9 +130,11 @@ public class HBaseScanNode extends ScanNode {
   public void init(Analyzer analyzer) throws ImpalaException {
     FeTable table = desc_.getTable();
     // determine scan predicates for clustering cols
-    for (int i = 0; i < table.getNumClusteringCols(); ++i) {
-      SlotDescriptor slotDesc = analyzer.getColumnSlot(
-          desc_, table.getColumns().get(i));
+    List<Column> columns = table.getColumns();
+    for (int i = 0; i < columns.size(); ++i) {
+      HBaseColumn col = (HBaseColumn) columns.get(i);
+      if (!col.isKeyColumn()) continue;
+      SlotDescriptor slotDesc = analyzer.getColumnSlot(desc_, col);
       if (slotDesc == null || !slotDesc.getType().isStringType()) {
         // the hbase row key is mapped to a non-string type
         // (since it's stored in ASCII it will be lexicographically ordered,
@@ -303,6 +305,7 @@ public class HBaseScanNode extends ScanNode {
       // We have run computeStats successfully. Don't need to estimate cardinality again
       // (IMPALA-8912). Check some invariants if computeStats has been called.
       Preconditions.checkState(numNodes_ > 0);
+      Preconditions.checkState(numInstances_ > 0);
       Preconditions.checkState(cardinality_ >= 0);
       cardinality_ = inputCardinality_;
       if (LOG.isTraceEnabled()) {
@@ -318,11 +321,12 @@ public class HBaseScanNode extends ScanNode {
         // May return -1 for the estimate if insufficient data is available.
         estimate = tbl.getEstimatedRowStats(startKey_, stopKey_);
       }
+      long rowsFromHms = tbl.getTTableStats().getNum_rows();
       if (estimate.first == -1) {
         // No useful estimate. Rely on HMS row count stats.
         // This works only if HBase stats are available in HMS. This is true
         // for the Impala tests, and may be true for some applications.
-        cardinality_ = tbl.getTTableStats().getNum_rows();
+        cardinality_ = rowsFromHms;
         if (LOG.isTraceEnabled()) {
           LOG.trace("Fallback to use table stats in HMS: num_rows=" + cardinality_);
         }
@@ -335,9 +339,10 @@ public class HBaseScanNode extends ScanNode {
         }
       } else {
         // Use the HBase sampling scan to estimate cardinality. Note that,
-        // in tests, this estimate has proven to be very rough: off by
-        // 2x or more.
-        cardinality_ = estimate.first;
+        // in tests, this estimate has proven to be very rough: off by 2x or more.
+        // Cap the cardinality estimation by the row count from HMS when available.
+        cardinality_ = (rowsFromHms >= 0) ? Long.min(estimate.first, rowsFromHms) :
+                                              estimate.first;
         if (estimate.second > 0) {
           suggestedCaching_ = (int)
               Math.max(MAX_HBASE_FETCH_BATCH_SIZE / estimate.second, 1);
@@ -358,19 +363,24 @@ public class HBaseScanNode extends ScanNode {
       LOG.trace("computeStats HbaseScan: cardinality=" + cardinality_);
     }
 
-    // Assume that each executor in the cluster gets a scan range, unless there are fewer
-    // scan ranges than nodes.
-    numNodes_ = Math.max(1, Math.min(scanRangeSpecs_.getConcrete_rangesSize(),
-                                ExecutorMembershipSnapshot.getCluster().numExecutors()));
+    // Assume that each node/instance in the cluster gets a scan range, unless there are
+    // fewer scan ranges than nodes/instances.
+    int numExecutors = analyzer.numExecutorsForPlanning();
+    numNodes_ =
+        Math.max(1, Math.min(scanRangeSpecs_.getConcrete_rangesSize(), numExecutors));
+    int maxInstances = numNodes_ * getMaxInstancesPerNode(analyzer);
+    numInstances_ =
+        Math.max(1, Math.min(scanRangeSpecs_.getConcrete_rangesSize(), maxInstances));
     if (LOG.isTraceEnabled()) {
-      LOG.trace("computeStats HbaseScan: #nodes=" + numNodes_);
+      LOG.trace(
+          "computeStats HbaseScan: #nodes=" + numNodes_ + " #instances=" + numInstances_);
     }
   }
 
   @Override
   protected String debugString() {
     FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
-    return Objects.toStringHelper(this)
+    return MoreObjects.toStringHelper(this)
         .add("tid", desc_.getId().asInt())
         .add("hiveTblName", tbl.getFullName())
         .add("hbaseTblName", tbl.getHBaseTableName())
@@ -491,7 +501,8 @@ public class HBaseScanNode extends ScanNode {
           TScanRangeLocationList scanRangeLocation = new TScanRangeLocationList();
           TNetworkAddress networkAddress = addressToTNetworkAddress(locEntry.getKey());
           scanRangeLocation.addToLocations(
-              new TScanRangeLocation(analyzer.getHostIndex().getIndex(networkAddress)));
+              new TScanRangeLocation(
+                  analyzer.getHostIndex().getOrAddIndex(networkAddress)));
 
           TScanRange scanRange = new TScanRange();
           scanRange.setHbase_key_range(keyRange);
@@ -579,9 +590,9 @@ public class HBaseScanNode extends ScanNode {
         } else {
           for (int i = 0; i < filters_.size(); ++i) {
             THBaseFilter filter = filters_.get(i);
-            output.append("\n  " + filter.family + ":" + filter.qualifier + " " +
-                CompareFilter.CompareOp.values()[filter.op_ordinal].toString() + " " +
-                "'" + filter.filter_constant + "'");
+            output.append("\n" + detailPrefix + filter.family + ":" + filter.qualifier
+                + " " + CompareFilter.CompareOp.values()[filter.op_ordinal].toString()
+                + " " + "'" + filter.filter_constant + "'");
           }
         }
         output.append('\n');
@@ -641,6 +652,13 @@ public class HBaseScanNode extends ScanNode {
       default: throw new IllegalArgumentException(
           "HBase: Unsupported Impala compare operator: " + impalaOp);
     }
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    Preconditions.checkNotNull(scanRangeSpecs_);
+    processingCost_ =
+        computeScanProcessingCost(queryOptions, scanRangeSpecs_.getConcrete_rangesSize());
   }
 
   @Override

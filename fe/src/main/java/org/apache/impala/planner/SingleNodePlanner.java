@@ -38,13 +38,17 @@ import org.apache.impala.analysis.CollectionTableRef;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ExprId;
 import org.apache.impala.analysis.ExprSubstitutionMap;
+import org.apache.impala.analysis.IcebergMetadataTableRef;
 import org.apache.impala.analysis.InlineViewRef;
 import org.apache.impala.analysis.JoinOperator;
 import org.apache.impala.analysis.MultiAggregateInfo;
 import org.apache.impala.analysis.MultiAggregateInfo.AggPhase;
 import org.apache.impala.analysis.NullLiteral;
+import org.apache.impala.analysis.Path;
+import org.apache.impala.analysis.Path.PathType;
 import org.apache.impala.analysis.QueryStmt;
 import org.apache.impala.analysis.SelectStmt;
+import org.apache.impala.analysis.SetOperationStmt.SetOperand;
 import org.apache.impala.analysis.SingularRowSrcTableRef;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotId;
@@ -55,20 +59,27 @@ import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.analysis.TupleId;
 import org.apache.impala.analysis.TupleIsNullPredicate;
 import org.apache.impala.analysis.UnionStmt;
-import org.apache.impala.analysis.UnionStmt.UnionOperand;
+import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.ColumnStats;
 import org.apache.impala.catalog.FeDataSourceTable;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.ScalarType;
+import org.apache.impala.catalog.TableLoadingException;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.NotImplementedException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.planner.AnalyticEvalNode.LimitPushdownInfo;
+import org.apache.impala.planner.JoinNode.DistributionMode;
+import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.AcidUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -85,9 +96,19 @@ import com.google.common.collect.Sets;
  * The single-node plan needs to be wrapped in a plan fragment for it to be executable.
  */
 public class SingleNodePlanner {
+  // Controls whether a distinct aggregation should be inserted before a join input.
+  // If the size of the distinct values after aggregation is less than or equal to
+  // the original input size multiplied by this threshold, the distinct agg should be
+  // inserted.
+  private static final double JOIN_DISTINCT_THRESHOLD = 0.25;
+
   private final static Logger LOG = LoggerFactory.getLogger(SingleNodePlanner.class);
 
   private final PlannerContext ctx_;
+
+  // Set to true if single node planning added new value transfers to the
+  // value transfer graph in 'analyzer'.
+  private boolean valueTransferGraphNeedsUpdate_ = false;
 
   public SingleNodePlanner(PlannerContext ctx) {
     ctx_ = ctx;
@@ -99,7 +120,7 @@ public class SingleNodePlanner {
    * performs the following actions.
    * In the top-down phase over query statements:
    * - Materialize the slots required for evaluating expressions of that statement.
-   * - Migrate conjuncts from parent blocks into inline views and union operands.
+   * - Migrate conjuncts from parent blocks into inline views and set operands.
    * In the bottom-up phase generate the plan tree for every query statement:
    * - Generate the plan for the FROM-clause of a select statement: The plan trees of
    *   absolute and uncorrelated table refs are connected via JoinNodes. The relative
@@ -150,6 +171,14 @@ public class SingleNodePlanner {
     PlanNode singleNodePlan = createQueryPlan(queryStmt, analyzer,
         ctx_.getQueryOptions().isDisable_outermost_topn());
     Preconditions.checkNotNull(singleNodePlan);
+    // Recompute the graph since we may have added new equivalences.
+    if (valueTransferGraphNeedsUpdate_) {
+      ctx_.getTimeline().markEvent("Recomputing value transfer graph");
+      analyzer.computeValueTransferGraph();
+      ctx_.getTimeline().markEvent("Value transfer graph computed");
+      valueTransferGraphNeedsUpdate_ = false;
+    }
+
     return singleNodePlan;
   }
 
@@ -159,9 +188,10 @@ public class SingleNodePlanner {
    *   are not inside the right child of a SubplanNode.
    * Throws a NotImplementedException if plan validation fails.
    */
-  public void validatePlan(PlanNode planNode) throws NotImplementedException {
+  public static void validatePlan(PlannerContext planCtx,
+    PlanNode planNode) throws NotImplementedException {
     // Any join can run in a single-node plan.
-    if (ctx_.isSingleNodeExec()) return;
+    if (planCtx.isSingleNodeExec()) return;
 
     if (planNode instanceof NestedLoopJoinNode) {
       JoinNode joinNode = (JoinNode) planNode;
@@ -179,31 +209,12 @@ public class SingleNodePlanner {
     if (planNode instanceof SubplanNode) {
       // Right and full outer joins with no equi-join conjuncts are ok in the right
       // child of a SubplanNode.
-      validatePlan(planNode.getChild(0));
+      validatePlan(planCtx, planNode.getChild(0));
     } else {
       for (PlanNode child: planNode.getChildren()) {
-        validatePlan(child);
+        validatePlan(planCtx, child);
       }
     }
-  }
-
-  /**
-   * Returns true if there is a join in the plan outside of the right branch of a
-   * subplan. This specific behaviour maintains compatibility with older
-   * validatePlan() logic that allowed joins with mt_dop only in this specific case
-   * (presumably by accident).
-   */
-  public boolean hasUnsupportedMtDopJoin(PlanNode planNode) {
-    if (planNode instanceof JoinNode) return true;
-
-    if (planNode instanceof SubplanNode) {
-      return hasUnsupportedMtDopJoin(planNode.getChild(0));
-    }
-
-    for (PlanNode child : planNode.getChildren()) {
-      if (hasUnsupportedMtDopJoin(child)) return true;
-    }
-    return false;
   }
 
   /**
@@ -227,7 +238,7 @@ public class SingleNodePlanner {
     EmptySetNode node = new EmptySetNode(ctx_.getNextNodeId(), tupleIds);
     node.init(analyzer);
     // Set the output smap to resolve exprs referencing inline views within stmt.
-    // Not needed for a UnionStmt because it materializes its input operands.
+    // Not needed for a SetOperationStmt because it materializes its input operands.
     if (stmt instanceof SelectStmt) {
       node.setOutputSmap(((SelectStmt) stmt).getBaseTblSmap());
     }
@@ -280,6 +291,7 @@ public class SingleNodePlanner {
         } else {
           groupingExprs = Collections.emptyList();
         }
+
         List<Expr> inputPartitionExprs = new ArrayList<>();
         root = analyticPlanner.createSingleNodePlan(
             root, groupingExprs, inputPartitionExprs);
@@ -307,11 +319,14 @@ public class SingleNodePlanner {
     }
 
     if (stmt.evaluateOrderBy() && sortHasMaterializedSlots) {
-      root = createSortNode(analyzer, root, stmt.getSortInfo(), stmt.getLimit(),
+      root = createSortNode(ctx_, analyzer, root, stmt.getSortInfo(), stmt.getLimit(),
           stmt.getOffset(), stmt.hasLimit(), disableTopN);
     } else {
       root.setLimit(stmt.getLimit());
       root.computeStats(analyzer);
+      if (root.hasLimit()) {
+        checkAndApplyLimitPushdown(root, null, root.getLimit(), analyzer, ctx_);
+      }
     }
 
     return root;
@@ -321,45 +336,112 @@ public class SingleNodePlanner {
    * Creates and initializes either a SortNode or a TopNNode depending on various
    * heuristics and configuration parameters.
    */
-  private SortNode createSortNode(Analyzer analyzer, PlanNode root, SortInfo sortInfo,
-      long limit, long offset, boolean hasLimit, boolean disableTopN)
-      throws ImpalaException {
+  public static SortNode createSortNode(PlannerContext planCtx, Analyzer analyzer,
+    PlanNode root, SortInfo sortInfo, long limit, long offset, boolean hasLimit,
+    boolean disableTopN) throws ImpalaException {
     SortNode sortNode;
-    long topNBytesLimit = ctx_.getQueryOptions().topn_bytes_limit;
+
+    if (hasLimit && offset == 0) {
+      checkAndApplyLimitPushdown(root, sortInfo, limit, analyzer, planCtx);
+    }
 
     if (hasLimit && !disableTopN) {
-      if (topNBytesLimit <= 0) {
-        sortNode =
-            SortNode.createTopNSortNode(ctx_.getNextNodeId(), root, sortInfo, offset);
-      } else {
-        long topNCardinality = PlanNode.capCardinalityAtLimit(root.cardinality_, limit);
-        long estimatedTopNMaterializedSize =
-            sortInfo.estimateTopNMaterializedSize(topNCardinality, offset);
-
-        if (estimatedTopNMaterializedSize < topNBytesLimit) {
-          sortNode =
-              SortNode.createTopNSortNode(ctx_.getNextNodeId(), root, sortInfo, offset);
-        } else {
-          sortNode =
-              SortNode.createTotalSortNode(ctx_.getNextNodeId(), root, sortInfo, offset);
-        }
-      }
+      sortNode = SortNode.createTopNSortNode(planCtx.getQueryOptions(),
+          planCtx.getNextNodeId(), root, sortInfo, offset, limit, false);
     } else {
       sortNode =
-          SortNode.createTotalSortNode(ctx_.getNextNodeId(), root, sortInfo, offset);
+          SortNode.createTotalSortNode(planCtx.getNextNodeId(), root, sortInfo, offset);
+      sortNode.setLimit(limit);
     }
     Preconditions.checkState(sortNode.hasValidStats());
-    sortNode.setLimit(limit);
     sortNode.init(analyzer);
+
     return sortNode;
   }
 
   /**
+   * For certain qualifying conditions, we can push a limit from the top level
+   * sort down to the sort associated with an AnalyticEval node.
+   */
+  private static void checkAndApplyLimitPushdown(PlanNode root, SortInfo sortInfo,
+    long limit, Analyzer analyzer, PlannerContext planCtx) {
+    LimitPushdownInfo pushdownLimit = null;
+    AnalyticEvalNode analyticNode = null;
+    List<PlanNode> intermediateNodes = new ArrayList<>();
+    SortNode analyticNodeSort = null;
+    PlanNode descendant = findDescendantAnalyticNode(root, intermediateNodes);
+    if (descendant != null && intermediateNodes.size() <= 1) {
+      Preconditions.checkArgument(descendant instanceof AnalyticEvalNode);
+      analyticNode = (AnalyticEvalNode) descendant;
+      if (!(analyticNode.getChild(0) instanceof SortNode)) {
+        // if the over() clause is empty, there won't be a child SortNode
+        // so limit pushdown is not applicable
+        return;
+      }
+      analyticNodeSort = (SortNode) analyticNode.getChild(0);
+      // Don't attempt conversion if there is already a limit or offset.
+      if (analyticNodeSort.hasLimit() || analyticNodeSort.hasOffset()) {
+        return;
+      }
+      int numNodes = intermediateNodes.size();
+      if (numNodes > 1 ||
+              (numNodes == 1 && !(intermediateNodes.get(0) instanceof SelectNode))) {
+        pushdownLimit = null;
+      } else if (numNodes == 0) {
+        pushdownLimit = analyticNode.checkForLimitPushdown(sortInfo,
+            root.getOutputSmap(), null, limit, analyticNodeSort,
+            planCtx.getRootAnalyzer());
+      } else {
+        SelectNode selectNode = (SelectNode) intermediateNodes.get(0);
+        pushdownLimit = analyticNode.checkForLimitPushdown(sortInfo,
+            root.getOutputSmap(), selectNode, limit, analyticNodeSort,
+            planCtx.getRootAnalyzer());
+      }
+    }
+
+    if (pushdownLimit != null) {
+      Preconditions.checkArgument(analyticNode != null);
+      Preconditions.checkArgument(analyticNode.getChild(0) instanceof SortNode);
+      analyticNodeSort.tryConvertToTopN(limit + pushdownLimit.additionalLimit,
+           analyzer, pushdownLimit.includeTies);
+      // after the limit is pushed down, update stats for the analytic eval node
+      // and intermediate nodes
+      analyticNode.computeStats(analyzer);
+      for (PlanNode n : intermediateNodes) {
+        n.computeStats(analyzer);
+      }
+    }
+  }
+
+  /**
+   * Starting from the supplied root PlanNode, traverse the descendants
+   * to find the first AnalyticEvalNode.  If a blocking node such as
+   * Join, Aggregate, Sort is encountered, return null. The
+   * 'intermediateNodes' is populated with the nodes encountered during
+   * traversal.
+   */
+  private static PlanNode findDescendantAnalyticNode(PlanNode root,
+    List<PlanNode> intermediateNodes) {
+    if (root == null || root instanceof AnalyticEvalNode) {
+      return root;
+    }
+    // If we encounter a blocking operator (sort, aggregate, join), or a Subplan,
+    // there's no need to go further. Also, we bail early if we encounter multi-input
+    // operator such as union-all.  In the future, we could potentially extend the
+    // limit pushdown to both sides of a union-all
+    if (root instanceof SortNode || root instanceof AggregationNode ||
+          root instanceof JoinNode || root instanceof SubplanNode ||
+          root.getChildren().size() > 1) {
+      return null;
+    }
+    intermediateNodes.add(root);
+    return findDescendantAnalyticNode(root.getChild(0), intermediateNodes);
+  }
+
+  /**
    * If there are unassigned conjuncts that are bound by tupleIds or if there are slot
-   * equivalences for tupleIds that have not yet been enforced, returns a SelectNode on
-   * top of root that evaluates those conjuncts; otherwise returns root unchanged.
-   * TODO: change this to assign the unassigned conjuncts to root itself, if that is
-   * semantically correct
+   * equivalences for tupleIds that have not yet been enforced, add them to the plan
+   * tree, returning either the original root or a new root.
    */
   private PlanNode addUnassignedConjuncts(
       Analyzer analyzer, List<TupleId> tupleIds, PlanNode root) {
@@ -369,21 +451,7 @@ public class SingleNodePlanner {
     // Gather unassigned conjuncts and generate predicates to enforce
     // slot equivalences for each tuple id.
     List<Expr> conjuncts = analyzer.getUnassignedConjuncts(root);
-    if (LOG.isTraceEnabled()) {
-      LOG.trace(String.format("unassigned conjuncts for (Node %s): %s",
-          root.getDisplayLabel(), Expr.debugString(conjuncts)));
-      LOG.trace("all conjuncts: " + analyzer.conjunctAssignmentsDebugString());
-    }
-    for (TupleId tid: tupleIds) {
-      analyzer.createEquivConjuncts(tid, conjuncts);
-    }
-    if (conjuncts.isEmpty()) return root;
-    // evaluate conjuncts in SelectNode
-    SelectNode selectNode = new SelectNode(ctx_.getNextNodeId(), root, conjuncts);
-    // init() marks conjuncts as assigned
-    selectNode.init(analyzer);
-    Preconditions.checkState(selectNode.hasValidStats());
-    return selectNode;
+    return root.addConjunctsToNode(ctx_, analyzer, tupleIds, conjuncts);
   }
 
   /**
@@ -425,7 +493,7 @@ public class SingleNodePlanner {
       if (plan.getCardinality() == -1) {
         // use 0 for the size to avoid it becoming the leftmost input
         // TODO: Consider raw size of scanned partitions in the absence of stats.
-        candidates.add(new Pair<TableRef, Long>(ref, new Long(0)));
+        candidates.add(new Pair<TableRef, Long>(ref, Long.valueOf(0)));
         if (LOG.isTraceEnabled()) {
           LOG.trace("candidate " + ref.getUniqueAlias() + ": 0");
         }
@@ -434,7 +502,7 @@ public class SingleNodePlanner {
       Preconditions.checkState(ref.isAnalyzed());
       long materializedSize =
           (long) Math.ceil(plan.getAvgRowSize() * (double) plan.getCardinality());
-      candidates.add(new Pair<TableRef, Long>(ref, new Long(materializedSize)));
+      candidates.add(new Pair<TableRef, Long>(ref, Long.valueOf(materializedSize)));
       if (LOG.isTraceEnabled()) {
         LOG.trace(
             "candidate " + ref.getUniqueAlias() + ": " + Long.toString(materializedSize));
@@ -654,6 +722,21 @@ public class SingleNodePlanner {
       return createAggregationPlan(selectStmt, analyzer, emptySetNode);
     }
 
+    // Transform outer join into inner join whenever possible
+    if (!analyzer.isStraightJoin() &&
+        analyzer.getQueryOptions().isEnable_outer_join_to_inner_transformation() &&
+        analyzer.hasOuterJoined(selectStmt.getTableRefs())) {
+      Set<TupleId> nonnullableTidList = new HashSet<>();
+      if (analyzer.simplifyOuterJoins(selectStmt.getTableRefs(), nonnullableTidList)) {
+        // Recompute the graph since we may need to add value-transfer edges based on the
+        // registered equi-join conjuncts.
+        ctx_.getTimeline().markEvent("Recomputing value transfer graph");
+        analyzer.computeValueTransferGraph();
+        ctx_.getTimeline().markEvent("Value transfer graph computed");
+        valueTransferGraphNeedsUpdate_ = false;
+      }
+    }
+
     // Separate table refs into parent refs (uncorrelated or absolute) and
     // subplan refs (correlated or relative), and generate their plan.
     List<TableRef> parentRefs = new ArrayList<>();
@@ -661,25 +744,16 @@ public class SingleNodePlanner {
     computeParentAndSubplanRefs(
         selectStmt.getTableRefs(), analyzer.isStraightJoin(), parentRefs, subplanRefs);
     MultiAggregateInfo multiAggInfo = selectStmt.getMultiAggInfo();
-    // Only optimize scan/agg plan if there is a single aggregation class.
-    AggregateInfo scanAggInfo = null;
-    if (multiAggInfo != null && multiAggInfo.getMaterializedAggClasses().size() == 1) {
-      scanAggInfo = multiAggInfo.getMaterializedAggClass(0);
-    }
-    PlanNode root = createTableRefsPlan(parentRefs, subplanRefs, scanAggInfo, analyzer);
+    PlanNode root = createTableRefsPlan(parentRefs, subplanRefs, multiAggInfo, analyzer);
     // Add aggregation, if any.
     if (multiAggInfo != null) {
       // Apply substitution for optimized scan/agg plan,
-      if (scanAggInfo != null) {
-        if (root instanceof HdfsScanNode) {
-          scanAggInfo.substitute(((HdfsScanNode) root).getOptimizedAggSmap(), analyzer);
-          scanAggInfo.getMergeAggInfo().substitute(
-              ((HdfsScanNode) root).getOptimizedAggSmap(), analyzer);
-        } else if (root instanceof KuduScanNode) {
-          scanAggInfo.substitute(((KuduScanNode) root).getOptimizedAggSmap(), analyzer);
-          scanAggInfo.getMergeAggInfo().substitute(
-              ((KuduScanNode) root).getOptimizedAggSmap(), analyzer);
-        }
+      if (multiAggInfo.getMaterializedAggClasses().size() == 1 &&
+          (root instanceof HdfsScanNode || root instanceof KuduScanNode)) {
+        AggregateInfo scanAggInfo = multiAggInfo.getMaterializedAggClass(0);
+        scanAggInfo.substitute(((ScanNode) root).getOptimizedAggSmap(), analyzer);
+        scanAggInfo.getMergeAggInfo().substitute(
+            ((ScanNode) root).getOptimizedAggSmap(), analyzer);
       }
       root = createAggregationPlan(selectStmt, analyzer, root);
     }
@@ -783,7 +857,17 @@ public class SingleNodePlanner {
           requiredTids.addAll(ref.getCorrelatedTupleIds());
         } else {
           CollectionTableRef collectionTableRef = (CollectionTableRef) ref;
-          requiredTids.add(collectionTableRef.getResolvedPath().getRootDesc().getId());
+          SlotRef collectionExpr =
+              (SlotRef) collectionTableRef.getCollectionExpr();
+          if (collectionExpr != null) {
+            // If the collection is within a (possibly nested) struct, add the tuple in
+            // which the top level struct is located.
+            SlotDescriptor desc = collectionExpr.getDesc();
+            TupleDescriptor topTuple = desc.getTopEnclosingTupleDesc();
+            requiredTids.add(topTuple.getId());
+          } else {
+            requiredTids.add(collectionTableRef.getResolvedPath().getRootDesc().getId());
+          }
         }
         // Add all plan table ref ids as an ordering dependency for straight_join.
         if (isStraightJoin) requiredTblRefIds.addAll(planTblRefIds);
@@ -823,20 +907,29 @@ public class SingleNodePlanner {
       parentRefs.get(i).setLeftTblRef(parentRefs.get(i - 1));
     }
     for (SubplanRef subplanRef: subplanRefs) subplanRef.tblRef.setLeftTblRef(null);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("parentRefs: {}",
+          parentRefs.stream().map(TableRef::debugString).reduce(", ", String::concat));
+      LOG.trace("subplanRefs: {}", subplanRefs.stream().map(r -> r.tblRef.debugString())
+          .reduce(", ", String::concat));
+    }
   }
 
   /**
    * Returns a plan tree for evaluating the given parentRefs and subplanRefs.
    */
   private PlanNode createTableRefsPlan(List<TableRef> parentRefs,
-      List<SubplanRef> subplanRefs, AggregateInfo aggInfo, Analyzer analyzer)
+      List<SubplanRef> subplanRefs, MultiAggregateInfo aggInfo, Analyzer analyzer)
       throws ImpalaException {
     // create plans for our table refs; use a list here instead of a map to
     // maintain a deterministic order of traversing the TableRefs during join
     // plan generation (helps with tests)
     List<Pair<TableRef, PlanNode>> parentRefPlans = new ArrayList<>();
+    List<CollectionTableRef> unnestCollectionRefs =
+        extractZippingUnnestTableRefs(parentRefs);
+    reduceUnnestCollectionRefs(parentRefs, unnestCollectionRefs);
     for (TableRef ref: parentRefs) {
-      PlanNode root = createTableRefNode(ref, aggInfo, analyzer);
+      PlanNode root = createTableRefNode(ref, aggInfo, analyzer, unnestCollectionRefs);
       Preconditions.checkNotNull(root);
       root = createSubplan(root, subplanRefs, true, analyzer);
       parentRefPlans.add(new Pair<TableRef, PlanNode>(ref, root));
@@ -946,6 +1039,39 @@ public class SingleNodePlanner {
   }
 
   /**
+   * This functions gathers and returns all the CollectionTableRefs that are for zipping
+   * unnest.
+   */
+  private List<CollectionTableRef> extractZippingUnnestTableRefs(
+      List<TableRef> refs) {
+    Preconditions.checkNotNull(refs);
+    List<CollectionTableRef> collectionRefs = Lists.newArrayList();
+    for (TableRef ref : refs) {
+      if (ref instanceof CollectionTableRef && ref.isZippingUnnest()) {
+        collectionRefs.add((CollectionTableRef)ref);
+      }
+    }
+    return collectionRefs;
+  }
+
+  /**
+   * This functions removes the items in 'unnestCollectionRefs' from 'refs' except the
+   * first item in 'unnestCollectionRefs'. This is used when the collectionTableRefs are
+   * handled by a single UNNEST node for zipping unnest. A single CollectionTableRef item
+   * has to remain in 'refs' so that the subplan creation can see that an UNNEST node has
+   * to be created.
+   */
+  private void reduceUnnestCollectionRefs(List<TableRef> refs,
+      List<CollectionTableRef> unnestCollectionRefs) {
+    Preconditions.checkNotNull(refs);
+    Preconditions.checkNotNull(unnestCollectionRefs);
+    if (unnestCollectionRefs.size() <= 1) return;
+    List<CollectionTableRef> reducedCollectionRefs =
+        unnestCollectionRefs.subList(1, unnestCollectionRefs.size());
+    refs.removeAll(reducedCollectionRefs);
+  }
+
+  /**
    * Returns a new AggregationNode that materializes the aggregation of the given stmt.
    * Assigns conjuncts from the Having clause to the returned node.
    */
@@ -982,23 +1108,27 @@ public class SingleNodePlanner {
   private AggregationNode createAggregationPlan(PlanNode root,
       MultiAggregateInfo multiAggInfo, Analyzer analyzer) throws InternalException {
     Preconditions.checkNotNull(multiAggInfo);
-    AggregationNode firstPhaseAgg =
+    AggregationNode agg =
         new AggregationNode(ctx_.getNextNodeId(), root, multiAggInfo, AggPhase.FIRST);
-    firstPhaseAgg.init(analyzer);
-    if (!multiAggInfo.hasSecondPhase()) return firstPhaseAgg;
+    agg.init(analyzer);
+    if (!multiAggInfo.hasSecondPhase() && !multiAggInfo.hasTransposePhase()) {
+      return agg;
+    }
 
-    firstPhaseAgg.unsetNeedsFinalize();
-    firstPhaseAgg.setIntermediateTuple();
+    agg.setIntermediateTuple();
 
-    AggregationNode secondPhaseAgg = new AggregationNode(
-        ctx_.getNextNodeId(), firstPhaseAgg, multiAggInfo, AggPhase.SECOND);
-    secondPhaseAgg.init(analyzer);
-    if (!multiAggInfo.hasTransposePhase()) return secondPhaseAgg;
-
-    AggregationNode transposePhaseAgg = new AggregationNode(
-        ctx_.getNextNodeId(), secondPhaseAgg, multiAggInfo, AggPhase.TRANSPOSE);
-    transposePhaseAgg.init(analyzer);
-    return transposePhaseAgg;
+    if (multiAggInfo.hasSecondPhase()) {
+      agg.unsetNeedsFinalize();
+      agg = new AggregationNode(
+          ctx_.getNextNodeId(), agg, multiAggInfo, AggPhase.SECOND);
+      agg.init(analyzer);
+    }
+    if (multiAggInfo.hasTransposePhase()) {
+      agg = new AggregationNode(
+          ctx_.getNextNodeId(), agg, multiAggInfo, AggPhase.TRANSPOSE);
+      agg.init(analyzer);
+    }
+    return agg;
   }
 
  /**
@@ -1075,6 +1205,8 @@ public class SingleNodePlanner {
     // On-clause of an outer join may be pushed into the inline view as well.
     migrateConjunctsToInlineView(analyzer, inlineViewRef);
 
+    migrateSimpleLimitToInlineView(analyzer, inlineViewRef);
+
     // Turn a constant select into a UnionNode that materializes the exprs.
     // TODO: unify this with createConstantSelectPlan(), this is basically the
     // same thing
@@ -1120,8 +1252,12 @@ public class SingleNodePlanner {
     // of the inline view's plan root. This ensures that all downstream exprs referencing
     // the inline view are replaced with exprs referencing the physical output of the
     // inline view's plan.
-    ExprSubstitutionMap outputSmap = ExprSubstitutionMap.compose(
-        inlineViewRef.getSmap(), rootNode.getOutputSmap(), analyzer);
+    ExprSubstitutionMap outputSmap = inlineViewRef.getSmap();
+    if (outputSmap != null && !inlineViewRef.isTableMaskingView()) {
+      outputSmap.trim(inlineViewRef.getBaseTblSmap(), analyzer);
+    }
+    outputSmap = ExprSubstitutionMap.compose(
+        outputSmap, rootNode.getOutputSmap(), analyzer);
     if (analyzer.isOuterJoined(inlineViewRef.getId())) {
       // Exprs against non-matched rows of an outer join should always return NULL.
       // Make the rhs exprs of the output smap nullable, if necessary. This expr wrapping
@@ -1155,7 +1291,77 @@ public class SingleNodePlanner {
       rootNode = addUnassignedConjuncts(
           analyzer, inlineViewRef.getDesc().getId().asList(), rootNode);
     }
+    // Transfer whether the inline view is for a non-correlated subquery returning at
+    // most one value to the root node when it is an AggregationNode.
+    if (rootNode instanceof AggregationNode) {
+      ((AggregationNode) rootNode)
+          .setIsNonCorrelatedScalarSubquery(
+              inlineViewRef.isNonCorrelatedScalarSubquery());
+    }
     return rootNode;
+  }
+
+  /**
+   * Get the unassigned conjuncts that can be evaluated in inline view and return them
+   * in 'evalInInlineViewPreds'.
+   * If a conjunct is not an On-clause predicate and is safe to propagate it inside the
+   * inline view, add it to 'evalAfterJoinPreds'.
+   */
+  private void getConjunctsToInlineView(final Analyzer analyzer, final String alias,
+      final List<TupleId> tupleIds, List<Expr> evalInInlineViewPreds,
+      List<Expr> evalAfterJoinPreds) {
+    List<Expr> unassignedConjuncts = analyzer.getUnassignedConjuncts(tupleIds, true);
+    for (Expr e: unassignedConjuncts) {
+      if (!e.isBoundByTupleIds(tupleIds)) continue;
+      List<TupleId> tids = new ArrayList<>();
+      e.getIds(tids, null);
+      if (tids.isEmpty()) {
+        evalInInlineViewPreds.add(e);
+      } else if (e.isOnClauseConjunct()) {
+        if (!analyzer.canEvalOnClauseConjunct(tupleIds, e)) continue;
+        evalInInlineViewPreds.add(e);
+      } else if (analyzer.isLastOjMaterializedByTupleIds(tupleIds, e)) {
+        evalInInlineViewPreds.add(e);
+      } else {
+        // The predicate belong to an outer-joined tuple, it's correct to duplicate(not
+        // migrate) this predicate inside the inline view since it does not evalute to
+        // true with null slots
+        try {
+          if (!analyzer.isTrueWithNullSlots(e)) {
+            evalAfterJoinPreds.add(e);
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Can propagate {} to inline view {}", e.debugString(), alias);
+            }
+          }
+        } catch (InternalException ex) {
+          // Expr evaluation failed in the backend. Skip 'e' since we cannot
+          // determine whether propagation is safe.
+          LOG.warn("Skipping propagation of conjunct because backend evaluation failed: "
+              + e.toSql(), ex);
+        }
+        continue;
+      }
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Can evaluate {} in inline view {}", e.debugString(), alias);
+      }
+    }
+  }
+
+  public void migrateSimpleLimitToInlineView(final Analyzer analyzer,
+    final InlineViewRef inlineViewRef) {
+    Pair<Boolean, Long> outerStatus = analyzer.getSimpleLimitStatus();
+    if (outerStatus == null || !outerStatus.first
+        || inlineViewRef.isTableMaskingView()) {
+      return;
+    }
+    Pair<Boolean, Long> viewStatus =
+        inlineViewRef.getAnalyzer().getSimpleLimitStatus();
+    // if the view already has a limit, we leave it as-is otherwise we
+    // apply the outer limit
+    if (viewStatus != null && !viewStatus.first) {
+      inlineViewRef.getAnalyzer().setSimpleLimitStatus(new Pair<>(Boolean.valueOf(true),
+          outerStatus.second));
+    }
   }
 
   /**
@@ -1168,14 +1374,32 @@ public class SingleNodePlanner {
    * makes the *output* of the computation visible to the enclosing scope, so that
    * filters from the enclosing scope can be safely applied (to the grouping cols, say).
    */
-  public void migrateConjunctsToInlineView(final Analyzer analyzer,
+  private void migrateConjunctsToInlineView(final Analyzer analyzer,
       final InlineViewRef inlineViewRef) throws ImpalaException {
-    List<Expr> unassignedConjuncts =
-        analyzer.getUnassignedConjuncts(inlineViewRef.getId().asList(), true);
-    if (LOG. isTraceEnabled()) {
-      LOG.trace("unassignedConjuncts: " + Expr.debugString(unassignedConjuncts));
+    List<TupleId> tids = inlineViewRef.getId().asList();
+    if (inlineViewRef.isTableMaskingView()
+        && inlineViewRef.getUnMaskedTableRef().exposeNestedColumnsByTableMaskView()) {
+      tids.add(inlineViewRef.getUnMaskedTableRef().getId());
+    }
+    List<Expr> unassignedConjuncts = analyzer.getUnassignedConjuncts(tids, true);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("migrateConjunctsToInlineView() unassignedConjuncts: " +
+          Expr.debugString(unassignedConjuncts));
     }
     if (!canMigrateConjuncts(inlineViewRef)) {
+      // We may be able to migrate some specific analytic conjuncts into the view.
+      List<Expr> analyticPreds = findAnalyticConjunctsToMigrate(analyzer, inlineViewRef,
+              unassignedConjuncts);
+      if (analyticPreds.size() > 0) {
+        if (LOG.isTraceEnabled()) {
+          LOG.trace("Migrate analytic predicates into view " +
+              Expr.debugString(analyticPreds));
+        }
+        analyzer.markConjunctsAssigned(analyticPreds);
+        unassignedConjuncts.removeAll(analyticPreds);
+        addConjunctsIntoInlineView(analyzer, inlineViewRef, analyticPreds);
+      }
+
       // mark (fully resolve) slots referenced by unassigned conjuncts as
       // materialized
       List<Expr> substUnassigned = Expr.substituteList(unassignedConjuncts,
@@ -1185,20 +1409,71 @@ public class SingleNodePlanner {
     }
 
     List<Expr> preds = new ArrayList<>();
-    for (Expr e: unassignedConjuncts) {
-      if (analyzer.canEvalPredicate(inlineViewRef.getId().asList(), e)) {
-        preds.add(e);
-        if (LOG. isTraceEnabled()) {
-          LOG.trace(String.format("Can evaluate %s in inline view %s", e.debugString(),
-                  inlineViewRef.getExplicitAlias()));
-        }
-      }
-    }
+    List<Expr> evalAfterJoinPreds = new ArrayList<>();
+    getConjunctsToInlineView(analyzer, inlineViewRef.getExplicitAlias(), tids, preds,
+        evalAfterJoinPreds);
     unassignedConjuncts.removeAll(preds);
     // Migrate the conjuncts by marking the original ones as assigned. They will either
     // be ignored if they are identity predicates (e.g. a = a), or be substituted into
     // new ones (viewPredicates below). The substituted ones will be re-registered.
     analyzer.markConjunctsAssigned(preds);
+    // Propagate the conjuncts evaluating the nullable side of outer-join.
+    // Don't mark them as assigned so they would be assigned at the JOIN node.
+    preds.addAll(evalAfterJoinPreds);
+    addConjunctsIntoInlineView(analyzer, inlineViewRef, preds);
+
+    // mark (fully resolve) slots referenced by remaining unassigned conjuncts as
+    // materialized
+    List<Expr> substUnassigned = Expr.substituteList(unassignedConjuncts,
+        inlineViewRef.getBaseTblSmap(), analyzer, false);
+    analyzer.materializeSlots(substUnassigned);
+  }
+
+  /**
+   * Return any conjuncts in 'conjuncts' that reference analytic exprs in 'inlineViewRef'
+   * and can be safely migrated into 'inlineViewRef', even if
+   * canMigrateConjuncts(inlineViewRef) is false.
+   */
+  private List<Expr> findAnalyticConjunctsToMigrate(final Analyzer analyzer,
+          final InlineViewRef inlineViewRef, List<Expr> conjuncts) {
+    // Not safe to migrate if the inline view has a limit or offset that is applied after
+    // analytic function evaluation.
+    if (inlineViewRef.getViewStmt().hasLimit() || inlineViewRef.getViewStmt().hasOffset()
+            || !(inlineViewRef.getViewStmt() instanceof SelectStmt)) {
+      return Collections.emptyList();
+    }
+    SelectStmt selectStmt = ((SelectStmt) inlineViewRef.getViewStmt());
+    if (!selectStmt.hasAnalyticInfo()) return Collections.emptyList();
+
+    // Find conjuncts that reference the (logical) analytic tuple. These conjuncts will
+    // only be evaluated after the analytic functions in the subquery so will not migrate
+    // to be evaluated earlier in the plan (which could produce incorrect results).
+    TupleDescriptor analyticTuple = selectStmt.getAnalyticInfo().getOutputTupleDesc();
+    List<Expr> analyticPreds = new ArrayList<>();
+    List<TupleId> tupleIds = new ArrayList<>();
+    for (Expr pred : conjuncts) {
+      Expr viewPred = pred.substitute(inlineViewRef.getSmap(), analyzer, false);
+      tupleIds.clear();
+      viewPred.getIds(tupleIds, null);
+      // Only consider analytic conjuncts which are referencing the analytic tuple
+      // and skip the ones which are referencing more than 1 tuple.
+      // Example: a = MAX(b) (where MAX(b) is an analytic function). In this case,
+      // the left side may not be referencing analytic tuple and it would not
+      // be safe to migrate such predicates into the inline view.
+      if (viewPred.referencesTuple(analyticTuple.getId()) && tupleIds.size() <= 1) {
+        analyticPreds.add(pred);
+      }
+    }
+    return analyticPreds;
+  }
+
+  /**
+   * Add the provided conjuncts to be evaluated inside 'inlineViewRef'.
+   * Does not mark the conjuncts as assigned.
+   */
+  private void addConjunctsIntoInlineView(final Analyzer analyzer,
+          final InlineViewRef inlineViewRef, List<Expr> preds)
+                  throws AnalysisException {
     // Generate predicates to enforce equivalences among slots of the inline view
     // tuple. These predicates are also migrated into the inline view.
     analyzer.createEquivConjuncts(inlineViewRef.getId(), preds);
@@ -1250,12 +1525,6 @@ public class SingleNodePlanner {
     // apply to the post-join/agg/analytic result of the inline view.
     for (Expr e: viewPredicates) e.setIsOnClauseConjunct(false);
     inlineViewRef.getAnalyzer().registerConjuncts(viewPredicates);
-
-    // mark (fully resolve) slots referenced by remaining unassigned conjuncts as
-    // materialized
-    List<Expr> substUnassigned = Expr.substituteList(unassignedConjuncts,
-        inlineViewRef.getBaseTblSmap(), analyzer, false);
-    analyzer.materializeSlots(substUnassigned);
   }
 
   /**
@@ -1308,7 +1577,7 @@ public class SingleNodePlanner {
    * The given 'aggInfo' is used for detecting and applying optimizations that span both
    * the scan and aggregation.
    */
-  private PlanNode createHdfsScanPlan(TableRef hdfsTblRef, AggregateInfo aggInfo,
+  private PlanNode createHdfsScanPlan(TableRef hdfsTblRef, MultiAggregateInfo aggInfo,
       List<Expr> conjuncts, Analyzer analyzer) throws ImpalaException {
     TupleDescriptor tupleDesc = hdfsTblRef.getDesc();
 
@@ -1316,7 +1585,7 @@ public class SingleNodePlanner {
     // end up removing some predicates.
     HdfsPartitionPruner pruner = new HdfsPartitionPruner(tupleDesc);
     Pair<List<? extends FeFsPartition>, List<Expr>> pair =
-        pruner.prunePartitions(analyzer, conjuncts, false);
+        pruner.prunePartitions(analyzer, conjuncts, false, hdfsTblRef);
     List<? extends FeFsPartition> partitions = pair.first;
 
     // Mark all slots referenced by the remaining conjuncts as materialized.
@@ -1341,19 +1610,19 @@ public class SingleNodePlanner {
       }
     }
 
-    // For queries which contain partition columns only, we may use the metadata instead
-    // of table scans. This is only feasible if all materialized aggregate expressions
-    // have distinct semantics. Please see createHdfsScanPlan() for details.
-    boolean fastPartitionKeyScans =
-        analyzer.getQueryCtx().client_request.query_options.optimize_partition_key_scans &&
-        aggInfo != null && aggInfo.hasAllDistinctAgg();
+    // For queries which contain partition columns only and where all materialized
+    // aggregate expressions have distinct semantics, we only need to return one
+    // row per partition. Please see createHdfsScanPlan() for details.
+    boolean allAggsDistinct = aggInfo != null && aggInfo.hasAllDistinctAgg();
+    boolean isPartitionKeyScan = allAggsDistinct && tupleDesc.hasClusteringColsOnly();
 
     // If the optimization for partition key scans with metadata is enabled,
     // try evaluating with metadata first. If not, fall back to scanning.
-    if (fastPartitionKeyScans && tupleDesc.hasClusteringColsOnly()) {
+    TQueryOptions queryOpts = analyzer.getQueryCtx().client_request.query_options;
+    if (isPartitionKeyScan && queryOpts.optimize_partition_key_scans) {
       Set<List<Expr>> uniqueExprs = new HashSet<>();
 
-      for (FeFsPartition partition: partitions) {
+      for (FeFsPartition partition : partitions) {
         // Ignore empty partitions to match the behavior of the scan based approach.
         if (partition.getSize() == 0) continue;
         List<Expr> exprs = new ArrayList<>();
@@ -1378,19 +1647,177 @@ public class SingleNodePlanner {
       }
       unionNode.init(analyzer);
       return unionNode;
+    } else if (addAcidSlotsIfNeeded(analyzer, hdfsTblRef, partitions)) {
+      // We are scanning a full ACID table that has delete delta files. Let's create
+      // a LEFT ANTI JOIN between the insert deltas and delete deltas.
+      return createAcidJoinNode(analyzer, hdfsTblRef, conjuncts, partitions, pair.second);
     } else {
       HdfsScanNode scanNode =
           new HdfsScanNode(ctx_.getNextNodeId(), tupleDesc, conjuncts, partitions,
-              hdfsTblRef, aggInfo, pair.second);
+              hdfsTblRef, aggInfo, pair.second, isPartitionKeyScan);
       scanNode.init(analyzer);
       return scanNode;
     }
   }
 
   /**
+   * Adds partitioning columns and ACID columns to the table. It's needed to do a hash
+   * join between insert deltas and delete deltas.
+   * Returns true when the slot refs are added successfully and they are needed.
+   * Return false means this was a no-op because the slot refs are not needed, e.g.
+   * it's a non-ACID table, or there are no delete delta files.
+   * Throws exception in case of errors.
+   * Purposefully made 'public' for third party usage.
+   */
+  public static boolean addAcidSlotsIfNeeded(Analyzer analyzer, TableRef hdfsTblRef,
+      List<? extends FeFsPartition> partitions) throws AnalysisException {
+    FeTable feTable = hdfsTblRef.getTable();
+    if (!AcidUtils.isFullAcidTable(feTable.getMetaStoreTable().getParameters())) {
+      return false;
+    }
+    boolean areThereDeletedRows = false;
+    for (FeFsPartition partition: partitions) {
+      if (partition.genDeleteDeltaPartition() != null) {
+        areThereDeletedRows = true;
+        break;
+      }
+    }
+    if (!areThereDeletedRows) return false;
+    addAcidSlots(analyzer, hdfsTblRef);
+    return true;
+  }
+
+  /* Purposefully made 'public' for third party usage.*/
+  public static void addAcidSlots(Analyzer analyzer, TableRef hdfsTblRef)
+      throws AnalysisException {
+    FeTable feTable = hdfsTblRef.getTable();
+    List<String> rawPath = new ArrayList<>();
+    rawPath.add(hdfsTblRef.getUniqueAlias());
+    // Add slot refs for the partitioning columns.
+    for (Column partCol : feTable.getClusteringColumns()) {
+      rawPath.add(partCol.getName());
+      addSlotRefToDesc(analyzer, rawPath);
+      rawPath.remove(rawPath.size() - 1);
+    }
+    // Add slot refs for the ACID fields that identify rows.
+    rawPath.add("row__id");
+    String[] acidFields = {"originaltransaction", "bucket", "rowid"};
+    for (String acidField : acidFields) {
+      rawPath.add(acidField);
+      addSlotRefToDesc(analyzer, rawPath);
+      rawPath.remove(rawPath.size() - 1);
+    }
+  }
+
+  /**
+   * Adds a new slot ref with path 'rawPath' to its tuple descriptor. This is a no-op if
+   * the tuple descriptor already has a slot ref with the given raw path.
+   */
+  public static void addSlotRefToDesc(Analyzer analyzer, List<String> rawPath)
+      throws AnalysisException {
+    Path resolvedPath = null;
+    try {
+      resolvedPath = analyzer.resolvePath(rawPath, PathType.SLOT_REF);
+    } catch (TableLoadingException e) {
+      // Should never happen because we only check registered table aliases.
+      Preconditions.checkState(false);
+    }
+    Preconditions.checkNotNull(resolvedPath);
+    SlotDescriptor desc = analyzer.registerSlotRef(resolvedPath);
+    desc.setIsMaterialized(true);
+  }
+
+  /**
+   * Takes an 'hdfsTblRef' of an ACID table and creates two scan nodes for it. One for
+   * the insert delta files, and one for the delete files. On top of the two scans it
+   * adds a LEFT ANTI HASH JOIN with BROADCAST distribution mode. I.e. delete events will
+   * be broadcasted to the nodes that scan the insert files.
+   */
+  private PlanNode createAcidJoinNode(Analyzer analyzer, TableRef hdfsTblRef,
+      List<Expr> conjuncts, List<? extends FeFsPartition> partitions,
+      List<Expr> partConjuncts)
+      throws ImpalaException {
+    FeTable feTable = hdfsTblRef.getTable();
+    Preconditions.checkState(AcidUtils.isFullAcidTable(
+      feTable.getMetaStoreTable().getParameters()));
+
+    // Let's create separate partitions for inserts and deletes.
+    List<FeFsPartition> insertDeltaPartitions = new ArrayList<>();
+    List<FeFsPartition> deleteDeltaPartitions = new ArrayList<>();
+    for (FeFsPartition part : partitions) {
+      insertDeltaPartitions.add(part.genInsertDeltaPartition());
+      FeFsPartition deleteDeltaPartition = part.genDeleteDeltaPartition();
+      if (deleteDeltaPartition != null) deleteDeltaPartitions.add(deleteDeltaPartition);
+    }
+    // The followings just create separate scan nodes for insert deltas and delete deltas,
+    // plus adds a LEFT ANTI HASH JOIN above them.
+    TableRef deleteDeltaRef = TableRef.newTableRef(analyzer, hdfsTblRef.getPath(),
+        hdfsTblRef.getUniqueAlias() + "-delete-delta");
+    addAcidSlots(analyzer, deleteDeltaRef);
+    HdfsScanNode deltaScanNode = new HdfsScanNode(ctx_.getNextNodeId(),
+        hdfsTblRef.getDesc(), conjuncts, insertDeltaPartitions, hdfsTblRef,
+        /*aggInfo=*/null, partConjuncts, /*isPartitionKeyScan=*/false);
+    deltaScanNode.init(analyzer);
+    HdfsScanNode deleteDeltaScanNode = new HdfsScanNode(ctx_.getNextNodeId(),
+        deleteDeltaRef.getDesc(), Collections.emptyList(), deleteDeltaPartitions,
+        deleteDeltaRef, /*aggInfo=*/null, partConjuncts, /*isPartitionKeyScan=*/false);
+    deleteDeltaScanNode.init(analyzer);
+    //TODO: ACID join conjuncts currently contain predicates for all partitioning columns
+    // and the ACID fields. So all of those columns will be the inputs of the hash
+    // function in the HASH JOIN. Probably we could only include 'originalTransaction' and
+    // 'rowid' in the hash predicates, while passing the other conjuncts in
+    // 'otherJoinConjuncts'.
+    List<BinaryPredicate> acidJoinConjuncts = createAcidJoinConjuncts(analyzer,
+        hdfsTblRef.getDesc(), deleteDeltaRef.getDesc());
+    JoinNode acidJoin = new HashJoinNode(deltaScanNode, deleteDeltaScanNode,
+        /*straight_join=*/true, DistributionMode.BROADCAST, JoinOperator.LEFT_ANTI_JOIN,
+        acidJoinConjuncts, /*otherJoinConjuncts=*/Collections.emptyList());
+    acidJoin.setId(ctx_.getNextNodeId());
+    acidJoin.init(analyzer);
+    acidJoin.setIsDeleteRowsJoin();
+    return acidJoin;
+  }
+
+  /**
+   * Creates conjuncts used in the ANTI-JOIN between insert deltas and delete
+   * deltas. I.e. it adds equality predicates for the partitioning columns and
+   * ACID columns. E.g. [insertDelta.part = deleteDelta.part,
+   * insertDelta.row__id.rowid = deleteDelta.row__id.rowid, ...]
+   * Purposefully made 'public' for third party usage.
+   *
+   * @param insertTupleDesc Tuple descriptor of the insert delta scan node
+   * @param deleteTupleDesc Tuple descriptor of the delete delta scan node
+   */
+  public static List<BinaryPredicate> createAcidJoinConjuncts(Analyzer analyzer,
+      TupleDescriptor insertTupleDesc, TupleDescriptor deleteTupleDesc)
+      throws AnalysisException {
+    List<BinaryPredicate> ret = new ArrayList<>();
+    // 'deleteTupleDesc' only has slot descriptors for the slots needed in the JOIN, i.e.
+    // it only has slot refs for the partitioning columns and ACID columns. Therefore we
+    // can just iterate over it and find the corresponding slot refs in the insert tuple
+    // descriptor and create an equality predicate between the slot ref pairs.
+    for (SlotDescriptor deleteSlotDesc : deleteTupleDesc.getSlots()) {
+      boolean foundMatch = false;
+      for (SlotDescriptor insertSlotDesc : insertTupleDesc.getSlots()) {
+        if (deleteSlotDesc.getMaterializedPath().equals(
+            insertSlotDesc.getMaterializedPath())) {
+          foundMatch = true;
+          BinaryPredicate pred = new BinaryPredicate(
+              Operator.EQ, new SlotRef(insertSlotDesc), new SlotRef(deleteSlotDesc));
+          pred.analyze(analyzer);
+          ret.add(pred);
+          break;
+        }
+      }
+      Preconditions.checkState(foundMatch);
+    }
+    return ret;
+  }
+
+  /**
    * Looks for a filesystem-based partition in 'partitions' with no DATE support and
-   * returns the first one it finds. Right now, scanning DATE values is only supported for
-   * TEXT, PARQUET and AVRO fileformats.
+   * returns the first one it finds. Right now, scanning DATE values is supported for
+   * TEXT, PARQUET, AVRO and ORC fileformats.
    *
    * Returns null otherwise.
    */
@@ -1412,7 +1839,7 @@ public class SingleNodePlanner {
    * Throws if a PlanNode.init() failed or if planning of the given
    * table ref is not implemented.
    */
-  private PlanNode createScanNode(TableRef tblRef, AggregateInfo aggInfo,
+  private PlanNode createScanNode(TableRef tblRef, MultiAggregateInfo aggInfo,
       Analyzer analyzer) throws ImpalaException {
     ScanNode scanNode = null;
 
@@ -1423,6 +1850,8 @@ public class SingleNodePlanner {
 
     // Also add remaining unassigned conjuncts
     List<Expr> unassigned = analyzer.getUnassignedConjuncts(tid.asList());
+    PlanNode.removeZippingUnnestConjuncts(unassigned, analyzer);
+
     conjuncts.addAll(unassigned);
     analyzer.markConjunctsAssigned(unassigned);
     analyzer.createEquivConjuncts(tid, conjuncts);
@@ -1442,6 +1871,11 @@ public class SingleNodePlanner {
     // TODO(todd) introduce FE interfaces for DataSourceTable, HBaseTable, KuduTable
     FeTable table = tblRef.getTable();
     if (table instanceof FeFsTable) {
+      if (table instanceof FeIcebergTable) {
+        IcebergScanPlanner icebergPlanner = new IcebergScanPlanner(analyzer, ctx_, tblRef,
+            conjuncts, aggInfo);
+        return icebergPlanner.createIcebergScanPlan();
+      }
       return createHdfsScanPlan(tblRef, aggInfo, conjuncts, analyzer);
     } else if (table instanceof FeDataSourceTable) {
       scanNode = new DataSourceScanNode(ctx_.getNextNodeId(), tblRef.getDesc(),
@@ -1456,13 +1890,21 @@ public class SingleNodePlanner {
       return scanNode;
     } else if (tblRef.getTable() instanceof FeKuduTable) {
       scanNode = new KuduScanNode(ctx_.getNextNodeId(), tblRef.getDesc(), conjuncts,
-          aggInfo);
+          aggInfo, tblRef);
       scanNode.init(analyzer);
       return scanNode;
     } else {
       throw new NotImplementedException(
-          "Planning not implemented for table ref class: " + tblRef.getClass());
+          "Planning not implemented for table class: " + table.getClass());
     }
+  }
+
+  private PlanNode createIcebergMetadataScanNode(TableRef tblRef, Analyzer analyzer)
+      throws ImpalaException {
+    IcebergMetadataScanNode icebergMetadataScanNode =
+        new IcebergMetadataScanNode(ctx_.getNextNodeId(), tblRef.getDesc());
+    icebergMetadataScanNode.init(analyzer);
+    return icebergMetadataScanNode;
   }
 
   /**
@@ -1542,6 +1984,28 @@ public class SingleNodePlanner {
   }
 
   /**
+   * Similar to getNormalizedEqPred(), except returns a normalized version of a binary
+   * single range predicate 'expr'. A single range predicate is defined as one with
+   * pred.getOp() being =, <, <=, > or >=.
+   */
+  public static BinaryPredicate getNormalizedSingleRangePred(
+      Expr expr, List<TupleId> lhsTids, List<TupleId> rhsTids, Analyzer analyzer) {
+    if (!(expr instanceof BinaryPredicate)) return null;
+    BinaryPredicate pred = (BinaryPredicate) expr;
+    if (!pred.getOp().isSingleRange()) return null;
+
+    if (pred.getChild(0).isConstant() || pred.getChild(1).isConstant()) return null;
+
+    Expr lhsExpr = Expr.getFirstBoundChild(pred, lhsTids);
+    Expr rhsExpr = Expr.getFirstBoundChild(pred, rhsTids);
+    if (lhsExpr == null || rhsExpr == null || lhsExpr == rhsExpr) return null;
+
+    BinaryPredicate result = new BinaryPredicate(pred.getOp(), lhsExpr, rhsExpr);
+    result.analyzeNoThrow(analyzer);
+    return result;
+  }
+
+  /**
    * Creates a new node to join outer with inner. Collects and assigns join conjunct
    * as well as regular conjuncts. Calls init() on the new join node.
    * Throws if the JoinNode.init() fails.
@@ -1595,7 +2059,14 @@ public class SingleNodePlanner {
         Preconditions.checkState(hasNullMatchingEqOperator);
       }
     }
+    PlanNode.removeZippingUnnestConjuncts(otherJoinConjuncts, analyzer);
     analyzer.markConjunctsAssigned(otherJoinConjuncts);
+
+    if (analyzer.getQueryOptions().isEnable_distinct_semi_join_optimization() &&
+            innerRef.getJoinOp().isLeftSemiJoin()) {
+      inner =
+          addDistinctToJoinInput(inner, analyzer, eqJoinConjuncts, otherJoinConjuncts);
+    }
 
     // Use a nested-loop join if there are no equi-join conjuncts, or if the inner
     // (build side) is a singular row src. A singular row src has a cardinality of 1, so
@@ -1617,25 +2088,127 @@ public class SingleNodePlanner {
   }
 
   /**
+   * Optionally add a aggregation node on top of 'joinInput' if it is cheaper to project
+   * and aggregate the slots needed to evaluate the provided join conjuncts. This
+   * is only safe to do if the join's results do not depend on the number of duplicate
+   * values and if the join does not need to return any slots from 'joinInput'.  E.g.
+   * the inner of a left semi join satisfies both of those conditions.
+   * @return the original 'joinInput' or its new AggregationNode parent.
+   */
+  private PlanNode addDistinctToJoinInput(PlanNode joinInput, Analyzer analyzer,
+          List<BinaryPredicate> eqJoinConjuncts, List<Expr> otherJoinConjuncts)
+                  throws InternalException, AnalysisException {
+    List<Expr> allJoinConjuncts = new ArrayList<>();
+    allJoinConjuncts.addAll(eqJoinConjuncts);
+    allJoinConjuncts.addAll(otherJoinConjuncts);
+    allJoinConjuncts = Expr.substituteList(
+            allJoinConjuncts, joinInput.getOutputSmap(), analyzer, true);
+
+    // Identify the unique slots from the inner required by the join conjuncts. Since this
+    // is a semi-join, the inner tuple is not returned from the join and we do not need
+    // any other slots from the inner.
+    List<SlotId> allSlotIds = new ArrayList<>();
+    Expr.getIds(allJoinConjuncts, null, allSlotIds);
+    List<TupleId> joinInputTupleIds = joinInput.getTupleIds();
+    List<Expr> distinctExprs = new ArrayList<>();
+    for (SlotDescriptor slot : analyzer.getSlotDescs(allSlotIds)) {
+      if (joinInputTupleIds.contains(slot.getParent().getId())) {
+        distinctExprs.add(new SlotRef(slot));
+      }
+    }
+
+    // If there are no join predicates, this can be more efficiently handled by
+    // inserting a limit in the plan (since the first row returned from 'joinInput'
+    // will satisfy the join predicates).
+    if (distinctExprs.isEmpty()) {
+      joinInput.setLimit(1);
+      return joinInput;
+    }
+    long numDistinct = AggregationNode.estimateNumGroups(distinctExprs,
+            joinInput.getCardinality());
+    if (numDistinct < 0 || joinInput.getCardinality() < 0) {
+      // Default to not adding the aggregation if stats are missing.
+      LOG.trace("addDistinctToJoinInput():: missing stats, will not add agg");
+      return joinInput;
+    }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("addDistinctToJoinInput(): " + "numDistinct=" + numDistinct +
+              " inputCardinality=" + joinInput.getCardinality());
+    }
+
+    // Check to see if an aggregation would reduce input by enough to justify inserting
+    // it. We factor in the average row size to account for the aggregate projecting
+    // out slots. The agg would be ineffective if the input already have 0 or 1 rows.
+    if (joinInput.getCardinality() <= 1 ||
+        numDistinct > JOIN_DISTINCT_THRESHOLD * joinInput.getCardinality()) {
+      return joinInput;
+    }
+
+    // Set up an aggregation node to return only distinct slots.
+    MultiAggregateInfo distinctAggInfo =
+         new MultiAggregateInfo(distinctExprs, Collections.emptyList(), null);
+    distinctAggInfo.analyze(analyzer);
+    distinctAggInfo.materializeRequiredSlots(analyzer, new ExprSubstitutionMap());
+    AggregationNode agg = new AggregationNode(
+            ctx_.getNextNodeId(), joinInput, distinctAggInfo, AggPhase.FIRST);
+    agg.init(analyzer);
+    // Mark the agg as materializing the same table ref. This is required so that other
+    // parts of planning, e.g. subplan generation, know that this plan tree materialized
+    // the table ref.
+    agg.setTblRefIds(joinInput.getTblRefIds());
+    // All references to the input slots in join conjuncts must be replaced with
+    // references to aggregate slots. The output smap from the aggregate info contains
+    // these mappings, so we can add it to the output smap of the agg to ensure that
+    // join conjuncts get replaced correctly.
+    agg.setOutputSmap(ExprSubstitutionMap.compose(
+            agg.getOutputSmap(), distinctAggInfo.getOutputSmap(), analyzer));
+
+    // Add value transfers between original slots and aggregate tuple so that runtime
+    // filters can be pushed through the aggregation. We can defer updating the
+    // value transfer graph until after the single node plan is constructed because
+    // a precondition of calling this function is that the join does not return any
+    // of the slots from this plan tree.
+    for (int i = 0; i < distinctExprs.size(); ++i) {
+      Expr distinctExpr = distinctExprs.get(i);
+      SlotDescriptor outputSlot =
+              distinctAggInfo.getAggClass(0).getResultTupleDesc().getSlots().get(i);
+      analyzer.registerValueTransfer(
+              ((SlotRef)distinctExpr).getSlotId(), outputSlot.getId());
+      valueTransferGraphNeedsUpdate_ = true;
+    }
+    return agg;
+  }
+
+  /**
    * Create a tree of PlanNodes for the given tblRef, which can be a BaseTableRef,
    * CollectionTableRef or an InlineViewRef.
    *
    * The given 'aggInfo' is used for detecting and applying optimizations that span both
    * the scan and aggregation. Only applicable to HDFS and Kudu table refs.
    *
+   * 'collectionRefs' holds all the CollectionTableRefs that serve the purpose of zipping
+   * unnest arrays. Unlike the regular CollectionTableRefs, these will be handled by a
+   * single UnnestNode.
+   *
    * Throws if a PlanNode.init() failed or if planning of the given
    * table ref is not implemented.
    */
-  private PlanNode createTableRefNode(TableRef tblRef, AggregateInfo aggInfo,
-      Analyzer analyzer) throws ImpalaException {
+  private PlanNode createTableRefNode(TableRef tblRef, MultiAggregateInfo aggInfo,
+      Analyzer analyzer, List<CollectionTableRef> collectionRefsToZip)
+      throws ImpalaException {
     PlanNode result = null;
     if (tblRef instanceof BaseTableRef) {
       result = createScanNode(tblRef, aggInfo, analyzer);
     } else if (tblRef instanceof CollectionTableRef) {
       if (tblRef.isRelative()) {
         Preconditions.checkState(ctx_.hasSubplan());
-        result = new UnnestNode(ctx_.getNextNodeId(), ctx_.getSubplan(),
-            (CollectionTableRef) tblRef);
+        if (collectionRefsToZip != null && collectionRefsToZip.size() > 0) {
+          result = new UnnestNode(ctx_.getNextNodeId(), ctx_.getSubplan(),
+              collectionRefsToZip);
+        } else {
+          result = new UnnestNode(ctx_.getNextNodeId(), ctx_.getSubplan(),
+              (CollectionTableRef) tblRef);
+        }
         result.init(analyzer);
       } else {
         result = createScanNode(tblRef, null, analyzer);
@@ -1646,6 +2219,8 @@ public class SingleNodePlanner {
       Preconditions.checkState(ctx_.hasSubplan());
       result = new SingularRowSrcNode(ctx_.getNextNodeId(), ctx_.getSubplan());
       result.init(analyzer);
+    } else if (tblRef instanceof IcebergMetadataTableRef) {
+      result = createIcebergMetadataScanNode(tblRef, analyzer);
     } else {
       throw new NotImplementedException(
           "Planning not implemented for table ref class: " + tblRef.getClass());
@@ -1660,13 +2235,11 @@ public class SingleNodePlanner {
    * distinct portion of the given unionStmt. The unionDistinctPlan is then added
    * as a child of the returned UnionNode.
    */
-  private UnionNode createUnionPlan(
-      Analyzer analyzer, UnionStmt unionStmt, List<UnionOperand> unionOperands,
-      PlanNode unionDistinctPlan)
-      throws ImpalaException {
+  private UnionNode createUnionPlan(Analyzer analyzer, UnionStmt unionStmt,
+      List<SetOperand> unionOperands, PlanNode unionDistinctPlan) throws ImpalaException {
     UnionNode unionNode = new UnionNode(ctx_.getNextNodeId(), unionStmt.getTupleId(),
-        unionStmt.getUnionResultExprs(), ctx_.hasSubplan());
-    for (UnionOperand op: unionOperands) {
+        unionStmt.getSetOperationResultExprs(), ctx_.hasSubplan());
+    for (SetOperand op : unionOperands) {
       if (op.getAnalyzer().hasEmptyResultSet()) {
         unmarkCollectionSlots(op.getQueryStmt());
         continue;
@@ -1688,7 +2261,7 @@ public class SingleNodePlanner {
     }
 
     if (unionDistinctPlan != null) {
-      Preconditions.checkState(unionStmt.hasDistinctOps());
+      Preconditions.checkState(unionStmt.hasUnionDistinctOps());
       Preconditions.checkState(unionDistinctPlan instanceof AggregationNode);
       unionNode.addChild(unionDistinctPlan,
           unionStmt.getDistinctAggInfo().getGroupingExprs());
@@ -1722,7 +2295,7 @@ public class SingleNodePlanner {
       // the individual operands.
       // Do this prior to creating the operands' plan trees so they get a chance to
       // pick up propagated predicates.
-      for (UnionOperand op: unionStmt.getOperands()) {
+      for (SetOperand op : unionStmt.getOperands()) {
         List<Expr> opConjuncts =
             Expr.substituteList(conjuncts, op.getSmap(), analyzer, false);
         op.getAnalyzer().registerConjuncts(opConjuncts);
@@ -1737,16 +2310,17 @@ public class SingleNodePlanner {
 
     PlanNode result = null;
     // create DISTINCT tree
-    if (unionStmt.hasDistinctOps()) {
+    if (unionStmt.hasUnionDistinctOps()) {
       result = createUnionPlan(
-          analyzer, unionStmt, unionStmt.getDistinctOperands(), null);
+          analyzer, unionStmt, unionStmt.getUnionDistinctOperands(), null);
       result = new AggregationNode(
           ctx_.getNextNodeId(), result, unionStmt.getDistinctAggInfo(), AggPhase.FIRST);
       result.init(analyzer);
     }
     // create ALL tree
-    if (unionStmt.hasAllOps()) {
-      result = createUnionPlan(analyzer, unionStmt, unionStmt.getAllOperands(), result);
+    if (unionStmt.hasUnionAllOps()) {
+      result =
+          createUnionPlan(analyzer, unionStmt, unionStmt.getUnionAllOperands(), result);
     }
 
     if (unionStmt.hasAnalyticExprs()) {

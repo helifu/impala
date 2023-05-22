@@ -25,6 +25,7 @@
 #include "rpc/jni-thrift-util.h"
 #include "util/backend-gflag-util.h"
 #include "util/jni-util.h"
+#include "util/test-info.h"
 #include "util/time.h"
 
 #include "common/names.h"
@@ -38,9 +39,10 @@ using namespace impala;
 // Authorization related flags. Must be set to valid values to properly configure
 // authorization.
 DEFINE_string(authorization_provider,
-    "sentry",
+    "",
     "Specifies the type of internally-provided authorization provider to use. "
-    "['ranger', 'sentry' (default)]");
+    "Defaults to unset, which disables authorization. To enable authorization, "
+    "set to one of the following: ['ranger']");
 DEFINE_string(authorization_factory_class,
     "",
     "Specifies the class name that implements the authorization provider. "
@@ -52,9 +54,6 @@ DEFINE_string(ranger_app_id, "",
     "required when authorization with Ranger is enabled.");
 DEFINE_string(server_name, "", "The name to use for securing this impalad "
     "server during authorization. Set to enable authorization.");
-DEFINE_string(authorization_policy_provider_class,
-    "org.apache.sentry.provider.common.HadoopGroupResourceAuthorizationProvider",
-    "Advanced: The authorization policy provider class name for Sentry.");
 DEFINE_string(authorized_proxy_user_config, "",
     "Specifies the set of authorized proxy users (users who can delegate to other "
     "users during authorization) and whom they are allowed to delegate. "
@@ -75,13 +74,20 @@ DEFINE_string(authorized_proxy_group_config, "",
     "all users. For example: hue=group1,group2;admin=*");
 DEFINE_string(authorized_proxy_group_config_delimiter, ",",
     "Specifies the delimiter used in authorized_proxy_group_config. ");
+DEFINE_bool(enable_shell_based_groups_mapping_support, false,
+    "Enables support for Hadoop groups mapping "
+    "org.apache.hadoop.security.ShellBasedUnixGroupsMapping. By default this support "
+    "is not enabled as it can lead to many process getting spawned to fetch groups for "
+    "user using shell command.");
 DEFINE_string(kudu_master_hosts, "", "Specifies the default Kudu master(s). The given "
     "value should be a comma separated list of hostnames or IP addresses; ports are "
     "optional.");
+DEFINE_bool(enable_kudu_impala_hms_check, true, "By default this flag is true. If "
+    "enabled checks that Kudu and Impala are using the same HMS instance(s).");
 
 Frontend::Frontend() {
   JniMethodDescriptor methods[] = {
-    {"<init>", "([B)V", &fe_ctor_},
+    {"<init>", "([BZ)V", &fe_ctor_},
     {"createExecRequest", "([B)[B", &create_exec_request_id_},
     {"getExplainPlan", "([B)Ljava/lang/String;", &get_explain_plan_id_},
     {"getHadoopConfig", "([B)[B", &get_hadoop_config_id_},
@@ -99,6 +105,7 @@ Frontend::Frontend() {
     {"getDataSrcMetadata", "([B)[B", &get_data_src_metadata_id_},
     {"getStats", "([B)[B", &get_stats_id_},
     {"getFunctions", "([B)[B", &get_functions_id_},
+    {"getTableHistory", "([B)[B", &get_table_history_id_},
     {"getCatalogObject", "([B)[B", &get_catalog_object_id_},
     {"getRoles", "([B)[B", &show_roles_id_},
     {"getPrincipalPrivileges", "([B)[B", &get_principal_privileges_id_},
@@ -111,7 +118,13 @@ Frontend::Frontend() {
     {"buildTestDescriptorTable", "([B)[B", &build_test_descriptor_table_id_},
     {"callQueryCompleteHooks", "([B)V", &call_query_complete_hooks_id_},
     {"abortTransaction", "(J)V", &abort_txn_},
+    {"addTransaction", "([B)V", &add_txn_},
     {"unregisterTransaction", "(J)V", &unregister_txn_},
+    {"getSaml2Redirect", "([B)[B", &get_saml2_redirect_id_},
+    {"validateSaml2Response", "([B)[B", &validate_saml2_response_id_},
+    {"validateSaml2Bearer", "([B)Ljava/lang/String;", &validate_saml2_bearer_id_},
+    {"abortKuduTransaction", "([B)V", &abort_kudu_txn_},
+    {"commitKuduTransaction", "([B)V", &commit_kudu_txn_}
   };
 
   JNIEnv* jni_env = JniUtil::GetJNIEnv();
@@ -128,9 +141,12 @@ Frontend::Frontend() {
   };
 
   jbyteArray cfg_bytes;
-  ABORT_IF_ERROR(GetThriftBackendGflags(jni_env, &cfg_bytes));
+  ABORT_IF_ERROR(GetThriftBackendGFlagsForJNI(jni_env, &cfg_bytes));
 
-  jobject fe = jni_env->NewObject(fe_class, fe_ctor_, cfg_bytes);
+  // Pass in whether this is a backend test, so that the Frontend can avoid certain
+  // unnecessary initialization that introduces dependencies on a running minicluster.
+  jboolean is_be_test = TestInfo::is_be_test();
+  jobject fe = jni_env->NewObject(fe_class, fe_ctor_, cfg_bytes, is_be_test);
   ABORT_IF_EXC(jni_env);
   ABORT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, fe, &fe_));
 }
@@ -200,6 +216,11 @@ Status Frontend::GetStats(const TShowStatsParams& params,
   return JniUtil::CallJniMethod(fe_, get_stats_id_, params, result);
 }
 
+Status Frontend::GetTableHistory(const TDescribeHistoryParams& params,
+      TGetTableHistoryResult* result) {
+  return JniUtil::CallJniMethod(fe_, get_table_history_id_, params, result);
+}
+
 Status Frontend::GetPrincipalPrivileges(const TShowGrantPrincipalParams& params,
     TResultSet* result) {
   return JniUtil::CallJniMethod(fe_, get_principal_privileges_id_, params, result);
@@ -267,6 +288,10 @@ Status Frontend::LoadData(const TLoadDataReq& request, TLoadDataResp* response) 
   return JniUtil::CallJniMethod(fe_, load_table_data_id_, request, response);
 }
 
+Status Frontend::addTransaction(const TQueryCtx& query_ctx) {
+  return JniUtil::CallJniMethod(fe_, add_txn_, query_ctx);
+}
+
 Status Frontend::AbortTransaction(int64_t transaction_id) {
   return JniUtil::CallJniMethod(fe_, abort_txn_, transaction_id);
 }
@@ -308,4 +333,30 @@ Status Frontend::BuildTestDescriptorTable(const TBuildTestDescriptorTableParams&
 // Call FE post-query execution hook
 Status Frontend::CallQueryCompleteHooks(const TQueryCompleteContext& context) {
   return JniUtil::CallJniMethod(fe_, call_query_complete_hooks_id_, context);
+}
+
+Status Frontend::GetSaml2Redirect( const TWrappedHttpRequest& request,
+    TWrappedHttpResponse* response)  {
+  return JniUtil::CallJniMethod(
+      fe_, get_saml2_redirect_id_, request, response);
+}
+
+Status Frontend::ValidateSaml2Response(
+    const TWrappedHttpRequest& request, TWrappedHttpResponse* response) {
+  return JniUtil::CallJniMethod(
+      fe_, validate_saml2_response_id_, request, response);
+}
+
+Status Frontend::ValidateSaml2Bearer(
+  const TWrappedHttpRequest& request, string* user) {
+  return JniUtil::CallJniMethod(
+      fe_, validate_saml2_bearer_id_, request, user);
+}
+
+Status Frontend::AbortKuduTransaction(const TUniqueId& query_id) {
+  return JniUtil::CallJniMethod(fe_, abort_kudu_txn_, query_id);
+}
+
+Status Frontend::CommitKuduTransaction(const TUniqueId& query_id) {
+  return JniUtil::CallJniMethod(fe_, commit_kudu_txn_, query_id);
 }

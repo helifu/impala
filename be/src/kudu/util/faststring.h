@@ -20,6 +20,9 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
+
+#include <glog/logging.h>
 
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/macros.h"
@@ -55,6 +58,25 @@ class faststring {
     ASAN_POISON_MEMORY_REGION(data_, capacity_);
   }
 
+  faststring(faststring&& other) noexcept
+      : faststring() {
+    *this = std::move(other);
+  }
+
+  faststring& operator=(faststring&& other) noexcept {
+    if (this == &other) return *this;
+
+    if (other.data_ == other.initial_data_) {
+      assign_copy(other.data(), other.size());
+      other.clear();
+    } else {
+      len_ = other.len_;
+      capacity_ = other.capacity_;
+      data_ = other.release();
+    }
+    return *this;
+  }
+
   ~faststring() {
     ASAN_UNPOISON_MEMORY_REGION(initial_data_, arraysize(initial_data_));
     if (data_ != initial_data_) {
@@ -84,9 +106,20 @@ class faststring {
     ASAN_UNPOISON_MEMORY_REGION(data_, len_);
   }
 
+  // Resize to 'newsize'. In contrast to 'resize()', if this requires allocating a new
+  // backing array, the new capacity is rounded up in the same manner as if data had been
+  // appended to the buffer.
+  void resize_with_extra_capacity(size_t newsize) {
+    if (newsize > capacity_) {
+      GrowToAtLeast(newsize);
+    }
+    resize(newsize);
+  }
+
   // Releases the underlying array; after this, the buffer is left empty.
   //
-  // NOTE: the data pointer returned by release() is not necessarily the pointer
+  // NOTE: the data pointer returned by release() always points to dynamically
+  // allocated memory and the caller must be responsible for releasing it.
   uint8_t *release() WARN_UNUSED_RESULT {
     uint8_t *ret = data_;
     if (ret == initial_data_) {
@@ -208,10 +241,10 @@ class faststring {
   // Reallocates the internal storage to fit only the current data.
   //
   // This may revert to using internal storage if the current length is shorter than
-  // kInitialCapacity. Note that, in that case, after this call, capacity() will return
-  // a capacity larger than the data length.
+  // kInitialCapacity. In that case, after this call, capacity() will go down to
+  // kInitialCapacity.
   //
-  // Any pointers within this instance are invalidated.
+  // Any pointers within this instance may be invalidated.
   void shrink_to_fit() {
     if (data_ == initial_data_ || capacity_ == len_) return;
     ShrinkToFitInternal();
@@ -221,6 +254,14 @@ class faststring {
   std::string ToString() const {
     return std::string(reinterpret_cast<const char *>(data()),
                        len_);
+  }
+
+  // Check various internal invariants. Used by tests.
+  void CheckInvariants() {
+    CHECK_LE(len_, capacity_);
+    if (data_ == initial_data_) {
+      CHECK_EQ(capacity_, kInitialCapacity);
+    }
   }
 
  private:
@@ -235,12 +276,12 @@ class faststring {
 
     // Call the non-inline slow path - this reduces the number of instructions
     // on the hot path.
-    GrowByAtLeast(count);
+    GrowToAtLeast(len_ + count);
   }
 
-  // The slow path of MakeRoomFor. Grows the buffer by either
+  // The slow path of EnsureRoomForAppend. Grows the buffer by either
   // 'count' bytes, or 50%, whichever is more.
-  void GrowByAtLeast(size_t count);
+  void GrowToAtLeast(size_t newcapacity);
 
   // Grow the array to the given capacity, which must be more than
   // the current capacity.
@@ -251,6 +292,8 @@ class faststring {
   uint8_t* data_;
   uint8_t initial_data_[kInitialCapacity];
   size_t len_;
+  // NOTE: we will make a initial buffer as part of the object, so the smallest
+  // possible value of capacity_ is kInitialCapacity.
   size_t capacity_;
 };
 

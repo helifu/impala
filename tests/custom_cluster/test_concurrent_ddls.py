@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 import threading
 
@@ -23,7 +25,7 @@ from multiprocessing import TimeoutError
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-
+from tests.util.shell_util import dump_server_stacktraces
 
 class TestConcurrentDdls(CustomClusterTestSuite):
   """Test concurrent DDLs with invalidate metadata"""
@@ -34,7 +36,6 @@ class TestConcurrentDdls(CustomClusterTestSuite):
             for e in local_catalog_enabled]
     return "--per_impalad_args=" + ";".join(args)
 
-  @pytest.mark.timeout(120)
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
     impalad_args="--use_local_catalog=false",
@@ -42,7 +43,6 @@ class TestConcurrentDdls(CustomClusterTestSuite):
   def test_ddls_with_invalidate_metadata(self, unique_database):
     self._run_ddls_with_invalidation(unique_database, sync_ddl=False)
 
-  @pytest.mark.timeout(300)
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
     impalad_args="--use_local_catalog=false",
@@ -50,7 +50,6 @@ class TestConcurrentDdls(CustomClusterTestSuite):
   def test_ddls_with_invalidate_metadata_sync_ddl(self, unique_database):
     self._run_ddls_with_invalidation(unique_database, sync_ddl=True)
 
-  @pytest.mark.timeout(120)
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
     start_args=_make_per_impalad_args([True, False]),
@@ -58,7 +57,6 @@ class TestConcurrentDdls(CustomClusterTestSuite):
   def test_mixed_catalog_ddls_with_invalidate_metadata(self, unique_database):
     self._run_ddls_with_invalidation(unique_database, sync_ddl=False)
 
-  @pytest.mark.timeout(300)
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
     start_args=_make_per_impalad_args([True, False]),
@@ -66,7 +64,6 @@ class TestConcurrentDdls(CustomClusterTestSuite):
   def test_mixed_catalog_ddls_with_invalidate_metadata_sync_ddl(self, unique_database):
     self._run_ddls_with_invalidation(unique_database, sync_ddl=True)
 
-  @pytest.mark.timeout(120)
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
     impalad_args="--use_local_catalog=true",
@@ -74,7 +71,6 @@ class TestConcurrentDdls(CustomClusterTestSuite):
   def test_local_catalog_ddls_with_invalidate_metadata(self, unique_database):
     self._run_ddls_with_invalidation(unique_database, sync_ddl=False)
 
-  @pytest.mark.timeout(300)
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
     impalad_args="--use_local_catalog=true",
@@ -97,26 +93,32 @@ class TestConcurrentDdls(CustomClusterTestSuite):
 
     def run_ddls(i):
       tbl_name = db + ".test_" + str(i)
-      for query_tmpl in [
+      # func_name = "f_" + str(i)
+      for query in [
+        # alter database operations
+        # TODO (IMPALA-9532): Uncomment the alter database operations
+        # "comment on database %s is 'test-concurrent-ddls'" % db,
+        # "alter database %s set owner user `test-user`" % db,
+        # "create function %s.%s() returns int location '%s/libTestUdfs.so' \
+        #    symbol='NoArgs'" % (db, func_name, WAREHOUSE),
+        # "drop function if exists %s.%s()" % (db, func_name),
         # Create a partitioned and unpartitioned table
-        "create table %s (i int)",
-        "create table %s_part (i int) partitioned by (j int)",
+        "create table %s (i int)" % tbl_name,
+        "create table %s_part (i int) partitioned by (j int)" % tbl_name,
         # Below queries could fail if running with invalidate metadata concurrently
-        "alter table %s_part add partition (j=1)",
-        "alter table %s_part add partition (j=2)",
-        "invalidate metadata %s_part",
-        "refresh %s",
-        "refresh %s_part",
-        "insert overwrite table %s select int_col from functional.alltypestiny",
-        "insert overwrite table %s_part partition(j=1) values (1), (2), (3), (4), (5)",
-        "insert overwrite table %s_part partition(j=2) values (1), (2), (3), (4), (5)"
+        "alter table %s_part add partition (j=1)" % tbl_name,
+        "alter table %s_part add partition (j=2)" % tbl_name,
+        "invalidate metadata %s_part" % tbl_name,
+        "refresh %s" % tbl_name,
+        "refresh %s_part" % tbl_name,
+        "insert overwrite table %s select int_col from "
+        "functional.alltypestiny" % tbl_name,
+        "insert overwrite table %s_part partition(j=1) "
+        "values (1), (2), (3), (4), (5)" % tbl_name,
+        "insert overwrite table %s_part partition(j=2) "
+        "values (1), (2), (3), (4), (5)" % tbl_name
       ]:
         try:
-          query = query_tmpl % tbl_name
-          # TODO(IMPALA-9123): Timeout logic here does not work for DDLs since they are
-          #  usually stuck in CREATED state and execute_async() won't return. We finally
-          #  use timeout in pytest.mark.timeout() but it's not precise. We should find a
-          #  more elegant way to detect timeout of DDLs.
           handle = tls.client.execute_async(query)
           is_finished = tls.client.wait_for_finished_timeout(handle, timeout=60)
           assert is_finished, "Query timeout(60s): " + query
@@ -124,17 +126,29 @@ class TestConcurrentDdls(CustomClusterTestSuite):
         except ImpalaBeeswaxException as e:
           # Could raise exception when running with INVALIDATE METADATA
           assert TestConcurrentDdls.is_acceptable_error(str(e), sync_ddl), str(e)
-      # TODO(IMPALA-9123): Detect hangs here instead of using pytest.mark.timeout()
       self.execute_query_expect_success(tls.client, "invalidate metadata")
+      return True
 
     # Run DDLs in single thread first. Some bugs causing DDL hangs can be hidden when run
     # with concurrent DDLs.
-    run_ddls(0)
+    res = pool.apply_async(run_ddls, (0,))
+    try:
+      res.get(timeout=100)
+    except TimeoutError:
+      dump_server_stacktraces()
+      assert False, "Single thread execution timeout!"
 
     # Run DDLs with invalidate metadata in parallel
     NUM_ITERS = 16
-    for i in pool.imap_unordered(run_ddls, xrange(1, NUM_ITERS + 1)):
-      pass
+    worker = [None] * (NUM_ITERS + 1)
+    for i in range(1, NUM_ITERS + 1):
+      worker[i] = pool.apply_async(run_ddls, (i,))
+    for i in range(1, NUM_ITERS + 1):
+      try:
+        worker[i].get(timeout=100)
+      except TimeoutError:
+        dump_server_stacktraces()
+        assert False, "Timeout in thread run_ddls(%d)" % i
 
   @classmethod
   def is_acceptable_error(cls, err, sync_ddl):
@@ -152,7 +166,6 @@ class TestConcurrentDdls(CustomClusterTestSuite):
       return True
     return False
 
-  @pytest.mark.timeout(120)
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
     impalad_args="--use_local_catalog=true",
@@ -170,17 +183,17 @@ class TestConcurrentDdls(CustomClusterTestSuite):
     def run_invalidate_metadata():
       # TODO(IMPALA-9123): Detect hangs here instead of using pytest.mark.timeout
       self.execute_query_expect_success(tls.client, "invalidate metadata")
-      tls.client.close()
 
     NUM_ITERS = 20
-    for i in xrange(NUM_ITERS):
+    pool = ThreadPool(processes=2)
+    for i in range(NUM_ITERS):
       # Run two INVALIDATE METADATA commands in parallel
-      pool = ThreadPool(processes=2)
       r1 = pool.apply_async(run_invalidate_metadata)
       r2 = pool.apply_async(run_invalidate_metadata)
       try:
         r1.get(timeout=60)
         r2.get(timeout=60)
       except TimeoutError:
+        dump_server_stacktraces()
         assert False, "INVALIDATE METADATA timeout in 60s!"
-      pool.terminate()
+    pool.terminate()

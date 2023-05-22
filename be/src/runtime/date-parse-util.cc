@@ -17,8 +17,6 @@
 
 #include "runtime/date-parse-util.h"
 
-#include <boost/date_time/gregorian/gregorian.hpp>
-
 #include "cctz/civil_time.h"
 #include "runtime/datetime-iso-sql-format-parser.h"
 #include "runtime/datetime-simple-date-format-parser.h"
@@ -108,7 +106,7 @@ bool DateParser::ParseSimpleDateFormat(const char* str, int len, bool accept_tim
   // Generating context lazily as a fall back if default formats fail.
   // ParseFormatTokenByStr() does not require a template format string.
   DateTimeFormatContext lazy_ctx(str, trimmed_len);
-  if (!SimpleDateFormatTokenizer::TokenizeByStr(&lazy_ctx, accept_time_toks, false)) {
+  if (!SimpleDateFormatTokenizer::TokenizeByStr(&lazy_ctx, accept_time_toks)) {
     return IndicateDateParseFailure(date);
   }
   return ParseSimpleDateFormat(str, trimmed_len, lazy_ctx, date);
@@ -130,6 +128,24 @@ bool DateParser::ParseIsoSqlFormat(const char* str, int len,
   return date->IsValid();
 }
 
+// Formats date into dst using the default format
+// Format:  yyyy-MM-dd
+// Offsets: 0123456789
+int DateParser::FormatDefault(const DateValue& date, char* dst) {
+  int year, month, day;
+  if (!date.ToYearMonthDay(&year, &month, &day)) {
+    *dst = '\0';
+    return -1;
+  }
+  else {
+    ZeroPad(dst, year, 4);
+    ZeroPad(dst + 5, month, 2);
+    ZeroPad(dst + 8, day, 2);
+    dst[7] = dst[4] = '-';
+    return SimpleDateFormatTokenizer::DEFAULT_DATE_FMT_LEN;
+  }
+}
+
 string DateParser::Format(const DateTimeFormatContext& dt_ctx, const DateValue& date) {
   DCHECK(dt_ctx.toks.size() > 0);
   DCHECK(dt_ctx.has_date_toks && !dt_ctx.has_time_toks);
@@ -145,7 +161,7 @@ string DateParser::Format(const DateTimeFormatContext& dt_ctx, const DateValue& 
     switch (tok.type) {
       case YEAR:
       case ROUND_YEAR: {
-        num_val = AdjustYearToLength(year, tok.len);
+        num_val = AdjustYearToLength(year, tok.divisor);
         break;
       }
       case QUARTER_OF_YEAR: {
@@ -189,7 +205,7 @@ string DateParser::Format(const DateTimeFormatContext& dt_ctx, const DateValue& 
         break;
       }
       case ISO8601_WEEK_NUMBERING_YEAR: {
-        num_val = AdjustYearToLength(date.Iso8601WeekNumberingYear(), tok.len);
+        num_val = AdjustYearToLength(date.Iso8601WeekNumberingYear(), tok.divisor);
         break;
       }
       case ISO8601_WEEK_OF_YEAR: {

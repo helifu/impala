@@ -18,10 +18,9 @@
 #ifndef IMPALA_RUNTIME_TEST_ENV
 #define IMPALA_RUNTIME_TEST_ENV
 
-#include "runtime/io/disk-io-mgr.h"
+#include "codegen/llvm-codegen-cache.h"
 #include "runtime/exec-env.h"
-#include "runtime/fragment-instance-state.h"
-#include "runtime/mem-tracker.h"
+#include "runtime/io/disk-io-mgr.h"
 #include "runtime/runtime-state.h"
 
 namespace impala {
@@ -38,8 +37,8 @@ class TestEnv {
 
   /// Set custom configuration for TmpFileMgr. Only has effect if called before Init().
   /// If not called, the default configuration is used.
-  void SetTmpFileMgrArgs(
-      const std::vector<std::string>& tmp_dirs, bool one_dir_per_device);
+  void SetTmpFileMgrArgs(const std::vector<std::string>& tmp_dirs,
+      bool one_dir_per_device, const std::string& compression, bool punch_holes);
 
   /// Disables creation of a BufferPool instance as part of this TestEnv in Init().
   void DisableBufferPool() { enable_buffer_pool_ = false; }
@@ -53,6 +52,9 @@ class TestEnv {
   /// memory consumption metrics is created, otherwise no metrics are used.
   /// If not called, a process memory tracker with no limit is created.
   void SetProcessMemTrackerArgs(int64_t bytes_limit, bool use_metrics);
+
+  /// Set the Default FS of ExecEnv.
+  void SetDefaultFS(const string& fs) { exec_env_->default_fs_ = fs; }
 
   /// Initialize the TestEnv with the specified arguments.
   Status Init();
@@ -75,9 +77,18 @@ class TestEnv {
   /// Return total of mem tracker consumption for all queries.
   int64_t TotalQueryMemoryConsumption();
 
+  /// Reset the codegen cache.
+  void ResetCodegenCache(MetricGroup* metrics) {
+    exec_env_->codegen_cache_.reset(new CodeGenCache(metrics));
+  }
+
+  /// Get a full URI for the provided path based on the default filesystem.
+  std::string GetDefaultFsPath(std::string path);
+
   ExecEnv* exec_env() { return exec_env_.get(); }
   MetricGroup* metrics() { return exec_env_->metrics(); }
   TmpFileMgr* tmp_file_mgr() { return exec_env_->tmp_file_mgr(); }
+  CodeGenCache* codegen_cache() { return exec_env_->codegen_cache_.get(); }
 
  private:
   /// Recreate global metric groups.
@@ -87,6 +98,8 @@ class TestEnv {
   bool have_tmp_file_mgr_args_;
   std::vector<std::string> tmp_dirs_;
   bool one_tmp_dir_per_device_;
+  std::string tmp_file_mgr_compression_;
+  bool tmp_file_mgr_punch_holes_;
 
   /// Whether a buffer pool should be created in Init().
   bool enable_buffer_pool_ = true;
@@ -96,7 +109,9 @@ class TestEnv {
   int64_t buffer_pool_capacity_;
 
   /// Arguments for process memory tracker, used in Init().
-  int64_t process_mem_limit_ = -1;
+  /// Default to 8GB, which should be enough for any tests that are not deliberately
+  /// allocating large amounts of memory.
+  int64_t process_mem_limit_ = 8L * 1024L * 1024L * 1024L;
   bool process_mem_tracker_use_metrics_ = false;
 
   /// Global state for test environment.

@@ -23,6 +23,7 @@ import org.apache.impala.common.InternalException;
 import org.apache.impala.thrift.TSessionState;
 import org.apache.impala.util.EventSequence;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
@@ -55,8 +56,7 @@ public interface AuthorizationChecker {
    * @param timeline optional timeline to mark events in the query profile
    */
   AuthorizationContext createAuthorizationContext(boolean doAudits, String sqlStmt,
-      TSessionState sessionState, Optional<EventSequence> timeline)
-      throws InternalException;
+      TSessionState sessionState, Optional<EventSequence> timeline);
 
   /**
    * Authorize an analyzed statement.
@@ -70,7 +70,7 @@ public interface AuthorizationChecker {
   /**
    * This method is to be executed after an authorization check has occurred.
    */
-  void postAuthorize(AuthorizationContext authzCtx)
+  void postAuthorize(AuthorizationContext authzCtx, boolean authzOk, boolean analysisOk)
       throws AuthorizationException, InternalException;
 
   /**
@@ -82,4 +82,34 @@ public interface AuthorizationChecker {
    * Invalidates an authorization cache.
    */
   void invalidateAuthorizationCache();
+
+  /**
+   * Returns whether the given table needs column masking or row filtering when read by
+   * the given user.
+   */
+  boolean needsMaskingOrFiltering(User user, String dbName, String tableName,
+      List<String> requiredColumns) throws InternalException;
+
+  /**
+   * Returns whether the given table needs row filtering when read by the given user.
+   */
+  boolean needsRowFiltering(User user, String dbName, String tableName)
+      throws InternalException;
+
+  /**
+   * Returns the column mask string for the given column.
+   */
+  String createColumnMask(User user, String dbName, String tableName, String columnName,
+      AuthorizationContext authzCtx) throws InternalException;
+
+  /**
+   * Returns the row filter for the given table.
+   */
+  String createRowFilter(User user, String dbName, String tableName,
+      AuthorizationContext rangerCtx) throws InternalException;
+
+  /**
+   * This method is to be executed after AnalysisContext#analyze() is completed.
+   */
+  void postAnalyze(AuthorizationContext authzCtx);
 }

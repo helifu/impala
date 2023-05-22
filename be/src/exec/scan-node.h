@@ -27,11 +27,11 @@
 namespace impala {
 
 class BlockingRowBatchQueue;
-class TScanRange;
+class ScanRangeParamsPB;
 
 class ScanPlanNode : public PlanNode {
  public:
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status Init(const TPlanNode& tnode, FragmentState* state) override;
   virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
 };
 
@@ -115,7 +115,8 @@ class ScanNode : public ExecNode {
 
   /// This should be called before Prepare(), and the argument must be not destroyed until
   /// after Prepare().
-  void SetScanRanges(const std::vector<TScanRangeParams>& scan_range_params) {
+  void SetScanRanges(
+      const google::protobuf::RepeatedPtrField<ScanRangeParamsPB>& scan_range_params) {
     scan_range_params_ = &scan_range_params;
   }
 
@@ -144,7 +145,7 @@ class ScanNode : public ExecNode {
   RuntimeState* runtime_state_ = nullptr;
 
   /// The scan ranges this scan node is responsible for. Not owned.
-  const std::vector<TScanRangeParams>* scan_range_params_;
+  const google::protobuf::RepeatedPtrField<ScanRangeParamsPB>* scan_range_params_;
 
   /// Total bytes read from the scanner. Initialised in subclasses that track
   /// bytes read, including HDFS and HBase by calling AddBytesReadCounters().
@@ -188,8 +189,8 @@ class ScanNode : public ExecNode {
 
   /// Waits for runtime filters to arrive, checking every 20ms. Max wait time is specified
   /// by the 'runtime_filter_wait_time_ms' flag, which is overridden by the query option
-  /// of the same name. Returns true if all filters arrived within the time limit (as
-  /// measured from the time of RuntimeFilterBank::RegisterFilter()), false otherwise.
+  /// of the same name. The wait starts from when this function is called. Returns
+  /// true if all filters arrived within the time limit, false otherwise.
   bool WaitForRuntimeFilters();
 
   /// Additional state only used by multi-threaded scan node implementations.
@@ -259,10 +260,14 @@ class ScanNode : public ExecNode {
     /// Thread group for all scanner threads.
     ThreadGroup scanner_threads_;
 
-    /// Maximum number of scanner threads. Set to 'NUM_SCANNER_THREADS' if that query
-    /// option is set. Otherwise, it's set to the number of cpu cores. Scanner threads
-    /// are generally cpu bound so there is no benefit in spinning up more threads than
-    /// the number of cores. Set in Open().
+    /// Maximum number of scanner threads.
+    /// The value is set to either of the following:
+    /// - 1, if COMPUTE_PROCESSING_COST=true;
+    /// - 'NUM_SCANNER_THREADS', if that query option is set and
+    ///   COMPUTE_PROCESSING_COST=false;
+    /// - Otherwise, it's set to the number of cpu cores.
+    /// Scanner threads are generally cpu bound so there is no benefit in spinning up
+    /// more threads than the number of cores. Set in Open().
     int max_num_scanner_threads_ = 0;
 
     /// Estimated amount of memory that each additional scanner thread will consume. Used

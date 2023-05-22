@@ -17,8 +17,17 @@
 
 #include "util/codec.h"
 
-#include <gutil/strings/substitute.h>
+#include <ostream>
+#include <utility>
 
+#include <boost/algorithm/string.hpp>
+#include <zstd.h>
+
+#include "common/compiler-util.h"
+#include "common/logging.h"
+#include "gutil/strings/substitute.h"
+#include "runtime/mem-pool.h"
+#include "util/bit-util.h"
 #include "util/compress.h"
 #include "util/decompress.h"
 
@@ -40,7 +49,7 @@ const char* const Codec::ZSTD_COMPRESSION =
 const char* const Codec::UNKNOWN_CODEC_ERROR =
     "This compression codec is currently unsupported: ";
 const char* const NO_LZO_MSG = "LZO codecs may not be created via the Codec interface. "
-    "Instead the LZO library is directly invoked.";
+    "Instead LZO is decoded by an optional text scanner plugin.";
 
 const Codec::CodecMap Codec::CODEC_MAP = {{"", THdfsCompression::NONE},
     {DEFAULT_COMPRESSION, THdfsCompression::DEFAULT},
@@ -51,11 +60,8 @@ const Codec::CodecMap Codec::CODEC_MAP = {{"", THdfsCompression::NONE},
     {ZSTD_COMPRESSION, THdfsCompression::ZSTD}};
 
 string Codec::GetCodecName(THdfsCompression::type type) {
-  for (const CodecMap::value_type& codec: g_CatalogObjects_constants.COMPRESSION_MAP) {
-    if (codec.second == type) return codec.first;
-  }
-  DCHECK(false) << "Missing codec in COMPRESSION_MAP: " << type;
-  return "INVALID";
+  return boost::algorithm::to_lower_copy(
+      string(_THdfsCompression_VALUES_TO_NAMES.find(type)->second));
 }
 
 Status Codec::GetHadoopCodecClassName(THdfsCompression::type type, string* out_name) {
@@ -68,6 +74,8 @@ Status Codec::GetHadoopCodecClassName(THdfsCompression::type type, string* out_n
   return Status(Substitute("Unsupported codec for given file type: $0",
       _THdfsCompression_VALUES_TO_NAMES.find(type)->second));
 }
+
+Codec::~Codec() {}
 
 Status Codec::CreateCompressor(MemPool* mem_pool, bool reuse, const string& codec,
     scoped_ptr<Codec>* compressor) {

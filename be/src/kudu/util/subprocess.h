@@ -112,6 +112,10 @@ class Subprocess {
   // exit code.
   Status WaitNoBlock(int* wait_status = nullptr) WARN_UNUSED_RESULT;
 
+  // Like Wait, but it also checks the exit code is 0. If it's not, or if it's
+  // not a clean exit, it returns RemoteError.
+  Status WaitAndCheckExitCode() WARN_UNUSED_RESULT;
+
   // Send a signal to the subprocess.
   // Note that this does not reap the process -- you must still Wait()
   // in order to reap it. Only call after starting.
@@ -143,10 +147,15 @@ class Subprocess {
   //
   // Also collects the output from the child process stdout and stderr into
   // 'stdout_out' and 'stderr_out' respectively.
+  //
+  // Optionally allows a passed map of environment variables to be set
+  // on the subprocess via `env_vars`.
   static Status Call(const std::vector<std::string>& argv,
                      const std::string& stdin_in = "",
                      std::string* stdout_out = nullptr,
-                     std::string* stderr_out = nullptr) WARN_UNUSED_RESULT;
+                     std::string* stderr_out = nullptr,
+                     std::map<std::string, std::string> env_vars = {})
+                     WARN_UNUSED_RESULT;
 
   // Return the pipe fd to the child's standard stream.
   // Stream should not be disabled or shared.
@@ -164,6 +173,8 @@ class Subprocess {
 
   pid_t pid() const;
   const std::string& argv0() const { return argv_[0]; }
+
+  bool IsStarted();
 
  private:
   FRIEND_TEST(SubprocessTest, TestGetProcfsState);

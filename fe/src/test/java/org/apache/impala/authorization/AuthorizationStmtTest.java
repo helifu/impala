@@ -29,12 +29,10 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.service.BackendConfig;
-import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TPrivilegeLevel;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TTableName;
-import org.apache.sentry.api.service.thrift.TSentryRole;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -78,23 +76,9 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
     RuntimeEnv.INSTANCE.reset();
   }
 
-  @Before
-  public void before() throws ImpalaException {
-    if (authzProvider_ == AuthorizationProvider.SENTRY) {
-      // Remove existing roles in order to not interfere with these tests. To be able to
-      // list existing roles, we have to invoke listAllRoles() as the user corresponding
-      // to User(System.getProperty("user.name")), which has the privilege to execute
-      // LIST_ROLES.
-      User user = new User(System.getProperty("user.name"));
-      for (TSentryRole role : sentryService_.listAllRoles(user)) {
-        authzCatalog_.removeRole(role.getRoleName());
-      }
-    }
-  }
-
   @Parameters
   public static Collection<AuthorizationProvider> data() {
-    return Arrays.asList(AuthorizationProvider.SENTRY, AuthorizationProvider.RANGER);
+    return Arrays.asList(AuthorizationProvider.RANGER);
   }
 
   private static final String[] ALLTYPES_COLUMNS_WITHOUT_ID = new String[]{"bool_col",
@@ -569,6 +553,7 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
 
     // Select a UDF.
     ScalarFunction fn = addFunction("functional", "f");
+    ScalarFunction fn2 = addFunction("functional", "f2");
     try {
       authorize("select functional.f()")
           .ok(onServer(TPrivilegeLevel.ALL))
@@ -577,13 +562,37 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
           .ok(onDatabase("functional", TPrivilegeLevel.ALL))
           .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
           .ok(onDatabase("functional", viewMetadataPrivileges()))
-          .error(accessError("functional"))
-          .error(accessError("functional"), onServer(allExcept(
+          // We do not have to explicitly grant the SELECT privilege on the UDF if we
+          // already grant the SELECT privilege on the database where the UDF belongs
+          // in that granting the SELECT privilege on the database also implies granting
+          // the SELECT privilege on all the UDF's in the database.
+          .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
+          .ok(onUdf("functional", "f", TPrivilegeLevel.SELECT),
+              onDatabase("functional", TPrivilegeLevel.INSERT))
+          .ok(onUdf("functional", "f", TPrivilegeLevel.SELECT),
+              onDatabase("functional", TPrivilegeLevel.REFRESH))
+          .error(selectFunctionError("functional.f"))
+          .error(selectFunctionError("functional.f"), onServer(allExcept(
               viewMetadataPrivileges())))
-          .error(accessError("functional"), onDatabase("functional", allExcept(
-              viewMetadataPrivileges())));
+          .error(selectFunctionError("functional.f"), onDatabase("functional", allExcept(
+              viewMetadataPrivileges())))
+          .error(accessError("functional"),
+              onUdf("functional", "f", TPrivilegeLevel.SELECT))
+          .error(accessError("functional"),
+              onUdf("functional", "f", TPrivilegeLevel.SELECT),
+              onServer(allExcept(viewMetadataPrivileges())))
+          .error(accessError("functional"),
+              onUdf("functional", "f", TPrivilegeLevel.SELECT),
+              onDatabase("functional", allExcept(viewMetadataPrivileges())))
+          .error(selectFunctionError("functional.f"),
+              onDatabase("functional", TPrivilegeLevel.INSERT),
+              onUdf("functional", "f2", TPrivilegeLevel.SELECT))
+          .error(selectFunctionError("functional.f"),
+              onDatabase("functional", TPrivilegeLevel.REFRESH),
+              onUdf("functional", "f2", TPrivilegeLevel.SELECT));;
     } finally {
       removeFunction(fn);
+      removeFunction(fn2);
     }
 
     // Select from non-existent database.
@@ -593,6 +602,24 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
     // Select from non-existent table.
     authorize("select 1 from functional.notbl")
         .error(selectError("functional.notbl"));
+
+    // Select from non-existent database in CTE without required privileges
+    authorize("with t as (select id from nodb.alltypes) select * from t")
+        .error(selectError("nodb.alltypes"));
+
+    // Select from non-existent table in CTE without required privileges
+    authorize("with t as (select id from functional.notbl) select * from t")
+        .error(selectError("functional.notbl"));
+
+    // Select from non-existent column in CTE without required privileges
+    authorize("with t as (select nocol from functional.alltypes) select * from t")
+        .error(selectError("functional.alltypes"))
+        .error(selectError("functional.alltypes"), onColumn("functional", "alltypes",
+            ALLTYPES_COLUMNS, TPrivilegeLevel.SELECT));
+
+    // With clause column labels exceeding the number of columns in the query
+    authorize("with t(c1, c2) as (select id from functional.alltypes) select * from t")
+        .error(selectError("functional.alltypes"));
 
     // Select with inline view.
     authorize("select a.* from (select * from functional.alltypes) a")
@@ -688,6 +715,68 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
             "allcomplextypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
             TPrivilegeLevel.SELECT)));
 
+    // Select with arrays types in select list.
+    authorize("select int_array_col, array_array_col from functional.allcomplextypes")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.SELECT))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.SELECT))
+        .ok(onColumn("functional", "allcomplextypes",
+            new String[]{"int_array_col", "array_array_col"},
+            TPrivilegeLevel.SELECT))
+        .error(selectError("functional.allcomplextypes"))
+        .error(selectError("functional.allcomplextypes"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
+        .error(selectError("functional.allcomplextypes"), onDatabase(
+            "functional", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
+        .error(selectError("functional.allcomplextypes"), onTable("functional",
+            "allcomplextypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
+        .error(selectError("functional.allcomplextypes"), onColumn("functional",
+            "allcomplextypes", new String[]{"int_array_col"}, TPrivilegeLevel.SELECT))
+        .error(selectError("functional.allcomplextypes"), onColumn("functional",
+            "allcomplextypes", new String[]{"array_array_col"}, TPrivilegeLevel.SELECT));
+
+    // Select with map types in select list.
+    authorize("select int_map_col, array_map_col, map_map_col "
+        + "from functional.allcomplextypes")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.SELECT))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.SELECT))
+        .ok(onColumn("functional", "allcomplextypes",
+            new String[]{"int_map_col", "array_map_col", "map_map_col"},
+            TPrivilegeLevel.SELECT))
+        .error(selectError("functional.allcomplextypes"))
+        .error(selectError("functional.allcomplextypes"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
+        .error(selectError("functional.allcomplextypes"), onDatabase(
+            "functional", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
+        .error(selectError("functional.allcomplextypes"), onTable("functional",
+            "allcomplextypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
+        .error(selectError("functional.allcomplextypes"), onColumn("functional",
+            "allcomplextypes", new String[]{"int_map_col"}, TPrivilegeLevel.SELECT))
+        .error(selectError("functional.allcomplextypes"), onColumn("functional",
+            "allcomplextypes", new String[]{"array_map_col"}, TPrivilegeLevel.SELECT))
+        .error(selectError("functional.allcomplextypes"), onColumn("functional",
+            "allcomplextypes", new String[]{"map_map_col"}, TPrivilegeLevel.SELECT))
+        .error(selectError("functional.allcomplextypes"), onColumn("functional",
+            "allcomplextypes", new String[]{"int_map_col", "map_map_col"},
+            TPrivilegeLevel.SELECT));
+
     for (AuthzTest authzTest: new AuthzTest[]{
         // Select with cross join.
         authorize("select * from functional.alltypes union all " +
@@ -735,6 +824,31 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
           .error(selectError("functional.alltypes"), onColumn("functional",
               "alltypessmall", ALLTYPES_COLUMNS, TPrivilegeLevel.SELECT));
     }
+
+    // Unnest an array.
+    authorize("select unnest(int_array_col) from functional.allcomplextypes")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.SELECT))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.SELECT))
+        .ok(onColumn("functional", "allcomplextypes",
+            new String[]{"id", "int_array_col"}, TPrivilegeLevel.SELECT))
+        .error(selectError("functional.allcomplextypes"))
+        .error(selectError("functional.allcomplextypes"), onServer(
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
+        .error(selectError("functional.allcomplextypes"), onDatabase("functional",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
+        .error(selectError("functional.allcomplextypes"), onTable("functional",
+            "allcomplextypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
+
 
     // Union on views.
     authorize("select id from functional.alltypes_view union all " +
@@ -936,7 +1050,11 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
   @Test
   public void testUseDb() throws ImpalaException {
     AuthzTest test = authorize("use functional");
-    for (TPrivilegeLevel privilege: TPrivilegeLevel.values()) {
+    // We exclude TPrivilegeLevel.RWSTORAGE because we do not ask Ranger service to grant
+    // the RWSTORAGE privilege on a resource if the resource is not a storage handler
+    // URI. Refer to RangerCatalogdAuthorizationManager#createGrantRevokeRequest() for
+    // further details.
+    for (TPrivilegeLevel privilege: allExcept(TPrivilegeLevel.RWSTORAGE)) {
       test.ok(onServer(privilege))
           .ok(onDatabase("functional", privilege))
           .ok(onTable("functional", "alltypes", privilege))
@@ -1124,7 +1242,11 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
 
     // Show tables.
     AuthzTest test = authorize("show tables in functional");
-    for (TPrivilegeLevel privilege: TPrivilegeLevel.values()) {
+    // We exclude TPrivilegeLevel.RWSTORAGE because we do not ask Ranger service to grant
+    // the RWSTORAGE privilege on a resource if the resource is not a storage handler
+    // URI. Refer to RangerCatalogdAuthorizationManager#createGrantRevokeRequest() for
+    // further details.
+    for (TPrivilegeLevel privilege: allExcept(TPrivilegeLevel.RWSTORAGE)) {
       test.ok(onServer(privilege))
           .ok(onDatabase("functional", privilege))
           .ok(onTable("functional", "alltypes", privilege));
@@ -1535,20 +1657,22 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
 
     // Create a database with a specific location.
     String uri = "hdfs://localhost:20500/test-warehouse/new_location";
-    String stmt = "create database newdb location " + "'" + uri + "'";
-    authorize(stmt)
-        .ok(onServer(TPrivilegeLevel.ALL))
-        .ok(onServer(TPrivilegeLevel.OWNER))
-        .ok(onServer(TPrivilegeLevel.CREATE), onUri(uri, TPrivilegeLevel.ALL))
-        .ok(onServer(TPrivilegeLevel.CREATE), onUri(uri, TPrivilegeLevel.OWNER))
-        .error(createError("newdb"))
-        .error(createError("newdb"), onServer(allExcept(TPrivilegeLevel.ALL,
-            TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)),
-            onUri(uri, TPrivilegeLevel.ALL))
-        .error(createError("newdb"), onServer(allExcept(TPrivilegeLevel.ALL,
-            TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)),
-            onUri(uri, TPrivilegeLevel.OWNER))
-        .error(accessError(uri), onServer(TPrivilegeLevel.CREATE));
+    for (AuthzTest test: new AuthzTest[]{
+      authorize("create database newdb location " + "'" + uri + "'"),
+      authorize("create database newdb managedlocation " + "'" + uri + "'")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .ok(onServer(TPrivilegeLevel.CREATE), onUri(uri, TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.CREATE), onUri(uri, TPrivilegeLevel.OWNER))
+          .error(createError("newdb"))
+          .error(createError("newdb"), onServer(allExcept(TPrivilegeLevel.ALL,
+              TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)),
+              onUri(uri, TPrivilegeLevel.ALL))
+          .error(createError("newdb"), onServer(allExcept(TPrivilegeLevel.ALL,
+              TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)),
+              onUri(uri, TPrivilegeLevel.OWNER))
+          .error(accessError(uri), onServer(TPrivilegeLevel.CREATE));
+    }
 
     // Database already exists.
     for (AuthzTest test: new AuthzTest[]{
@@ -1740,8 +1864,8 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
         .error(systemDbError(), onServer(TPrivilegeLevel.ALL))
         .error(systemDbError(), onServer(TPrivilegeLevel.OWNER));
 
-    // IMPALA-4000: Only users with ALL/OWNER privileges on SERVER may create external
-    // Kudu tables.
+    // Only users with ALL/OWNER privileges on SERVER may create external Kudu tables
+    // when 'kudu.master_addresses' is specified.
     authorize("create external table functional.kudu_tbl stored as kudu " +
         "tblproperties ('kudu.master_addresses'='127.0.0.1', 'kudu.table_name'='tbl')")
         .ok(onServer(TPrivilegeLevel.ALL))
@@ -1749,10 +1873,59 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
         .error(createError("functional"))
         .error(accessError("server1"), onServer(allExcept(TPrivilegeLevel.ALL,
             TPrivilegeLevel.OWNER)))
-        .error(accessError("server1"), onDatabase("functional", TPrivilegeLevel.ALL))
-        .error(accessError("server1"), onDatabase("functional", TPrivilegeLevel.OWNER));
+        .error(accessError("server1"), onDatabase("functional", TPrivilegeLevel.ALL),
+            onStorageHandlerUri("kudu", "127.0.0.1/tbl", TPrivilegeLevel.RWSTORAGE))
+        .error(accessError("server1"), onDatabase("functional", TPrivilegeLevel.OWNER),
+            onStorageHandlerUri("kudu", "127.0.0.1/tbl", TPrivilegeLevel.RWSTORAGE));
 
-    // IMPALA-4000: ALL/OWNER privileges on SERVER are not required to create managed
+
+    // ALL/OWNER privileges on SERVER are not required to create external Kudu tables
+    // when 'kudu.master_addresses' is not specified as long as the RWSTORAGE privilege
+    // is granted on the storage handler URI.
+    authorize("create external table functional.kudu_tbl stored as kudu " +
+        "tblproperties ('kudu.table_name'='tbl')")
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL),
+            onStorageHandlerUri("kudu", "127.0.0.1/tbl", TPrivilegeLevel.RWSTORAGE))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER),
+            onStorageHandlerUri("kudu", "127.0.0.1/tbl", TPrivilegeLevel.RWSTORAGE))
+        .ok(onDatabase("functional", TPrivilegeLevel.CREATE),
+            onStorageHandlerUri("kudu", "127.0.0.1/tbl", TPrivilegeLevel.RWSTORAGE))
+        .error(rwstorageError("kudu://127.0.0.1/tbl"),
+            onDatabase("functional", TPrivilegeLevel.ALL))
+        .error(rwstorageError("kudu://127.0.0.1/tbl"),
+            onDatabase("functional", TPrivilegeLevel.OWNER))
+        .error(rwstorageError("kudu://127.0.0.1/tbl"),
+            onDatabase("functional", TPrivilegeLevel.CREATE))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(createError("functional"));
+
+    // Wildcard is supported when a storage handler URI is specified.
+    authorize("create external table functional.kudu_tbl stored as kudu " +
+        "tblproperties ('kudu.table_name'='impala::tpch_kudu.nation')")
+        .ok(onDatabase("functional", TPrivilegeLevel.CREATE),
+            onStorageHandlerUri("*", "*", TPrivilegeLevel.RWSTORAGE))
+        .ok(onDatabase("functional", TPrivilegeLevel.CREATE),
+            onStorageHandlerUri("kudu", "*", TPrivilegeLevel.RWSTORAGE))
+        .ok(onDatabase("functional", TPrivilegeLevel.CREATE),
+            onStorageHandlerUri("kudu", "127.0.0.1/impala::tpch_kudu.*",
+                TPrivilegeLevel.RWSTORAGE));
+
+    // The authorization will fail if the wildcard storage handler URI on which the
+    // privilege is granted does not cover the storage handler URI of the Kudu table used
+    // to create the external table whether or not the Kudu table exists.
+    for (String tableName : new String[]{"alltypes", "alltypestiny", "non_existing"}) {
+      authorize(String.format("create external table functional.kudu_tbl " +
+          "stored as kudu tblproperties " +
+          "('kudu.table_name'='impala::functional_kudu.%s')", tableName))
+          .error(rwstorageError(
+              String.format("kudu://127.0.0.1/impala::functional_kudu.%s", tableName)),
+              onDatabase("functional", TPrivilegeLevel.CREATE),
+              onStorageHandlerUri("kudu", "127.0.0.1/impala::tpch_kudu.*",
+                  TPrivilegeLevel.RWSTORAGE));
+    }
+
+    // ALL/OWNER privileges on SERVER are not required to create managed
     // tables.
     authorize("create table functional.kudu_tbl (i int, j int, primary key (i))" +
         " partition by hash (i) partitions 9 stored as kudu")
@@ -2058,7 +2231,6 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
 
   @Test
   public void testAlterTable() throws ImpalaException {
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
     for (AuthzTest test: new AuthzTest[]{
         authorize("alter table functional.alltypes add column c1 int"),
         authorize("alter table functional.alltypes add columns(c1 int)"),
@@ -2102,7 +2274,6 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
               allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
               TPrivilegeLevel.ALTER)));
     }
-    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
 
     try {
       // We cannot set an owner to a role that doesn't exist
@@ -2125,21 +2296,9 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
             .error(accessError(true, "functional.alltypes"),
                 onTable(true, "functional", "alltypes", allExcept(
                     TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
-        // TODO: Checking if a request is allowed by checking if grant option flag is set
-        // is to Sentry.
-        // The following do not result in Ranger authorization errors.
-        if (authzProvider_ == AuthorizationProvider.SENTRY) {
-          test.error(accessError(true, "functional.alltypes"), onServer(
-              TPrivilegeLevel.values()))
-              .error(accessError(true, "functional.alltypes"), onDatabase("functional",
-                  TPrivilegeLevel.values()))
-              .error(accessError(true, "functional.alltypes"), onTable("functional",
-                  "alltypes", TPrivilegeLevel.values()));
-        } else {
-          test.ok(onServer(TPrivilegeLevel.values()));
-          test.ok(onDatabase("functional", TPrivilegeLevel.values()));
-          test.ok(onTable("functional", "alltypes", TPrivilegeLevel.values()));
-        }
+        test.ok(onServer(TPrivilegeLevel.values()));
+        test.ok(onDatabase("functional", TPrivilegeLevel.values()));
+        test.ok(onTable("functional", "alltypes", TPrivilegeLevel.values()));
       }
     } finally {
       authzCatalog_.removeRole("foo_owner");
@@ -2378,21 +2537,9 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
             .error(accessError(true, "functional.alltypes_view"), onTable("functional",
                 "alltypes_view", allExcept(TPrivilegeLevel.ALL,
                     TPrivilegeLevel.OWNER)));
-        // TODO: Checking if a request is allowed by checking if grant option flag is set
-        // is to Sentry.
-        // The following do not result in Ranger authorization errors.
-        if (authzProvider_ == AuthorizationProvider.SENTRY) {
-          test.error(accessError(true, "functional.alltypes_view"), onServer(
-              TPrivilegeLevel.values()))
-              .error(accessError(true, "functional.alltypes_view"), onDatabase(
-                  "functional", TPrivilegeLevel.values()))
-              .error(accessError(true, "functional.alltypes_view"), onTable("functional",
-                  "alltypes_view", TPrivilegeLevel.values()));
-        } else {
-          test.ok(onServer(TPrivilegeLevel.values()));
-          test.ok(onDatabase("functional", TPrivilegeLevel.values()));
-          test.ok(onTable("functional", "alltypes_view", TPrivilegeLevel.values()));
-        }
+        test.ok(onServer(TPrivilegeLevel.values()));
+        test.ok(onDatabase("functional", TPrivilegeLevel.values()));
+        test.ok(onTable("functional", "alltypes_view", TPrivilegeLevel.values()));
       }
     } finally {
       authzCatalog_.removeRole("foo_owner");
@@ -2432,21 +2579,10 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
                 TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
             .error(accessError(true, "functional"), onDatabase(true, "functional",
                 allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
-        // TODO: Checking if a request is allowed by checking if grant option flag is set
-        // is to Sentry.
-        // The following do not result in Ranger authorization errors.
-        if (authzProvider_ == AuthorizationProvider.SENTRY) {
-          authorize(String.format("alter database functional set owner %s foo",
-              ownerType))
-              .error(accessError(true, "functional"), onServer(TPrivilegeLevel.values()))
-              .error(accessError(true, "functional"), onDatabase("functional",
-                  TPrivilegeLevel.values()));
-        } else {
-          authorize(String.format("alter database functional set owner %s foo",
-              ownerType))
-              .ok(onServer(TPrivilegeLevel.values()))
-              .ok(onDatabase("functional", TPrivilegeLevel.values()));
-        }
+        authorize(String.format("alter database functional set owner %s foo",
+            ownerType))
+            .ok(onServer(TPrivilegeLevel.values()))
+            .ok(onDatabase("functional", TPrivilegeLevel.values()));
 
         // Database does not exist.
         authorize(String.format("alter database nodb set owner %s foo", ownerType))
@@ -2825,7 +2961,7 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
           // analysis context, we have to explicitly specify the requesting user
           // corresponding to 'user_' defined in AuthorizationTestBase.java. Otherwise,
           // an analysis context will be created with a user corresponding to
-          // User(System.getProperty("user.name")), resulting in a Sentry authorization
+          // User(System.getProperty("user.name")), resulting in a Ranger authorization
           // error.
           authorize(createAnalysisCtx(options, authzFactory_, user_.getName()),
               "select functional.to_lower('ABCDEF')")
@@ -2834,10 +2970,53 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
             .ok(onDatabase("functional", TPrivilegeLevel.ALL))
             .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
             .ok(onDatabase("functional", viewMetadataPrivileges()))
-            .error(accessError("functional"))
-            .error(accessError("functional"), onDatabase("functional",
-                allExcept(viewMetadataPrivileges())));
+            .error(selectFunctionError("functional.to_lower"))
+            .error(selectFunctionError("functional.to_lower"), onDatabase("functional",
+                allExcept(viewMetadataPrivileges())))
+            .error(accessError("functional"), onUdf("functional", "to_lower",
+                TPrivilegeLevel.SELECT))
+            .error(accessError("functional"),
+                onDatabase("functional", allExcept(viewMetadataPrivileges())),
+                onUdf("functional", "to_lower", TPrivilegeLevel.SELECT));
       }
+    } finally {
+      removeFunction(fn);
+    }
+
+    // IMPALA-11728: Make sure use of a UDF in the fallback database requires a) any
+    // of the INSERT, REFRESH, SELECT privileges on all the tables and columns in the
+    // database, and b) the SELECT privilege on the UDF in the database.
+    fn = addFunction("functional", "f");
+    try {
+      TQueryOptions options = new TQueryOptions();
+      options.setFallback_db_for_functions("functional");
+      authorize(createAnalysisCtx(options, authzFactory_, user_.getName()), "select f()")
+          // When the scope of a privilege is database, all the tables, columns, as well
+          // as UDF's will be covered. A requesting user granted any of the ALL, OWNER,
+          // or SELECT privileges on the database will be allowed to execute the UDF.
+          .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional", viewMetadataPrivileges()))
+          // We do not have to explicitly grant the SELECT privilege on the UDF if we
+          // already grant the SELECT privilege on the database where the UDF belongs
+          // in that granting the SELECT privilege on the database also implies granting
+          // the SELECT privilege on all the UDF's in the database.
+          .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
+          .ok(onDatabase("functional", TPrivilegeLevel.INSERT),
+              onUdf("functional", "f", TPrivilegeLevel.SELECT))
+          .ok(onDatabase("functional", TPrivilegeLevel.REFRESH),
+              onUdf("functional", "f", TPrivilegeLevel.SELECT))
+          .error(selectFunctionError("functional.f"))
+          .error(selectFunctionError("functional.f"),
+              onDatabase("functional", allExcept(viewMetadataPrivileges())))
+          .error(accessError("functional"),
+              onUdf("functional", "f", TPrivilegeLevel.SELECT))
+          .error(accessError("functional"),
+              onUdf("functional", "f", TPrivilegeLevel.SELECT),
+              onServer(allExcept(viewMetadataPrivileges())))
+          .error(accessError("functional"),
+              onUdf("functional", "f", TPrivilegeLevel.SELECT),
+              onDatabase("functional", allExcept(viewMetadataPrivileges())));
     } finally {
       removeFunction(fn);
     }
@@ -2856,54 +3035,63 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
             onTable("functional", "alltypes", TPrivilegeLevel.ALL));
   }
 
-  @Test
-  public void testColumnMaskEnabled() throws ImpalaException {
-    if (authzProvider_ == AuthorizationProvider.SENTRY) return;
+  private void createColumnMaskingPolicy(String policyName, String dbName, String tblName,
+      String colName, String user, String maskType, String maskExpr) {
+    String json = String.format("{\n" +
+        "  \"name\": \"%s\",\n" +
+        "  \"policyType\": 1,\n" +
+        "  \"serviceType\": \"" + RANGER_SERVICE_TYPE + "\",\n" +
+        "  \"service\": \"" + RANGER_SERVICE_NAME + "\",\n" +
+        "  \"resources\": {\n" +
+        "    \"database\": {\n" +
+        "      \"values\": [\"%s\"],\n" +
+        "      \"isExcludes\": false,\n" +
+        "      \"isRecursive\": false\n" +
+        "    },\n" +
+        "    \"table\": {\n" +
+        "      \"values\": [\"%s\"],\n" +
+        "      \"isExcludes\": false,\n" +
+        "      \"isRecursive\": false\n" +
+        "    },\n" +
+        "    \"column\": {\n" +
+        "      \"values\": [\"%s\"],\n" +
+        "      \"isExcludes\": false,\n" +
+        "      \"isRecursive\": false\n" +
+        "    }\n" +
+        "  },\n" +
+        "  \"dataMaskPolicyItems\": [\n" +
+        "    {\n" +
+        "      \"accesses\": [\n" +
+        "        {\n" +
+        "          \"type\": \"select\",\n" +
+        "          \"isAllowed\": true\n" +
+        "        }\n" +
+        "      ],\n" +
+        "      \"users\": [\"%s\"],\n" +
+        "      \"dataMaskInfo\": {\n" +
+        "        \"dataMaskType\": \"%s\"\n" +
+        "        %s\n" +
+        "      }\n" +
+        "    }\n" +
+        "  ]\n" +
+        "}", policyName, dbName, tblName, colName, user, maskType,
+        maskExpr == null ? "" : String.format(", \"valueExpr\": \"%s\"", maskExpr));
+    createRangerPolicy(policyName, json);
+  }
 
+  /**
+   * Test the error messages when Column Masking is disabled.
+   */
+  @Test
+  public void testColumnMaskDisabled() throws ImpalaException {
     String policyName = "col_mask";
     for (String tableName: new String[]{"alltypes", "alltypes_view"}) {
-      String json = String.format("{\n" +
-          "  \"name\": \"%s\",\n" +
-          "  \"policyType\": 1,\n" +
-          "  \"serviceType\": \"%s\",\n" +
-          "  \"service\": \"%s\",\n" +
-          "  \"resources\": {\n" +
-          "    \"database\": {\n" +
-          "      \"values\": [\"functional\"],\n" +
-          "      \"isExcludes\": false,\n" +
-          "      \"isRecursive\": false\n" +
-          "    },\n" +
-          "    \"table\": {\n" +
-          "      \"values\": [\"%s\"],\n" +
-          "      \"isExcludes\": false,\n" +
-          "      \"isRecursive\": false\n" +
-          "    },\n" +
-          "    \"column\": {\n" +
-          "      \"values\": [\"string_col\"],\n" +
-          "      \"isExcludes\": false,\n" +
-          "      \"isRecursive\": false\n" +
-          "    }\n" +
-          "  },\n" +
-          "  \"dataMaskPolicyItems\": [\n" +
-          "    {\n" +
-          "      \"accesses\": [\n" +
-          "        {\n" +
-          "          \"type\": \"select\",\n" +
-          "          \"isAllowed\": true\n" +
-          "        }\n" +
-          "      ],\n" +
-          "      \"users\": [\"%s\"],\n" +
-          "      \"dataMaskInfo\": {\"dataMaskType\": \"MASK\"}\n" +
-          "    }\n" +
-          "  ]\n" +
-          "}", policyName, RANGER_SERVICE_TYPE, RANGER_SERVICE_NAME, tableName,
-          user_.getShortName());
-
+      BackendConfig.INSTANCE.setColumnMaskingEnabled(false);
+      // Row filtering depends on column masking. So we should disable it as well.
+      BackendConfig.INSTANCE.setRowFilteringEnabled(false);
       try {
-        // Clear existing row filter policies, otherwise they will cause different
-        // error message since we check them before any column masking policies.
-        clearRangerRowFilterPolicies("functional", tableName);
-        createRangerPolicy(policyName, json);
+        createColumnMaskingPolicy(policyName, "functional", tableName, "string_col",
+            user_.getShortName(), "MASK", /*maskExpr*/null);
         rangerImpalaPlugin_.refreshPoliciesAndTags();
 
         // Queries on columns that are not masked should be allowed.
@@ -2960,7 +3148,7 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
         // Update.
         authorize(String.format(
             "update functional_kudu.alltypes set int_col = 1 where string_col in " +
-            "(select string_col from functional.%s)", tableName))
+                "(select string_col from functional.%s)", tableName))
             .error(columnMaskError(String.format("functional.%s.string_col", tableName)),
                 onServer(TPrivilegeLevel.ALL));
         // Delete.
@@ -2975,50 +3163,58 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
                 onServer(TPrivilegeLevel.ALL));
       } finally {
         deleteRangerPolicy(policyName);
+        BackendConfig.INSTANCE.setColumnMaskingEnabled(true);
+        BackendConfig.INSTANCE.setRowFilteringEnabled(true);
       }
     }
   }
 
-  @Test
-  public void testRowFilterEnabled() throws ImpalaException {
-    if (authzProvider_ == AuthorizationProvider.SENTRY) return;
+  private void createRowFilteringPolicy(String policyName, String dbName, String tblName,
+      String user, String rowFilter) {
+    String json = String.format("{\n" +
+            "  \"name\": \"%s\",\n" +
+            "  \"policyType\": 2,\n" +
+            "  \"serviceType\": \"" + RANGER_SERVICE_TYPE + "\",\n" +
+            "  \"service\": \"" + RANGER_SERVICE_NAME + "\",\n" +
+            "  \"resources\": {\n" +
+            "    \"database\": {\n" +
+            "      \"values\": [\"%s\"],\n" +
+            "      \"isExcludes\": false,\n" +
+            "      \"isRecursive\": false\n" +
+            "    },\n" +
+            "    \"table\": {\n" +
+            "      \"values\": [\"%s\"],\n" +
+            "      \"isExcludes\": false,\n" +
+            "      \"isRecursive\": false\n" +
+            "    }\n" +
+            "  },\n" +
+            "  \"rowFilterPolicyItems\": [\n" +
+            "    {\n" +
+            "      \"accesses\": [\n" +
+            "        {\n" +
+            "          \"type\": \"select\",\n" +
+            "          \"isAllowed\": true\n" +
+            "        }\n" +
+            "      ],\n" +
+            "      \"users\": [\"%s\"],\n" +
+            "      \"rowFilterInfo\": {\"filterExpr\": \"%s\"}\n" +
+            "    }\n" +
+            "  ]\n" +
+            "}", policyName, dbName, tblName, user, rowFilter);
+    createRangerPolicy(policyName, json);
+  }
 
+  /**
+   * Test the error messages when Row Filtering is disabled.
+   */
+  @Test
+  public void testRowFilterDisabled() throws ImpalaException {
     String policyName = "row_filter";
     for (String tableName: new String[]{"alltypes", "alltypes_view"}) {
-      String json = String.format("{\n" +
-          "  \"name\": \"%s\",\n" +
-          "  \"policyType\": 2,\n" +
-          "  \"serviceType\": \"%s\",\n" +
-          "  \"service\": \"%s\",\n" +
-          "  \"resources\": {\n" +
-          "    \"database\": {\n" +
-          "      \"values\": [\"functional\"],\n" +
-          "      \"isExcludes\": false,\n" +
-          "      \"isRecursive\": false\n" +
-          "    },\n" +
-          "    \"table\": {\n" +
-          "      \"values\": [\"%s\"],\n" +
-          "      \"isExcludes\": false,\n" +
-          "      \"isRecursive\": false\n" +
-          "    }\n" +
-          "  },\n" +
-          "  \"rowFilterPolicyItems\": [\n" +
-          "    {\n" +
-          "      \"accesses\": [\n" +
-          "        {\n" +
-          "          \"type\": \"select\",\n" +
-          "          \"isAllowed\": true\n" +
-          "        }\n" +
-          "      ],\n" +
-          "      \"users\": [\"%s\"],\n" +
-          "      \"rowFilterInfo\": {\"filterExpr\": \"id = 0\"}\n" +
-          "    }\n" +
-          "  ]\n" +
-          "}", policyName, RANGER_SERVICE_TYPE, RANGER_SERVICE_NAME, tableName,
-          user_.getShortName());
-
+      BackendConfig.INSTANCE.setRowFilteringEnabled(false);
       try {
-        createRangerPolicy(policyName, json);
+        createRowFilteringPolicy(policyName, "functional", tableName,
+            user_.getShortName(), "id = 0");
         rangerImpalaPlugin_.refreshPoliciesAndTags();
 
         // Queries on tables that are not filtered should be allowed.
@@ -3083,7 +3279,234 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
                 onServer(TPrivilegeLevel.ALL));
       } finally {
         deleteRangerPolicy(policyName);
+        BackendConfig.INSTANCE.setRowFilteringEnabled(true);
       }
+    }
+  }
+
+  /**
+   * Validates updates on data/metadata of table/view that has column-masking or
+   * row-filtering policies are blocked.
+   */
+  @Test
+  public void testUpdateOnMaskedTables() throws Exception {
+    try {
+      createRowFilteringPolicy("alltypes_row_filter", "functional", "alltypes",
+          user_.getShortName(), "id = 0");
+      createRowFilteringPolicy("alltypes_view_row_filter", "functional",
+          "alltypes_view", user_.getShortName(), "id = 0");
+      createColumnMaskingPolicy("alltypestiny_id_mask", "functional", "alltypestiny",
+          "id", user_.getShortName(), "CUSTOM", "id + 100");
+      createColumnMaskingPolicy("kudu_id_mask", "functional_kudu", "alltypes",
+          "id", user_.getShortName(), "MASK_NULL", /*maskExpr*/null);
+      // Add an unmasked policy. It should not block updates.
+      createColumnMaskingPolicy("alltypessmall_id_unmask", "functional", "alltypessmall",
+          "id", user_.getShortName(), "MASK_NONE", /*maskExpr*/null);
+      createColumnMaskingPolicy("alltypes_sint_mask", "functional_orc_def",
+          "alltypes", "smallint_col", user_.getShortName(), "MASK_NULL",
+          /*maskExpr*/null);
+      // Create a column mask on a materialized view column. Since this
+      // MV references source table with a column masking policy (defined
+      // above), the expectation is that the MV's own column masking should
+      // not trigger but rather the authorization exception for the
+      // source table should be thrown.
+      createColumnMaskingPolicy("mv1_alltypes_jointbl_c2_mask", "functional_orc_def",
+          "mv1_alltypes_jointbl", "c2", user_.getShortName(), "MASK_NULL",
+          /*maskExpr*/null);
+      rangerImpalaPlugin_.refreshPoliciesAndTags();
+
+      // Select is ok.
+      authorize("select * from functional.alltypes")
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT));
+      authorize("select * from functional.alltypes_view")
+          .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.SELECT));
+      authorize("select * from functional.alltypestiny")
+          .ok(onTable("functional", "alltypestiny", TPrivilegeLevel.SELECT));
+
+      // Select * from materialized view is NOT OK since one of the source
+      // tables used in the join within the MV have column masking.
+      authorize("select * from functional_orc_def.mv1_alltypes_jointbl")
+        .error(mvSelectError("functional_orc_def.mv1_alltypes_jointbl"),
+        onTable("functional_orc_def", "mv1_alltypes_jointbl", TPrivilegeLevel.SELECT));
+
+      // Select <col> from MV is NOT OK even if the column being selected was
+      // originally from a non-masked table.
+      authorize("select c3 from functional_orc_def.mv1_alltypes_jointbl")
+        .error(mvSelectError("functional_orc_def.mv1_alltypes_jointbl"),
+        onTable("functional_orc_def", "mv1_alltypes_jointbl", TPrivilegeLevel.SELECT));
+
+      // Block INSERT, TRUNCATE even given SERVER ALL privilege
+      authorize("insert into functional.alltypes partition(year, month) " +
+          "select * from functional.alltypestiny")
+          .error(insertError("functional.alltypes"), onServer(TPrivilegeLevel.ALL))
+          // error for 'select' appears earlier than 'insert'
+          .error(selectError("functional.alltypestiny"),
+              onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+          .error(selectError("functional.alltypestiny"),
+              onDatabase("functional", allExcept(
+                  TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT,
+                  TPrivilegeLevel.SELECT)));
+      authorize("truncate table functional.alltypes")
+          .error(insertError("functional.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("insert into functional.alltypestiny partition(year, month) " +
+          "select * from functional.alltypessmall")
+          .error(insertError("functional.alltypestiny"), onServer(TPrivilegeLevel.ALL))
+          // error for 'select' appears earlier than 'insert'
+          .error(selectError("functional.alltypessmall"),
+              onTable("functional", "alltypestiny", TPrivilegeLevel.ALL))
+          .error(selectError("functional.alltypessmall"),
+              onDatabase("functional", allExcept(
+                  TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT,
+                  TPrivilegeLevel.SELECT)));
+      authorize("truncate table functional.alltypestiny")
+          .error(insertError("functional.alltypestiny"), onServer(TPrivilegeLevel.ALL));
+
+      // Block UPSERT, DELETE even given SERVER ALL privilege
+      authorize("upsert into functional_kudu.alltypes " +
+          "select * from functional.alltypes")
+          .error(accessError("functional_kudu.alltypes"), onServer(TPrivilegeLevel.ALL))
+          // error for 'select' appears earlier than 'access'
+          .error(selectError("functional.alltypes"),
+              onTable("functional_kudu", "alltypes", TPrivilegeLevel.ALL));
+      authorize("delete from functional_kudu.alltypes")
+          .error(accessError("functional_kudu.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("delete from functional_kudu.alltypes")
+          .error(accessError("functional_kudu.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("delete from functional_kudu.alltypes where id is not null")
+          .error(accessError("functional_kudu.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("delete a from functional_kudu.alltypes a join functional.alltypes b " +
+          "on a.id = b.id")
+          .error(accessError("functional_kudu.alltypes"), onServer(TPrivilegeLevel.ALL));
+
+      // Block compute stats even given SERVER ALL privilege
+      authorize("compute stats functional.alltypes")
+          .error(alterError("functional.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("compute incremental stats functional.alltypes")
+          .error(alterError("functional.alltypes"), onServer(TPrivilegeLevel.ALL));
+
+      // Block ALTER even given SERVER ALL privilege
+      authorize("alter table functional.alltypes add columns (new_id int)")
+          .error(alterError("functional.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("alter table functional.alltypes drop partition (year=2009, month=1)")
+          .error(alterError("functional.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("alter view functional.alltypes_view as select 1")
+          .error(alterError("functional.alltypes_view"), onServer(TPrivilegeLevel.ALL));
+      authorize("alter table functional.alltypestiny add partition (year=1, month=1)")
+          .error(alterError("functional.alltypestiny"), onServer(TPrivilegeLevel.ALL));
+
+      // Block DROP even given SERVER ALL privilege
+      authorize("drop table functional.alltypes")
+          .error(dropError("functional.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("drop view functional.alltypes_view")
+          .error(dropError("functional.alltypes_view"), onServer(TPrivilegeLevel.ALL));
+      authorize("drop table functional.alltypestiny")
+          .error(dropError("functional.alltypestiny"), onServer(TPrivilegeLevel.ALL));
+      authorize("drop table functional_kudu.alltypes")
+          .error(dropError("functional_kudu.alltypes"), onServer(TPrivilegeLevel.ALL));
+
+      // Block REFRESH even given SERVER ALL privilege
+      authorize("refresh functional.alltypes")
+          .error(refreshError("functional.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("refresh functional.alltypes_view")
+          .error(refreshError("functional.alltypes_view"), onServer(TPrivilegeLevel.ALL));
+      authorize("refresh functional.alltypestiny")
+          .error(refreshError("functional.alltypestiny"), onServer(TPrivilegeLevel.ALL));
+      authorize("invalidate metadata functional.alltypes")
+          .error(refreshError("functional.alltypes"), onServer(TPrivilegeLevel.ALL));
+      authorize("invalidate metadata functional.alltypes_view")
+          .error(refreshError("functional.alltypes_view"), onServer(TPrivilegeLevel.ALL));
+      authorize("invalidate metadata functional.alltypestiny")
+          .error(refreshError("functional.alltypestiny"), onServer(TPrivilegeLevel.ALL));
+
+      // Unmasked policy won't block updates
+      authorize("insert into functional.alltypessmall partition(year, month) " +
+          "select * from functional.alltypestiny")
+          .ok(onTable("functional", "alltypessmall", TPrivilegeLevel.INSERT),
+              onTable("functional", "alltypestiny", TPrivilegeLevel.SELECT));
+      authorize("alter table functional.alltypessmall add partition (year=1, month=1)")
+          .ok(onTable("functional", "alltypessmall", TPrivilegeLevel.ALTER));
+      authorize("compute stats functional.alltypessmall")
+          .ok(onTable("functional", "alltypessmall",
+              TPrivilegeLevel.ALTER, TPrivilegeLevel.SELECT));
+      authorize("compute incremental stats functional.alltypessmall")
+          .ok(onTable("functional", "alltypessmall",
+              TPrivilegeLevel.ALTER, TPrivilegeLevel.SELECT));
+      authorize("drop table functional.alltypessmall")
+          .ok(onTable("functional", "alltypessmall", TPrivilegeLevel.DROP));
+      authorize("refresh functional.alltypessmall")
+          .ok(onTable("functional", "alltypessmall", TPrivilegeLevel.REFRESH));
+      authorize("invalidate metadata functional.alltypessmall")
+          .ok(onTable("functional", "alltypessmall", TPrivilegeLevel.REFRESH));
+    } finally {
+      deleteRangerPolicy("alltypes_row_filter");
+      deleteRangerPolicy("alltypes_view_row_filter");
+      deleteRangerPolicy("alltypestiny_id_mask");
+      deleteRangerPolicy("kudu_id_mask");
+      deleteRangerPolicy("alltypessmall_id_unmask");
+      deleteRangerPolicy("alltypes_sint_mask");
+      deleteRangerPolicy("mv1_alltypes_jointbl_c2_mask");
+    }
+  }
+
+  /**
+   * Validates access privileges are checked inside column-masking/row-filtering
+   * expressions (IMPALA-10728).
+   */
+  @Test
+  public void testPrivInMaskingExprs() throws Exception {
+    // Create a row-filter that contains a subquery on another table. Verify that accesses
+    // inside the subquery are also checked.
+    try {
+      createRowFilteringPolicy("alltypes_subquery_filter", "functional", "alltypes",
+          user_.getShortName(), "id in (select id from functional.alltypestiny)");
+      String[] queries = {
+          "select * from functional.alltypes",
+          "select id from functional.alltypes",
+          "select int_col from functional.alltypes"
+      };
+      for (String q : queries) {
+        authorize(q)
+            .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT),
+                onTable("functional", "alltypestiny", TPrivilegeLevel.SELECT))
+            .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT),
+                onColumn("functional", "alltypestiny", "id", TPrivilegeLevel.SELECT))
+            // Can't read the table if missing SELECT privilege on column "id" of table
+            // "functional.alltypestiny".
+            .error(selectError("functional.alltypestiny"),
+                onTable("functional", "alltypes", TPrivilegeLevel.SELECT))
+            .error(selectError("functional.alltypestiny"),
+                onTable("functional", "alltypes", TPrivilegeLevel.SELECT),
+                onColumn("functional", "alltypestiny", "int_col",
+                    TPrivilegeLevel.SELECT));
+      }
+    } finally {
+      deleteRangerPolicy("alltypes_subquery_filter");
+    }
+    // Create a column-masking policy that masks a column using another column. Verify
+    // that accesses on both columns are checked. Create a column-masking policy that
+    // masks a column to NULL. Verify that access on the column are still checked.
+    try {
+      createColumnMaskingPolicy("alltypes_replace_id", "functional", "alltypes", "id",
+          user_.getShortName(), "CUSTOM", "int_col");
+      createColumnMaskingPolicy("alltypes_nullify_str", "functional", "alltypes",
+          "string_col", user_.getShortName(), "MASK_NULL", /*maskExpr*/null);
+      authorize("select id from functional.alltypes")
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT))
+          .ok(onColumn("functional", "alltypes", "id", TPrivilegeLevel.SELECT),
+              onColumn("functional", "alltypes", "int_col", TPrivilegeLevel.SELECT))
+          .error(selectError("functional.alltypes"),
+              onColumn("functional", "alltypes", "id", TPrivilegeLevel.SELECT))
+          .error(selectError("functional.alltypes"),
+              onColumn("functional", "alltypes", "int_col", TPrivilegeLevel.SELECT));
+      // Although string_col is masked as NULL, we still require access privilege on it.
+      authorize("select bool_col, string_col from functional.alltypes")
+          .ok(onColumn("functional", "alltypes", "bool_col", TPrivilegeLevel.SELECT),
+              onColumn("functional", "alltypes", "string_col", TPrivilegeLevel.SELECT))
+          .error(selectError("functional.alltypes"),
+              onColumn("functional", "alltypes", "bool_col", TPrivilegeLevel.SELECT));
+    } finally {
+      deleteRangerPolicy("alltypes_replace_id");
+      deleteRangerPolicy("alltypes_nullify_str");
     }
   }
 
@@ -3094,8 +3517,6 @@ public class AuthorizationStmtTest extends AuthorizationTestBase {
    */
   @Test
   public void testRangerObjectOwnership() throws Exception {
-    if (authzProvider_ == AuthorizationProvider.SENTRY) return;
-
     // 'as_owner_' is by default set to false for AuthorizationTestBase. But since this
     // test is meant for testing Ranger's behavior when the requesting user is the owner
     // of the resources, we set 'as_owner_' to true.

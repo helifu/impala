@@ -25,6 +25,7 @@
 #include "runtime/raw-value.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/row-batch.h"
+#include "runtime/test-env.h"
 #include "runtime/tuple-row.h"
 #include "service/fe-support.h"
 #include "service/frontend.h"
@@ -45,21 +46,32 @@ const int NULL_VALUE_PERCENT = 10;
 class RowBatchSerializeTest : public testing::Test {
  protected:
   ObjectPool pool_;
-  scoped_ptr<MemTracker> tracker_;
+  std::shared_ptr<MemTracker> tracker_;
+  std::shared_ptr<CharMemTrackerAllocator> char_mem_tracker_allocator_;
 
-  // For computing tuple mem layouts.
-  scoped_ptr<Frontend> fe_;
+  scoped_ptr<TestEnv> test_env_;
+  RuntimeState* runtime_state_ = nullptr;
+
+  TQueryOptions dummy_query_opts_;
 
   virtual void SetUp() {
-    fe_.reset(new Frontend());
+    test_env_.reset(new TestEnv);
+    ASSERT_OK(test_env_->Init());
     tracker_.reset(new MemTracker());
+    char_mem_tracker_allocator_.reset(new CharMemTrackerAllocator(tracker_));
+    ASSERT_OK(test_env_->CreateQueryState(1234, &dummy_query_opts_, &runtime_state_));
   }
 
   virtual void TearDown() {
     pool_.Clear();
+    tracker_->Close();
     tracker_.reset();
-    fe_.reset();
+    test_env_.reset();
+    runtime_state_ = nullptr;
   }
+
+  /// Helper to get frontend from 'test_env_'.
+  Frontend* frontend() const { return test_env_->exec_env()->frontend(); }
 
   // Serializes and deserializes 'batch', then checks that the deserialized batch is valid
   // and has the same contents as 'batch'. If serialization returns an error (e.g. if the
@@ -68,10 +80,10 @@ class RowBatchSerializeTest : public testing::Test {
       bool print_batches, bool full_dedup = false) {
     if (print_batches) cout << PrintBatch(batch) << endl;
 
-    TRowBatch trow_batch;
-    RETURN_IF_ERROR(batch->Serialize(&trow_batch, full_dedup));
+    OutboundRowBatch row_batch(char_mem_tracker_allocator_);
+    RETURN_IF_ERROR(batch->Serialize(&row_batch, full_dedup));
 
-    RowBatch deserialized_batch(&row_desc, trow_batch, tracker_.get());
+    RowBatch deserialized_batch(&row_desc, row_batch, tracker_.get());
     if (print_batches) cout << PrintBatch(&deserialized_batch) << endl;
 
     EXPECT_EQ(batch->num_rows(), deserialized_batch.num_rows());
@@ -79,7 +91,8 @@ class RowBatchSerializeTest : public testing::Test {
       TupleRow* row = batch->GetRow(row_idx);
       TupleRow* deserialized_row = deserialized_batch.GetRow(row_idx);
 
-      for (int tuple_idx = 0; tuple_idx < row_desc.tuple_descriptors().size(); ++tuple_idx) {
+      for (int tuple_idx = 0; tuple_idx < row_desc.tuple_descriptors().size();
+           ++tuple_idx) {
         TupleDescriptor* tuple_desc = row_desc.tuple_descriptors()[tuple_idx];
         Tuple* tuple = row->GetTuple(tuple_idx);
         Tuple* deserialized_tuple = deserialized_row->GetTuple(tuple_idx);
@@ -104,7 +117,7 @@ class RowBatchSerializeTest : public testing::Test {
     // tuple: (int, string, string, string)
     // This uses three strings so that this test can reach INT_MAX+1 without any
     // single string exceeding the 1GB limit on string length (see string-value.h).
-    DescriptorTblBuilder builder(fe_.get(), &pool_);
+    DescriptorTblBuilder builder(frontend(), &pool_);
     builder.DeclareTuple() << TYPE_INT << TYPE_STRING << TYPE_STRING << TYPE_STRING;
     DescriptorTbl* desc_tbl = builder.Build();
 
@@ -203,7 +216,7 @@ class RowBatchSerializeTest : public testing::Test {
       }
 
       if (type.IsCollectionType()) {
-        const TupleDescriptor& item_desc = *slot_desc->collection_item_descriptor();
+        const TupleDescriptor& item_desc = *slot_desc->children_tuple_descriptor();
         CollectionValue* coll_value = reinterpret_cast<CollectionValue*>(slot);
         CollectionValue* deserialized_coll_value =
             reinterpret_cast<CollectionValue*>(deserialized_slot);
@@ -250,10 +263,10 @@ class RowBatchSerializeTest : public testing::Test {
         break;
       }
       case TYPE_ARRAY: {
-        const TupleDescriptor* item_desc = slot_desc.collection_item_descriptor();
+        const TupleDescriptor* item_desc = slot_desc.children_tuple_descriptor();
         int array_len = rand() % (MAX_ARRAY_LEN + 1);
         CollectionValue cv;
-        CollectionValueBuilder builder(&cv, *item_desc, pool, NULL, array_len);
+        CollectionValueBuilder builder(&cv, *item_desc, pool, runtime_state_, array_len);
         Tuple* tuple_mem;
         int n;
         EXPECT_OK(builder.GetFreeMemory(&tuple_mem, &n));
@@ -380,7 +393,7 @@ class RowBatchSerializeTest : public testing::Test {
 
 TEST_F(RowBatchSerializeTest, Basic) {
   // tuple: (int)
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << TYPE_INT;
   DescriptorTbl* desc_tbl = builder.Build();
 
@@ -395,7 +408,7 @@ TEST_F(RowBatchSerializeTest, Basic) {
 
 TEST_F(RowBatchSerializeTest, String) {
   // tuple: (int, string)
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << TYPE_INT << TYPE_STRING;
   DescriptorTbl* desc_tbl = builder.Build();
 
@@ -439,9 +452,9 @@ TEST_F(RowBatchSerializeTest, BasicArray) {
   // tuple: (int, string, array<int>)
   ColumnType array_type;
   array_type.type = TYPE_ARRAY;
-  array_type.children.push_back(TYPE_INT);
+  array_type.children.push_back(ColumnType(TYPE_INT));
 
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << TYPE_INT << TYPE_STRING << array_type;
   DescriptorTbl* desc_tbl = builder.Build();
 
@@ -458,18 +471,21 @@ TEST_F(RowBatchSerializeTest, StringArray) {
   // tuple: (int, string, array<struct<int, string, string>>)
   ColumnType struct_type;
   struct_type.type = TYPE_STRUCT;
-  struct_type.children.push_back(TYPE_INT);
+  struct_type.children.push_back(ColumnType(TYPE_INT));
   struct_type.field_names.push_back("int1");
-  struct_type.children.push_back(TYPE_STRING);
+  struct_type.field_ids.push_back(-1);
+  struct_type.children.push_back(ColumnType(TYPE_STRING));
   struct_type.field_names.push_back("string1");
-  struct_type.children.push_back(TYPE_STRING);
+  struct_type.field_ids.push_back(-1);
+  struct_type.children.push_back(ColumnType(TYPE_STRING));
   struct_type.field_names.push_back("string2");
+  struct_type.field_ids.push_back(-1);
 
   ColumnType array_type;
   array_type.type = TYPE_ARRAY;
   array_type.children.push_back(struct_type);
 
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << TYPE_INT << TYPE_STRING << array_type;
   DescriptorTbl* desc_tbl = builder.Build();
 
@@ -486,14 +502,16 @@ TEST_F(RowBatchSerializeTest, NestedArrays) {
   // tuple: (array<struct<array<string>, array<string, string>>>)
   ColumnType inner_array_type1;
   inner_array_type1.type = TYPE_ARRAY;
-  inner_array_type1.children.push_back(TYPE_STRING);
+  inner_array_type1.children.push_back(ColumnType(TYPE_STRING));
 
   ColumnType inner_struct_type;
   inner_struct_type.type = TYPE_STRUCT;
-  inner_struct_type.children.push_back(TYPE_STRING);
+  inner_struct_type.children.push_back(ColumnType(TYPE_STRING));
   inner_struct_type.field_names.push_back("string1");
-  inner_struct_type.children.push_back(TYPE_STRING);
+  inner_struct_type.field_ids.push_back(-1);
+  inner_struct_type.children.push_back(ColumnType(TYPE_STRING));
   inner_struct_type.field_names.push_back("string2");
+  inner_struct_type.field_ids.push_back(-1);
 
   ColumnType inner_array_type2;
   inner_array_type2.type = TYPE_ARRAY;
@@ -503,14 +521,16 @@ TEST_F(RowBatchSerializeTest, NestedArrays) {
   struct_type.type = TYPE_STRUCT;
   struct_type.children.push_back(inner_array_type1);
   struct_type.field_names.push_back("array1");
+  struct_type.field_ids.push_back(-1);
   struct_type.children.push_back(inner_array_type2);
   struct_type.field_names.push_back("array2");
+  struct_type.field_ids.push_back(-1);
 
   ColumnType array_type;
   array_type.type = TYPE_ARRAY;
   array_type.children.push_back(struct_type);
 
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << array_type;
   DescriptorTbl* desc_tbl = builder.Build();
 
@@ -534,7 +554,7 @@ TEST_F(RowBatchSerializeTest, DupCorrectnessFull) {
 
 void RowBatchSerializeTest::TestDupCorrectness(bool full_dedup) {
   // tuples: (int), (string)
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << TYPE_INT;
   builder.DeclareTuple() << TYPE_STRING;
   DescriptorTbl* desc_tbl = builder.Build();
@@ -575,7 +595,7 @@ TEST_F(RowBatchSerializeTest, DupRemovalFull) {
 // Test that tuple deduplication results in the expected reduction in serialized size.
 void RowBatchSerializeTest::TestDupRemoval(bool full_dedup) {
   // tuples: (int, string)
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << TYPE_INT << TYPE_STRING;
   DescriptorTbl* desc_tbl = builder.Build();
 
@@ -592,14 +612,14 @@ void RowBatchSerializeTest::TestDupRemoval(bool full_dedup) {
   vector<Tuple*> tuples;
   CreateTuples(tuple_desc, batch->tuple_data_pool(), num_distinct_tuples, 0, 10, &tuples);
   AddTuplesToRowBatch(num_rows, tuples, repeats, batch);
-  TRowBatch trow_batch;
-  EXPECT_OK(batch->Serialize(&trow_batch, full_dedup));
+  OutboundRowBatch row_batch(char_mem_tracker_allocator_);
+  EXPECT_OK(batch->Serialize(&row_batch, full_dedup));
   // Serialized data should only have one copy of each tuple.
   int64_t total_byte_size = 0; // Total size without duplication
   for (int i = 0; i < tuples.size(); ++i) {
     total_byte_size += tuples[i]->TotalByteSize(tuple_desc);
   }
-  EXPECT_EQ(total_byte_size, trow_batch.uncompressed_size);
+  EXPECT_EQ(total_byte_size, row_batch.header()->uncompressed_size());
   TestRowBatch(row_desc, batch, false, full_dedup);
 }
 
@@ -614,7 +634,7 @@ TEST_F(RowBatchSerializeTest, ConsecutiveNullsFull) {
 // Test that deduplication handles NULL tuples correctly.
 void RowBatchSerializeTest::TestConsecutiveNulls(bool full_dedup) {
   // tuples: (int)
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << TYPE_INT;
   DescriptorTbl* desc_tbl = builder.Build();
   vector<bool> nullable_tuples(1, true);
@@ -642,7 +662,7 @@ TEST_F(RowBatchSerializeTest, ZeroLengthTuplesDedup) {
 
 void RowBatchSerializeTest::TestZeroLengthTuple(bool full_dedup) {
   // tuples: (int), (string), ()
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << TYPE_INT;
   builder.DeclareTuple() << TYPE_STRING;
   builder.DeclareTuple();
@@ -668,8 +688,8 @@ TEST_F(RowBatchSerializeTest, DedupPathologicalFull) {
   // Need 3 tuples + array to enable non-adjacent dedup automatically
   ColumnType array_type;
   array_type.type = TYPE_ARRAY;
-  array_type.children.push_back(TYPE_STRING);
-  DescriptorTblBuilder builder(fe_.get(), &pool_);
+  array_type.children.push_back(ColumnType(TYPE_STRING));
+  DescriptorTblBuilder builder(frontend(), &pool_);
   builder.DeclareTuple() << TYPE_INT;
   builder.DeclareTuple() << TYPE_INT;
   builder.DeclareTuple() << array_type;
@@ -705,7 +725,7 @@ TEST_F(RowBatchSerializeTest, DedupPathologicalFull) {
   // The last tuple is a duplicated array with a large string inside.
   const TupleDescriptor* array_tuple_desc = row_desc.tuple_descriptors()[array_tuple_idx];
   const SlotDescriptor* array_slot_desc = array_tuple_desc->slots()[0];
-  const TupleDescriptor* array_item_desc = array_slot_desc->collection_item_descriptor();
+  const TupleDescriptor* array_item_desc = array_slot_desc->children_tuple_descriptor();
   const SlotDescriptor* string_slot_desc = array_item_desc->slots()[0];
   MemPool* pool = batch->tuple_data_pool();
   for (int i = 0; i < num_distinct_array_tuples; ++i) {
@@ -730,15 +750,16 @@ TEST_F(RowBatchSerializeTest, DedupPathologicalFull) {
   // Full dedup should be automatically enabled because of row batch structure.
   EXPECT_TRUE(UseFullDedup(batch));
   LOG(INFO) << "Serializing row batch";
-  TRowBatch trow_batch;
-  EXPECT_OK(batch->Serialize(&trow_batch));
-  LOG(INFO) << "Serialized batch size: " << trow_batch.tuple_data.size();
-  LOG(INFO) << "Serialized batch uncompressed size: " << trow_batch.uncompressed_size;
+  OutboundRowBatch row_batch(char_mem_tracker_allocator_);
+  EXPECT_OK(batch->Serialize(&row_batch));
+  LOG(INFO) << "Serialized batch size: " << row_batch.TupleDataAsSlice().size();
+  LOG(INFO) << "Serialized batch uncompressed size: "
+            << row_batch.header()->uncompressed_size();
   LOG(INFO) << "Serialized batch expected size: " << total_byte_size;
   // Serialized data should only have one copy of each tuple.
-  EXPECT_EQ(total_byte_size, trow_batch.uncompressed_size);
+  EXPECT_EQ(total_byte_size, row_batch.header()->uncompressed_size());
   LOG(INFO) << "Deserializing row batch";
-  RowBatch deserialized_batch(&row_desc, trow_batch, tracker_.get());
+  RowBatch deserialized_batch(&row_desc, row_batch, tracker_.get());
   LOG(INFO) << "Verifying row batch";
   // Need to do special verification: comparing all duplicate strings is too slow.
   EXPECT_EQ(batch->num_rows(), deserialized_batch.num_rows());

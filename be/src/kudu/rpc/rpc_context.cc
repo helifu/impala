@@ -48,12 +48,10 @@ namespace rpc {
 
 RpcContext::RpcContext(InboundCall *call,
                        const google::protobuf::Message *request_pb,
-                       google::protobuf::Message *response_pb,
-                       scoped_refptr<ResultTracker> result_tracker)
+                       google::protobuf::Message *response_pb)
   : call_(CHECK_NOTNULL(call)),
     request_pb_(request_pb),
-    response_pb_(response_pb),
-    result_tracker_(std::move(result_tracker)) {
+    response_pb_(response_pb) {
   VLOG(4) << call_->remote_method().service_name() << ": Received RPC request for "
           << call_->ToString() << ":" << std::endl << SecureDebugString(*request_pb_);
   TRACE_EVENT_ASYNC_BEGIN2("rpc_call", "RPC", this,
@@ -64,10 +62,15 @@ RpcContext::RpcContext(InboundCall *call,
 RpcContext::~RpcContext() {
 }
 
+void RpcContext::SetResultTracker(scoped_refptr<ResultTracker> result_tracker) {
+  DCHECK(!result_tracker_);
+  result_tracker_ = std::move(result_tracker);
+}
+
 void RpcContext::RespondSuccess() {
   if (AreResultsTracked()) {
     result_tracker_->RecordCompletionAndRespond(call_->header().request_id(),
-                                                response_pb_.get());
+                                                response_pb_);
   } else {
     VLOG(4) << call_->remote_method().service_name() << ": Sending RPC success response for "
         << call_->ToString() << ":" << std::endl << SecureDebugString(*response_pb_);
@@ -82,7 +85,7 @@ void RpcContext::RespondSuccess() {
 void RpcContext::RespondNoCache() {
   if (AreResultsTracked()) {
     result_tracker_->FailAndRespond(call_->header().request_id(),
-                                    response_pb_.get());
+                                    response_pb_);
   } else {
     VLOG(4) << call_->remote_method().service_name() << ": Sending RPC failure response for "
         << call_->ToString() << ": " << SecureDebugString(*response_pb_);
@@ -140,6 +143,10 @@ const rpc::RequestIdPB* RpcContext::request_id() const {
   return call_->header().has_request_id() ? &call_->header().request_id() : nullptr;
 }
 
+int32_t RpcContext::call_id() const {
+  return call_->call_id();
+}
+
 size_t RpcContext::GetTransferSize() const {
   return call_->GetTransferSize();
 }
@@ -148,7 +155,7 @@ Status RpcContext::AddOutboundSidecar(unique_ptr<RpcSidecar> car, int* idx) {
   return call_->AddOutboundSidecar(std::move(car), idx);
 }
 
-Status RpcContext::GetInboundSidecar(int idx, Slice* slice) {
+Status RpcContext::GetInboundSidecar(int idx, Slice* slice) const {
   return call_->GetInboundSidecar(idx, slice);
 }
 
@@ -173,11 +180,11 @@ std::string RpcContext::requestor_string() const {
     call_->remote_address().ToString();
 }
 
-std::string RpcContext::method_name() const {
+const std::string& RpcContext::method_name() const {
   return call_->remote_method().method_name();
 }
 
-std::string RpcContext::service_name() const {
+const std::string& RpcContext::service_name() const {
   return call_->remote_method().service_name();
 }
 
@@ -189,7 +196,11 @@ MonoTime RpcContext::GetTimeReceived() const {
   return call_->GetTimeReceived();
 }
 
-Trace* RpcContext::trace() {
+MonoTime RpcContext::GetTimeHandled() const {
+  return call_->GetTimeHandled();
+}
+
+Trace* RpcContext::trace() const {
   return call_->trace();
 }
 

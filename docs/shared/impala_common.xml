@@ -1514,22 +1514,22 @@ alter table partitioned_data set tblproperties ('numRows'='1030000', 'STATS_GENE
       </p>
 
       <p id="live_reporting_details">
-        The output from this query option is printed to standard error. The output is only
-        displayed in interactive mode, that is, not when the <codeph>-q</codeph> or
-        <codeph>-f</codeph> options are used.
+        The output from this query option is printed to standard
+        error. The output is  displayed only in interactive mode, not when the <codeph>-q</codeph>
+        or <codeph>-f</codeph> options are used. 
       </p>
 
-      <p id="live_progress_live_summary_asciinema">
-        To see how the <codeph>LIVE_PROGRESS</codeph> and <codeph>LIVE_SUMMARY</codeph> query
+      <p id="live_progress_live_summary_asciinema">To see how the <codeph>LIVE_PROGRESS</codeph> and <codeph>LIVE_SUMMARY</codeph> query
         options work in real time, see
         <xref href="https://asciinema.org/a/1rv7qippo0fe7h5k1b6k4nexk" scope="external" format="html">this
-        animated demo</xref>.
+          animated demo</xref>.
       </p>
-
+      
       <p rev="2.5.0" id="runtime_filter_mode_blurb">
-        Because the runtime filtering feature is enabled by default only for local processing,
-        the other filtering-related query options have the greatest effect when used in
-        combination with the setting <codeph>RUNTIME_FILTER_MODE=GLOBAL</codeph>.
+        Because the runtime filtering feature is
+        enabled by default only for local processing, the other filtering-related query options have
+        the greatest effect when used in combination with the setting
+          <codeph>RUNTIME_FILTER_MODE=GLOBAL</codeph>. 
       </p>
 
       <note id="square_bracket_hint_caveat" rev="IMPALA-2522">
@@ -3175,8 +3175,9 @@ flight_num:           INT32 SNAPPY DO:83456393 FPO:83488603 SZ:10216514/11474301
 
       <p id="impala_parquet_encodings_caveat">
         Impala can query Parquet files that use the <codeph>PLAIN</codeph>,
-        <codeph>PLAIN_DICTIONARY</codeph>, <codeph>BIT_PACKED</codeph>, and <codeph>RLE</codeph>
-        encodings. Currently, Impala does not support <codeph>RLE_DICTIONARY</codeph> encoding.
+        <codeph>PLAIN_DICTIONARY</codeph>, <codeph>BIT_PACKED</codeph>, <codeph>RLE</codeph>
+        and <codeph>RLE_DICTIONARY</codeph> encodings. <codeph>RLE_DICTIONARY</codeph> is supported
+        only in <keyword keyref="impala40"/> and up.
         When creating files outside of Impala for use by Impala, make sure to use one of the
         supported encodings. In particular, for MapReduce jobs,
         <codeph>parquet.writer.version</codeph> must not be defined (especially as
@@ -3347,6 +3348,17 @@ flight_num:           INT32 SNAPPY DO:83456393 FPO:83488603 SZ:10216514/11474301
 <codeblock>isi hdfs settings modify --default-block-size=256MB</codeblock>
       </p>
 
+      <p id="ozone_blurb" rev="4.2.0">
+        <b>Ozone considerations:</b>
+      </p>
+
+      <p id="ozone_block_size_caveat" rev="4.2.0">
+        Because Apache Ozone storage buckets use a global value for the block size rather than
+        a configurable value for each file, the <codeph>PARQUET_FILE_SIZE</codeph> query option
+        has no effect when Impala inserts data into a table or partition residing on Ozone
+        storage.
+      </p>
+
       <p id="hbase_blurb">
         <b>HBase considerations:</b>
       </p>
@@ -3361,6 +3373,15 @@ flight_num:           INT32 SNAPPY DO:83456393 FPO:83488603 SZ:10216514/11474301
 
       <p id="hbase_no">
         <b>HBase considerations:</b> This data type cannot be used with HBase tables.
+      </p>
+
+      <p id="iceberg_blurb">
+        <b>Iceberg considerations:</b>
+      </p>
+
+      <p id="iceberg_load_data">
+        See <xref href="../topics/impala_iceberg.xml#iceberg_load"/> for details about
+        <codeph>LOAD DATA</codeph> with Iceberg.
       </p>
 
       <p id="internals_blurb">
@@ -4509,10 +4530,9 @@ sudo pip-python install ssl</codeblock>
         Currently, the <codeph>INSERT OVERWRITE</codeph> syntax cannot be used with Kudu tables.
       </p>
 
-      <p id="kudu_unsupported_data_type" rev="kudu">
-        Currently, the data types <codeph>CHAR</codeph>, <codeph>VARCHAR</codeph>,
-        <codeph>ARRAY</codeph>, <codeph>MAP</codeph>, and <codeph>STRUCT</codeph> cannot be used
-        with Kudu tables.
+      <p id="kudu_unsupported_data_type" rev="kudu"> Currently, the data types
+        <codeph>CHAR</codeph>, <codeph>ARRAY</codeph>, <codeph>MAP</codeph>, and
+          <codeph>STRUCT</codeph> cannot be used with Kudu tables.
       </p>
 
       <p id="kudu_non_pk_data_type" rev="kudu">
@@ -4564,38 +4584,19 @@ CREATE EXTERNAL TABLE impala_name STORED AS KUDU
         in the underlying Kudu table, in contrast to an HDFS-backed external
         table where existing data files are left untouched.</p>
 
-      <p id="kudu_sentry_limitations" rev="IMPALA-4000">
-        Access to Kudu tables must be granted to and revoked from roles with the following
-        considerations:
-        <ul>
-          <li>
-            Only users with the <codeph>ALL</codeph> privilege on <codeph>SERVER</codeph> can
-            create external Kudu tables.
-          </li>
-
-          <li>
-            The <codeph>ALL</codeph> privileges on <codeph>SERVER</codeph> is required to
-            specify the <codeph>kudu.master_addresses</codeph> property in the <codeph>CREATE
-            TABLE</codeph> statements for managed tables as well as external tables.
-          </li>
-
-          <li>
-            Access to Kudu tables is enforced at the table level and at the column level.
-          </li>
-
-          <li>
-            The <codeph>SELECT</codeph>- and <codeph>INSERT</codeph>-specific permissions are
-            supported.
-          </li>
-
-          <li>
-            The <codeph>DELETE</codeph>, <codeph>UPDATE</codeph>, and <codeph>UPSERT</codeph>
-            operations require the <codeph>ALL</codeph> privilege.
-          </li>
-        </ul>
-        Because non-SQL APIs can access Kudu data without going through Sentry authorization,
-        currently the Sentry support is considered preliminary and subject to change.
-      </p>
+      <p id="kudu_sentry_limitations" rev="IMPALA-4000"> Access to Kudu tables must be granted to
+        and revoked from principal with the following considerations: <ul>
+          <li> Only users with the <codeph>ALL</codeph> privilege on <codeph>SERVER</codeph> can
+            create external Kudu tables. </li>
+          <li> The <codeph>ALL</codeph> privileges on <codeph>SERVER</codeph> is required to specify
+            the <codeph>kudu.master_addresses</codeph> property in the <codeph>CREATE TABLE</codeph>
+            statements for managed tables as well as external tables. </li>
+          <li> Access to Kudu tables is enforced at the table level and at the column level. </li>
+          <li> The <codeph>SELECT</codeph>- and <codeph>INSERT</codeph>-specific permissions are
+            supported. </li>
+          <li> The <codeph>DELETE</codeph>, <codeph>UPDATE</codeph>, and <codeph>UPSERT</codeph>
+            operations require the <codeph>ALL</codeph> privilege. </li>
+        </ul></p>
 
       <p rev="2.9.0 IMPALA-5137" id="kudu_timestamp_nanoseconds_caveat">
         The nanosecond portion of an Impala <codeph>TIMESTAMP</codeph> value is rounded to the

@@ -15,11 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.skip import SkipIf
 
-@SkipIf.not_hdfs
+
+@SkipIf.not_dfs
 class TestHedgedReads(CustomClusterTestSuite):
   """ Exercises the hedged reads code path.
       NOTE: We unfortunately cannot force hedged reads on a minicluster, but we enable

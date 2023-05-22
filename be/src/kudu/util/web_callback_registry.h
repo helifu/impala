@@ -14,14 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_UTIL_WEB_CALLBACK_REGISTRY_H
-#define KUDU_UTIL_WEB_CALLBACK_REGISTRY_H
+#pragma once
 
-#include <iosfwd>
+#include <functional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
-
-#include <boost/function.hpp>
 
 #include "kudu/util/easy_json.h"
 
@@ -29,7 +27,9 @@ namespace kudu {
 
 enum class HttpStatusCode {
   Ok, // 200
+  TemporaryRedirect, //307
   BadRequest, // 400
+  AuthenticationRequired, // 401
   NotFound, // 404
   LengthRequired, // 411
   RequestEntityTooLarge, // 413
@@ -53,6 +53,9 @@ class WebCallbackRegistry {
     // The query string, parsed into key/value argument pairs.
     ArgumentMap parsed_args;
 
+    // The HTTP request headers.
+    ArgumentMap request_headers;
+
     // The raw query string passed in the URL. May be empty.
     std::string query_string;
 
@@ -61,42 +64,48 @@ class WebCallbackRegistry {
 
     // In the case of a POST, the posted data.
     std::string post_data;
-  };
 
-  typedef std::unordered_map<std::string, std::string> HttpResponseHeaders;
+    // The socket address of the requester, <host>:<port>.
+    // Define this variable for IMPALA-9182.
+    std::string source_socket;
+
+    // Authenticated user, or 'anonymous' if no auth used
+    // Define this variable for IMPALA-10779.
+    std::string source_user = "anonymous";
+  };
 
   // A response to an HTTP request whose body is rendered by template.
   struct WebResponse {
     // Determines the status code of the HTTP response.
-    HttpStatusCode status_code;
+    HttpStatusCode status_code = HttpStatusCode::Ok;
 
     // Additional headers added to the HTTP response.
-    HttpResponseHeaders response_headers;
+    ArgumentMap response_headers;
 
     // A JSON object to be rendered to HTML by a mustache template.
-    EasyJson* output;
+    EasyJson output;
   };
 
   // A response to an HTTP request.
   struct PrerenderedWebResponse {
     // Determines the status code of the HTTP response.
-    HttpStatusCode status_code;
+    HttpStatusCode status_code = HttpStatusCode::Ok;
 
     // Additional headers added to the HTTP response.
-    HttpResponseHeaders response_headers;
+    ArgumentMap response_headers;
 
     // The fully-rendered HTML response body.
-    std::ostringstream* output;
+    std::ostringstream output;
   };
 
   // A function that handles an HTTP request where the response body will be rendered
   // with a mustache template from the JSON object held by 'resp'.
-  typedef boost::function<void (const WebRequest& args, WebResponse* resp)>
+  typedef std::function<void (const WebRequest& args, WebResponse* resp)>
       PathHandlerCallback;
 
   // A function that handles an HTTP request, where the response body is the contents
   // of the 'output' member of 'resp'.
-  typedef boost::function<void (const WebRequest& args, PrerenderedWebResponse* resp)>
+  typedef std::function<void (const WebRequest& args, PrerenderedWebResponse* resp)>
       PrerenderedPathHandlerCallback;
 
   virtual ~WebCallbackRegistry() {}
@@ -122,8 +131,9 @@ class WebCallbackRegistry {
                                               const PrerenderedPathHandlerCallback& callback,
                                               bool is_styled,
                                               bool is_on_nav_bar) = 0;
+
+  // Returns true if 'req' was proxied via Knox, false otherwise.
+  static bool IsProxiedViaKnox(const WebRequest& req);
 };
 
 } // namespace kudu
-
-#endif /* KUDU_UTIL_WEB_CALLBACK_REGISTRY_H */

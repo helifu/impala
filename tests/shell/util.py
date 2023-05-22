@@ -1,5 +1,5 @@
 #!/usr/bin/env impala-python
-# encoding=utf-8
+# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -18,30 +18,46 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+import logging
 import os
+import socket
+from contextlib import closing
+
+import pexpect
 import pytest
 import re
 import shlex
+import sys
 import time
 from subprocess import Popen, PIPE
 
 from tests.common.environ import (IMPALA_LOCAL_BUILD_VERSION,
                                   ImpalaTestClusterProperties)
+from tests.common.impala_service import ImpaladService
 from tests.common.impala_test_suite import (IMPALAD_BEESWAX_HOST_PORT,
-    IMPALAD_HS2_HOST_PORT, IMPALAD_HS2_HTTP_HOST_PORT)
+    IMPALAD_HS2_HOST_PORT, IMPALAD_HS2_HTTP_HOST_PORT,
+    STRICT_HS2_HOST_PORT, STRICT_HS2_HTTP_HOST_PORT)
+from tests.common.test_vector import ImpalaTestDimension
 
+LOG = logging.getLogger('tests/shell/util.py')
+LOG.addHandler(logging.StreamHandler())
 
 SHELL_HISTORY_FILE = os.path.expanduser("~/.impalahistory")
 IMPALA_HOME = os.environ['IMPALA_HOME']
 
-if ImpalaTestClusterProperties.get_instance().is_remote_cluster():
-  # With remote cluster testing, we cannot assume that the shell was built locally.
-  IMPALA_SHELL_EXECUTABLE = os.path.join(IMPALA_HOME, "bin/impala-shell.sh")
-else:
-  # Test the locally built shell distribution.
-  IMPALA_SHELL_EXECUTABLE = os.path.join(
-      IMPALA_HOME, "shell/build", "impala-shell-" + IMPALA_LOCAL_BUILD_VERSION,
-      "impala-shell")
+def build_shell_env(env=None):
+  """ Construct the environment for the shell to run in based on 'env', or the current
+  process's environment if env is None."""
+  if not env: env = os.environ
+  # Don't inherit PYTHONPATH or LD_LIBRARY_PATH - the shell launch script must set
+  # these to include dependencies. Copy 'env' to avoid mutating argument or os.environ.
+  env = dict(env)
+  if "PYTHONPATH" in env:
+    del env["PYTHONPATH"]
+  if "LD_LIBRARY_PATH" in env:
+    del env["LD_LIBRARY_PATH"]
+  return env
 
 
 def assert_var_substitution(result):
@@ -100,14 +116,17 @@ def assert_pattern(pattern, result, text, message):
 
 
 def run_impala_shell_cmd(vector, shell_args, env=None, expect_success=True,
-                         stdin_input=None, wait_until_connected=True):
+                         stdin_input=None, wait_until_connected=True,
+                         stdout_file=None, stderr_file=None):
   """Runs the Impala shell on the commandline.
 
   'shell_args' is a string which represents the commandline options.
   Returns a ImpalaShellResult.
   """
   result = run_impala_shell_cmd_no_expect(vector, shell_args, env, stdin_input,
-                                          expect_success and wait_until_connected)
+                                          expect_success and wait_until_connected,
+                                          stdout_file=stdout_file,
+                                          stderr_file=stderr_file)
   if expect_success:
     assert result.rc == 0, "Cmd %s was expected to succeed: %s" % (shell_args,
                                                                    result.stderr)
@@ -117,7 +136,8 @@ def run_impala_shell_cmd(vector, shell_args, env=None, expect_success=True,
 
 
 def run_impala_shell_cmd_no_expect(vector, shell_args, env=None, stdin_input=None,
-                                   wait_until_connected=True):
+                                   wait_until_connected=True, stdout_file=None,
+                                   stderr_file=None):
   """Runs the Impala shell on the commandline.
 
   'shell_args' is a string which represents the commandline options.
@@ -125,7 +145,8 @@ def run_impala_shell_cmd_no_expect(vector, shell_args, env=None, stdin_input=Non
 
   Does not assert based on success or failure of command.
   """
-  p = ImpalaShell(vector, shell_args, env=env, wait_until_connected=wait_until_connected)
+  p = ImpalaShell(vector, shell_args, env=env, wait_until_connected=wait_until_connected,
+                  stdout_file=stdout_file, stderr_file=stderr_file)
   result = p.get_result(stdin_input)
   return result
 
@@ -133,10 +154,17 @@ def run_impala_shell_cmd_no_expect(vector, shell_args, env=None, stdin_input=Non
 def get_impalad_host_port(vector):
   """Get host and port to connect to based on test vector provided."""
   protocol = vector.get_value("protocol")
+  strict = vector.get_value_with_default("strict_hs2_protocol", False)
   if protocol == 'hs2':
-    return IMPALAD_HS2_HOST_PORT
+    if strict:
+      return STRICT_HS2_HOST_PORT
+    else:
+      return IMPALAD_HS2_HOST_PORT
   elif protocol == 'hs2-http':
-    return IMPALAD_HS2_HTTP_HOST_PORT
+    if strict:
+      return STRICT_HS2_HTTP_HOST_PORT
+    else:
+      return IMPALAD_HS2_HTTP_HOST_PORT
   else:
     assert protocol == 'beeswax', protocol
     return IMPALAD_BEESWAX_HOST_PORT
@@ -150,9 +178,23 @@ def get_impalad_port(vector):
 def get_shell_cmd(vector):
   """Get the basic shell command to start the shell, given the provided test vector.
   Returns the command as a list of string arguments."""
-  return [IMPALA_SHELL_EXECUTABLE,
-          "--protocol={0}".format(vector.get_value("protocol")),
-          "-i{0}".format(get_impalad_host_port(vector))]
+  impala_shell_executable = get_impala_shell_executable(vector)
+  if vector.get_value_with_default("strict_hs2_protocol", False):
+    protocol = vector.get_value("protocol")
+    return impala_shell_executable + [
+            "--protocol={0}".format(protocol),
+            "--strict_hs2_protocol",
+            "--use_ldap_test_password",
+            "-i{0}".format(get_impalad_host_port(vector))]
+  else:
+    return impala_shell_executable + [
+            "--protocol={0}".format(vector.get_value("protocol")),
+            "-i{0}".format(get_impalad_host_port(vector))]
+
+
+def spawn_shell(shell_cmd):
+  """Spawn a shell process with the provided command line. Returns the Pexpect object."""
+  return pexpect.spawn(shell_cmd[0], shell_cmd[1:], env=build_shell_env())
 
 
 def get_open_sessions_metric(vector):
@@ -172,16 +214,21 @@ class ImpalaShellResult(object):
 
 
 class ImpalaShell(object):
-  """A single instance of the Impala shell. The proces is started when this object is
+  """A single instance of the Impala shell. The process is started when this object is
      constructed, and then users should repeatedly call send_cmd(), followed eventually by
      get_result() to retrieve the process output. This constructor will wait until
      Impala shell is connected for the specified timeout unless wait_until_connected is
      set to False or --quiet is passed into the args."""
-  def __init__(self, vector, args=None, env=None, wait_until_connected=True, timeout=60):
-    self.shell_process = self._start_new_shell_process(vector, args, env=env)
+  def __init__(self, vector, args=None, env=None, wait_until_connected=True, timeout=60,
+               stdout_file=None, stderr_file=None):
+    self.shell_process = self._start_new_shell_process(vector, args, env=env,
+                                                       stdout_file=stdout_file,
+                                                       stderr_file=stderr_file)
     # When --quiet option is passed to Impala shell, we should not wait until we see
-    # "Connected to" because it will never be printed to stderr.
-    if wait_until_connected and (args is None or "--quiet" not in args):
+    # "Connected to" because it will never be printed to stderr. The same is true
+    # if stderr is redirected.
+    if wait_until_connected and (args is None or "--quiet" not in args) and \
+       stderr_file is None:
       start_time = time.time()
       connected = False
       while time.time() - start_time < timeout and not connected:
@@ -226,15 +273,90 @@ class ImpalaShell(object):
     result.rc = self.shell_process.returncode
     return result
 
-  def _start_new_shell_process(self, vector, args=None, env=None):
+  def _start_new_shell_process(self, vector, args=None, env=None, stdout_file=None,
+                               stderr_file=None):
     """Starts a shell process and returns the process handle"""
     cmd = get_shell_cmd(vector)
     if args is not None: cmd += args
-    if not env: env = os.environ
-    # Don't inherit PYTHONPATH - the shell launch script should set up PYTHONPATH
-    # to include dependencies. Copy 'env' to avoid mutating argument or os.environ.
-    env = dict(env)
-    if "PYTHONPATH" in env:
-      del env["PYTHONPATH"]
-    return Popen(cmd, shell=False, stdout=PIPE, stdin=PIPE, stderr=PIPE,
-                 env=env)
+    stdout_arg = stdout_file if stdout_file is not None else PIPE
+    stderr_arg = stderr_file if stderr_file is not None else PIPE
+    return Popen(cmd, shell=False, stdout=stdout_arg, stdin=PIPE, stderr=stderr_arg,
+                 env=build_shell_env(env))
+
+
+def get_unused_port():
+  """ Find an unused port http://stackoverflow.com/questions/1365265 """
+  with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+    s.bind(('', 0))
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    return s.getsockname()[1]
+
+
+def wait_for_query_state(vector, stmt, state, max_retry=15):
+  """Waits for the given query 'stmt' to reach the given query 'state'. The state of the
+  query is taken from the debug web ui. Polls the state of 'stmt' every second until the
+  query gets to a state given via 'state' or a maximum retry count is reached.
+  Restriction: Only works if there is only one in flight query."""
+  impalad_service = ImpaladService(get_impalad_host_port(vector).split(':')[0])
+  if not impalad_service.wait_for_num_in_flight_queries(1):
+    raise Exception("No in flight query found")
+
+  retry_count = 0
+  while retry_count <= max_retry:
+    query_info = impalad_service.get_in_flight_queries()[0]
+    print(str(query_info))
+    if query_info['stmt'] != stmt:
+      exc_text = "The found in flight query is not the one under test: " + \
+          query_info['stmt']
+      raise Exception(exc_text)
+    if query_info['state'] == state:
+      return
+    retry_count += 1
+    time.sleep(1.0)
+  raise Exception("Query didn't reach desired state: " + state)
+
+
+# Returns shell executable, and whether to include pypi variants
+def get_dev_impala_shell_executable():
+  # Note that pytest.config.getoption is deprecated usage. We use this
+  # in a couple of other places. Ultimately, it needs to be addressed if
+  # we ever want to get off of pytest 2.9.2.
+  impala_shell_executable = pytest.config.getoption('shell_executable')
+
+  if impala_shell_executable is not None:
+    return impala_shell_executable, False
+
+  if ImpalaTestClusterProperties.get_instance().is_remote_cluster():
+    # With remote cluster testing, we cannot assume that the shell was built locally.
+    return os.path.join(IMPALA_HOME, "bin/impala-shell.sh"), False
+  else:
+    # Test the locally built shell distribution.
+    return os.path.join(IMPALA_HOME, "shell/build",
+        "impala-shell-" + IMPALA_LOCAL_BUILD_VERSION, "impala-shell"), True
+
+
+def create_impala_shell_executable_dimension(dev_only=False):
+  _, include_pypi = get_dev_impala_shell_executable()
+  dimensions = []
+  if os.getenv("IMPALA_SYSTEM_PYTHON2"):
+    dimensions.append('dev')
+  if os.getenv("IMPALA_SYSTEM_PYTHON3"):
+    dimensions.append('dev3')
+  if include_pypi and not dev_only:
+    if os.getenv("IMPALA_SYSTEM_PYTHON2"):
+      dimensions.append('python2')
+    if os.getenv("IMPALA_SYSTEM_PYTHON3"):
+      dimensions.append('python3')
+  return ImpalaTestDimension('impala_shell', *dimensions)
+
+
+def get_impala_shell_executable(vector):
+  # impala-shell is invoked some places where adding a test vector may not make sense;
+  # use 'dev' as the default.
+  impala_shell_executable, _ = get_dev_impala_shell_executable()
+  return {
+    'dev': [impala_shell_executable],
+    'dev3': ['env', 'IMPALA_PYTHON_EXECUTABLE=python3', impala_shell_executable],
+    'python2': [os.path.join(IMPALA_HOME, 'shell/build/py2_venv/bin/impala-shell')],
+    'python3': [os.path.join(IMPALA_HOME, 'shell/build/py3_venv/bin/impala-shell')]
+  }[vector.get_value_with_default('impala_shell', 'dev')]

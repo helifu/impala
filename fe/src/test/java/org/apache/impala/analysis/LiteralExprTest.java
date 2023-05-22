@@ -24,10 +24,6 @@ import static org.junit.Assert.fail;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.FrontendTestBase;
-import org.apache.impala.common.ImpalaException;
-import org.apache.impala.common.SqlCastException;
-import org.apache.impala.rewrite.ExprRewriteRule;
-import org.apache.impala.rewrite.FoldConstantsRule;
 import org.junit.Test;
 
 /**
@@ -48,6 +44,7 @@ public class LiteralExprTest extends FrontendTestBase {
     testLiteralExprPositive("1.0", Type.FLOAT);
     testLiteralExprPositive("1.0", Type.DOUBLE);
     testLiteralExprPositive("ABC", Type.STRING);
+    testLiteralExprPositive("ABC", Type.BINARY);
     testLiteralExprPositive("1.1", ScalarType.createDecimalType(2, 1));
     testLiteralExprPositive("2001-02-28", Type.DATE);
 
@@ -76,7 +73,7 @@ public class LiteralExprTest extends FrontendTestBase {
   private void testLiteralExprPositive(String value, Type type) {
     LiteralExpr expr = null;
     try {
-      expr = LiteralExpr.create(value, type);
+      expr = LiteralExpr.createFromUnescapedStr(value, type);
     } catch (Exception e) {
       fail("\nFailed to create LiteralExpr of type: " + type.toString() +
           " from: " + value + " due to " + e.getMessage() + "\n");
@@ -90,7 +87,7 @@ public class LiteralExprTest extends FrontendTestBase {
     boolean failure = false;
     LiteralExpr expr = null;
     try {
-      expr = LiteralExpr.create(value, type);
+      expr = LiteralExpr.createFromUnescapedStr(value, type);
     } catch (Exception e) {
       failure = true;
     }

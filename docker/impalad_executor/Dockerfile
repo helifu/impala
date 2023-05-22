@@ -18,6 +18,17 @@
 ARG BASE_IMAGE=impala_base
 FROM ${BASE_IMAGE}
 
+# IMPALA-10278: Temporarily switch back to including all the same libraries
+# as the coordinator. This will require further changes to exec-lib to be
+# able to use it here.
+COPY --chown=impala lib /opt/impala/lib
+
+# Run the daemon_entrypoint.sh script as a sanity check. This verifies that
+# daemon_entrypoint.sh is detecting Java appropriately and constructing a
+# LD_LIBRARY_PATH that allows impalad to start. The --version flag exits
+# before starting the JVM, so that is the limit of this check.
+RUN /opt/impala/bin/daemon_entrypoint.sh /opt/impala/bin/impalad --version
+
 # Externally-facing ports
 # Debug webserver
 EXPOSE 25000
@@ -26,4 +37,5 @@ ENTRYPOINT ["/opt/impala/bin/daemon_entrypoint.sh", "/opt/impala/bin/impalad",\
      "-log_dir=/opt/impala/logs",\
      "-abort_on_config_error=false", "-state_store_host=statestored",\
      "-catalog_service_host=catalogd", "-is_coordinator=false",\
-     "-mem_limit_includes_jvm=true", "--rpc_use_loopback=true"]
+     "-mem_limit_includes_jvm=true", "--rpc_use_loopback=true",\
+     "-use_resolved_hostname=true"]

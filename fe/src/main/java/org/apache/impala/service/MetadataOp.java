@@ -25,6 +25,7 @@ import java.util.Set;
 
 import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
 import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
+import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hive.service.rpc.thrift.TGetCrossReferenceReq;
 import org.apache.hive.service.rpc.thrift.TGetPrimaryKeysReq;
 import org.apache.impala.analysis.StmtMetadataLoader;
@@ -48,6 +49,7 @@ import org.apache.impala.common.ImpalaException;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TColumnValue;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TMetadataOpRequest;
 import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TResultSet;
@@ -60,6 +62,8 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 
+import javax.annotation.Nullable;
+
 /**
  * Metadata operation. It contains static methods to execute HiveServer2 metadata
  * operations and return the results, result schema and an unique request id in
@@ -71,8 +75,7 @@ public class MetadataOp {
   // Static column values
   private static final TColumnValue NULL_COL_VAL = new TColumnValue();
   private static final TColumnValue EMPTY_COL_VAL = createTColumnValue("");
-  public static final String TABLE_TYPE_TABLE = "TABLE";
-  public static final String TABLE_TYPE_VIEW = "VIEW";
+  private static final String TABLE_COMMENT_KEY = "comment";
 
   // Result set schema for each of the metadata operations.
   private final static TResultSetMetadata GET_CATALOGS_MD = new TResultSetMetadata();
@@ -374,23 +377,16 @@ public class MetadataOp {
             continue;
           }
 
-          String comment = null;
+          String comment = table.getTableComment();
+          String tableType = getTableTypeString(table);
           List<Column> columns = Lists.newArrayList();
           List<SQLPrimaryKey> primaryKeys = Lists.newArrayList();
           List<SQLForeignKey> foreignKeys = Lists.newArrayList();
           // If the table is not yet loaded, the columns will be unknown. Add it
           // to the set of missing tables.
-          String tableType = TABLE_TYPE_TABLE;
           if (!table.isLoaded() || table instanceof FeIncompleteTable) {
             result.missingTbls.add(new TableName(db.getName(), tabName));
           } else {
-            if (table.getMetaStoreTable() != null) {
-              comment = table.getMetaStoreTable().getParameters().get("comment");
-              String tableTypeStr = table.getMetaStoreTable().getTableType() == null ?
-                  null : table.getMetaStoreTable().getTableType().toUpperCase();
-              tableType = MetastoreShim.HMS_TO_IMPALA_TYPE
-                  .getOrDefault(tableTypeStr, TABLE_TYPE_TABLE);
-            }
             columns.addAll(fe.getColumns(table, columnPatternMatcher, user));
             if (columnPatternMatcher != PatternMatcher.MATCHER_MATCH_NONE) {
               // It is unnecessary to populate pk/fk information if the request does not
@@ -416,6 +412,29 @@ public class MetadataOp {
       }
     }
     return result;
+  }
+
+  public static String getTableTypeString(FeTable table) {
+    String msTableType;
+    if (table instanceof FeIncompleteTable) {
+      // FeIncompleteTable doesn't have a msTable object but it contains the Impala table
+      // type if the table is loaded in catalogd.
+      return table.getTableType().name();
+    }
+    Table msTbl = table.getMetaStoreTable();
+    msTableType = msTbl == null ? null : msTbl.getTableType();
+    return getImpalaTableType(msTableType).name();
+  }
+
+  public static TImpalaTableType getImpalaTableType(@Nullable String msTableType) {
+    if (msTableType != null) msTableType = msTableType.toUpperCase();
+    return MetastoreShim.HMS_TO_IMPALA_TYPE.getOrDefault(msTableType,
+        TImpalaTableType.TABLE);
+  }
+
+  @Nullable
+  public static String getTableComment(Table msTbl) {
+    return msTbl == null ? null : msTbl.getParameters().get(TABLE_COMMENT_KEY);
   }
 
   /**
@@ -576,8 +595,8 @@ public class MetadataOp {
       for (String tableType : tableTypes) {
         tableType = tableType.toUpperCase();
         upperCaseTableTypes.add(tableType);
-        if (tableType.equals(TABLE_TYPE_TABLE)) hasValidTableType = true;
-        if (tableType.equals(TABLE_TYPE_VIEW)) hasValidTableType = true;
+        if (tableType.equals(TImpalaTableType.TABLE.name())) hasValidTableType = true;
+        if (tableType.equals(TImpalaTableType.VIEW.name())) hasValidTableType = true;
       }
       if (!hasValidTableType) return result;
     }
@@ -644,8 +663,8 @@ public class MetadataOp {
 
     for (int i = 0; i < dbsMetadata.dbs.size(); ++i) {
       for (int j = 0; j < dbsMetadata.tableNames.get(i).size(); ++j) {
-        TResultRow row = new TResultRow();
         for (SQLPrimaryKey pk : dbsMetadata.primaryKeys.get(i).get(j)) {
+          TResultRow row = new TResultRow();
           row.colVals = Lists.newArrayList();
           row.colVals.add(EMPTY_COL_VAL);
           row.colVals.add(createTColumnValue(pk.getTable_db()));
@@ -710,9 +729,8 @@ public class MetadataOp {
         List<SQLForeignKey> filteredForeignKeys =
             filterForeignKeys(dbsMetadata.foreignKeys.get(i).get(j), parentSchemaName,
                 parentTableName);
-
-        TResultRow row = new TResultRow();
         for (SQLForeignKey fk : filteredForeignKeys) {
+          TResultRow row = new TResultRow();
           row.colVals = Lists.newArrayList();
           row.colVals.add(EMPTY_COL_VAL); // PKTABLE_CAT
           row.colVals.add(createTColumnValue(fk.getPktable_db()));
@@ -898,11 +916,11 @@ public class MetadataOp {
   private static void createGetTableTypesResults() {
     TResultRow row = new TResultRow();
     row.colVals = Lists.newArrayList();
-    row.colVals.add(createTColumnValue(TABLE_TYPE_TABLE));
+    row.colVals.add(createTColumnValue(TImpalaTableType.TABLE.name()));
     GET_TABLE_TYPES_RESULTS.add(row);
     row = new TResultRow();
     row.colVals = Lists.newArrayList();
-    row.colVals.add(createTColumnValue(TABLE_TYPE_VIEW));
+    row.colVals.add(createTColumnValue(TImpalaTableType.VIEW.name()));
     GET_TABLE_TYPES_RESULTS.add(row);
   }
 

@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.apache.hadoop.hive.common.FileUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
@@ -45,6 +46,8 @@ import org.apache.impala.thrift.TColumnDescriptor;
 import org.apache.impala.thrift.TGetCatalogMetricsResult;
 import org.apache.impala.thrift.THdfsPartition;
 import org.apache.impala.thrift.TTableStats;
+import org.apache.impala.util.AcidUtils;
+import org.apache.impala.util.MetaStoreUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -95,14 +98,17 @@ public abstract class FeCatalogUtils {
    * @throws TableLoadingException if any type is invalid
    */
   public static ImmutableList<Column> fieldSchemasToColumns(
-      Iterable<FieldSchema> fieldSchemas,
-      String tableName) throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException {
+    boolean isFullAcidTable = AcidUtils.isFullAcidTable(msTbl.getParameters());
     int pos = 0;
     ImmutableList.Builder<Column> ret = ImmutableList.builder();
-    for (FieldSchema s : fieldSchemas) {
-      Type type = parseColumnType(s, tableName);
-      ret.add(new Column(s.getName(), type, s.getComment(), pos));
-      ++pos;
+    for (FieldSchema s : Iterables.concat(msTbl.getPartitionKeys(),
+                                          msTbl.getSd().getCols())) {
+      if (isFullAcidTable && pos == msTbl.getPartitionKeys().size()) {
+        ret.add(AcidUtils.getRowIdColumnType(pos++));
+      }
+      Type type = parseColumnType(s, msTbl.getTableName());
+      ret.add(new Column(s.getName(), type, s.getComment(), pos++));
     }
     return ret.build();
   }
@@ -134,7 +140,7 @@ public abstract class FeCatalogUtils {
   public static List<TColumnDescriptor> getTColumnDescriptors(FeTable table) {
     List<TColumnDescriptor> colDescs = new ArrayList<>();
     for (Column col: table.getColumns()) {
-      colDescs.add(new TColumnDescriptor(col.getName(), col.getType().toThrift()));
+      colDescs.add(col.toDescriptor());
     }
     return colDescs;
   }
@@ -235,7 +241,7 @@ public abstract class FeCatalogUtils {
         keyValues.add(NullLiteral.create(type));
       } else {
         try {
-          keyValues.add(LiteralExpr.create(partitionKey, type));
+          keyValues.add(LiteralExpr.createFromUnescapedStr(partitionKey, type));
         } catch (Exception ex) {
           LOG.warn(String.format(
               "Failed to create literal expression: type: %s, value: '%s'",
@@ -259,14 +265,8 @@ public abstract class FeCatalogUtils {
    * TODO: this could be a default method in FeFsPartition in Java 8.
    */
   public static String getPartitionName(FeFsPartition partition) {
-    FeFsTable table = partition.getTable();
-    List<String> partitionCols = new ArrayList<>();
-    for (int i = 0; i < table.getNumClusteringCols(); ++i) {
-      partitionCols.add(table.getColumns().get(i).getName());
-    }
-
-    return FileUtils.makePartName(
-        partitionCols, getPartitionValuesAsStrings(partition, true));
+    return getPartitionName(partition.getTable(),
+        getPartitionValuesAsStrings(partition, true));
   }
 
   // TODO: this could be a default method in FeFsPartition in Java 8.
@@ -282,6 +282,35 @@ public abstract class FeCatalogUtils {
       }
     }
     return ret;
+  }
+
+  public static String getPartitionName(HdfsPartition.Builder partBuilder) {
+    HdfsTable table = partBuilder.getTable();
+    List<String> partitionValues = new ArrayList<>();
+    for (LiteralExpr partValue : partBuilder.getPartitionValues()) {
+      partitionValues.add(PartitionKeyValue.getPartitionKeyValueString(
+          partValue, table.getNullPartitionKeyValue()));
+    }
+    return getPartitionName(table, partitionValues);
+  }
+
+  public static String getPartitionName(FeFsTable table, List<String> partitionValues) {
+    List<String> partitionKeys = table.getClusteringColumns().stream()
+        .map(Column::getName)
+        .collect(Collectors.toList());
+    return FileUtils.makePartName(partitionKeys, partitionValues);
+  }
+
+  public static String getPartitionName(List<PartitionKeyValue> partitionKeyValues) {
+    List<String> partitionKeys = partitionKeyValues.stream()
+        .map(PartitionKeyValue::getColName)
+        .collect(Collectors.toList());
+    List<String> partitionValues = partitionKeyValues.stream()
+        .map(PartitionKeyValue::getLiteralValue)
+        .map(l -> PartitionKeyValue.getPartitionKeyValueString(
+             l, MetaStoreUtil.DEFAULT_NULL_PARTITION_KEY_VALUE))
+        .collect(Collectors.toList());
+    return FileUtils.makePartName(partitionKeys, partitionValues);
   }
 
   // TODO: this could be a default method in FeFsPartition in Java 8.
@@ -319,20 +348,15 @@ public abstract class FeCatalogUtils {
   public static THdfsPartition fsPartitionToThrift(FeFsPartition part,
       ThriftObjectType type) {
     HdfsStorageDescriptor sd = part.getInputFormatDescriptor();
-    THdfsPartition thriftHdfsPart = new THdfsPartition(
-        sd.getLineDelim(),
-        sd.getFieldDelim(),
-        sd.getCollectionDelim(),
-        sd.getMapKeyDelim(),
-        sd.getEscapeChar(),
-        sd.getFileFormat().toThrift(),
-        Expr.treesToThrift(part.getPartitionValues()),
-        sd.getBlockSize());
+    THdfsPartition thriftHdfsPart = new THdfsPartition();
+    thriftHdfsPart.setHdfs_storage_descriptor(sd.toThrift());
+    thriftHdfsPart.setPartitionKeyExprs(Expr.treesToThrift(part.getPartitionValues()));
     thriftHdfsPart.setId(part.getId());
     thriftHdfsPart.setLocation(part.getLocationAsThrift());
     if (part.getWriteId() >= 0)
       thriftHdfsPart.setWrite_id(part.getWriteId());
     if (type == ThriftObjectType.FULL) {
+      thriftHdfsPart.setPartition_name(part.getPartitionName());
       thriftHdfsPart.setStats(new TTableStats(part.getNumRows()));
       thriftHdfsPart.setAccess_level(part.getAccessLevel());
       thriftHdfsPart.setIs_marked_cached(part.isMarkedCached());
@@ -346,9 +370,20 @@ public abstract class FeCatalogUtils {
       long numBlocks = 0;
       long totalFileBytes = 0;
       for (FileDescriptor fd: part.getFileDescriptors()) {
-        thriftHdfsPart.addToFile_desc(fd.toThrift());
         numBlocks += fd.getNumFileBlocks();
         totalFileBytes += fd.getFileLength();
+      }
+      if (!part.getInsertFileDescriptors().isEmpty()) {
+        for (FileDescriptor fd : part.getInsertFileDescriptors()) {
+          thriftHdfsPart.addToInsert_file_desc(fd.toThrift());
+        }
+        for (FileDescriptor fd : part.getDeleteFileDescriptors()) {
+          thriftHdfsPart.addToDelete_file_desc(fd.toThrift());
+        }
+      } else {
+        for (FileDescriptor fd: part.getFileDescriptors()) {
+          thriftHdfsPart.addToFile_desc(fd.toThrift());
+        }
       }
       thriftHdfsPart.setNum_blocks(numBlocks);
       thriftHdfsPart.setTotal_file_size_bytes(totalFileBytes);

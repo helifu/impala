@@ -46,7 +46,7 @@ function generate_config {
   perl -wpl -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' \
       "${GCIN}" > "${GCOUT}.tmp"
 
-  if [ "${IMPALA_KERBERIZE}" = "" ]; then
+  if [[ "${IMPALA_KERBERIZE}" != "true" ]]; then
     sed '/<!-- BEGIN Kerberos/,/END Kerberos settings -->/d' \
         "${GCOUT}.tmp" > "${GCOUT}"
   else
@@ -65,9 +65,8 @@ function generate_config {
 }
 
 CREATE_METASTORE=0
-CREATE_SENTRY_POLICY_DB=0
 CREATE_RANGER_POLICY_DB=0
-: ${IMPALA_KERBERIZE=}
+UPGRADE_METASTORE_DB=0
 
 # parse command line options
 for ARG in $*
@@ -76,21 +75,16 @@ do
     -create_metastore)
       CREATE_METASTORE=1
       ;;
-    -create_sentry_policy_db)
-      CREATE_SENTRY_POLICY_DB=1
-      ;;
     -create_ranger_policy_db)
       CREATE_RANGER_POLICY_DB=1
       ;;
-    -k|-kerberize|-kerberos|-kerb)
-      # This could also come in through the environment...
-      export IMPALA_KERBERIZE=1
+    -upgrade_metastore_db)
+      UPGRADE_METASTORE_DB=1
       ;;
     -help|*)
       echo "[-create_metastore] : If true, creates a new metastore."
-      echo "[-create_sentry_policy_db] : If true, creates a new sentry policy db."
       echo "[-create_ranger_policy_db] : If true, creates a new Ranger policy db."
-      echo "[-kerberize] : Enable kerberos on the cluster"
+      echo "[-upgrade_metastore_db] : If true, upgrades the schema of HMS db."
       exit 1
       ;;
   esac
@@ -104,7 +98,7 @@ fi
 
 ${CLUSTER_DIR}/admin create_cluster
 
-if [ ! -z "${IMPALA_KERBERIZE}" ]; then
+if [[ "${IMPALA_KERBERIZE}" = "true" ]]; then
   # Sanity check...
   if ! ${CLUSTER_DIR}/admin is_kerberized; then
     echo "Kerberized cluster not created, even though told to."
@@ -128,12 +122,11 @@ RANGER_TEST_CONF_DIR="${IMPALA_HOME}/testdata/cluster/ranger"
 echo "Config dir: ${CONFIG_DIR}"
 echo "Current user: ${CURRENT_USER}"
 echo "Metastore DB: ${METASTORE_DB}"
-echo "Sentry DB   : ${SENTRY_POLICY_DB}"
 echo "Ranger DB   : ${RANGER_POLICY_DB}"
 
 pushd ${CONFIG_DIR}
 # Cleanup any existing files
-rm -f {core,hdfs,hbase,hive,yarn,mapred}-site.xml
+rm -f {core,hdfs,hbase,hive,ozone,yarn,mapred}-site.xml
 rm -f authz-provider.ini
 
 # Generate hive configs first so that schemaTool can be used to init the metastore schema
@@ -146,6 +139,34 @@ mkdir -p hive-site-ext
 rm -f hive-site-ext/hive-site.xml
 ln -s "${CONFIG_DIR}/hive-site_ext.xml" hive-site-ext/hive-site.xml
 
+export HIVE_VARIANT=without_hms_config
+$IMPALA_HOME/bin/generate_xml_config.py hive-site.xml.py hive-site_without_hms.xml
+mkdir -p hive-site-without-hms
+rm -f hive-site-without-hms/hive-site.xml
+ln -s "${CONFIG_DIR}/hive-site_without_hms.xml" hive-site-without-hms/hive-site.xml
+
+export HIVE_VARIANT=events_cleanup
+$IMPALA_HOME/bin/generate_xml_config.py hive-site.xml.py hive-site_events_cleanup.xml
+mkdir -p hive-site-events-cleanup
+rm -f hive-site-events-cleanup/hive-site.xml
+ln -s "${CONFIG_DIR}/hive-site_events_cleanup.xml" hive-site-events-cleanup/hive-site.xml
+
+export HIVE_VARIANT=ranger_auth
+HIVE_RANGER_CONF_DIR=hive-site-ranger-auth
+$IMPALA_HOME/bin/generate_xml_config.py hive-site.xml.py hive-site_ranger_auth.xml
+
+# Cleanup pycache if created
+rm -rf __pycache__
+
+rm -rf $HIVE_RANGER_CONF_DIR
+mkdir -p $HIVE_RANGER_CONF_DIR
+ln -s "${CONFIG_DIR}/hive-site_ranger_auth.xml" $HIVE_RANGER_CONF_DIR/hive-site.xml
+# Link some neccessary config files for Hive.
+for f in ranger-hive-security.xml ranger-hive-audit.xml log4j.properties \
+    hive-log4j2.properties; do
+  ln -s "${CONFIG_DIR}/$f" "$HIVE_RANGER_CONF_DIR/$f"
+done
+
 generate_config hive-log4j2.properties.template hive-log4j2.properties
 
 if [ $CREATE_METASTORE -eq 1 ]; then
@@ -157,16 +178,18 @@ if [ $CREATE_METASTORE -eq 1 ]; then
   # version and invokes the appropriate scripts
   CLASSPATH={$CLASSPATH}:${CONFIG_DIR} ${HIVE_HOME}/bin/schematool -initSchema -dbType \
 postgres 1>${IMPALA_CLUSTER_LOGS_DIR}/schematool.log 2>&1
+  # TODO: We probably don't need to do this anymore
   # Increase the size limit of PARAM_VALUE from SERDE_PARAMS table to be able to create
   # HBase tables with large number of columns.
   echo "alter table \"SERDE_PARAMS\" alter column \"PARAM_VALUE\" type character varying" \
       | psql -q -U hiveuser -d ${METASTORE_DB}
 fi
 
-if [ $CREATE_SENTRY_POLICY_DB -eq 1 ]; then
-  echo "Creating Sentry Policy Server DB"
-  dropdb -U hiveuser $SENTRY_POLICY_DB 2> /dev/null || true
-  createdb -U hiveuser $SENTRY_POLICY_DB
+if [ $UPGRADE_METASTORE_DB -eq 1 ]; then
+  echo "Upgrading the schema of metastore db ${METASTORE_DB}. Check \
+${IMPALA_CLUSTER_LOGS_DIR}/schematool.log for details."
+  CLASSPATH={$CLASSPATH}:${CONFIG_DIR} ${HIVE_HOME}/bin/schematool -upgradeSchema \
+-dbType postgres 1>${IMPALA_CLUSTER_LOGS_DIR}/schematool.log 2>&1
 fi
 
 if [ $CREATE_RANGER_POLICY_DB -eq 1 ]; then
@@ -179,14 +202,16 @@ if [ $CREATE_RANGER_POLICY_DB -eq 1 ]; then
   popd
 fi
 
-echo "Linking common conf files from local cluster:"
+echo "Copying common conf files from local cluster:"
 CLUSTER_HADOOP_CONF_DIR=$(${CLUSTER_DIR}/admin get_hadoop_client_conf_dir)
-for file in core-site.xml hdfs-site.xml yarn-site.xml ; do
+for file in core-site.xml hdfs-site.xml ozone-site.xml yarn-site.xml ; do
   echo ... $file
-  ln -s ${CLUSTER_HADOOP_CONF_DIR}/$file
+  # These need to be copied instead of symlinked so that they can be accessed when the
+  # directory is bind-mounted into /opt/impala/conf in docker containers.
+  cp ${CLUSTER_HADOOP_CONF_DIR}/$file .
 done
 
-if ${CLUSTER_DIR}/admin is_kerberized; then
+if [[ "${IMPALA_KERBERIZE}" = "true" ]]; then
   # KERBEROS TODO: Without this, the yarn daemons can see these
   # files, but mapreduce jobs *cannot* see these files.  This seems
   # strange, but making these symlinks also results in data loading
@@ -201,14 +226,7 @@ fi
 generate_config log4j.properties.template log4j.properties
 generate_config hbase-site.xml.template hbase-site.xml
 
-$IMPALA_HOME/bin/generate_xml_config.py sentry-site.xml.py sentry-site.xml
-for SENTRY_VARIANT in oo oo_nogrant no_oo ; do
-  export SENTRY_VARIANT
-  $IMPALA_HOME/bin/generate_xml_config.py sentry-site.xml.py \
-      sentry-site_${SENTRY_VARIANT}.xml
-done
-
-if [ ! -z "${IMPALA_KERBERIZE}" ]; then
+if [[ "${IMPALA_KERBERIZE}" = "true" ]]; then
   generate_config hbase-jaas-server.conf.template hbase-jaas-server.conf
   generate_config hbase-jaas-client.conf.template hbase-jaas-client.conf
 fi
@@ -227,11 +245,28 @@ cp -f "${RANGER_TEST_CONF_DIR}/ranger-admin-env-logdir.sh" "${RANGER_SERVER_CONF
 cp -f "${RANGER_TEST_CONF_DIR}/ranger-admin-env-piddir.sh" "${RANGER_SERVER_CONF_DIR}"
 cp -f "${RANGER_SERVER_CONFDIST_DIR}/security-applicationContext.xml" \
     "${RANGER_SERVER_CONF_DIR}"
+
+# Prepend the following 5 URL's to the line starting with "<intercept-url pattern="/**"".
+# Before the end-to-end tests could be performed in a Kerberized environment
+# automatically, we need to allow the requests for the following links so that the
+# statements like CREATE/DROP ROLE <role_name>,
+# GRANT/REVOKE ROLE <role_name> TO/FROM GROUP <group_name>, and SHOW ROLES could work in a
+# non-Kerberized environment. It is better to add the allowed links using sed than to use
+# a hardcoded configuration file consisting of those links since some other configurations
+# could change after CDP_BUILD_NUMBER is bumped up, e.g., the version of jquery.
+sed -i '/<intercept-url pattern="\/\*\*"/i \
+    <intercept-url pattern="/service/public/v2/api/roles/*" access="permitAll"/> \
+    <intercept-url pattern="/service/public/v2/api/roles/name/*" access="permitAll"/> \
+    <intercept-url pattern="/service/public/v2/api/roles/grant/*" access="permitAll"/> \
+    <intercept-url pattern="/service/public/v2/api/roles/revoke/*" access="permitAll"/> \
+    <intercept-url pattern="/service/public/v2/api/roles/names/*" access="permitAll"/>' \
+"${RANGER_SERVER_CONF_DIR}/security-applicationContext.xml"
+
 if [[ -f "${POSTGRES_JDBC_DRIVER}" ]]; then
   cp -f "${POSTGRES_JDBC_DRIVER}" "${RANGER_SERVER_LIB_DIR}"
 else
   # IMPALA-8261: Running this script should not fail when FE has not been built.
-  MAVEN_URL="http://central.maven.org/maven2/org/postgresql/postgresql"
+  MAVEN_URL="https://repo.maven.apache.org/maven2/org/postgresql/postgresql"
   JDBC_JAR="postgresql-${IMPALA_POSTGRES_JDBC_DRIVER_VERSION}.jar"
   wget -P "${RANGER_SERVER_LIB_DIR}" \
     "${MAVEN_URL}/${IMPALA_POSTGRES_JDBC_DRIVER_VERSION}/${JDBC_JAR}"

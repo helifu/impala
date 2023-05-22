@@ -20,16 +20,21 @@
 #define IMPALA_EXEC_FILTER_CONTEXT_H
 
 #include <boost/unordered_map.hpp>
-#include "exprs/scalar-expr-evaluator.h"
 #include "runtime/runtime-filter.h"
 #include "util/runtime-profile.h"
+
+namespace llvm {
+class Function;
+}
 
 namespace impala {
 
 class BloomFilter;
 class LlvmCodeGen;
 class MinMaxFilter;
+class RuntimeState;
 class ScalarExpr;
+class ScalarExprEvaluator;
 class TupleRow;
 
 /// Container struct for per-filter statistics, with statistics for each granularity of
@@ -98,6 +103,9 @@ struct FilterContext {
   /// Working copy of local min-max filter
   MinMaxFilter* local_min_max_filter = nullptr;
 
+  /// Working copy of local in-list filter
+  InListFilter* local_in_list_filter = nullptr;
+
   /// Struct name in LLVM IR.
   static const char* LLVM_CLASS_NAME;
 
@@ -114,6 +122,14 @@ struct FilterContext {
   /// Evaluates 'row' with 'expr_eval' and inserts the value into 'local_bloom_filter'
   /// or 'local_min_max_filter' as appropriate.
   void Insert(TupleRow* row) const noexcept;
+
+  /// Implements different flavors of insertion based on filter type and comparison
+  /// op in filter desc.
+  ///  1). When the op is EQ, regardless of filter type, call this->Insert(TupleRow* row);
+  ///  2). When the op is LE, LT, GE or GT and the filter type is min/max, call
+  //       MinMaxFilter::InsertFor<op>(TupleRow* row);
+  ///  3). DCHECK(false) otherwise.
+  void InsertPerCompareOp(TupleRow* row) const noexcept;
 
   /// Materialize filter values by copying any values stored by filters into memory owned
   /// by the filter. Filters may assume that the memory for Insert()-ed values stays valid
@@ -135,12 +151,20 @@ struct FilterContext {
   /// On success, 'fn' is set to the generated function. On failure, an error status is
   /// returned.
   static Status CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_expr,
-      FilterContext* ctx, llvm::Function** fn) WARN_UNUSED_RESULT;
+      const TRuntimeFilterDesc& filter_desc, llvm::Function** fn) WARN_UNUSED_RESULT;
 
   // Returns if there is any always_false filter in ctxs. If there is, the counter stats
   // is updated.
   static bool CheckForAlwaysFalse(const std::string& stats_name,
       const std::vector<FilterContext>& ctxs);
+
+  /// Returns true if 'filter' is a min-max filter and whose range overlaps enough
+  /// with the range defined by the column low and high values in 'desc'. Return false
+  /// otherwise. The degree of the overlap is determined by the overlap ratio and the
+  /// 'threshold' (query option 'minmax_filter_threshold') that is used as a lower bound
+  /// for the ratio.
+  static bool ShouldRejectFilterBasedOnColumnStats(const TRuntimeFilterTargetDesc& desc,
+      MinMaxFilter* minmax_filter, float threshold);
 };
 
 }

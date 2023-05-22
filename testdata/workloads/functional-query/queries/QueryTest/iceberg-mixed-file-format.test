@@ -1,0 +1,10 @@
+====
+---- QUERY
+select * from functional_parquet.iceberg_mixed_file_format;
+---- RESULTS
+1,'avro',0.5,true
+3,'parquet',2.5,false
+2,'orc',1.5,false
+---- TYPES
+INT, STRING, DOUBLE, BOOLEAN
+====

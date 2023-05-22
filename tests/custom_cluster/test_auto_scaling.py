@@ -17,6 +17,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import logging
 import pytest
 from time import sleep, time
@@ -24,10 +26,9 @@ from time import sleep, time
 from tests.util.auto_scaler import AutoScaler
 from tests.util.concurrent_workload import ConcurrentWorkload
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfEC
 
 LOG = logging.getLogger("test_auto_scaling")
-
+TOTAL_BACKENDS_METRIC_NAME = "cluster-membership.backends.total"
 
 class TestAutoScaling(CustomClusterTestSuite):
   @classmethod
@@ -43,28 +44,34 @@ class TestAutoScaling(CustomClusterTestSuite):
   """This class contains tests that exercise the logic related to scaling clusters up and
   down by adding and removing groups of executors."""
   INITIAL_STARTUP_TIME_S = 10
-  STATE_CHANGE_TIMEOUT_S = 45
+  STATE_CHANGE_TIMEOUT_S = 60
   # This query will scan two partitions (month = 1, 2) and thus will have 1 fragment
   # instance per executor on groups of size 2. Each partition has 2 rows, so it performs
-  # two comparisons and should take around 1 second to complete.
+  # two comparisons and should take around 2 second to complete.
   QUERY = """select * from functional_parquet.alltypestiny where month < 3
-             and id + random() < sleep(500)"""
+             and id + random() < sleep(1000)"""
 
   def _get_total_admitted_queries(self):
-    return self.impalad_test_service.get_total_admitted_queries("default-pool")
+    admitted_queries = self.impalad_test_service.get_total_admitted_queries(
+      "default-pool")
+    LOG.info("Current total admitted queries: %s", admitted_queries)
+    return admitted_queries
 
   def _get_num_backends(self):
-    return self.impalad_test_service.get_metric_value("cluster-membership.backends.total")
+    metric_val = self.impalad_test_service.get_metric_value(TOTAL_BACKENDS_METRIC_NAME)
+    LOG.info("Getting metric %s : %s", TOTAL_BACKENDS_METRIC_NAME, metric_val)
+    return metric_val
 
   def _get_num_running_queries(self):
-    return self.impalad_test_service.get_num_running_queries("default-pool")
+    running_queries = self.impalad_test_service.get_num_running_queries("default-pool")
+    LOG.info("Current running queries: %s", running_queries)
+    return running_queries
 
-  @SkipIfEC.fix_later
   def test_single_workload(self):
     """This test exercises the auto-scaling logic in the admission controller. It spins up
-    a base cluster (coordinator, catalog, statestore), runs some queries to observe that
-    new executors are started, then stops the workload and observes that the cluster gets
-    shutdown."""
+    a base cluster (coordinator, catalog, statestore), runs a workload to initiate a
+    scaling up event as the queries start queuing, then stops the workload and observes
+    that the cluster gets shutdown."""
     GROUP_SIZE = 2
     EXECUTOR_SLOTS = 3
     auto_scaler = AutoScaler(executor_slots=EXECUTOR_SLOTS, group_size=GROUP_SIZE)
@@ -89,7 +96,6 @@ class TestAutoScaling(CustomClusterTestSuite):
       assert any(self._get_total_admitted_queries() >= 10 or sleep(1)
                  for _ in range(self.STATE_CHANGE_TIMEOUT_S)), \
           "Did not admit enough queries within %s s" % self.STATE_CHANGE_TIMEOUT_S
-
       # Wait for second executor group to start
       cluster_size = (2 * GROUP_SIZE) + 1
       assert any(self._get_num_backends() >= cluster_size or sleep(1)
@@ -99,32 +105,12 @@ class TestAutoScaling(CustomClusterTestSuite):
       assert self.impalad_test_service.get_metric_value(
         "cluster-membership.executor-groups.total-healthy") >= 2
 
-      # Wait for query rate to exceed the maximum for a single executor group. In the past
-      # we tried to wait for it to pass a higher threshold but on some platforms we saw
-      # that it was too flaky.
-      min_query_rate = EXECUTOR_SLOTS
-      max_query_rate = 0
-      # This barrier has been flaky in the past so we wait 2x as long as for the other
-      # checks.
-      end = time() + 2 * self.STATE_CHANGE_TIMEOUT_S
-      while time() < end:
-        current_rate = workload.get_query_rate()
-        LOG.info("Current rate: %s" % current_rate)
-        max_query_rate = max(max_query_rate, current_rate)
-        if max_query_rate > min_query_rate:
-          break
-        sleep(1)
-
-      assert max_query_rate >= min_query_rate, "Query rate did not reach %s within %s " \
-          "s. Maximum was %s. Cluster size is %s." % (min_query_rate,
-          self.STATE_CHANGE_TIMEOUT_S, max_query_rate, cluster_size)
-
       LOG.info("Stopping workload")
       workload.stop()
 
       # Wait for workers to spin down
       self.impalad_test_service.wait_for_metric_value(
-        "cluster-membership.backends.total", 1,
+        TOTAL_BACKENDS_METRIC_NAME, 1,
         timeout=self.STATE_CHANGE_TIMEOUT_S, interval=1)
       assert self.impalad_test_service.get_metric_value(
         "cluster-membership.executor-groups.total") == 0
@@ -135,7 +121,6 @@ class TestAutoScaling(CustomClusterTestSuite):
       LOG.info("Stopping auto scaler")
       auto_scaler.stop()
 
-  @SkipIfEC.fix_later
   def test_single_group_maxed_out(self):
     """This test starts an auto scaler and limits it to a single executor group. It then
     makes sure that the query throughput does not exceed the expected limit."""
@@ -155,7 +140,7 @@ class TestAutoScaling(CustomClusterTestSuite):
       # Wait for workers to spin up
       cluster_size = GROUP_SIZE + 1  # +1 to include coordinator.
       self.impalad_test_service.wait_for_metric_value(
-        "cluster-membership.backends.total", cluster_size,
+        TOTAL_BACKENDS_METRIC_NAME, cluster_size,
         timeout=self.STATE_CHANGE_TIMEOUT_S, interval=1)
 
       # Wait until we admitted at least 10 queries
@@ -184,7 +169,7 @@ class TestAutoScaling(CustomClusterTestSuite):
 
       # Wait for workers to spin down
       self.impalad_test_service.wait_for_metric_value(
-        "cluster-membership.backends.total", 1,
+        TOTAL_BACKENDS_METRIC_NAME, 1,
         timeout=self.STATE_CHANGE_TIMEOUT_S, interval=1)
       assert self.impalad_test_service.get_metric_value(
         "cluster-membership.executor-groups.total") == 0
@@ -195,7 +180,6 @@ class TestAutoScaling(CustomClusterTestSuite):
       LOG.info("Stopping auto scaler")
       auto_scaler.stop()
 
-  @SkipIfEC.fix_later
   def test_sequential_startup(self):
     """This test starts an executor group sequentially and observes that no queries are
     admitted until the group has been fully started."""
@@ -242,7 +226,7 @@ class TestAutoScaling(CustomClusterTestSuite):
 
       # Wait for workers to spin down
       self.impalad_test_service.wait_for_metric_value(
-        "cluster-membership.backends.total", 1,
+        TOTAL_BACKENDS_METRIC_NAME, 1,
         timeout=self.STATE_CHANGE_TIMEOUT_S, interval=1)
       assert self.impalad_test_service.get_metric_value(
         "cluster-membership.executor-groups.total") == 0

@@ -37,7 +37,6 @@ using namespace impala;
 
 DECLARE_bool(abort_on_config_error);
 DECLARE_int32(idle_session_timeout);
-DECLARE_int32(be_port);
 DECLARE_int32(beeswax_port);
 
 // TODO: When sleep(..) queries can be cancelled, write a test that confirms long-running
@@ -50,6 +49,8 @@ DECLARE_int32(beeswax_port);
 // tear-down logic), but which we create multiple times in unit tests. We leak this pool
 // instead of destroying it to avoid destroying the contained objects.
 static ObjectPool* perm_objects;
+
+namespace impala {
 
 TEST(SessionTest, TestExpiry) {
   const int NUM_SESSIONS = 5;
@@ -120,6 +121,8 @@ TEST(SessionTest, TestExpiry) {
   SleepForMs(1000);
   statestore->ShutdownForTesting();
 }
+
+} // namespace impala
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);

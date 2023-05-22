@@ -45,11 +45,6 @@ DEFINE_int32(max_nonhdfs_partitions_parallel_load, 20,
 DEFINE_int32(initial_hms_cnxn_timeout_s, 120,
     "Number of seconds catalogd will wait to establish an initial connection to the HMS "
     "before exiting.");
-DEFINE_int64(sentry_catalog_polling_frequency_s, 60,
-    "Frequency (in seconds) at which the the catalogd polls the sentry service to update "
-    "any policy changes.");
-DEFINE_string(sentry_config, "", "Local path to a sentry-site.xml configuration "
-    "file. If set, authorization will be enabled.");
 
 Catalog::Catalog() {
   JniMethodDescriptor methods[] = {
@@ -61,11 +56,12 @@ Catalog::Catalog() {
     {"getTableMetrics", "([B)Ljava/lang/String;", &get_table_metrics_id_},
     {"getDbs", "([B)[B", &get_dbs_id_},
     {"getFunctions", "([B)[B", &get_functions_id_},
-    {"checkUserSentryAdmin", "([B)[B", &sentry_admin_check_id_},
     {"getCatalogObject", "([B)[B", &get_catalog_object_id_},
+    {"getJsonCatalogObject", "([B)Ljava/lang/String;", &get_json_catalog_object_id_},
     {"getPartialCatalogObject", "([B)[B", &get_partial_catalog_object_id_},
     {"getCatalogDelta", "([B)[B", &get_catalog_delta_id_},
     {"getCatalogUsage", "()[B", &get_catalog_usage_id_},
+    {"getOperationUsage", "()[B", &get_operation_usage_id_},
     {"getCatalogVersion", "()J", &get_catalog_version_id_},
     {"getCatalogServerMetrics", "()[B", &get_catalog_server_metrics_},
     {"getEventProcessorSummary", "()[B", &get_event_processor_summary_},
@@ -85,7 +81,7 @@ Catalog::Catalog() {
   }
 
   jbyteArray cfg_bytes;
-  ABORT_IF_ERROR(GetThriftBackendGflags(jni_env, &cfg_bytes));
+  ABORT_IF_ERROR(GetThriftBackendGFlagsForJNI(jni_env, &cfg_bytes));
 
   jobject catalog = jni_env->NewObject(catalog_class_, catalog_ctor_, cfg_bytes);
   CLEAN_EXIT_IF_EXC(jni_env);
@@ -95,6 +91,10 @@ Catalog::Catalog() {
 Status Catalog::GetCatalogObject(const TCatalogObject& req,
     TCatalogObject* resp) {
   return JniUtil::CallJniMethod(catalog_, get_catalog_object_id_, req, resp);
+}
+
+Status Catalog::GetJsonCatalogObject(const TCatalogObject& req, string* res) {
+  return JniUtil::CallJniMethod(catalog_, get_json_catalog_object_id_, req, res);
 }
 
 Status Catalog::GetPartialCatalogObject(const TGetPartialCatalogObjectRequest& req,
@@ -161,6 +161,10 @@ Status Catalog::GetCatalogUsage(TGetCatalogUsageResponse* response) {
   return JniUtil::CallJniMethod(catalog_, get_catalog_usage_id_, response);
 }
 
+Status Catalog::GetOperationUsage(TGetOperationUsageResponse* response) {
+  return JniUtil::CallJniMethod(catalog_, get_operation_usage_id_, response);
+}
+
 Status Catalog::GetEventProcessorSummary(
     TEventProcessorMetricsSummaryResponse* response) {
   return JniUtil::CallJniMethod(catalog_, get_event_processor_summary_, response);
@@ -182,11 +186,6 @@ Status Catalog::PrioritizeLoad(const TPrioritizeLoadRequest& req) {
 Status Catalog::GetPartitionStats(
     const TGetPartitionStatsRequest& req, TGetPartitionStatsResponse* resp) {
   return JniUtil::CallJniMethod(catalog_, get_partition_stats_id_, req, resp);
-}
-
-Status Catalog::SentryAdminCheck(const TSentryAdminCheckRequest& req,
-    TSentryAdminCheckResponse* resp) {
-  return JniUtil::CallJniMethod(catalog_, sentry_admin_check_id_, req, resp);
 }
 
 Status Catalog::UpdateTableUsage(const TUpdateTableUsageRequest& req) {

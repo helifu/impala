@@ -35,15 +35,20 @@ DEFINE_string(hostname, "", "Hostname to use for this daemon, also used as part 
               "the Kerberos principal, if enabled. If not set, the system default will be"
               " used");
 
-DEFINE_int32(be_port, 22000,
-    "port on which thrift based ImpalaInternalService is exported");
+DEFINE_bool(use_resolved_hostname, false, "If true, --hostname is resolved before use, "
+              "so that the IP address will be used everywhere instead of the hostname.");
+
 DEFINE_int32(krpc_port, 27000,
     "port on which KRPC based ImpalaInternalService is exported");
 
 // Kerberos is enabled if and only if principal is set.
 DEFINE_string(principal, "", "Kerberos principal. If set, both client and backend "
-    "network connections will use Kerberos encryption and authentication. Kerberos will "
-    "not be used for internal or external connections if this is not set.");
+    "network connections will use Kerberos encryption and authentication and the daemon "
+    "will acquire a Kerberos TGT (i.e. do the equivalent of the kinit command) and keep "
+    "it refreshed for the lifetime of the daemon.  If this is not set the TGT ticket "
+    "will not be acquired and incoming connections will not be authenticated or "
+    "encrypted using Kerberos. However, the TGT and other settings may be inherited from "
+    "the environment and used by client libraries in certain cases.");
 DEFINE_string(be_principal, "", "Kerberos principal for backend network connections only,"
     "overriding --principal if set. Must not be set if --principal is not set.");
 DEFINE_string(keytab_file, "", "Absolute path to Kerberos keytab file");
@@ -52,6 +57,18 @@ DEFINE_string(krb5_ccname, "/tmp/krb5cc_impala_internal", "Absolute path to the 
 DEFINE_string(krb5_conf, "", "Absolute path to Kerberos krb5.conf if in a non-standard "
     "location. Does not normally need to be set.");
 DEFINE_string(krb5_debug_file, "", "Turn on Kerberos debugging and output to this file");
+DEFINE_bool(skip_internal_kerberos_auth, false,
+    "(Advanced) skip kerberos authentication for incoming internal connections from "
+    "other daemons within the Impala cluster (i.e. impalads, statestored, catalogd). "
+    "Must be set to the same value across all daemons. Only has an effect if --principal "
+    "is set, i.e. Kerberos is enabled.");
+DEFINE_bool(skip_external_kerberos_auth, false,
+    "(Advanced) skip kerberos authentication for incoming external connections to "
+    "this daemon, e.g. clients connecting to the HS2 interface. Only has an effect "
+    "if --principal is set, i.e. Kerberos is enabled.");
+DEFINE_string(anonymous_user_name, "anonymous",
+    "Default username used when a client connects to an unsecured impala daemon and "
+    "does not specify a username.");
 
 static const string mem_limit_help_msg = "Limit on process memory consumption. "
     "Includes the JVM's memory consumption only if --mem_limit_includes_jvm is true. "
@@ -147,6 +164,9 @@ DEFINE_bool(thread_creation_fault_injection, false, "A fault injection option th
 DEFINE_int32(stress_catalog_init_delay_ms, 0, "A stress option that injects extra delay"
     " in milliseconds when initializing an impalad's local catalog replica. Delay <= 0"
     " inject no delay.");
+DEFINE_int32(stress_catalog_startup_delay_ms, 0, "A stress option that injects extra "
+    "delay in milliseconds during the startup of catalogd. The delay is before the "
+    "catalogd opens ports or accepts connections. Delay <= 0 injects no delay.");
 DEFINE_int32(stress_disk_read_delay_ms, 0, "A stress option that injects extra delay"
     " in milliseconds when the I/O manager is reading from disk.");
 #endif
@@ -178,6 +198,17 @@ DEFINE_int32(kudu_client_rpc_timeout_ms, default_kudu_client_rpc_timeout_ms,
     "kudu_operation_timeout_ms. This must be a positive value or it will be ignored and "
     "Kudu's default of 10s will be used. There is no way to disable timeouts.");
 
+// Timeout for connection negotiation between Kudu client in the BE and Kudu
+// servers, in milliseconds. For details on connection negotiation, see
+// https://github.com/apache/kudu/blob/master/docs/design-docs/rpc.md#negotiation
+DEFINE_int32(kudu_client_connection_negotiation_timeout_ms, 3000,
+    "(Advanced) Timeout for connection negotiation between Kudu client and "
+    "Kudu masters and tablet servers, in milliseconds");
+
+// SASL protocol name for Kudu used in the FE and BE when creating Kudu client.
+// The default name is "kudu".
+DEFINE_string(kudu_sasl_protocol_name, "kudu", "SASL protocol name for Kudu");
+
 DEFINE_int64(inc_stats_size_limit_bytes, 200 * (1LL<<20), "Maximum size of "
     "incremental stats the catalog is allowed to serialize per table. "
     "This limit is set as a safety check, to prevent the JVM from "
@@ -196,6 +227,15 @@ DEFINE_bool(redirect_stdout_stderr, true,
 DEFINE_int32(max_log_files, 10, "Maximum number of log files to retain per severity "
     "level. The most recent log files are retained. If set to 0, all log files are "
     "retained.");
+
+static const string re2_mem_limit_help_msg =
+    "Maximum bytes of memory to be used by re2's regex engine "
+    "to hold the compiled form of the regexp. For more memory-consuming patterns, "
+    "this can be set to be a higher number."
+    + Substitute(MEM_UNITS_HELP_MSG, "memory limit for RE2 max_mem opt")
+    + "Default to 8MB. Using percentage is discouraged.";
+
+DEFINE_string(re2_mem_limit, "8MB", re2_mem_limit_help_msg.c_str());
 
 // The read size is the preferred size of the reads issued to HDFS or the local FS.
 // There is a trade off of latency and throughput, trying to keep disks busy but
@@ -235,19 +275,23 @@ DEFINE_bool(invalidate_tables_on_memory_pressure, false, "Configure catalogd to 
     "invalidate_table_timeout_s. To enable this feature, a true flag must be applied to "
     "both catalogd and impalad.");
 
-DEFINE_int32(hms_event_polling_interval_s, 0,
-    "Configure catalogd to invalidate cached table metadata based on metastore events. "
+DEFINE_int32(hms_event_polling_interval_s, 1,
+    "Configure catalogd to refresh cached table metadata based on metastore events. "
     "These metastore events could be generated by external systems like Apache Hive or "
     "a different Impala cluster using the same Hive metastore server as this one. "
     "A non-zero value of this flag sets the polling interval of catalogd in seconds to "
     "fetch new metastore events. A value of zero disables this feature. When enabled, "
-    "this flag has the same effect as \"INVALIDATE METADATA\" statement on the table "
+    "this flag has the same effect as \"REFRESH\" statement on the table "
     "for certain metastore event types. Additionally, in case of events which detect "
     "creation or removal of objects from metastore, catalogd adds or removes such "
     "objects from its cached metadata. This feature is independent of time and memory "
-    "based automatic invalidation of tables. Note that this is still an experimental "
-    "feature and not recommended to be deployed on production systems until it is "
-    "made generally available.");
+    "based automatic invalidation of tables.");
+
+DEFINE_bool(enable_insert_events, true,
+    "Enables insert events in the events processor. When this configuration is set to "
+    "true Impala will generate INSERT event types which when received by other Impala "
+    "clusters can be used to automatically refresh the tables or partitions. Event "
+    "processing must be turned on for this flag to have any effect.");
 
 DEFINE_string(blacklisted_dbs, "sys,information_schema",
     "Comma separated list for blacklisted databases. Configure which databases to be "
@@ -266,18 +310,11 @@ DEFINE_double_hidden(invalidate_tables_fraction_on_memory_pressure, 0.1,
     "The fraction of tables to invalidate when CatalogdTableInvalidator considers the "
     "old GC generation to be almost full.");
 
-DEFINE_bool_hidden(unlock_mt_dop, false,
-    "(Experimental) If true, allow specifying mt_dop for all queries.");
-
-DEFINE_bool_hidden(mt_dop_auto_fallback, false,
-    "(Experimental) If true, fall back to non-mt_dop if mt_dop query option is set and "
-    "a query does not support it. Has no effect if --unlock_mt_dop is true.");
-
 DEFINE_bool_hidden(recursively_list_partitions, true,
     "If true, recursively list the content of partition directories.");
 
-DEFINE_bool(unlock_zorder_sort, false,
-    "(Experimental) If true, enables using ZORDER option for SORT BY.");
+DEFINE_bool(unlock_zorder_sort, true,
+    "If true, enables using ZORDER option for SORT BY.");
 
 DEFINE_string(min_privilege_set_for_show_stmts, "any",
     "Comma separated list of privileges. Any one of them is required to show a database "
@@ -299,6 +336,55 @@ DEFINE_int64(impala_slow_rpc_threshold_ms, 2 * 60 * 1000,
     "Slow RPCs trigger additional logging and other diagnostics. Lowering this value "
     "may result in false positives"
     "This overrides KRPC's --rpc_duration_too_long_ms setting.");
+
+DEFINE_int32(num_check_authorization_threads, 1,
+    "The number of threads used to check authorization for the user when executing show "
+    "tables/databases. This configuration is applicable only when authorization is "
+    "enabled. A value of 1 disables multi-threaded execution for checking authorization."
+    "However, a small value of larger than 1 may limit the parallism of FE requests when "
+    "checking authorization with a high concurrency. The value must be in the range of "
+    "1 to 128.");
+
+DEFINE_bool_hidden(use_customized_user_groups_mapper_for_ranger, false,
+    "If true, use the customized user-to-groups mapper when performing authorization via"
+    " Ranger.");
+
+DEFINE_bool(enable_incremental_metadata_updates, true,
+    "If true, Catalog Server will send incremental table updates in partition level in "
+    "the statestore topic updates. Legacy coordinators will apply the partition updates "
+    "incrementally, i.e. reuse unchanged partition metadata. Disable this feature by "
+    "setting this to false in the Catalog Server. Then metadata of each table will be "
+    "propagated as a whole object in the statestore topic updates. Note that legacy "
+    "coordinators can apply incremental or full table updates so don't need this flag.");
+
+DEFINE_bool(enable_catalogd_hms_cache, true,
+    "If true, response for the HMS APIs that are implemented in catalogd will be served "
+    "from catalogd. If this flag is false or a given API is not implemented in catalogd,"
+    " it will be redirected to HMS.");
+
+DEFINE_bool(enable_legacy_avx_support, false,
+    "If true, Impala relaxes its x86_64 CPU feature requirement to allow running on "
+    "machines with AVX but no AVX2. This allows running Impala on older machines "
+    "without AVX2 support. This is a legacy mode that will be removed in a "
+    "future release.");
+
+DEFINE_bool(pull_table_types_and_comments, false,
+    "When set, catalogd will always load the table types and comments at startup and in "
+    "executing INVALIDATE METADATA commands. In other words, unloaded tables will not "
+    "just contain the table names, but also the table types and comments. This is a "
+    "catalogd-only flag. Required if users want GET_TABLES requests return correct table "
+    "types or comments.");
+
+// TGeospatialLibrary's values are mapped here as constants
+static const string geo_lib_none = "NONE";
+static const string geo_lib_hive_esri = "HIVE_ESRI";
+
+static const string geo_lib_help_msg =
+    "Specifies which implementation of "
+    "geospatial functions should be included as builtins. Possible values: [\""
+    + geo_lib_none + "\", \"" + geo_lib_hive_esri + "\"]";
+
+DEFINE_string(geospatial_library, geo_lib_none, geo_lib_help_msg.c_str());
 
 // ++========================++
 // || Startup flag graveyard ||
@@ -329,16 +415,21 @@ DEFINE_int64(impala_slow_rpc_threshold_ms, 2 * 60 * 1000,
 REMOVED_FLAG(abfs_read_chunk_size);
 REMOVED_FLAG(adls_read_chunk_size);
 REMOVED_FLAG(authorization_policy_file);
+REMOVED_FLAG(authorization_policy_provider_class);
+REMOVED_FLAG(be_port);
 REMOVED_FLAG(be_service_threads);
 REMOVED_FLAG(cgroup_hierarchy_path);
+REMOVED_FLAG(coordinator_rpc_threads);
 REMOVED_FLAG(disable_admission_control);
 REMOVED_FLAG(disable_mem_pools);
 REMOVED_FLAG(enable_accept_queue_server);
+REMOVED_FLAG(enable_orc_scanner);
 REMOVED_FLAG(enable_partitioned_aggregation);
 REMOVED_FLAG(enable_partitioned_hash_join);
 REMOVED_FLAG(enable_phj_probe_side_filtering);
 REMOVED_FLAG(enable_rm);
 REMOVED_FLAG(kerberos_reinit_interval);
+REMOVED_FLAG(ldap_manual_config);
 REMOVED_FLAG(llama_addresses);
 REMOVED_FLAG(llama_callback_port);
 REMOVED_FLAG(llama_host);
@@ -348,6 +439,7 @@ REMOVED_FLAG(llama_registration_timeout_secs);
 REMOVED_FLAG(llama_registration_wait_secs);
 REMOVED_FLAG(local_nodemanager_url);
 REMOVED_FLAG(max_free_io_buffers);
+REMOVED_FLAG(mt_dop_auto_fallback);
 REMOVED_FLAG(pull_incremental_statistics);
 REMOVED_FLAG(report_status_retry_interval_ms);
 REMOVED_FLAG(resource_broker_cnxn_attempts);
@@ -359,11 +451,14 @@ REMOVED_FLAG(rm_default_cpu_vcores);
 REMOVED_FLAG(rm_default_memory);
 REMOVED_FLAG(rpc_cnxn_attempts);
 REMOVED_FLAG(rpc_cnxn_retry_interval_ms);
+REMOVED_FLAG(sentry_catalog_polling_frequency_s);
+REMOVED_FLAG(sentry_config);
 REMOVED_FLAG(skip_lzo_version_check);
 REMOVED_FLAG(staging_cgroup);
 REMOVED_FLAG(status_report_interval);
 REMOVED_FLAG(status_report_max_retries);
 REMOVED_FLAG(suppress_unknown_disk_id_warnings);
+REMOVED_FLAG(unlock_mt_dop);
 REMOVED_FLAG(use_krpc);
 REMOVED_FLAG(use_kudu_kinit);
 REMOVED_FLAG(use_statestore);

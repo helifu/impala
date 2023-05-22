@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -496,7 +497,7 @@ public class ColumnLineageGraph {
               feTable.getMetaStoreTable().getCreateTime());
         } else {
           // -1 is just a placeholder that will be updated after the table/view has been
-          // created. See impala-server.cc (LogLineageRecord) for more information.
+          // created. See client-request-state.cc (LogLineageRecord) for more information.
           metadata = new Metadata(target.tableName_.toString(), -1);
         }
       }
@@ -760,8 +761,8 @@ public class ColumnLineageGraph {
   }
 
   private String getQueryHash(String queryStr) {
-    Hasher hasher = Hashing.md5().newHasher();
-    hasher.putString(queryStr);
+    Hasher hasher = Hashing.murmur3_128().newHasher();
+    hasher.putUnencodedChars(queryStr);
     return hasher.hash().toString();
   }
 

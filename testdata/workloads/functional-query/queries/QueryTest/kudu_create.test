@@ -151,7 +151,8 @@ create table tbl_with_null_defaults (x int primary key, i1 tinyint default null,
   i2 smallint default null, i3 int default null, i4 bigint default null,
   vals string default null, valf float default null, vald double default null,
   valb boolean default null, valdec4 decimal(9) default null,
-  valdec8 decimal(18) default null, valdec16 decimal(38) default null)
+  valdec8 decimal(18) default null, valdec16 decimal(38) default null,
+  valdate date default null, valvc varchar(2000) default null)
   partition by hash (x) partitions 3 stored as kudu
 ---- RESULTS
 'Table has been created.'
@@ -162,11 +163,11 @@ insert into tbl_with_null_defaults (x) values (1);
 NumModifiedRows: 1
 NumRowErrors: 0
 ---- LABELS
-X, I1, I2, I3, I4, VALS, VALF, VALD, VALB, VALDEC4, VALDEC8, VALDEC16
+X, I1, I2, I3, I4, VALS, VALF, VALD, VALB, VALDEC4, VALDEC8, VALDEC16, VALDATE, VALVC
 ---- DML_RESULTS: tbl_with_null_defaults
-1,NULL,NULL,NULL,NULL,'NULL',NULL,NULL,NULL,NULL,NULL,NULL
+1,NULL,NULL,NULL,NULL,'NULL',NULL,NULL,NULL,NULL,NULL,NULL,NULL,'NULL'
 ---- TYPES
-INT,TINYINT,SMALLINT,INT,BIGINT,STRING,FLOAT,DOUBLE,BOOLEAN,DECIMAL,DECIMAL,DECIMAL
+INT,TINYINT,SMALLINT,INT,BIGINT,STRING,FLOAT,DOUBLE,BOOLEAN,DECIMAL,DECIMAL,DECIMAL,DATE,STRING
 ====
 ---- QUERY
 # Overlapping ranges are rejected by the Kudu client
@@ -177,7 +178,7 @@ partition by range (
   partition cast('2009-01-02 10:00:00' as timestamp) <= VALUES
 ) stored as kudu
 ---- CATCH
-NonRecoverableException: overlapping range partitions: first range partition: 2009-01-02T00:00:00.000000Z <= VALUES < 2009-01-03T00:00:00.000000Z, second range partition: VALUES >= 2009-01-02T10:00:00.000000Z
+NonRecoverableException: overlapping range partitions: first range partition: 2009-01-02T00:00:00.000000Z <= VALUES < 2009-01-03T00:00:00.000000Z, second range partition: 2009-01-02T10:00:00.000000Z <= VALUES
 ====
 ---- QUERY
 # Creates a range partitioned Kudu table with a timestamp PK. Note that nanoseconds
@@ -351,4 +352,316 @@ where id between 0 and 1;
 show range partitions ctas_rewrite;
 ---- RESULTS
 '0 <= VALUES < 100'
+====
+---- QUERY
+# create table with primary key of DATE type
+create table kudu_date_key (fdatekey date primary key, val string)
+stored as kudu
+---- RESULTS
+'Table has been created.'
+---- ERRORS
+Unpartitioned Kudu tables are inefficient for large data sizes.
+====
+---- QUERY
+insert into kudu_date_key values (DATE '1970-01-01', 'Unix epoch'), (DATE '2019-12-12', 'today')
+---- RUNTIME_PROFILE
+NumModifiedRows: 2
+NumRowErrors: 0
+---- LABELS
+FDATEKEY,VAL
+---- DML_RESULTS: kudu_date_key
+1970-01-01,'Unix epoch'
+2019-12-12,'today'
+---- TYPES
+DATE,STRING
+====
+---- QUERY
+# create table with invalid default DATE value
+create table kudu_invalid_default_date (fdate date default DATE '111111-33-33')
+stored as kudu
+---- CATCH
+AnalysisException: Invalid date literal: '111111-33-33'
+====
+---- QUERY
+# create table with DATE primary key partitioned by range
+create table kudu_datepk_range (fdate DATE not null primary key)
+partition by range (fdate)
+(
+  partition values < DATE '1900-01-01',
+  partition DATE '1900-01-01' <= values < DATE '1970-01-01',
+  partition DATE '1970-01-01' <= values < DATE '2000-01-01',
+  partition DATE '2000-01-01' <= values
+)
+stored as kudu
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+insert into kudu_datepk_range values
+  (DATE '1800-01-01'),
+  (DATE '1970-01-01'),
+  (DATE '2019-12-12')
+---- RUNTIME_PROFILE
+NumModifiedRows: 3
+NumRowErrors: 0
+---- LABELS
+FDATE
+---- DML_RESULTS: kudu_datepk_range
+1800-01-01
+1970-01-01
+2019-12-12
+---- TYPES
+DATE
+====
+---- QUERY
+select * from kudu_datepk_range;
+---- RESULTS
+1800-01-01
+1970-01-01
+2019-12-12
+---- TYPES
+DATE
+====
+---- QUERY
+# Creates a Kudu table with varchar columns, primary key,
+# hash partition and range partition.
+create table create_varchar
+(
+ valvc varchar(10),
+ primary key (valvc))
+partition by hash (valvc) partitions 4, range (valvc) (
+ partition values < cast('m' as VARCHAR(10)),
+ partition cast('m' as VARCHAR(10)) <= values)
+stored as kudu;
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+insert into create_varchar values
+  (cast('a' as VARCHAR(10))),
+  (cast('m' as VARCHAR(10))),
+  (cast('z' as VARCHAR(10)))
+---- RUNTIME_PROFILE
+NumModifiedRows: 3
+NumRowErrors: 0
+---- LABELS
+VALVC
+---- DML_RESULTS: create_varchar
+'a'
+'m'
+'z'
+---- TYPES
+STRING
+====
+---- QUERY
+# Creates as select table with varchar columns and primary key
+create table ctas_varchar primary key (vc)
+stored as kudu
+as select vc from functional.chars_tiny;
+select * from ctas_varchar;
+---- RESULTS
+'1cccc'
+'2cccccc'
+'3ccc'
+'4cc'
+'5c'
+'6c'
+'c'
+---- TYPES
+STRING
+====
+---- QUERY
+# Create with keyword 'stored by'
+create table kudu_stored_by (i int primary key, s string, ts timestamp, d date) stored by kudu;
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+describe formatted kudu_stored_by;
+---- RESULTS: VERIFY_IS_SUBSET
+'','storage_handler     ','org.apache.hadoop.hive.kudu.KuduStorageHandler'
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Create Kudu table with non unique primary key
+create table non_unique_key_create_tbl1 (id int non unique primary key, name string)
+partition by hash (id) partitions 3
+stored as kudu
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+insert into non_unique_key_create_tbl1 values (1,'Martin'), (2,'Smith');
+---- RESULTS
+: 2
+---- RUNTIME_PROFILE
+NumModifiedRows: 2
+NumRowErrors: 0
+====
+---- QUERY
+# auto-incrementing column is not shown for "select *"
+select * from non_unique_key_create_tbl1 where name = 'Martin';
+---- RESULTS
+1,'Martin'
+---- TYPES
+INT,STRING
+====
+---- QUERY
+# Create Kudu table with non unique composite primary key
+create table non_unique_key_create_tbl2 (a int, b string, non unique primary key(a, b))
+partition by hash (a) partitions 3
+stored as kudu
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+# Create Kudu table with non unique composite primary key
+create table non_unique_key_create_tbl3 (a string, b int, non unique primary key(a, b))
+partition by hash (a) partitions 3
+stored as kudu
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+# Create Kudu table without primary key columns,
+# partition columns will be promoted as non unique primary key columns.
+create table promote_partition_keys_as_non_unique_keys_test (a int, b string, c float)
+partition by hash (a, b) partitions 3
+stored as kudu;
+---- RESULTS
+'Table has been created.'
+---- ERRORS
+Partition columns (a, b) are promoted as non unique primary key.
+====
+---- QUERY
+# Create Kudu table without primary key columns,
+# partition columns cannot be promoted as non unique primary key columns since the columns
+# are not beginning columns of the table.
+create table partition_keys_not_promoted_test (a int, b string, c float)
+partition by hash (b, c) partitions 3
+stored as kudu;
+---- CATCH
+AnalysisException: Specify primary key or non unique primary key for the Kudu table, or create partitions with the beginning columns of the table.
+====
+---- QUERY
+# Create unpartitioned Kudu table with non unique primary key column.
+create table non_unique_key_create_tbl4 (a int non unique primary key, b string)
+stored as kudu;
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+# Create Kudu table in CTAS statement with non unique primary key
+create table non_unique_key_create_tbl5 non unique primary key (id)
+partition by hash (id) partitions 3
+stored as kudu
+as select id, int_col from functional.alltypestiny;
+select * from non_unique_key_create_tbl5 order by id asc;
+---- RESULTS
+0,0
+1,1
+2,0
+3,1
+4,0
+5,1
+6,0
+7,1
+---- TYPES
+INT,INT
+====
+---- QUERY
+# Create Kudu table in CTAS statement with non unique primary key and range partitions
+create table non_unique_key_create_tbl6 non unique primary key (id)
+partition by range (id) (partition values <= 1, partition 1 < values <= 3,
+  partition 3 < values <= 5, partition 5 < values)
+stored as kudu
+as select id, int_col from functional.alltypestiny order by id asc limit 100;
+select id, int_col, auto_incrementing_id from non_unique_key_create_tbl6 order by id asc;
+---- RESULTS
+0,0,1
+1,1,2
+2,0,1
+3,1,2
+4,0,1
+5,1,2
+6,0,1
+7,1,2
+---- TYPES
+INT,INT,BIGINT
+====
+---- QUERY
+# Non unique primary key for non Kudu table
+create table non_unique_key_create_tbl7 (x int, y boolean, non unique primary key(x, y))
+---- CATCH
+AnalysisException: NON UNIQUE PRIMARY KEY is only supported for Kudu
+====
+---- QUERY
+# Non unique primary keys should be declared first
+create table non_unique_key_create_tbl8 (x int, y int, non unique primary key(y))
+  partition by hash (y) partitions 3 stored as kudu
+---- CATCH
+ImpalaRuntimeException: Kudu NON UNIQUE PRIMARY KEY columns must be specified as the first columns in the table (expected leading columns ('y') but found ('x'))
+====
+---- QUERY
+# Non unique primary keys should be be listed in the same order
+create table non_unique_key_create_tbl9 (x int, y int, z int, non unique primary key(y,x))
+  partition by hash (y) partitions 3 stored as kudu
+---- CATCH
+ImpalaRuntimeException: Kudu NON UNIQUE PRIMARY KEY columns must be specified as the first columns in the table (expected leading columns ('y', 'x') but found ('x', 'y'))
+====
+---- QUERY
+# Non unique primary key cannot be boolean type
+create table non_unique_key_create_tbl10 (x boolean non unique primary key)
+  partition by hash(x) partitions 8 stored as kudu
+---- CATCH
+NonRecoverableException: key column may not have type of BOOL, FLOAT, or DOUBLE
+====
+---- QUERY
+# Non unique primary key cannot be float type
+create table non_unique_key_create_tbl11 (x float non unique primary key)
+  partition by hash(x) partitions 8 stored as kudu
+---- CATCH
+NonRecoverableException: key column may not have type of BOOL, FLOAT, or DOUBLE
+====
+---- QUERY
+# Non unique primary key cannot be double type
+create table non_unique_key_create_tbl12 (x double non unique primary key)
+  partition by hash(x) partitions 8 stored as kudu
+---- CATCH
+NonRecoverableException: key column may not have type of BOOL, FLOAT, or DOUBLE
+====
+---- QUERY
+# Cannot create a Kudu table without any key and partition
+create table non_unique_key_create_tbl13 (x int) stored as kudu
+---- CATCH
+AnalysisException: A primary key is required for a Kudu table.
+====
+---- QUERY
+# Cannot create a Kudu table with a column named as "auto_incrementing_id"
+create table non_unique_key_create_tbl14 (id int primary key, auto_incrementing_id bigint)
+  partition by hash(id) partitions 3 stored as kudu
+---- CATCH
+IllegalArgumentException: Column name auto_incrementing_id is reserved by Kudu engine
+====
+---- QUERY
+# Create Kudu table in CTAS statement without specifying primary key.
+# Partition column 'id' is promoted as non unique primary key.
+create table non_unique_key_create_tbl15
+partition by range (id) (partition values <= 1, partition 1 < values <= 3,
+  partition 3 < values <= 5, partition 5 < values)
+stored as kudu
+as select id, int_col from functional.alltypestiny order by id asc limit 100;
+select id, int_col, auto_incrementing_id from non_unique_key_create_tbl15 order by id asc;
+---- RESULTS
+0,0,1
+1,1,2
+2,0,1
+3,1,2
+4,0,1
+5,1,2
+6,0,1
+7,1,2
+---- TYPES
+INT,INT,BIGINT
 ====

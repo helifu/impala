@@ -21,9 +21,13 @@ A script for generating arbitrary junit XML reports while building Impala.
 These files will be consumed by jenkins.impala.io to generate reports for
 easier triaging of build and setup errors.
 """
+from __future__ import absolute_import, division, print_function
 import argparse
+import codecs
 import errno
 import os
+import re
+import sys
 import textwrap
 from xml.dom import minidom
 from xml.etree import ElementTree as ET
@@ -163,10 +167,29 @@ class JunitReport(object):
     )
     junit_log_file = os.path.join(junitxml_logdir, filename)
 
-    with open(junit_log_file, 'w') as f:
-      f.write(str(self))
+    with codecs.open(junit_log_file, encoding="UTF-8", mode='w') as f:
+      if sys.version_info.major < 3:
+        f.write(unicode(self))
+      else:
+        f.write(str(self))
 
     return junit_log_file
+
+  @staticmethod
+  def remove_ansi_escape_sequences(string):
+    """
+    Remove ANSI escape sequences from this string.
+
+    ANSI escape sequences customize terminal output by adding colors, etc.
+    Compilers use them to add color to error messages. ANSI escape
+    sequences interfere with producing the JUnitXML (and do not add any
+    value for JUnitXML), so this function strips them.
+
+    See https://stackoverflow.com/questions/14693701 for more information
+    on this solution.
+    """
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', string)
 
   @staticmethod
   def get_xml_content(file_or_string=None):
@@ -175,30 +198,42 @@ class JunitReport(object):
 
     If the supplied parameter is the path to a file, the contents will be inserted
     into the XML report. If the parameter is just plain string, use that as the
-    content for the report.
+    content for the report. For a file or a string passed in on the commandline,
+    this assumes it could contain Unicode content and converts it to a Unicode
+    object.
 
     Args:
       file_or_string: a path to a file, or a plain string
 
     Returns:
-      content as a string
+      content as a unicode object
     """
     if file_or_string is None:
-      content = ''
+      content = u''
     elif os.path.exists(file_or_string):
-      with open(file_or_string, 'r') as f:
+      with codecs.open(file_or_string, encoding="UTF-8", mode='r') as f:
         content = f.read()
     else:
-      content = file_or_string
-    return content
+      # This is a string passed in on the command line. Make sure to return it as
+      # a unicode string.
+      if sys.version_info.major < 3:
+        content = unicode(file_or_string, encoding="UTF-8")
+      else:
+        content = file_or_string
+    return JunitReport.remove_ansi_escape_sequences(content)
+
+  def __unicode__(self):
+    """
+    Generate and return a pretty-printable XML unicode string
+    """
+    root_node_unicode = ET.tostring(self.root_element)
+    root_node_dom = minidom.parseString(root_node_unicode)
+    return root_node_dom.toprettyxml(indent=' ' * 4)
 
   def __str__(self):
-    """
-    Generate and return a pretty-printable XML string.
-    """
-    root_node_str = minidom.parseString(ET.tostring(self.root_element))
-    return root_node_str.toprettyxml(indent=' ' * 4)
-
+    if sys.version_info.major < 3:
+      return unicode(self).encode('utf-8')
+    return self.__unicode__()
 
 def get_options():
   """Parse and return command line options."""
@@ -221,7 +256,7 @@ def get_options():
   parser.add_argument("--stdout",
                       help=textwrap.dedent(
                           """Standard output to include in the XML report. Can be
-                          either a string or the path to a file..""")
+                          either a string or the path to a file.""")
                       )
   parser.add_argument("--stderr",
                       help=textwrap.dedent(

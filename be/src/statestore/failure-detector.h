@@ -15,14 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef STATESTORE_FAILURE_DETECTOR_H
-#define STATESTORE_FAILURE_DETECTOR_H
-
-#include <boost/thread/thread_time.hpp>
+#include <map>
+#include <mutex>
 #include <string>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
-#include <boost/thread/mutex.hpp>
+#include <boost/thread/thread_time.hpp>
 
 namespace impala {
 
@@ -87,7 +86,7 @@ class TimeoutFailureDetector : public FailureDetector {
 
  private:
   /// Protects all members
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// Record of last time a successful heartbeat was received
   std::map<std::string, boost::system_time> peer_heartbeat_record_;
@@ -130,7 +129,7 @@ class MissedHeartbeatFailureDetector : public FailureDetector {
   PeerState ComputePeerState(int32_t missed_heatbeat_count);
 
   /// Protects all members
-  boost::mutex lock_;
+  std::mutex lock_;
 
   /// The maximum number of heartbeats that can be missed consecutively before a
   /// peer is considered failed.
@@ -143,7 +142,4 @@ class MissedHeartbeatFailureDetector : public FailureDetector {
   /// Number of consecutive heartbeats missed by peer.
   std::map<std::string, int32_t> missed_heartbeat_counts_;
 };
-
 }
-
-#endif // IMPALA_SPARROW_FAILURE_DETECTOR_H

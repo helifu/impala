@@ -18,7 +18,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# This will create/control/destroy a local hdfs/yarn/kms/kudu cluster.
+# This will create/control/destroy a local hdfs/yarn/kms or ozone + kudu cluster.
 #
 # All roles run on 127.0.0.1, just like the standard mini cluster included with hadoop.
 # The difference is with this cluster, each role runs in its own process and has its own
@@ -31,28 +31,17 @@ set -euo pipefail
 . $IMPALA_HOME/bin/report_build_error.sh
 setup_report_build_error
 
-: ${IMPALA_KERBERIZE=}
-: ${INCLUDE_YARN=}
-
-# For Hive 3, we require Yarn for Tez support.
-if "$USE_CDP_HIVE"; then
-  INCLUDE_YARN=1
-fi
-
-while getopts vky OPT; do
+while getopts vy OPT; do
   case $OPT in
     v) set -x;;
-    k) export IMPALA_KERBERIZE=1;;
-    y) export INCLUDE_YARN=1;;
-    ?) echo "Usage: $0 [-v (verbose) -k (kerberize) -y (yarn)] ACTION (see source...)"; exit 1;;
+    ?) echo "Usage: $0 [-v (verbose) -k (kerberize)] ACTION (see source...)"; exit 1;;
   esac
 done
 shift $(($OPTIND-1))
 
 DIR=$(dirname $0)
-NODES_DIR="$DIR/cdh$CDH_MAJOR_VERSION"
 NODE_COUNT=3
-if [[ "$TARGET_FILESYSTEM" == "hdfs" && "$ERASURE_CODING" = true ]]; then
+if [[ "$ERASURE_CODING" = true ]]; then
   NODE_COUNT=5
 fi
 NODE_PREFIX=node-
@@ -66,19 +55,16 @@ export KILL_CLUSTER_MARKER=IBelongToTheMiniCluster
 
 if [[ "$TARGET_FILESYSTEM" == "hdfs" ]]; then
   # The check above indicates that the regular mini-cluster is in use.
-  SUPPORTED_SERVICES=(hdfs kms)
-  if [ -n "${INCLUDE_YARN}" ]; then
-    SUPPORTED_SERVICES+=(yarn)
-  fi
+  SUPPORTED_SERVICES=(hdfs kms yarn)
+elif [[ "$TARGET_FILESYSTEM" == "ozone" ]]; then
+  SUPPORTED_SERVICES=(kms ozone)
 else
   # Either a remote distributed file system or a local non-distributed file system is
   # in use. Currently the only service that is expected to work is Kudu, though in theory
   # the other services could work after the proper configuration changes.
   SUPPORTED_SERVICES=()
 fi
-if $KUDU_IS_SUPPORTED; then
-  SUPPORTED_SERVICES+=(kudu)
-fi
+SUPPORTED_SERVICES+=(kudu)
 
 # All DataNodes and NodeManagers need a unique but fixed address. The IP is fixed at
 # 127.0.0.1, so the only difference is the port. The address must be fixed because it is
@@ -102,6 +88,7 @@ export YARN_WEBUI_PORT=8088   # same as default
 export KMS_WEBUI_PORT=9600    # changed to make room for non-ephemeral HBase ports
                               # (HADOOP-12811)
 export KUDU_WEBUI_PORT=8051   # same as default
+export OZONE_WEBUI_PORT=9874  # same as default for OM WebUI
 
 # Empty dirs that should be included in the templates. Since git ignores empty dirs it is
 # easier to maintain them here.
@@ -109,7 +96,6 @@ EMPTY_NODE_DIRS=$(echo data/dfs/{dn,nn} var/{run,lib/hadoop-hdfs,log} \
     var/{log,run}/kudu/{master,ts} var/lib/kudu/{master,ts}/{wal,data})
 
 EASY_ACCESS_LOG_DIR="$IMPALA_CLUSTER_LOGS_DIR"
-MINIKDC_INIT=${IMPALA_HOME}/testdata/bin/minikdc.sh
 
 FIND_EXECUTABLE_FILTER="-executable"
 if ! find /dev/null "${FIND_EXECUTABLE_FILTER}" 2> /dev/null; then
@@ -127,12 +113,8 @@ fi
 # ourselves a fresh TGT (Ticket-Granting-Ticket).
 #
 function kerberize_setup {
-  if is_kerberized; then
-    export IMPALA_KERBERIZE=1
-  fi
-
   # No kerberos?  We're done.
-  if [ -z "${IMPALA_KERBERIZE}" ]; then
+  if [[ "${IMPALA_KERBERIZE}" != "true" ]]; then
     return
   fi
 
@@ -170,9 +152,6 @@ function kerberize_setup {
     exit 1
   fi
 
-  # Starting it has no effect if it's already started...
-  ${MINIKDC_INIT} start
-
   # Source the appropriate minikdc environment variables
   . ${MINIKDC_ENV}
 
@@ -190,7 +169,7 @@ function kerberize_setup {
 function is_kerberized {
   HCONFSC="`get_hadoop_client_conf_dir`/core-site.xml"
   if [ -f "${HCONFSC}" ]; then
-    if grep -qi "Kerberos settings" "${HCONFSC}"; then
+    if grep -qi "kerberos" "${HCONFSC}"; then
       # If the config exists and has kerberos things in it, treat as kerberized
       return 0
     fi
@@ -201,13 +180,13 @@ function is_kerberized {
 
 function cluster_exists {
   # Just use the first node as an indicator...
-  if [[ ! -e "$NODES_DIR/${NODE_PREFIX}1" ]]; then
+  if [[ ! -e "$IMPALA_CLUSTER_NODES_DIR/${NODE_PREFIX}1" ]]; then
     return 1
   fi
 }
 
 function create_cluster {
-  mkdir -p "$NODES_DIR"
+  mkdir -p "$IMPALA_CLUSTER_NODES_DIR"
 
   # Used to populate config templates later
   GROUP=$(id -gn)
@@ -216,13 +195,9 @@ function create_cluster {
   # Blow away existing config files (so we don't pick up kerberos settings)
   rm -f `get_hadoop_client_conf_dir`/*
 
-  if [ ! -z "${IMPALA_KERBERIZE}" ]; then
+  if [[ "${IMPALA_KERBERIZE}" = "true" ]]; then
     kerberize_setup
     echo "Creating Kerberized cluster."
-  else
-    # Stop the minikdc in case it was running
-    . ${MINIKDC_ENV}
-    ${MINIKDC_INIT} stop
   fi
 
   echo "Hostname for internal communication: ${INTERNAL_LISTEN_HOST}" \
@@ -235,14 +210,16 @@ function create_cluster {
     echo "Creating $NODE at $NODE_DIR"
 
     mkdir -p "$NODE_DIR"
-    cp -a "$COMMON_NODE_TEMPLATE"/* "$NODE_DIR"
+    # Copy recursively and dereference symlinks. This allows us to use symlinks
+    # in the node_template directory without worrying about dangling symlinks.
+    cp -RL "$COMMON_NODE_TEMPLATE"/* "$NODE_DIR"
     if [[ -e "$NODE_TEMPLATE" ]]; then
-      cp -a "$NODE_TEMPLATE"/* "$NODE_DIR"
+      cp -RL "$NODE_TEMPLATE"/* "$NODE_DIR"
     fi
     if [[ $NODE_IDX -gt 1 ]]; then
       # Remove master role scripts from slave nodes
       rm -f "$NODE_DIR/etc/init.d/"{hdfs-namenode,yarn-resourcemanager} \
-            "$NODE_DIR/etc/init.d/"{kms,kudu-master}
+            "$NODE_DIR/etc/init.d/"{kms,kudu-master,ozone-scm,ozone-manager}
       # Only run one YARN nodemanager (more memory-efficient to scale up a
       # single NM than run several)
       rm -f "$NODE_DIR/etc/init.d/yarn-nodemanager"
@@ -293,7 +270,7 @@ function create_cluster {
 
       # Chop out everything between the BEGIN/END Kerberos comments if
       # not kerberized
-      if [ -z "${IMPALA_KERBERIZE}" ]; then
+      if [[ "${IMPALA_KERBERIZE}" != "true" ]]; then
         sed '/<!-- BEGIN Kerberos/,/END Kerberos settings -->/d' \
             "$ACTUAL_PATH.1" > "$ACTUAL_PATH"
       else
@@ -317,6 +294,8 @@ function create_cluster {
       ACTUAL_PATH="${TEMPLATE_PATH%$PY_TEMPLATE_SUFFIX}".xml
       $IMPALA_HOME/bin/generate_xml_config.py $TEMPLATE_PATH $ACTUAL_PATH
       rm $TEMPLATE_PATH
+      # Remove pycache if created
+      rm -rf $(dirname $TEMPLATE_PATH)/__pycache__
     done
   done
 }
@@ -327,11 +306,10 @@ function start_cluster {
     return 1
   fi
 
-  if [ ! -z "${IMPALA_KERBERIZE}" ] && ! is_kerberized; then
+  if [[ "${IMPALA_KERBERIZE}" = "true" ]] && ! is_kerberized; then
     echo "Kerberized start requested, but the config files aren't set up"
-    echo "for kerberos.  Destroy the cluster and rebuild it:"
-    echo "  --> $ ./testdata/cluster/admin delete_cluster"
-    echo "  --> $ IMPALA_KERBERIZE=1 ./testdata/cluster/admin create_cluster"
+    echo "for kerberos. You must regenerate configurations with "
+    echo  "  ./bin/create-test-configuration.sh"
     exit 1
   fi
 
@@ -342,27 +320,6 @@ function start_cluster {
 
   if [ ${#SUPPORTED_SERVICES[@]} -gt 0 ]; then
     for SERVICE in ${SUPPORTED_SERVICES[@]-}; do
-      # If all of the following are true, we wait for ntp to sync before proceeding:
-      #
-      # 1. Kudu is being started
-      # 2. An internet connection is available (checked by pinging $NTP_CANARY)
-      # 3. ntp-wait is installed (checked by calling ntp-wait with the "--help" flag)
-      if [[ "${SERVICE}" == "kudu" ]]; then
-        NTP_CANARY=pool.ntp.org
-        if ! ping -c 1 -w 5 "${NTP_CANARY}" >/dev/null 2>/dev/null; then
-          echo "WARNING: cannot reach ${NTP_CANARY}; ntp sync recommended for Kudu"
-        else
-          # ntp-wait is in /usr/sbin on both CentOS and Debian-based systems, but regular
-          # users don't always have /usr/sbin in $PATH. Use the absolute path.
-          ntp_wait=$(command -v ntp-wait || echo /usr/sbin/ntp-wait)
-          if [[ ! -x $ntp_wait ]]; then
-            echo "WARNING: ntp-wait not installed; ntp sync recommended for Kudu"
-          elif ! $ntp_wait -v; then
-            echo "ntp-wait failed; cannot start kudu"
-            return 1
-          fi
-        fi
-      fi
       start $SERVICE
     done
 
@@ -370,6 +327,29 @@ function start_cluster {
     sleep 10
     check_cluster_status
   fi
+
+  if [[ "${TARGET_FILESYSTEM}" = "ozone" ]]; then
+    local replication=''
+    echo "Creating Ozone volume/bucket"
+    if [ -n "${OZONE_ERASURECODE_POLICY:-}" ]; then
+      replication="--type EC --replication ${OZONE_ERASURECODE_POLICY}"
+      echo "with erasure coding ${OZONE_ERASURECODE_POLICY}"
+    fi
+
+    local bucketkey=''
+    if $USE_OZONE_ENCRYPTION; then
+      echo "Ozone encryption enabled for ${OZONE_VOLUME}/test-warehouse"
+
+      # Encryption is done at the bucket level, so ensure the keys are available first.
+      ${IMPALA_HOME}/testdata/bin/setup-dfs-keys.sh testkey
+      bucketkey='--bucketkey testkey'
+    fi
+
+    ozone sh volume create ${OZONE_VOLUME} || true
+    ozone sh bucket create ${bucketkey} ${replication} \
+        ${OZONE_VOLUME}/test-warehouse || true
+  fi
+
   return $?
 }
 
@@ -418,7 +398,7 @@ function exec_init_script {
   local CMD="$1"
 
   local PIDS=()
-  for SCRIPT in $(find "$NODES_DIR" -path "*/$NODE_PREFIX*/etc/init.d/$SCRIPT_NAME" \
+  for SCRIPT in $(find "$IMPALA_CLUSTER_NODES_DIR" -path "*/$NODE_PREFIX*/etc/init.d/$SCRIPT_NAME" \
       $FIND_EXECUTABLE_FILTER -type f); do
     if "$SCRIPT" status &>/dev/null; then
       RUNNING=true
@@ -453,7 +433,7 @@ function check_cluster_status {
 
   ROLE_COUNT=0
   NOT_RUNNING=()
-  for NODE_DIR in "$NODES_DIR/$NODE_PREFIX"*; do
+  for NODE_DIR in "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"*; do
     for SERVICE in ${SUPPORTED_SERVICES[@]-}; do
       for SCRIPT in $(find "$NODE_DIR" -path "*/etc/init.d/$SERVICE*" $FIND_EXECUTABLE_FILTER \
           -type f); do
@@ -506,30 +486,31 @@ function restart {
 
 function delete_data {
   # Delete namenode, datanode and KMS data while preserving directory structure.
-  rm -rf "$NODES_DIR/$NODE_PREFIX"*/data/dfs/{nn,dn}/*
-  rm -f "$NODES_DIR/$NODE_PREFIX"*/data/kms.keystore
+  rm -rf "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"*/data/dfs/{nn,dn}/*
+  rm -f "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"*/data/kms.keystore
+  rm -rf "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"*/data/ozone
   delete_kudu_data
 }
 
 function delete_kudu_data {
-  rm -rf "$NODES_DIR/$NODE_PREFIX"*/var/lib/kudu/{master,ts}/*
+  rm -rf "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"*/var/lib/kudu/{master,ts}/*
 }
 
 function delete_cluster {
   pkill -u $USER -f $KILL_CLUSTER_MARKER || true
-  rm -rf "$NODES_DIR"
+  rm -rf "$IMPALA_CLUSTER_NODES_DIR"
 }
 
 function get_node_dir {
   if $IS_OSX; then
-    greadlink -f "$NODES_DIR/$1"
+    greadlink -f "$IMPALA_CLUSTER_NODES_DIR/$1"
   else
-    readlink -f "$NODES_DIR/$1"
+    readlink -f "$IMPALA_CLUSTER_NODES_DIR/$1"
   fi
 }
 
 function get_hadoop_client_conf_dir {
-  echo "$NODES_DIR/$NODE_PREFIX"1/etc/hadoop/conf
+  echo "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"1/etc/hadoop/conf
 }
 
 COMMAND=$1

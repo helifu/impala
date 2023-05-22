@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#pragma once
 
-#ifndef IMPALA_EXEC_SCANNER_CONTEXT_H
-#define IMPALA_EXEC_SCANNER_CONTEXT_H
-
+#include <cstdint>
 #include <deque>
 
-#include <boost/cstdint.hpp>
 #include <boost/scoped_ptr.hpp>
 
 #include "common/compiler-util.h"
@@ -390,6 +388,11 @@ class ScannerContext {
   /// Returns the added stream. The returned stream is owned by this context.
   Stream* AddStream(io::ScanRange* range, int64_t reservation);
 
+  /// Add and start a stream to this ScannerContext for 'range'.
+  /// Returns the added stream through output parameter 'stream'.
+  Status AddAndStartStream(
+      io::ScanRange* range, int64_t reservation, ScannerContext::Stream** stream);
+
   /// Returns true if RuntimeState::is_cancelled() is true, or if scan node is not
   /// multi-threaded and is done (finished, cancelled or reached it's limit).
   /// In all other cases returns false.
@@ -439,5 +442,3 @@ class ScannerContext {
 };
 
 }
-
-#endif

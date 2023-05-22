@@ -18,6 +18,7 @@
 package org.apache.impala.planner;
 
 import static org.junit.Assert.fail;
+import org.junit.Assert;
 
 import java.io.FileWriter;
 import java.io.IOException;
@@ -47,8 +48,10 @@ import org.apache.impala.testutil.TestFileParser.TestCase;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.testutil.TestUtils.ResultFilter;
 import org.apache.impala.thrift.ImpalaInternalServiceConstants;
+import org.apache.impala.thrift.QueryConstants;
 import org.apache.impala.thrift.TDescriptorTable;
 import org.apache.impala.thrift.TExecRequest;
+import org.apache.impala.thrift.TExecutorGroupSet;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.THBaseKeyRange;
 import org.apache.impala.thrift.THdfsFileSplit;
@@ -89,7 +92,7 @@ public class PlannerTestBase extends FrontendTestBase {
   private final static boolean GENERATE_OUTPUT_FILE = true;
   private final java.nio.file.Path testDir_ = Paths.get("functional-planner", "queries",
       "PlannerTest");
-  private static java.nio.file.Path outDir_;
+  protected static java.nio.file.Path outDir_;
   private static KuduClient kuduClient_;
 
   // Map from plan ID (TPlanNodeId) to the plan node with that ID.
@@ -105,12 +108,14 @@ public class PlannerTestBase extends FrontendTestBase {
     TUpdateExecutorMembershipRequest updateReq = new TUpdateExecutorMembershipRequest();
     updateReq.setIp_addresses(Sets.newHashSet("127.0.0.1"));
     updateReq.setHostnames(Sets.newHashSet("localhost"));
-    updateReq.setNum_executors(3);
+    TExecutorGroupSet group_set = new TExecutorGroupSet();
+    group_set.curr_num_executors = 3;
+    group_set.expected_num_executors = 20; // default num_expected_executors startup flag
+    updateReq.setExec_group_sets(new ArrayList<TExecutorGroupSet>());
+    updateReq.getExec_group_sets().add(group_set);
     ExecutorMembershipSnapshot.update(updateReq);
 
-    if (RuntimeEnv.INSTANCE.isKuduSupported()) {
-      kuduClient_ = new KuduClient.KuduClientBuilder("127.0.0.1:7051").build();
-    }
+    kuduClient_ = new KuduClient.KuduClientBuilder("127.0.0.1:7051").build();
     String logDir = System.getenv("IMPALA_FE_TEST_LOGS_DIR");
     if (logDir == null) logDir = "/tmp";
     outDir_ = Paths.get(logDir, "PlannerTest");
@@ -241,6 +246,11 @@ public class PlannerTestBase extends FrontendTestBase {
         // All partitions of insertTableId are okay.
         if (tableDesc.getId() == insertTableId) continue;
         if (!tableDesc.isSetHdfsTable()) continue;
+        // Iceberg partitions are handled differently, in Impala there's always a single
+        // HMS partition in an Iceberg table and actual partition/file pruning is
+        // handled by Iceberg. This means 'scanRangePartitions' can be empty while the
+        // descriptor table still has the single HMS partition.
+        if (tableDesc.isSetIcebergTable() && scanRangePartitions.isEmpty()) continue;
         THdfsTable hdfsTable = tableDesc.getHdfsTable();
         for (Map.Entry<Long, THdfsPartition> e :
              hdfsTable.getPartitions().entrySet()) {
@@ -494,7 +504,7 @@ public class PlannerTestBase extends FrontendTestBase {
     } else {
       // for distributed and parallel execution we want to run on all available nodes
       queryOptions.setNum_nodes(
-          ImpalaInternalServiceConstants.NUM_NODES_ALL);
+          QueryConstants.NUM_NODES_ALL);
     }
     if (section == Section.PARALLELPLANS
         && (!queryOptions.isSetMt_dop() || queryOptions.getMt_dop() == 0)) {
@@ -542,12 +552,16 @@ public class PlannerTestBase extends FrontendTestBase {
       if (!testOptions.contains(PlannerTestOption.VALIDATE_SCAN_FS)) {
         resultFilters.add(TestUtils.SCAN_NODE_SCHEME_FILTER);
       }
+      if (testOptions.contains(
+              PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS)) {
+        resultFilters.add(TestUtils.PARTITIONS_FILTER);
+      }
 
       String planDiff = TestUtils.compareOutput(
           Lists.newArrayList(explainStr.split("\n")), expectedPlan, true, resultFilters);
       if (!planDiff.isEmpty()) {
-        errorLog.append(String.format(
-            "\nSection %s of query:\n%s\n\n%s", section, query, planDiff));
+        errorLog.append(String.format("\nSection %s of query at line %d:\n%s\n\n%s",
+            section, testCase.getStartingLineNum(), query, planDiff));
         // Append the VERBOSE explain plan because it contains details about
         // tuples/sizes/cardinality for easier debugging.
         String verbosePlan = getVerboseExplainPlan(queryCtx);
@@ -795,6 +809,30 @@ public class PlannerTestBase extends FrontendTestBase {
     return builder.toString();
   }
 
+  protected int getRowSize(String query, TQueryOptions queryOptions) {
+    TQueryCtx queryCtx = TestUtils.createQueryContext(Catalog.DEFAULT_DB,
+        System.getProperty("user.name"));
+    queryCtx.client_request.setStmt(query);
+    PlanCtx planCtx = new PlanCtx(queryCtx);
+    queryCtx.client_request.query_options = queryOptions;
+
+    try {
+      TExecRequest execRequest = frontend_.createExecRequest(planCtx);
+    } catch (ImpalaException e) {
+      Assert.fail("Failed to create exec request for '" + query + "': " + e.getMessage());
+    }
+
+    String explainStr = planCtx.getExplainString();
+
+    Pattern rowSizePattern = Pattern.compile("row-size=([0-9]*)B");
+    Matcher m = rowSizePattern.matcher(explainStr);
+    boolean matchFound = m.find();
+    Assert.assertTrue("Row size not found in plan.", matchFound);
+    String rowSizeStr = m.group(1);
+    return Integer.valueOf(rowSizeStr);
+  }
+
+
   /**
    * Assorted binary options that alter the behaviour of planner tests, generally
    * enabling additional more-detailed checks.
@@ -832,7 +870,10 @@ public class PlannerTestBase extends FrontendTestBase {
     VALIDATE_SCAN_FS,
     // If set, disables the attempt to compute an estimated number of rows in an
     // hdfs table.
-    DISABLE_HDFS_NUM_ROWS_ESTIMATE
+    DISABLE_HDFS_NUM_ROWS_ESTIMATE,
+    // If set, make no attempt to validate the estimated number of rows for any
+    // partitions in an hdfs table.
+    DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS
   }
 
   protected void runPlannerTestFile(String testFile, TQueryOptions options) {
@@ -861,7 +902,7 @@ public class PlannerTestBase extends FrontendTestBase {
         Collections.<PlannerTestOption>emptySet());
   }
 
-  private void runPlannerTestFile(String testFile, String dbName, TQueryOptions options,
+  protected void runPlannerTestFile(String testFile, String dbName, TQueryOptions options,
         Set<PlannerTestOption> testOptions) {
     String fileName = testDir_.resolve(testFile + ".test").toString();
     if (options == null) {
